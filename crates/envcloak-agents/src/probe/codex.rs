@@ -35,16 +35,10 @@ pub fn toml_str(s: &str) -> String {
     toml_edit::Value::from(s).to_string().trim().to_owned()
 }
 
-/// The arguments of a run of `prompt` against the model at `base_url`, in
-/// `sandbox`, with the probe's own `-c` settings and flags, then the probe
-/// home's.
-pub fn args(
-    base_url: &str,
-    prompt: &str,
-    sandbox: &str,
-    probe: &[String],
-    home: &[String],
-) -> Vec<OsString> {
+/// The settings every run pins: no git check, strict settings, approval
+/// policy `never`, and the scripted model at `base_url` as the only
+/// provider.
+fn pinned(base_url: &str) -> Vec<OsString> {
     let provider = format!(
         "model_providers.ec={{name={}, base_url={}, env_key=\"EC_MODEL_TOKEN\", \
          wire_api=\"responses\"}}",
@@ -52,11 +46,8 @@ pub fn args(
         toml_str(&format!("{base_url}/v1"))
     );
     let mut out: Vec<OsString> = [
-        "exec",
         "--skip-git-repo-check",
         "--strict-config",
-        "--sandbox",
-        sandbox,
         "-c",
         "approval_policy=\"never\"",
         "-c",
@@ -71,8 +62,50 @@ pub fn args(
     .map(OsString::from)
     .collect();
     out.push(provider.into());
+    out
+}
+
+/// The arguments of a run of `prompt` against the model at `base_url`, in
+/// `sandbox`, with the probe's own `-c` settings and flags, then the probe
+/// home's.
+pub fn args(
+    base_url: &str,
+    prompt: &str,
+    sandbox: &str,
+    probe: &[String],
+    home: &[String],
+) -> Vec<OsString> {
+    let mut out: Vec<OsString> = vec!["exec".into()];
+    out.extend(pinned(base_url));
+    out.extend(["--sandbox".into(), sandbox.into()]);
     out.extend(probe.iter().map(OsString::from));
     out.extend(home.iter().map(OsString::from));
+    out.push(prompt.into());
+    out
+}
+
+/// The arguments of a run of `prompt` in the session `session`, resumed
+/// (`exec resume`), against the model at `base_url`: as [`args`], with the
+/// sandbox as its setting, which `exec resume` takes in place of
+/// `--sandbox` (measured on the pinned 0.159.2), and the session's id
+/// before the prompt.
+pub fn resume_args(
+    base_url: &str,
+    session: &str,
+    prompt: &str,
+    sandbox: &str,
+    probe: &[String],
+    home: &[String],
+) -> Vec<OsString> {
+    let mut out: Vec<OsString> = vec!["exec".into(), "resume".into()];
+    out.extend(pinned(base_url));
+    out.extend([
+        "-c".into(),
+        format!("sandbox_mode={}", toml_str(sandbox)).into(),
+    ]);
+    out.extend(probe.iter().map(OsString::from));
+    out.extend(home.iter().map(OsString::from));
+    out.push(session.into());
     out.push(prompt.into());
     out
 }

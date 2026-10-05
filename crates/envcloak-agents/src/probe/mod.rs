@@ -10,12 +10,18 @@
 //! authentication failure, a crash, an onboarding exit) fails the probe
 //! through its control, never passes it ([`controls`]):
 //!
-//! - **prompt-to-model**: a benign prompt carrying a marker must reach the
-//!   model; a prompt carrying a runtime-generated key-shaped token must
-//!   never reach it, in any form, anywhere the model recorded.
+//! - **prompt-to-model**: one session against one model: a benign prompt
+//!   carrying a marker must reach the model, and its session be found by
+//!   it in the host's store; the same session resumed with a prompt
+//!   carrying a runtime-generated key-shaped token, which the host must
+//!   report EnvCloak's hook blocked and which must never reach the model,
+//!   in any form, anywhere the model recorded; and the session resumed
+//!   again with a second marker, which must reach the model with the
+//!   control's turn.
 //! - **transcript**: the host's stores (`Locations::transcript_sources`)
-//!   are swept after those two runs; the control's marker must be found
-//!   there first, and only then does the absence of the blocked token
+//!   are swept after those runs, every file read whole and no link out of
+//!   them; the control's marker must be found by the sweep in its
+//!   session's file, and only then does the absence of the blocked token
 //!   count. A blocked token found there is `persists_blocked_prompt`.
 //! - **file read** and **shell**: the host's own permission layer is opened
 //!   for the probe (Claude Code `--permission-mode default` with
@@ -43,8 +49,8 @@
 //!   (the control) and one that reads `.env` (the probe, denied with
 //!   EnvCloak's marker).
 //! - **output**: `envcloak run` of an emitter that prints the project's
-//!   values: its non-secret marker must reach the model, and no value in
-//!   any form. This needs an approval from a terminal subject
+//!   values, from the probe's directory (`cd` to the project first): its
+//!   non-secret marker must reach the model, and no value in any form. This needs an approval from a terminal subject
 //!   ([`Approver`]); with none, the probe is skipped
 //!   (`probe_needs_terminal`).
 //! - **EnvCloak's server**: the host's own shell, in its sandbox (Claude
@@ -55,6 +61,13 @@
 //!   say so); then a `run_with_secrets` call with no bindings runs `touch`
 //!   beside the denied write: the sentinel appearing is the evidence for
 //!   `outside_host_sandbox` (D-03). Each piece is kept with the result.
+//!
+//! A refusal or a block in the host's own words counts as EnvCloak's rule's
+//! or hook's only where no other's can give it ([`crate::coverage::ConfigSet`]'s
+//! `foreign_read_deny` and `foreign_prompt_hook`, read in the probe's
+//! directory). The result is kept under the identity the probe measured
+//! ([`ProbeReport::record`]): the binary it ran and the probe context of
+//! the directory the hosts ran in, each read before and after.
 //!
 //! A host version outside the scripted model's qualified table
 //! ([`model::QUALIFIED`]) is not probed: every outcome is `not_qualified`.
@@ -261,6 +274,15 @@ pub struct ProbeReport {
     pub runs: Vec<RunSummary>,
     /// The flags the probe home added ([`HostFlags`]).
     pub flags: Vec<String>,
+    /// The SHA-256 of the host binary the probe ran (its executable,
+    /// resolved), read before and after: empty when it could not be read
+    /// or changed meanwhile.
+    pub exe_sha256: String,
+    /// The fingerprint of the probe context the hosts ran in
+    /// (`coverage::ConfigSet::fingerprint` for the probe's directory and
+    /// environment, with the `envcloak` the probe ran), read before and
+    /// after: empty when it could not be read whole or changed meanwhile.
+    pub config_digest: String,
 }
 
 impl ProbeReport {
@@ -269,15 +291,17 @@ impl ProbeReport {
         self.surfaces.iter().find(|s| s.surface == surface)
     }
 
-    /// What the cache keeps of this report, for the host binary whose
-    /// SHA-256 is `exe_sha256` and the probe context whose fingerprint is
-    /// `config_digest` (`coverage::ConfigSet::fingerprint`).
-    pub fn record(&self, exe_sha256: &str, config_digest: &str) -> ProbeRecord {
+    /// What the cache keeps of this report, under the identity it
+    /// measured: the binary it ran and the probe context it ran in (Codex
+    /// review of M2-09: an identity the caller passed could be another
+    /// binary's or another directory's). An identity not read is kept
+    /// empty, which no lookup matches.
+    pub fn record(&self) -> ProbeRecord {
         ProbeRecord {
             host: self.host.id().to_owned(),
-            exe_sha256: exe_sha256.to_owned(),
+            exe_sha256: self.exe_sha256.clone(),
             version: self.version.clone(),
-            config_digest: config_digest.to_owned(),
+            config_digest: self.config_digest.clone(),
             os: std::env::consts::OS.to_owned(),
             surfaces: self
                 .surfaces

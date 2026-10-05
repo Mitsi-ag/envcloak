@@ -11,7 +11,8 @@
 //! valid one that loads (the positive controls), with the exact-cap
 //! receipt loading and a failed store removing its own temporary file.
 //! Adapted only to the record's fields added since (the sentinel's
-//! evidence, the cases not run). [`the_cache_follows_the_probe_context`]
+//! evidence, the cases not run) and to the report keeping the identity it
+//! measured (the binary run, the probe context). [`the_cache_follows_the_probe_context`]
 //! adds the probe context's transitions (Codex F-132) on real files.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -114,6 +115,8 @@ fn producer(host: Host, step: usize, outcome: Outcome) -> ProbeReport {
         },
         runs: vec![],
         flags: vec![format!("fixture-context-{step}")],
+        exe_sha256: "a".repeat(64),
+        config_digest: "b".repeat(64),
     }
 }
 fn host(n: usize) -> Host {
@@ -198,7 +201,7 @@ fn exercise(root: &Path, c: &mut Counts) {
             let h = host(op / 3);
             let outcome = outcomes[op % 3];
             let want = expected(h, step, outcome);
-            let got = producer(h, step, outcome).record(&want.exe_sha256, &want.config_digest);
+            let got = producer(h, step, outcome).record();
             c.check(got == want, "producer preserves receipt fields");
             model.insert(h.id().to_owned(), want);
             cache.put(got);
@@ -430,7 +433,14 @@ fn the_cache_follows_the_probe_context() {
     let first = fingerprint().expect("a complete context");
     let sha = "a".repeat(64);
     let mut cache = Cache::default();
-    cache.put(producer(Agent::ClaudeCode, 0, Outcome::Passed).record(&sha, &first));
+    cache.put(
+        ProbeReport {
+            exe_sha256: sha.clone(),
+            config_digest: first.clone(),
+            ..producer(Agent::ClaudeCode, 0, Outcome::Passed)
+        }
+        .record(),
+    );
     let current = |cache: &Cache| {
         let fp = fingerprint().unwrap_or_default();
         matches!(

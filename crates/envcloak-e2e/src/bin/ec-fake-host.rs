@@ -13,10 +13,25 @@
 //! - `url`: `"dead"` sends to a port nothing listens on (and then ends
 //!   with `exit`, as a host that swallows the error would);
 //! - `prompt`: `"block"` (the default) never sends a prompt holding a
-//!   key-shaped token; `"leak"` sends it;
+//!   key-shaped token, and prints what Claude Code prints when EnvCloak's
+//!   prompt hook blocks one (`UserPromptSubmit operation blocked by
+//!   hook:` and the hook's reason, its marker first); `"leak"` sends it;
+//!   `"drop"` sends nothing and prints nothing, as a run that ended for
+//!   another reason; `"other"` prints another hook's block, without
+//!   EnvCloak's marker;
+//! - sessions as Claude Code keeps them: `--session-id <id>` starts the
+//!   session `~/.claude/projects/fake/<id>.jsonl`, `--resume <id>` goes on
+//!   with it, the prompts it sent before going to the model again with
+//!   the new one (without either, `session.jsonl`); `session`: `"lost"`
+//!   keeps every prompt in `session.jsonl` whatever the id; `resume`:
+//!   `"fresh"` goes on with no earlier turn;
 //! - `persist`: `"allowed"` (the default) keeps each prompt it sent in
-//!   `~/.claude/projects/fake/session.jsonl`; `"all"` keeps a blocked one
-//!   too; `"none"` keeps nothing;
+//!   the session's file; `"all"` keeps a blocked one too; `"none"` keeps
+//!   nothing; `"linked"` keeps a blocked one in a file outside the stores
+//!   that a link in them leads to;
+//! - `locked`: `true` leaves a file in its store that cannot be read;
+//! - `stray`: `true` also sends the model a request for a route it does
+//!   not serve;
 //! - `mention`: `"guarded"` (the default) expands `@<file>` mentions but
 //!   `@.env`; `"all"` expands that too; `"none"` expands nothing;
 //! - `tools`: what a call that reads `.env` or prints the environment
@@ -42,6 +57,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -50,7 +66,11 @@ use serde_json::{Value, json};
 
 struct Mode {
     dead: bool,
-    leak_prompt: bool,
+    prompt: String,
+    session_lost: bool,
+    resume_fresh: bool,
+    locked: bool,
+    stray: bool,
     persist: String,
     mention: String,
     tools: String,
@@ -69,7 +89,11 @@ fn mode(home: &Path) -> Mode {
     let s = |k: &str, d: &str| v.get(k).and_then(Value::as_str).unwrap_or(d).to_owned();
     Mode {
         dead: s("url", "ok") == "dead",
-        leak_prompt: s("prompt", "block") == "leak",
+        prompt: s("prompt", "block"),
+        session_lost: s("session", "kept") == "lost",
+        resume_fresh: s("resume", "history") == "fresh",
+        locked: v.get("locked").and_then(Value::as_bool) == Some(true),
+        stray: v.get("stray").and_then(Value::as_bool) == Some(true),
         persist: s("persist", "allowed"),
         mention: s("mention", "guarded"),
         tools: s("tools", "marker"),
@@ -122,25 +146,73 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .and_then(|t| serde_json::from_str::<Value>(t).ok())
         .is_some_and(|v| v["sandbox"]["enabled"] == json!(true));
-    let transcript = home.join(".claude/projects/fake/session.jsonl");
-    let keep = |text: &str| {
-        let _ = std::fs::create_dir_all(transcript.parent().unwrap_or(&home));
+    let flag = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    let resumed = flag("--resume");
+    let id = resumed.clone().or_else(|| flag("--session-id"));
+    let store = home.join(".claude/projects/fake");
+    let transcript = match id.filter(|_| !m.session_lost) {
+        Some(id) => store.join(format!("{id}.jsonl")),
+        None => store.join("session.jsonl"),
+    };
+    let _ = std::fs::create_dir_all(&store);
+    if m.locked {
+        let locked = store.join("locked.jsonl");
+        let _ = std::fs::write(&locked, b"{}");
+        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000));
+    }
+    let keep = |file: &Path, text: &str, blocked: bool| {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&transcript)
+            .open(file)
         {
-            let _ = writeln!(f, "{}", json!({"prompt": text}));
+            let _ = writeln!(f, "{}", json!({"prompt": text, "blocked": blocked}));
         }
     };
-    if key_shaped(&prompt) && !m.leak_prompt {
-        if m.persist == "all" {
-            keep(&prompt);
+    // The prompts the session sent before, which go to the model again.
+    let earlier: Vec<String> = if resumed.is_some() && !m.resume_fresh {
+        std::fs::read_to_string(&transcript)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v["blocked"] != json!(true))
+            .filter_map(|v| v["prompt"].as_str().map(str::to_owned))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if key_shaped(&prompt) && m.prompt != "leak" {
+        match m.persist.as_str() {
+            "all" => keep(&transcript, &prompt, true),
+            "linked" => {
+                // Kept outside the stores, behind a link in them.
+                let outside = home.join("elsewhere");
+                let _ = std::fs::create_dir_all(&outside);
+                keep(&outside.join("kept.jsonl"), &prompt, true);
+                let _ = std::os::unix::fs::symlink(
+                    outside.join("kept.jsonl"),
+                    store.join("linked.jsonl"),
+                );
+            }
+            _ => {}
+        }
+        match m.prompt.as_str() {
+            "drop" => {}
+            "other" => println!("UserPromptSubmit operation blocked by hook:\nNot today."),
+            _ => println!(
+                "UserPromptSubmit operation blocked by hook:\n[envcloak:key_in_prompt] EnvCloak \
+                 stopped this prompt before it reached the model."
+            ),
         }
         std::process::exit(m.exit);
     }
     if m.persist != "none" {
-        keep(&prompt);
+        keep(&transcript, &prompt, false);
     }
     let mut first = prompt.clone();
     if m.mention != "none" {
@@ -171,7 +243,15 @@ fn main() {
     .iter()
     .map(|n| json!({"name": n, "input_schema": {"type": "object"}}))
     .collect();
-    let mut messages = vec![json!({"role": "user", "content": first})];
+    let mut messages: Vec<Value> = Vec::new();
+    for text in earlier {
+        messages.push(json!({"role": "user", "content": text}));
+        messages.push(json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}));
+    }
+    messages.push(json!({"role": "user", "content": first}));
+    if m.stray {
+        stray(&base, &key);
+    }
     for _ in 0..16 {
         let body = json!({
             "model": "fake", "max_tokens": 64, "stream": false,
@@ -342,6 +422,29 @@ fn call(m: &Mode, sandboxed: bool, name: &str, input: &Value) -> String {
         "mcp__ecprobe__echo" => control(&|| format!("{}{}", s("text"), s("more"))),
         _ => "Error: no such tool".to_owned(),
     }
+}
+
+/// A request for a route the model does not serve.
+fn stray(base: &str, key: &str) {
+    let Some(addr) = base
+        .strip_prefix("http://")
+        .map(|a| a.trim_end_matches('/'))
+    else {
+        return;
+    };
+    let Ok(mut s) = TcpStream::connect(addr) else {
+        return;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+    let _ = s.write_all(
+        format!(
+            "GET /v1/elsewhere HTTP/1.1\r\nHost: {addr}\r\nx-api-key: {key}\r\nconnection: \
+             close\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    let mut sink = Vec::new();
+    let _ = s.read_to_end(&mut sink);
 }
 
 /// One Messages request; the reply's JSON, or `None` when nothing

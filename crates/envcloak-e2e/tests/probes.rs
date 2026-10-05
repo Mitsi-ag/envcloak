@@ -9,8 +9,12 @@
 //!   version and system, and `agents status` reports, from the cached
 //!   results and the home's real configuration, exactly the matrix's
 //!   states and tokens, which are what the probes observed (the test fails
-//!   if a claim differs from the observation); the probe context is the
-//!   same before and after the probe.
+//!   if a claim differs from the observation). The result is kept under the
+//!   identity the probe measured (the binary it ran, which `PATH` leads to
+//!   by a link, and the probe context of the directory the hosts ran in,
+//!   the same before and after), which is what `agents status` reads
+//!   there; another directory, a launcher script in place of the binary or
+//!   a project setting there makes it stale.
 //! - Each pinned host's sentinel probe, its evidence read on disk, gives
 //!   the matrix's server line with `outside_host_sandbox` in both the human
 //!   and the `--json` report; on Linux it runs again outside CI's user
@@ -22,16 +26,22 @@
 //!   Code's `@.env` case fails when the `Read(**/.env*)` deny rule is taken
 //!   out; Codex's hooks, left untrusted (no trust bypass), fail every hook
 //!   probe and read `degraded (fails_open_on_timeout, hooks_untrusted;
-//!   probe=failed)`.
+//!   probe=failed)`; a block Codex reports beside a prompt hook of
+//!   another's is not counted as EnvCloak's.
 //! - A hook that outlives the host's timeout lets the prompt it would block
 //!   through, on both hosts: `fails_open_on_timeout` is what the pinned
 //!   hosts do.
 //! - A stand-in host (`ec-fake-host`) failing each control or each probe
-//!   gives the outcome, state and reasons it must, and one pointed at a
-//!   dead base URL fails every probe through its control; its sentinel
-//!   needs its shell to run and write, its file read takes the hook where
-//!   the rule leaves it, and a mention it does not expand is reported
-//!   skipped.
+//!   gives the outcome, state and reasons it must (the prompt probe's
+//!   session not kept or not found, its run ending without sending anything
+//!   or blocked by another hook, the session not going on; a store it
+//!   cannot read, or one behind a link out of the stores), one the model
+//!   does not wholly serve fails every probe, and one pointed at a dead
+//!   base URL fails every probe through its control; its output probe
+//!   passes only redacted, its sentinel needs its shell to run and write,
+//!   its file read takes the hook where the rule leaves it and counts no
+//!   refusal under a rule not known to be EnvCloak's, and a mention it does
+//!   not expand is reported skipped.
 #![allow(clippy::unwrap_used)]
 
 use std::ffi::OsString;
@@ -240,19 +250,13 @@ fn site(host: Host, test: &str) -> Option<Site> {
     let probe_project = home.join("probe");
     std::fs::create_dir_all(&probe_project).unwrap();
     let agent = AgentHome::within(&h.home, host, installed);
+    // The person's `PATH` leads to the pinned build by a link, as a
+    // native install's does: `agents status` and the probe resolve it to
+    // the same binary (Codex review of M2-09: a launcher script was hashed
+    // in place of the binary probed).
     let bin = root.join("host-bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let name = match host {
-        Host::ClaudeCode => "claude",
-        Host::Codex => "codex",
-    };
-    write_script(
-        &bin.join(name),
-        &format!(
-            "#!/bin/sh\nexec {} \"$@\"\n",
-            quoted(agent.installed.exe.to_str().unwrap())
-        ),
-    );
+    std::os::unix::fs::symlink(&agent.installed.exe, bin.join(host_name(host))).unwrap();
     let mut s = Site {
         h,
         agent,
@@ -297,10 +301,12 @@ impl Site {
         env
     }
 
+    /// The host as the person's `PATH` has it: what `agents status` hashes
+    /// is what the probe runs.
     fn probe_host(&self) -> ProbeHost {
         ProbeHost {
             host: agent_of(self.host),
-            exe: self.agent.installed.exe.clone(),
+            exe: self.bin.join(host_name(self.host)),
             version: self.agent.installed.pin.version.clone(),
         }
     }
@@ -415,17 +421,17 @@ impl Site {
         report
     }
 
-    /// The configuration `agents status` reads in `HOME`, and its digest.
+    /// The configuration `agents status` reads in the probe's directory,
+    /// where the hosts ran.
     fn config(&self) -> ConfigSet {
         let env = self.env();
         let lookup = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
         let l = Locations::new(&lookup).unwrap();
-        let home = std::fs::canonicalize(self.h.home.home()).unwrap();
         ConfigSet::read(
             agent_of(self.host),
             &l,
             &coverage::claude_managed_dir(),
-            &home,
+            &self.probe_project,
             &lookup,
         )
     }
@@ -433,11 +439,8 @@ impl Site {
     /// The SHA-256 `agents status` keys the cache by: the host's file on
     /// `PATH`, resolved.
     fn exe_sha256(&self) -> String {
-        let name = match self.host {
-            Host::ClaudeCode => "claude",
-            Host::Codex => "codex",
-        };
-        coverage::file_sha256(&std::fs::canonicalize(self.bin.join(name)).unwrap()).unwrap()
+        coverage::file_sha256(&std::fs::canonicalize(self.bin.join(host_name(self.host))).unwrap())
+            .unwrap()
     }
 
     /// The probe context's fingerprint `agents status` keys the cache by,
@@ -446,22 +449,59 @@ impl Site {
         self.config().fingerprint(&self.h.cli()).unwrap()
     }
 
-    /// Keeps `report` in the cache as `agents status --probe` will (M2-28).
+    /// Keeps `report` in the cache as `agents status --probe` will (M2-28):
+    /// under the identity the probe measured, which is what `agents
+    /// status` reads in the probe's directory.
     fn cache(&self, report: &ProbeReport) {
+        assert_eq!(report.exe_sha256, self.exe_sha256(), "the binary probed");
+        assert_eq!(
+            report.config_digest,
+            self.fingerprint(),
+            "the probe context the hosts ran in, unchanged while probed"
+        );
         let path = Cache::path(&self.h.data_dir());
         let mut c = Cache::load(&path);
-        c.put(report.record(&self.exe_sha256(), &self.fingerprint()));
+        c.put(report.record());
         c.store(&path).unwrap();
     }
 
-    /// `envcloak agents status [--json]` in `HOME`.
+    /// `envcloak agents status [--json]` in the probe's directory.
     fn status(&mut self, json: bool) -> envcloak_e2e::Human {
-        let home = self.h.home.home();
+        let dir = self.probe_project.clone();
+        self.status_in(&dir, json)
+    }
+
+    /// `envcloak agents status [--json]` in `dir`.
+    fn status_in(&mut self, dir: &Path, json: bool) -> envcloak_e2e::Human {
         let mut args = vec!["agents", "status"];
         if json {
             args.push("--json");
         }
-        person_with_hosts(self, &home, &args)
+        person_with_hosts(self, dir, &args)
+    }
+
+    /// What `agents status --json` in `dir` says the host's results rest
+    /// on: `current`, `changed_since_probe` or `not_probed`.
+    fn probed_in(&mut self, dir: &Path) -> String {
+        let out = self.status_in(dir, true);
+        assert_eq!(out.code, 0, "{}", out.all());
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == self.host.id())
+            .unwrap_or_else(|| panic!("{v}"))["probed"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+}
+
+fn host_name(host: Host) -> &'static str {
+    match host {
+        Host::ClaudeCode => "claude",
+        Host::Codex => "codex",
     }
 }
 
@@ -534,13 +574,12 @@ fn whole_probe(host: Host, test: &str) {
         return;
     };
     // The probe context a result is kept for is the one it ran in: the
-    // host changes none of it while it is probed.
-    let before = s.fingerprint();
+    // host changes none of it while it is probed (the probe reads it
+    // before and after, and keeps no identity when they differ).
     let report = s.probe(&Surface::ALL, false, true);
-    assert_eq!(
-        before,
-        s.fingerprint(),
-        "the probe changed the configuration its result is kept for"
+    assert!(
+        !report.config_digest.is_empty() && !report.exe_sha256.is_empty(),
+        "the probe kept no identity: its context changed or could not be read"
     );
     let version = s.agent.installed.pin.version.clone();
     let row: Vec<(String, String)> = matrix(host.id(), &version)
@@ -573,7 +612,7 @@ fn whole_probe(host: Host, test: &str) {
     assert_eq!(a["probed"], "current", "{a}");
     assert_eq!(a["identified_by"], "version", "{a}");
     let cs = s.config();
-    let record = report.record(&s.exe_sha256(), &s.fingerprint());
+    let record = report.record();
     let expected = coverage::assemble(agent_of(host), &version, &cs, Probed::Current(&record));
     for (name, want) in &row {
         let entry = a["surfaces"]
@@ -620,6 +659,48 @@ fn whole_probe(host: Host, test: &str) {
         );
     }
     assert!(text.contains("outside_host_sandbox"), "{text}");
+    // The result is current only for what was probed (Codex review of
+    // M2-09): another directory, a launcher that is not the binary probed,
+    // another configuration in the probe's directory each read stale, and
+    // putting each back reads current again (the controls).
+    let probe_dir = s.probe_project.clone();
+    let home_dir = s.h.home.home();
+    assert_eq!(s.probed_in(&probe_dir), "current");
+    assert_eq!(
+        s.probed_in(&home_dir),
+        "changed_since_probe",
+        "another directory"
+    );
+    let link = s.bin.join(host_name(host));
+    std::fs::remove_file(&link).unwrap();
+    write_script(
+        &link,
+        &format!(
+            "#!/bin/sh\nexec {} \"$@\"\n",
+            quoted(s.agent.installed.exe.to_str().unwrap())
+        ),
+    );
+    assert_eq!(
+        s.probed_in(&probe_dir),
+        "changed_since_probe",
+        "a launcher script"
+    );
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&s.agent.installed.exe, &link).unwrap();
+    assert_eq!(s.probed_in(&probe_dir), "current", "the link put back");
+    let (dir, file, text) = match host {
+        Host::ClaudeCode => (".claude", "settings.json", "{}\n"),
+        Host::Codex => (".codex", "config.toml", "# the person's\n"),
+    };
+    std::fs::create_dir_all(probe_dir.join(dir)).unwrap();
+    std::fs::write(probe_dir.join(dir).join(file), text).unwrap();
+    assert_eq!(
+        s.probed_in(&probe_dir),
+        "changed_since_probe",
+        "a project setting"
+    );
+    std::fs::remove_file(probe_dir.join(dir).join(file)).unwrap();
+    assert_eq!(s.probed_in(&probe_dir), "current", "the setting taken out");
     s.agent.check_pinned();
     s.h.assert_swept(&format!("M2-09 probes ({})", host.id()));
 }
@@ -1017,6 +1098,53 @@ fn codex_untrusted_hooks_read_degraded_with_failed_probes() {
     s.h.assert_swept("M2-09 untrusted hooks (Codex)");
 }
 
+/// Codex reports a prompt hook's block naming no hook: beside a prompt hook
+/// of the person's, in the file it reads hooks from, the block is not
+/// known to be EnvCloak's and the prompt probe fails through its witness,
+/// though the token is kept from the model (the class of the verifier's
+/// round-2 finding: a refusal taken as EnvCloak's without its provenance).
+/// Without that hook, the control, it passes.
+///
+/// Mutation checked: the witness counted whatever hook gave it (`ours`
+/// answering true for Codex): the probe passes and this fails.
+#[test]
+fn codex_block_beside_another_prompt_hook_is_not_counted() {
+    const REPORTED: &str = "the host reports EnvCloak's hook blocked the prompt";
+    let Some(mut s) = site(Host::Codex, "M2-09 another prompt hook (Codex)") else {
+        return;
+    };
+    let file = s.agent.codex_home().join("hooks.json");
+    let installed = std::fs::read(&file).unwrap();
+    let mut v: Value = serde_json::from_slice(&installed).unwrap();
+    v["hooks"]["UserPromptSubmit"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"hooks": [{"type": "command", "command": "/usr/bin/true"}]}));
+    std::fs::write(&file, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    let report = s.probe(&[Surface::PromptToModel], false, true);
+    let p = report.surface(Surface::PromptToModel).unwrap().clone();
+    assert_eq!(p.outcome, Outcome::Failed, "{p:?}");
+    let failed: Vec<(&str, &str)> = p
+        .checks
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| (c.name, c.why))
+        .collect();
+    assert_eq!(
+        failed,
+        [(
+            REPORTED,
+            "a prompt hook blocked it, not known to be EnvCloak's"
+        )],
+        "{p:?}"
+    );
+    std::fs::write(&file, &installed).unwrap();
+    let report = s.probe(&[Surface::PromptToModel], false, true);
+    let p = report.surface(Surface::PromptToModel).unwrap();
+    assert_eq!(p.outcome, Outcome::Passed, "the control: {p:?}");
+    s.h.assert_swept("M2-09 another prompt hook (Codex)");
+}
+
 /// A `UserPromptSubmit` hook that would block the prompt but outlives the
 /// host's timeout: the prompt, holding a key-shaped token, goes on to the
 /// model. This is the `fails_open_on_timeout` the coverage report gives
@@ -1103,6 +1231,14 @@ fn fake(mode: &Value) -> Fake {
     std::fs::create_dir_all(&project).unwrap();
     std::fs::create_dir_all(root.join("tmp")).unwrap();
     std::fs::write(home.join(".ec-fake-host.json"), mode.to_string()).unwrap();
+    // The settings the stand-in's home holds, as EnvCloak's installer
+    // leaves them: its `Read(**/.env*)` deny rule, which the stand-in's
+    // `rule` mode acts out; a mode's `settings` in their place.
+    let settings = mode.get("settings").cloned().unwrap_or_else(
+        || json!({"permissions": {"deny": [envcloak_agents::hosts::claude::READ_DENY]}}),
+    );
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/settings.json"), settings.to_string()).unwrap();
     Fake {
         _dir: dir,
         root,
@@ -1213,7 +1349,7 @@ fn a_stand_in_that_holds_passes_every_probe_it_runs() {
         Agent::ClaudeCode,
         "2.1.280",
         &installed(),
-        Probed::Current(&r.record("x", "y")),
+        Probed::Current(&r.record()),
     );
     assert_eq!(
         c.surface(Surface::Output).map(ToString::to_string),
@@ -1250,7 +1386,7 @@ fn a_dead_base_url_fails_every_probe_through_its_control() {
         Agent::ClaudeCode,
         "2.1.280",
         &installed(),
-        Probed::Current(&r.record("x", "y")),
+        Probed::Current(&r.record()),
     );
     for s in c.surfaces.iter().take(5) {
         assert_eq!(s.probe, Outcome::Failed, "{s}");
@@ -1261,6 +1397,15 @@ fn a_dead_base_url_fails_every_probe_through_its_control() {
 /// Each control failing alone, and each probe failing alone, gives that
 /// surface `failed` (through the check that failed), and its state never
 /// `active`.
+///
+/// Mutations checked: the prompt probe without the host's report of the
+/// block (`reported && ours` replaced by `true`): the run that ends
+/// without sending anything (`prompt: drop`) passes and this fails; the
+/// session's next turn without the control's (`reached(&rc.requests,
+/// &ctl)` dropped): a fresh session after the block passes and this
+/// fails; the transcript without its sweep's completeness (`swept.complete`
+/// replaced by `true`, the verifier's round-2 finding): the locked store
+/// and the linked one pass and this fails.
 #[test]
 fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
     struct Case {
@@ -1279,10 +1424,48 @@ fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
             failed: &[Surface::Transcript],
             check: "the blocked prompt is in none of them",
         },
+        // A host that keeps no session cannot be resumed: the probe's
+        // session is not found, and both fail through that control.
         Case {
             mode: json!({"persist": "none"}),
+            failed: &[Surface::PromptToModel, Surface::Transcript],
+            check: "the control's session is found in the host's store",
+        },
+        Case {
+            mode: json!({"session": "lost"}),
+            failed: &[Surface::PromptToModel, Surface::Transcript],
+            check: "the control's session is found in the host's store",
+        },
+        // Codex's finding: only the probe's run ends without sending
+        // anything, and without the host reporting a block.
+        Case {
+            mode: json!({"prompt": "drop"}),
+            failed: &[Surface::PromptToModel, Surface::Transcript],
+            check: "the host reports EnvCloak's hook blocked the prompt",
+        },
+        // Another hook's block, without EnvCloak's marker.
+        Case {
+            mode: json!({"prompt": "other"}),
+            failed: &[Surface::PromptToModel, Surface::Transcript],
+            check: "the host reports EnvCloak's hook blocked the prompt",
+        },
+        // The session does not go on after the block.
+        Case {
+            mode: json!({"resume": "fresh"}),
+            failed: &[Surface::PromptToModel, Surface::Transcript],
+            check: "the session goes on after the block, the control's turn in it",
+        },
+        // A store that cannot be read whole, or one behind a link out of
+        // the stores that holds the blocked prompt: no clean sweep.
+        Case {
+            mode: json!({"locked": true}),
             failed: &[Surface::Transcript],
-            check: "the control prompt is in the host's stores",
+            check: "the host's stores were read whole",
+        },
+        Case {
+            mode: json!({"persist": "linked"}),
+            failed: &[Surface::Transcript],
+            check: "the host's stores were read whole",
         },
         Case {
             mode: json!({"tools": "plain"}),
@@ -1333,19 +1516,31 @@ fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
             };
             assert_eq!(s.outcome, want, "{}: {surface:?}: {s:?}", case.mode);
             if want == Outcome::Failed && !case.check.is_empty() {
+                // The transcript fails through its own check where the
+                // case is the transcript's, else through the prompt's.
+                let own = case.failed == [Surface::Transcript];
                 assert!(
                     s.checks.iter().any(|c| !c.passed && c.name == case.check)
-                        || surface == Surface::Transcript,
+                        || (surface == Surface::Transcript && !own),
                     "{}: {surface:?}: {s:?}",
                     case.mode
                 );
+                if surface == Surface::Transcript && own {
+                    let failed: Vec<&str> = s
+                        .checks
+                        .iter()
+                        .filter(|c| !c.passed)
+                        .map(|c| c.name)
+                        .collect();
+                    assert_eq!(failed, [case.check], "{}: {s:?}", case.mode);
+                }
             }
         }
         let c = coverage::assemble(
             Agent::ClaudeCode,
             "2.1.280",
             &installed(),
-            Probed::Current(&r.record("x", "y")),
+            Probed::Current(&r.record()),
         );
         for surface in case.failed {
             let s = c.surface(*surface).unwrap();
@@ -1392,7 +1587,7 @@ fn a_stand_in_sentinel_needs_its_shell_to_run_and_write() {
             Agent::ClaudeCode,
             "2.1.280",
             &installed(),
-            Probed::Current(&r.record("x", "y")),
+            Probed::Current(&r.record()),
         )
         .envcloak_server
         .map(|l| l.to_string())
@@ -1441,9 +1636,11 @@ fn a_stand_in_sentinel_needs_its_shell_to_run_and_write() {
 /// hook refuses both; with the hook's marker gone, the probe fails
 /// through its hook case alone.
 ///
-/// Mutation checked: the hook's case reading the project's `.env` (the
+/// Mutations checked: the hook's case reading the project's `.env` (the
 /// `ELSEWHERE` folder's replaced by the project in `file_read`): the rule
-/// refuses it without the marker and this fails.
+/// refuses it without the marker and this fails; the rule's provenance
+/// not checked (`rule_is_ours` answering true): the person's own deny
+/// rule passes the rule's case and this fails.
 #[test]
 fn a_stand_in_file_read_takes_the_hook_where_the_rule_leaves_it() {
     const MARKED: &str = "the probe call is denied with EnvCloak's marker";
@@ -1469,6 +1666,35 @@ fn a_stand_in_file_read_takes_the_hook_where_the_rule_leaves_it() {
     let r = fake_probe(&json!({"rule": "off", "tools": "run"}));
     let f = failed(&r);
     assert!(f.contains(&MARKED) && f.contains(&RULE), "{f:?}");
+    // The host's words name no rule: beside a deny rule of the person's
+    // for the file tools, or without EnvCloak's, the refusal is not known
+    // to be EnvCloak's rule's, and the rule's case fails (the verifier's
+    // round-2 finding, for M2-28's machines).
+    let read_deny = envcloak_agents::hosts::claude::READ_DENY;
+    for settings in [
+        json!({"permissions": {"deny": [read_deny, "Read(./secrets/**)"]}}),
+        json!({}),
+    ] {
+        let r = fake_probe(&json!({"settings": settings}));
+        assert_eq!(
+            failed(&r),
+            [RULE],
+            "{settings}: {:?}",
+            r.surface(Surface::FileRead)
+        );
+        let why = r
+            .surface(Surface::FileRead)
+            .unwrap()
+            .checks
+            .iter()
+            .find(|c| c.name == RULE)
+            .unwrap()
+            .why;
+        assert_eq!(
+            why,
+            "the host refused it under a rule not known to be EnvCloak's"
+        );
+    }
 }
 
 /// A host that does not expand `@` mentions under `-p`: the file read's
@@ -1493,7 +1719,7 @@ fn a_mention_the_host_does_not_expand_is_reported_skipped() {
         Agent::ClaudeCode,
         "2.1.280",
         &installed(),
-        Probed::Current(&r.record("x", "y")),
+        Probed::Current(&r.record()),
     );
     assert_eq!(
         c.surface(Surface::FileRead).map(ToString::to_string),
@@ -1506,6 +1732,192 @@ fn a_mention_the_host_does_not_expand_is_reported_skipped() {
     // The control: a host that expands them runs the case.
     let r = fake_probe(&json!({}));
     assert!(r.surface(Surface::FileRead).unwrap().skipped.is_empty());
+}
+
+/// A host that also sends the model a request it does not serve (an
+/// unknown route) makes every run of its probes unfit to read: each
+/// probe fails, through a control, never passes (the verifier's round-2
+/// finding: nothing failed without `usable`'s check of the model's run).
+///
+/// Mutation checked: `HostRun::usable` without `self.clean`: every probe
+/// passes and this fails.
+#[test]
+fn a_stand_in_the_model_does_not_wholly_serve_fails_every_probe() {
+    let r = fake_probe(&json!({"stray": true}));
+    for surface in [
+        Surface::PromptToModel,
+        Surface::Transcript,
+        Surface::FileRead,
+        Surface::Shell,
+        Surface::Mcp,
+    ] {
+        let s = r.surface(surface).unwrap();
+        assert_eq!(s.outcome, Outcome::Failed, "{surface:?}: {s:?}");
+        assert!(
+            s.checks.iter().any(|c| c.control && !c.passed),
+            "{surface:?}: {s:?}"
+        );
+    }
+    assert!(r.runs.iter().all(|run| !run.clean), "{:?}", r.runs);
+    // The control: the same host without the stray request passes.
+    let r = fake_probe(&json!({}));
+    assert!(r.runs.iter().all(|run| run.clean), "{:?}", r.runs);
+}
+
+/// The output probe on the stand-in, with an emitter in place of
+/// `envcloak run`'s command and a runner in place of `envcloak`: it
+/// passes only when the emitter's marker reached the model and no value
+/// in any form did. A value as it is, base64 or hexadecimal fails it; an
+/// emitter that prints no marker, or a run `envcloak` refused, fails it
+/// through its control (Codex review of M2-09: no test made the output
+/// probe or its control fail).
+///
+/// Mutations checked: the leak check dropped (`!leaked` replaced by
+/// `true`): the three leaks pass and this fails; the control dropped
+/// (`ran` replaced by `true`): the emitter with no marker and the refused
+/// run pass and this fails.
+#[test]
+fn a_stand_in_output_probe_needs_its_marker_and_no_value() {
+    const VALUE: &str = "ecp-value-6d2a-91c4-0e7b-55f3";
+    const MARKER: &str = "ecp-emit-3c1d-8a02";
+    let b64 = base64_of(VALUE.as_bytes());
+    let hex: String = VALUE.bytes().map(|b| format!("{b:02x}")).collect();
+    let (a, b) = MARKER.split_at(MARKER.len() / 2);
+    let marker = format!("printf '%s%s\\n' '{a}' '{b}'\n");
+    let cases: [(&str, String, bool, Option<&str>); 6] = [
+        ("redacted", marker.clone(), true, None),
+        (
+            "the value as it is",
+            format!("{marker}printf '%s\\n' '{VALUE}'\n"),
+            true,
+            Some("no value reached the model in any form"),
+        ),
+        (
+            "base64",
+            format!("{marker}printf '%s\\n' '{b64}'\n"),
+            true,
+            Some("no value reached the model in any form"),
+        ),
+        (
+            "hexadecimal",
+            format!("{marker}printf '%s\\n' '{hex}'\n"),
+            true,
+            Some("no value reached the model in any form"),
+        ),
+        (
+            "no marker",
+            "printf '%s\\n' 'nothing here'\n".to_owned(),
+            true,
+            Some("the emitter ran under envcloak run and its marker reached the model"),
+        ),
+        (
+            "a run envcloak refused",
+            marker,
+            false,
+            Some("the emitter ran under envcloak run and its marker reached the model"),
+        ),
+    ];
+    for (name, emitter, runs, failing) in cases {
+        let r = fake_output_probe(&format!("#!/bin/sh\n{emitter}"), runs, VALUE, MARKER);
+        let out = r.surface(Surface::Output).unwrap();
+        let failed: Vec<&str> = out
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| c.name)
+            .collect();
+        match failing {
+            None => assert_eq!(out.outcome, Outcome::Passed, "{name}: {out:?}"),
+            Some(check) => {
+                assert_eq!(out.outcome, Outcome::Failed, "{name}: {out:?}");
+                assert_eq!(failed, [check], "{name}: {out:?}");
+            }
+        }
+        assert_eq!(
+            r.runs
+                .iter()
+                .find(|run| run.name == "output")
+                .and_then(|run| run.approved),
+            Some(true),
+            "{name}"
+        );
+    }
+}
+
+/// Base64, standard alphabet, padded.
+fn base64_of(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(A[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// The stand-in probed on its output surface: `emitter` the command a
+/// stand-in `envcloak` runs (`runs`), or refuses with
+/// `approval_required` (not `runs`); the project binds `value`.
+fn fake_output_probe(emitter: &str, runs: bool, value: &str, marker: &str) -> ProbeReport {
+    let f = fake(&json!({}));
+    let project = f.root.join("acme");
+    std::fs::create_dir_all(&project).unwrap();
+    write_script(&project.join("emit"), emitter);
+    let runner = f.root.join("bin").join("envcloak");
+    std::fs::create_dir_all(runner.parent().unwrap()).unwrap();
+    write_script(
+        &runner,
+        if runs {
+            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n"
+        } else {
+            "#!/bin/sh\necho 'envcloak: approval_required request=x' >&2\nexit 125\n"
+        },
+    );
+    let yes = Yes;
+    let home = ProbeHome {
+        root: f.root.clone(),
+        home: f.home.clone(),
+        env: vec![
+            ("HOME".into(), f.home.clone().into()),
+            ("PATH".into(), TEST_PATH.into()),
+            ("TMPDIR".into(), f.root.join("tmp").into()),
+            ("CLAUDE_CODE_TMPDIR".into(), f.root.join("tmp").into()),
+        ],
+        project: f.project.clone(),
+        model_exe: probe_model_exe(),
+        envcloak: runner,
+        mcp_fixture: None,
+        sentinel_project: None,
+        output: Some(OutputFixture {
+            project,
+            command: vec!["./emit".to_owned()],
+            marker: marker.to_owned(),
+            values: vec![zeroize::Zeroizing::new(value.as_bytes().to_vec())],
+        }),
+        approver: Some(&yes),
+        run_limit: Duration::from_secs(60),
+    };
+    let host = ProbeHost {
+        host: Agent::ClaudeCode,
+        exe: PathBuf::from(env!("CARGO_BIN_EXE_ec-fake-host")),
+        version: "2.1.280".to_owned(),
+    };
+    probe::run_surfaces(
+        &host,
+        &home,
+        &HostFlags::default(),
+        &[Surface::Output],
+        false,
+    )
 }
 
 /// A host version outside the scripted model's qualified table is not
