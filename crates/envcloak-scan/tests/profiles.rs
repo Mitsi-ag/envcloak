@@ -183,3 +183,31 @@ fn fish_export_scopes_and_comments_preserve_literals() {
         assert!(f.single_complete_line);
     }
 }
+
+#[test]
+fn templates_cannot_hide_unsupported_shell_syntax() {
+    for source in [
+        "A=($HOME)\n",
+        "export A=($HOME)\n",
+        "A=(one two)\n",
+        "A=x($HOME)\n",
+        "A=$HOME)\n",
+        "A=$HOME; echo side_effect\n",
+        "A=\"$HOME\n",
+        "A=$(echo placeholder)\n",
+    ] {
+        let report = parse_profile(&SecretBytes::copy_from(source.as_bytes()), Shell::Posix);
+        assert!(!report.complete());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.reason == "unsupported_syntax")
+        );
+        assert_eq!(report.findings.len(), 1);
+        let finding = &report.findings[0];
+        assert_eq!(finding.disposition, Disposition::Manual);
+        assert!(finding.value.is_none());
+        assert!(!finding.single_complete_line);
+    }
+}

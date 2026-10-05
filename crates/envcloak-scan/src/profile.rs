@@ -158,10 +158,10 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
             .unwrap_or(b"");
         let complete_tail = tail.is_empty() || tail.starts_with(b"#");
         let complex = !complete_tail;
-        let disposition = if template {
-            Disposition::Template
-        } else if unsupported || q != 0 || escaped || complex {
+        let disposition = if unsupported || q != 0 || escaped || complex {
             Disposition::Manual
+        } else if template {
+            Disposition::Template
         } else {
             Disposition::Literal
         };
