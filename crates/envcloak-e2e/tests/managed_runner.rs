@@ -261,6 +261,10 @@ fn dumper(dir: &Path) -> PathBuf {
 /// memory to a file at exit, asks for the launch and is answered
 /// `started`; the dump holds the client's own positive control (a marker
 /// it kept in memory) and no encoding of the key.
+///
+/// Mutation checked: the runner writing the server's environment to its
+/// client's output before starting the server: the dump holds the key, and
+/// this fails at its sweep (checked before the answer is).
 #[test]
 fn an_injected_library_finds_no_value_in_the_client() {
     if managed_common::release_run("an_injected_library_finds_no_value_in_the_client") {
@@ -303,9 +307,7 @@ fn an_injected_library_finds_no_value_in_the_client() {
     let home = w.h.home.home();
     let ran = w.h.agent_line(&home, &line);
     assert!(ran.status.success(), "{}", text(&ran));
-    let answer = w.read_out(&output, "the injected client's");
-    assert!(started(&answer), "{answer}");
-    assert_eq!(report(&answer)["vars"][KEY], w.key_digest());
+    // The dump first: what the client held, whatever it was answered.
     let bytes = std::fs::read(&dump).unwrap();
     let needle = control.as_bytes();
     let held = bytes
@@ -319,6 +321,9 @@ fn an_injected_library_finds_no_value_in_the_client() {
         bytes.len()
     );
     w.h.assert_clean("the client's memory", &bytes);
+    let answer = w.read_out(&output, "the injected client's");
+    assert!(started(&answer), "{answer}");
+    assert_eq!(report(&answer)["vars"][KEY], w.key_digest());
     w.h.assert_swept("after the injected client");
 }
 
@@ -393,6 +398,60 @@ fn the_lifeline_ending_stops_the_server() {
     let ms = answer["output_ended_ms"]
         .as_u64()
         .unwrap_or_else(|| panic!("the server did not stop: {answer}"));
+    assert!(ms <= 6000, "{ms} ms");
+}
+
+/// D-34, D-36: the client killed (SIGKILL, by the shell that started it)
+/// takes its lifeline and its end of the server's input with it, and the
+/// runner stops the server through its owned handle within 5 seconds: the
+/// server's process, a child of the runner until then (the positive
+/// control), is gone. The server does not end with its input (it lingers
+/// 30 seconds), so only the runner's stop ends it in time.
+///
+/// Mutation checked: the runner ignoring the client's endings (its lifeline
+/// and input), stopping the server only when it exits by itself: the
+/// server is still there after 8 seconds, and this fails.
+#[test]
+fn the_client_killed_stops_the_server() {
+    if managed_common::release_run("the_client_killed_stops_the_server") {
+        return;
+    }
+    let mut w = World::new(&[]);
+    let mut argv = w.fixture_argv();
+    argv.as_array_mut()
+        .unwrap()
+        .extend([json!("--linger"), json!("30")]);
+    let reg = w.register(json!({ "argv": argv }));
+    let launch = reg["launch"].as_str().unwrap().to_owned();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let progress = w.h.files().join("progress.json");
+    let never = w.h.files().join("never");
+    let _ = w.agent_background(
+        "request",
+        &json!({
+            "launch": launch,
+            "send": ["report"],
+            "progress_file": progress.to_str().unwrap(),
+            "continue_file": never.to_str().unwrap(),
+        }),
+    );
+    let progressed = w.wait_out(&progress, Duration::from_secs(60), "the first report");
+    let r: Value = serde_json::from_str(progressed["replies"][0].as_str().unwrap().trim()).unwrap();
+    let server = i32::try_from(r["pid"].as_i64().unwrap()).unwrap();
+    let runner = r["ppid"].as_i64().unwrap();
+    let alive = || envcloak_sys::proc_info(server).is_ok_and(|p| i64::from(p.ppid) == runner);
+    assert!(alive(), "the server is not running under its runner: {r}");
+    let t = std::time::Instant::now();
+    w.h.agent_kill_last();
+    while alive() {
+        assert!(
+            t.elapsed() < Duration::from_secs(8),
+            "the server outlived its client"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let ms = t.elapsed().as_millis();
     assert!(ms <= 6000, "{ms} ms");
 }
 

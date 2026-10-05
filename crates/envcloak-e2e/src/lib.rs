@@ -874,6 +874,22 @@ impl Harness {
         }
     }
 
+    /// Kills, with SIGKILL, the job [`Harness::agent_spawn`] started last:
+    /// the agent's shell signals its own child (`kill -KILL $!`), as an
+    /// agent ending a program it started would. Returns at once.
+    ///
+    /// # Panics
+    /// When the agent's shell is gone.
+    pub fn agent_kill_last(&mut self) {
+        let Some(agent) = self.agent.as_mut() else {
+            panic!("no agent");
+        };
+        let written = writeln!(agent.stdin, "kill -KILL $!").and_then(|()| agent.stdin.flush());
+        if let Err(e) = written {
+            panic!("the agent's shell is gone: {e}");
+        }
+    }
+
     /// `envcloak <args>` run by the agent in `cwd`.
     pub fn agent(&mut self, cwd: &Path, args: &[&str]) -> Output {
         let mut line = quoted(self.cli().to_str().unwrap_or(""));
