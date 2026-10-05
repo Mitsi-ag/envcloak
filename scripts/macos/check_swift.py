@@ -73,7 +73,11 @@ Rules (the id is what a finding and an allowlist entry name):
                  and extensions (in every file), and in Swift: App Intents,
                  Intents, Spotlight, `onOpenURL`, `handlesExternalEvents`,
                  Apple event handlers, services providers, user activities
-                 and the app delegate's open callbacks (rule 2).
+                 and the app delegate's open callbacks (rule 2). The keys
+                 are read from every property list under apps/macos as
+                 parsed (XML in any encoding, or binary, at any depth,
+                 whatever the file is called) and as text from the build
+                 settings (`INFOPLIST_KEY_...`).
   a11y-action    accessibility actions, which another program can perform
                  (rule 2: none may approve, reveal or write): SwiftUI's
                  action, adjustable, scroll, zoom and quick actions, custom
@@ -151,24 +155,38 @@ Rules (the id is what a finding and an allowlist entry name):
                  (R-M3-24: no third-party code, no analytics SDK).
   linked-code    code that reaches the app other than from the Swift this
                  check reads (R-M3-24): a manifest's `.binaryTarget`,
-                 `.systemLibrary`, `unsafeFlags`, `linkedLibrary`,
+                 `.systemLibrary`, `.macro`, `unsafeFlags`, `linkedLibrary`,
                  `linkedFramework` or plugin; a project's script phase,
                  build rule, legacy or aggregate target, a library or
                  framework file reference other than the SDK's, an absolute
                  path, a path outside apps/macos and assets/brand, or a
                  linker or include search setting (`OTHER_LDFLAGS`, the
-                 search paths, `OTHER_SWIFT_FLAGS`, `OTHER_CFLAGS`); and
-                 any Mach-O, archive, library or framework file in the
-                 tree.
+                 search paths, `OTHER_SWIFT_FLAGS`, `OTHER_CFLAGS`); any
+                 Mach-O, archive, library or framework file in the tree;
+                 and any source that compiles into the app as something
+                 else, or generates code for it, or instantiates classes
+                 by name: C, C++, Objective-C, headers, module maps,
+                 assembly, Metal, lex and yacc, Rez, Swift interfaces and
+                 modules, intent definitions, Core ML models, Core Data
+                 models, storyboards, XIBs and NIBs, Reality files,
+                 playgrounds (scripts/check-sources.sh --swift also checks
+                 every object a build linked against the Swift it read).
   entitlement    any key in an entitlements file, which must parse as a
-                 property list: no tier signs one yet (M3-10 adds the
-                 keychain group's, as scripts/macos/sign_check.py's list
-                 does), and `com.apple.security.get-task-allow`, any
+                 property list (XML or binary): no tier signs one yet
+                 (M3-10 adds the keychain group's, as
+                 scripts/macos/sign_check.py's list does), and
+                 `com.apple.security.get-task-allow`, any
                  `com.apple.security.cs.` (hardened-runtime exception) and
                  any `com.apple.security.temporary-exception.` key are
                  never signed (D3-05, D3-06).
+  unreadable     a file a rule must read but cannot: a property list (by
+                 name, `.plist` or `.entitlements`, or by its content) that
+                 does not parse, or a build setting, project, scheme, JSON
+                 or strings file that is not UTF-8 or UTF-16 text. Never
+                 skipped.
   key-literal    a string matching a provider's key pattern
-                 (providers/*.toml) in any text file (rule 7).
+                 (providers/*.toml) in any file, a file that is not text
+                 read byte for byte (rule 7).
   symlink        a symbolic link that does not resolve inside assets/brand/.
   stray-swift    a Swift file outside the product and test roots.
   lex            a Swift file the lexer cannot read whole.
@@ -1638,46 +1656,95 @@ def check_manifest(rel, toks):
                     find("remote-package", rel, t.line, "a package path outside %s" % PACKAGES)
             else:
                 find("remote-package", rel, t.line, "a package this check cannot place")
-        if t.text in ("binaryTarget", "systemLibrary", "plugin") and member:
+        if t.text in ("binaryTarget", "systemLibrary", "plugin", "macro") and member:
             find("linked-code", rel, t.line, "`.%s`: code that is not Swift this check reads" % t.text)
         if t.text in ("unsafeFlags", "linkedLibrary", "linkedFramework", "plugins"):
             find("linked-code", rel, t.line, "`%s`: links or runs code this check does not read" % t.text)
 
 
+# Text formats whose keys and settings the rules read.
 PLIST_INPUTS = (".plist", ".entitlements", ".xcconfig", ".pbxproj", ".xcscheme", ".json", ".strings", ".xcstrings")
+# Files that must parse as a property list.
+PLIST_REQUIRED = (".plist", ".entitlements")
+LOOKS_LIKE_PLIST = re.compile(r"\A\s*(?:<\?xml[^>]*>\s*)?(?:<!DOCTYPE\s+plist[^>]*>\s*)?<plist[\s>]")
 
 
 def line_of(text, pos):
     return text.count("\n", 0, pos) + 1
 
 
-def check_text_file(rel, text):
-    if not rel.endswith(PLIST_INPUTS):
-        return
-    for key in SIDE_DOOR_KEYS:
-        # `_` may come before a key: INFOPLIST_KEY_<Key> sets it from a build setting.
-        for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
-            find("side-door", rel, line_of(text, m.start()), "`%s` (SPEC §12 \"No side doors\")" % key)
-    for key in LAUNCH_KEYS:
-        for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
-            find("launch-input", rel, line_of(text, m.start()), "`%s` sets the app's environment" % key)
-    if rel.endswith((".pbxproj", ".xcconfig")):
+def decode_text(data):
+    """A file's text: UTF-8, or UTF-16 or UTF-32 with a byte order mark;
+    None for anything else holding a NUL byte."""
+    for bom, codec in ((b"\xff\xfe\x00\x00", "utf-32"), (b"\x00\x00\xfe\xff", "utf-32"), (b"\xff\xfe", "utf-16"), (b"\xfe\xff", "utf-16")):
+        if data.startswith(bom):
+            try:
+                return data.decode(codec)
+            except UnicodeDecodeError:
+                return None
+    if b"\0" in data:
+        return None
+    return data.decode("utf-8-sig" if data.startswith(b"\xef\xbb\xbf") else "utf-8", "surrogateescape")
+
+
+def plist_keys(value):
+    """Every dictionary key in a parsed property list, at any depth."""
+    if isinstance(value, dict):
+        for key, inner in value.items():
+            yield str(key)
+            yield from plist_keys(inner)
+    elif isinstance(value, list):
+        for inner in value:
+            yield from plist_keys(inner)
+
+
+def check_text_file(rel, data, text):
+    """The key and settings rules for one file under apps/macos. A property
+    list is read parsed (XML in any encoding, or binary), whatever its name,
+    so a binary or UTF-16 Info.plist or one named `Extra-Info.xml` is read
+    like any other; one that must parse and does not, and a text input that
+    is not text, are findings, never skipped."""
+    looks = data.startswith(b"bplist") or (text is not None and LOOKS_LIKE_PLIST.match(text) is not None)
+    parsed = None
+    if looks or rel.endswith(PLIST_REQUIRED + (".strings",)):
+        try:
+            parsed = plistlib.loads(data)
+        except Exception:  # noqa: BLE001 - any parse failure is handled below
+            parsed = None
+        if parsed is None and (looks or rel.endswith(PLIST_REQUIRED)):
+            find("unreadable", rel, 0, "a property list this check cannot parse, so its keys would go unchecked")
+    if parsed is not None:
+        keys = set(plist_keys(parsed))
+        for key in SIDE_DOOR_KEYS:
+            if key in keys:
+                find("side-door", rel, 0, "`%s` (SPEC §12 \"No side doors\")" % key)
+        for key in LAUNCH_KEYS:
+            if key in keys:
+                find("launch-input", rel, 0, "`%s` sets the app's environment" % key)
+    elif rel.endswith(PLIST_INPUTS):
+        if text is None:
+            find("unreadable", rel, 0, "not UTF-8 or UTF-16 text, so this check cannot read it")
+        else:
+            for key in SIDE_DOOR_KEYS:
+                # `_` may come before a key: INFOPLIST_KEY_<Key> sets it from a build setting.
+                for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
+                    find("side-door", rel, line_of(text, m.start()), "`%s` (SPEC §12 \"No side doors\")" % key)
+            for key in LAUNCH_KEYS:
+                for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
+                    find("launch-input", rel, line_of(text, m.start()), "`%s` sets the app's environment" % key)
+    if text is not None and rel.endswith((".pbxproj", ".xcconfig")):
         for m in LINK_SETTINGS.finditer(text):
             find("linked-code", rel, line_of(text, m.start()), "`%s` links or includes code from outside the reviewed sources" % m.group(1))
-    if rel.endswith(".pbxproj"):
+    if text is not None and rel.endswith(".pbxproj"):
         check_pbxproj(rel, text)
     if rel.endswith(".entitlements"):
-        for m in FORBIDDEN_ENTITLEMENT.finditer(text):
-            find("entitlement", rel, line_of(text, m.start()), "`%s` is never signed into EnvCloak (D3-05, D3-06)" % m.group(0))
-        try:
-            ents = plistlib.loads(text.encode("utf-8", "surrogateescape"))
-        except Exception:  # noqa: BLE001 - any parse failure is a finding
-            ents = None
-        if not isinstance(ents, dict):
+        if not isinstance(parsed, dict):
             find("entitlement", rel, 0, "not a property list dictionary this check can read")
         else:
-            for key in sorted(ents):
-                if not FORBIDDEN_ENTITLEMENT.fullmatch(key):
+            for key in sorted(parsed):
+                if FORBIDDEN_ENTITLEMENT.fullmatch(key):
+                    find("entitlement", rel, 0, "`%s` is never signed into EnvCloak (D3-05, D3-06)" % key)
+                else:
                     find("entitlement", rel, 0, "`%s`: no signing tier signs an entitlement yet (M3-10 adds the keychain group's)" % key)
 
 
@@ -1704,8 +1771,12 @@ def check_pbxproj(rel, text):
             find("linked-code", rel, line_of(text, m.start()), "a path outside %s/ and %s: `%s`" % (APP, BRAND, path))
 
 
-def check_committed_binary(rel, real):
+def check_tree_file(rel, real):
     segments = rel.split("/")
+    for seg in segments[2:]:
+        if seg.lower().endswith(COMPILED_SUFFIXES):
+            find("linked-code", rel, 0, "`%s`: a source kind that compiles into the app as something other than the Swift this check reads" % seg)
+            return
     if any(s.endswith((".framework", ".xcframework")) for s in segments[:-1]) or rel.endswith(BINARY_SUFFIXES):
         find("linked-code", rel, 0, "a library or framework in the tree")
         return
@@ -1831,12 +1902,13 @@ def main(argv):
 
     pats = key_patterns(root)
     for rel, real in texts:
-        check_committed_binary(rel, real)
-        text = read_text(real)
-        if text is None:
-            continue
-        check_text_file(rel, text)
-        check_key_literals(rel, text, pats)
+        check_tree_file(rel, real)
+        with open(real, "rb") as f:
+            data = f.read()
+        text = decode_text(data)
+        check_text_file(rel, data, text)
+        # A file that is not text is read byte for byte.
+        check_key_literals(rel, text if text is not None else data.decode("latin-1"), pats)
 
     for rel, real, cls, brand in swift:
         if cls == "stray":
