@@ -71,6 +71,7 @@ pub fn scan_reader(
     let mut skipped = false;
     let mut stopped = false;
     let mut exhausted = false;
+    let mut utf8 = Utf8Boundary::default();
     loop {
         let remaining = budget.bytes.saturating_sub(report.bytes);
         if remaining == 0 {
@@ -94,7 +95,12 @@ pub fn scan_reader(
         report.bytes += n as u64;
         for (i, &b) in chunk[..n].iter().enumerate() {
             let boundary = if json { b == b'\n' } else { delimiter(b) };
-            if boundary {
+            let (before, discard) = if json { (false, false) } else { utf8.step(b) };
+            if before {
+                report.not_scanned += 1;
+                report.issue(&source, "invalid_text");
+            }
+            if boundary || before {
                 if !skipped && !buffer.is_empty() {
                     if json {
                         stopped = !json_line(
@@ -120,11 +126,12 @@ pub fn scan_reader(
                 }
                 buffer.clear();
                 skipped = false;
-                start = chunk_start + i as u64 + 1;
+                start = chunk_start + i as u64 + u64::from(boundary || discard);
                 if stopped {
                     break;
                 }
-            } else if !skipped {
+            }
+            if !boundary && !discard && !skipped {
                 if buffer.len() == cap {
                     report.not_scanned += 1;
                     report.issue(
@@ -174,6 +181,55 @@ pub fn scan_reader(
     }
     Ok(report)
 }
+// Keep UTF-8 state across read chunks. Invalid bytes separate raw text before
+// the token cap is applied, so a long binary run cannot swallow later text.
+#[derive(Default)]
+struct Utf8Boundary {
+    remaining: u8,
+    lower: u8,
+    upper: u8,
+}
+impl Utf8Boundary {
+    // (flush before this byte, discard this byte). An ASCII byte interrupting
+    // a sequence starts the next text run and must not be discarded.
+    fn step(&mut self, b: u8) -> (bool, bool) {
+        let interrupted = self.remaining > 0;
+        if interrupted && (self.lower..=self.upper).contains(&b) {
+            self.remaining -= 1;
+            self.lower = 0x80;
+            self.upper = 0xbf;
+            return (false, false);
+        }
+        self.remaining = 0;
+        self.lower = 0x80;
+        self.upper = 0xbf;
+        match b {
+            0..=0x7f => {}
+            0xc2..=0xdf => self.remaining = 1,
+            0xe0..=0xef => {
+                self.remaining = 2;
+                if b == 0xe0 {
+                    self.lower = 0xa0;
+                }
+                if b == 0xed {
+                    self.upper = 0x9f;
+                }
+            }
+            0xf0..=0xf4 => {
+                self.remaining = 3;
+                if b == 0xf0 {
+                    self.lower = 0x90;
+                }
+                if b == 0xf4 {
+                    self.upper = 0x8f;
+                }
+            }
+            _ => return (true, true),
+        }
+        (interrupted, false)
+    }
+}
+
 fn delimiter(b: u8) -> bool {
     b.is_ascii_whitespace() || b < 32
 }

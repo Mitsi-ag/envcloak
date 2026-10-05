@@ -64,8 +64,8 @@ oversized tokens produce fixed reasons. Strings are decoded with raw offsets
 for their escape sequences. Tokens of at least 16 characters yield raw,
 base64, hex and percent-decoded candidates, with a 4 KiB candidate cap. Raw
 stores use the same token rules without JSON decoding. Each bounded token
-retains its whole spelling, plus punctuation-trimmed and punctuation-separated
-readings, assignment right-hand sides and query values. Short JSON strings
+retains its whole spelling, plus ASCII punctuation-trimmed and
+punctuation-separated readings, assignment right-hand sides and query values. Short JSON strings
 also retain whole-string and whitespace-word readings. URL user information,
 Go DSN passwords and `password`/`passwd`/`pwd` connection fields carry their
 specific password forms to the daemon, including on decoded readings.
