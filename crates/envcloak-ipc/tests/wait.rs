@@ -1241,6 +1241,7 @@ fn request_of(n: i32, item: (ItemId, FieldId)) -> AccessRequest {
         mode: Mode::Inject,
         argv_display: vec![format!("./job-{n}")],
         new_project: false,
+        managed: None,
     }
 }
 
