@@ -19,20 +19,22 @@
 id = "claude-code"
 version = "2.1.280"
 
+# Claude Code's own permission settings refuse the probe's `Read .env`
+# (the project named by its resolved path) before EnvCloak's hook, with
+# EnvCloak's `Read(**/.env*)` deny rule: the file never reaches the model,
+# but no EnvCloak marker does either, and a denial without the marker is a
+# failed probe (M2 plan, M2-09). The same on both systems; a path spelled
+# through a link (macOS's `/tmp`) reaches the hook first instead, which is
+# not the call the probe makes.
 [host.macos]
 prompt_to_model = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 transcript = "unsupported (persists_blocked_prompt; probe=failed)"
-file_read = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
+file_read = "degraded (fails_open_on_timeout, workspace_untrusted; probe=failed)"
 shell = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 mcp = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 output = "active (probe=passed)"
 envcloak_server = "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
 
-# On Linux CI measured Claude Code's own permission settings refusing the
-# probe's `Read .env` before EnvCloak's hook (as M2-08 measured for a Read
-# of .ENV.staging there): the file never reaches the model, but no EnvCloak
-# marker does either, and a denial without the marker is a failed probe
-# (M2 plan, M2-09). On macOS the hook runs first.
 [host.linux]
 prompt_to_model = "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)"
 transcript = "unsupported (persists_blocked_prompt; probe=failed)"
