@@ -322,6 +322,7 @@ version = "0.1.0"
 dependencies = [
  "envcloak-agents",
  "envcloak-policy",
+ "envcloak-scan",
  "envcloak-sys",
  "envcloak-testkit",
  "libc",

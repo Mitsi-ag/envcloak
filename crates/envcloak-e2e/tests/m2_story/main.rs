@@ -18,6 +18,7 @@
 mod install;
 mod live_guard;
 mod mcp;
+mod scanners;
 mod skeleton;
 
 /// The story runs with the network CI says (`ENVCLOAK_TEST_NETWORK`):
