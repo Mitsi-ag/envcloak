@@ -62,9 +62,12 @@
 //!
 //! A pending `run.request` answer carries the same provider's test items
 //! proposed for its live bindings (`envcloak_policy::proposals`), which
-//! `envcloak run`'s `approval_required` line names; `pending.get` builds
-//! the descriptor's classifications and proposals from the vault each
-//! time it is asked.
+//! `envcloak run`'s `approval_required` line names, read from the pending
+//! request its id names, as `pending.get` reads them for the statement: a
+//! request asked again through other layers is pending on its own, so the
+//! answer and the statement advise the same edit. `pending.get` builds the
+//! descriptor's classifications and proposals from the vault each time it
+//! is asked.
 //!
 //! No grant is evaluated, and no proof taken, from a vault whose
 //! integrity check failed ([`crate::state::State::unlocked`]).
@@ -107,7 +110,7 @@ use envcloak_policy::{
     BindingSource, BoundRef, Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError,
     Mode, Now, PENDING_TTL, Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance,
     ProfileName, ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy,
-    bind_items, effective_policy, gather_hashed, load_project, proposals, resolve_sourced,
+    bind_items, effective_policy, gather_hashed, load_project, resolve_sourced,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -602,8 +605,15 @@ pub fn run_request(
             Decision::Pending(id) => {
                 // The same provider's test items, for the live bindings, so
                 // the `approval_required` text names them (SPEC §10b); the
-                // daemon substitutes nothing.
-                let proposals = proposals(&again.bindings, s.unlocked()?.items());
+                // daemon substitutes nothing. Read from the pending request
+                // the id names, as its statement is (`pending.get`): the
+                // answer advises what the statement does.
+                let items = s.unlocked()?.items().to_vec();
+                let proposals = s
+                    .grants()
+                    .pending_descriptor(&id, &now, &items)
+                    .ok_or(RpcError::new(ErrorKind::Internal))?
+                    .proposals;
                 s.audit(AuditEvent::Request(Box::new(RequestAudit {
                     decision: "pending",
                     request_id: Some(id.to_string()),

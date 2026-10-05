@@ -657,6 +657,61 @@ fn the_test_item_is_proposed_and_a_changed_proposal_is_a_mismatch() {
     f.sweep();
 }
 
+/// A request asked again under one root through another layer is pending
+/// on its own, and each pending answer proposes what its statement does
+/// (Codex, round 3: deduplication by the fingerprint alone answered a
+/// request repeated through `[env]` with the id of the one asked through
+/// `--ref`, its advice built from `[env]` while the statement, from the
+/// request first made, advised the `--ref`; following the statement left
+/// the live binding of `[env]` in place). The live Stripe key is bound by
+/// `--ref`, then, the manifest changed to bind it in `[env]`, by `[env]`:
+/// the same variable, item and field, two requests. Asked again through
+/// either layer, the request already pending for it.
+///
+/// Mutation: deduplicate by the fingerprint alone (`same_layers`
+/// answering true): the `[env]` request gets the `--ref` request's id,
+/// its answer advises `[env]` while the statement advises the `--ref`,
+/// and this fails.
+#[test]
+fn a_request_through_another_layer_is_pending_on_its_own() {
+    let f = Fixture::new();
+    let mut r = Requester::start(&f, "agent");
+    let live_ref = "STRIPE_SECRET_KEY=stripe/acme-live";
+    let (by_ref, by_ref_proposed) = r.ask(&[live_ref]);
+    let by_ref = by_ref.strip_prefix("pending ").unwrap().to_owned();
+    // The manifest's `[env]` binds the live key now.
+    let manifest = std::fs::read_to_string(&f.manifest).unwrap();
+    let changed = manifest.replace(
+        "STRIPE_SECRET_KEY = \"stripe/acme-test\"",
+        "STRIPE_SECRET_KEY = \"stripe/acme-live\"",
+    );
+    assert_ne!(changed, manifest);
+    std::fs::write(&f.manifest, changed).unwrap();
+    let (by_env, by_env_proposed) = r.ask(&[]);
+    let by_env = by_env.strip_prefix("pending ").unwrap().to_owned();
+    assert_ne!(by_env, by_ref, "one pending request for two layers");
+    // Each answer proposes what its statement does, for its own layer.
+    for (id, proposed, source) in [
+        (&by_ref, &by_ref_proposed, BindingSource::Ref),
+        (&by_env, &by_env_proposed, BindingSource::Env),
+    ] {
+        let shown = f.shown(id);
+        assert_eq!(&shown.proposals, proposed, "{id}");
+        let stripe: Vec<&Proposal> = proposed
+            .iter()
+            .filter(|x| x.env_name == "STRIPE_SECRET_KEY")
+            .collect();
+        assert_eq!(stripe.len(), 1, "{proposed:?}");
+        assert_eq!(stripe[0].source, source, "{id}");
+        assert_eq!(stripe[0].test_slug, "stripe/acme-test");
+    }
+    // Asked again through either layer: the request pending for it.
+    assert_eq!(r.pending(&[]), by_env);
+    assert_eq!(r.pending(&[live_ref]), by_ref);
+    drop(r);
+    f.sweep();
+}
+
 /// SPEC §10b "A grant ends on" (R-M2-22): a reclassification by hand,
 /// test to live, ends the grants and pending requests that bind the item;
 /// the agent's next request is pending and needs the tick. Tightening
