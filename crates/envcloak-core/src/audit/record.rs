@@ -115,11 +115,19 @@ pub enum AuditKind {
     /// first chunk is read; or the proof failed. The request id is the
     /// backup's; the count says how many files.
     RestoreV2 = 26,
+    /// An item's classification was set by hand (`items.reclassify`): the
+    /// item; the reason names the change (`test_to_live`), and the count
+    /// how many grants that bound it ended. Towards `test` or `unknown`
+    /// with a proof, or the proof failed.
+    Reclassify = 30,
+    /// An approval was refused by the live-key guard (`live_not_ticked`):
+    /// the request id, and the items whose live bindings it left unticked.
+    LiveRefused = 31,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 25] = [
+    pub const ALL: [AuditKind; 27] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -145,6 +153,8 @@ impl AuditKind {
         AuditKind::MarkExposed,
         AuditKind::BackupV2,
         AuditKind::RestoreV2,
+        AuditKind::Reclassify,
+        AuditKind::LiveRefused,
     ];
 
     /// The kind's stable token.
@@ -175,6 +185,8 @@ impl AuditKind {
             AuditKind::MarkExposed => "mark_exposed",
             AuditKind::BackupV2 => "backup_v2",
             AuditKind::RestoreV2 => "restore_v2",
+            AuditKind::Reclassify => "reclassify",
+            AuditKind::LiveRefused => "live_refused",
         }
     }
 

@@ -473,6 +473,7 @@ fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
                 v(labels::STRIPE_SECRET_KEY),
             ),
         ],
+        proposals: Vec::new(),
     };
     assert!(good.well_formed());
     let f = proto::result_frame(9, &good).unwrap();
@@ -495,20 +496,24 @@ fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
         RunAnswer {
             decision: pending(),
             values: one("A", "a/b", v(labels::OPENAI_API_KEY)),
+            proposals: Vec::new(),
         },
         RunAnswer {
             decision: DecisionView::Denied {
                 reason: "repeated".into(),
             },
             values: one("A", "a/b", v(labels::OPENAI_API_KEY)),
+            proposals: Vec::new(),
         },
         RunAnswer {
             decision: covered(),
             values: one("NOT=A NAME", "a/b", v(labels::OPENAI_API_KEY)),
+            proposals: Vec::new(),
         },
         RunAnswer {
             decision: covered(),
             values: one("A", "Not A Slug", v(labels::OPENAI_API_KEY)),
+            proposals: Vec::new(),
         },
         RunAnswer {
             decision: covered(),
@@ -516,10 +521,12 @@ fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
                 released("A", "a/b", v(labels::OPENAI_API_KEY)),
                 released("A", "c/d", v(labels::STRIPE_SECRET_KEY)),
             ],
+            proposals: Vec::new(),
         },
         RunAnswer {
             decision: covered(),
             values: one("A", "a/b", WireSecret::new(SecretBytes::copy_from(b""))),
+            proposals: Vec::new(),
         },
         RunAnswer {
             decision: covered(),
@@ -528,10 +535,75 @@ fn a_run_answer_carries_values_only_when_covered_and_well_formed() {
                 "a/b",
                 WireSecret::new(SecretBytes::copy_from(b"a value\0with a NUL")),
             ),
+            proposals: Vec::new(),
         },
+        // Proposals only with a pending decision, each of the daemon's
+        // shapes, no variable twice (SPEC §10b "Live-key guard").
+        RunAnswer {
+            decision: covered(),
+            values: Vec::new(),
+            proposals: vec![proposal("A", "a/live", "a/test", None)],
+        },
+        RunAnswer {
+            decision: DecisionView::Denied {
+                reason: "repeated".into(),
+            },
+            values: Vec::new(),
+            proposals: vec![proposal("A", "a/live", "a/test", None)],
+        },
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![proposal("NOT=A NAME", "a/live", "a/test", None)],
+        ),
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![proposal("A", "Not A Slug", "a/test", None)],
+        ),
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![proposal("A", "a/live", "a/te st", None)],
+        ),
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![proposal("A", "a/live", "a/test", Some("Bad Field"))],
+        ),
+        RunAnswer::pending(
+            "ABCDEFGH".into(),
+            vec![
+                proposal("A", "a/live", "a/test", None),
+                proposal("A", "b/live", "b/test", None),
+            ],
+        ),
     ];
     for (i, a) in bad.iter().enumerate() {
         assert!(!a.well_formed(), "case {i}");
+    }
+    // The positive control: a pending answer with well-formed proposals,
+    // which crosses the wire whole.
+    let proposed = RunAnswer::pending(
+        "ABCDEFGH".into(),
+        vec![
+            proposal("A", "a/live", "a/test", None),
+            proposal("B", "b/live", "b/test", Some("secret")),
+        ],
+    );
+    assert!(proposed.well_formed());
+    let f = proto::result_frame(9, &proposed).unwrap();
+    let back: RunAnswer = proto::parse_response::<<RunRequest as Method>::Output>(&f, 9).unwrap();
+    assert_eq!(back.proposals, proposed.proposals);
+    // Absent on the wire when there are none, as before M2-13.
+    let plain = serde_json::to_string(&RunAnswer::decided(pending())).unwrap();
+    assert!(!plain.contains("proposals"), "{plain}");
+}
+
+/// A proposal of the test item `test` for variable `env`, bound to the live
+/// item `live`.
+fn proposal(env: &str, live: &str, test: &str, field: Option<&str>) -> envcloak_policy::Proposal {
+    envcloak_policy::Proposal {
+        env_name: env.to_owned(),
+        live_slug: live.to_owned(),
+        test_slug: test.to_owned(),
+        test_field: field.map(str::to_owned),
     }
 }
 
