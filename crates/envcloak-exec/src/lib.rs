@@ -321,6 +321,12 @@ pub enum ExecError {
     /// redacted until its end or the cutoff. The command was started, and
     /// how it ended is not known (SPEC §6.1 step 8).
     MonitorLost,
+    /// PTY mode: the person's terminal could not be put back in raw mode
+    /// once the command or `envcloak run` was continued, so the command
+    /// was not given it: no key was passed on from then on, and the run
+    /// ended, its session hung up (Codex's review of M2-19). The command
+    /// was started, and how it ended is not known.
+    TerminalLost(io::ErrorKind),
 }
 
 impl ExecError {
@@ -342,20 +348,26 @@ impl ExecError {
             ExecError::NulByte => "binding_unresolved",
             ExecError::NotFound => "command_not_found",
             ExecError::NotExecutable(_) => "command_not_executable",
-            ExecError::Setup(_) | ExecError::Followed(_) => "run_failed",
+            ExecError::Setup(_) | ExecError::Followed(_) | ExecError::TerminalLost(_) => {
+                "run_failed"
+            }
             ExecError::PtyUnavailable => "pty_unavailable",
             ExecError::MonitorLost => "pty_monitor_lost",
         }
     }
 
     /// Whether the command may have been started before this failure:
-    /// only [`ExecError::Followed`] and [`ExecError::MonitorLost`]. Every
+    /// only [`ExecError::Followed`], [`ExecError::MonitorLost`] and
+    /// [`ExecError::TerminalLost`]. Every
     /// other failure comes before the command could run (a spawn that
     /// fails runs nothing), so a program that started `envcloak run` may
     /// tell "not started" from "may have run" by this, never by the exit
     /// code or the output.
     pub fn may_have_started(&self) -> bool {
-        matches!(self, ExecError::Followed(_) | ExecError::MonitorLost)
+        matches!(
+            self,
+            ExecError::Followed(_) | ExecError::MonitorLost | ExecError::TerminalLost(_)
+        )
     }
 
     /// A fixed message: no argument, value or path.
@@ -386,6 +398,11 @@ impl ExecError {
             ExecError::MonitorLost => {
                 "the PTY monitor ended before it reported how the command ended; its session \
                  was hung up and your terminal restored: the command may have run"
+            }
+            ExecError::TerminalLost(_) => {
+                "your terminal could not be put back in raw mode for the command after a stop, \
+                 so the command was not continued with your terminal showing what you type; its \
+                 session was hung up: the command may have run"
             }
         }
     }
