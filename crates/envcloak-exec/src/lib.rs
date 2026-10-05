@@ -90,7 +90,7 @@ pub use coverage::{
     COMFORT_LEN, CoverageReport, Label, MIN_VALUE_LEN, ShortPolicy, build_pty_redactor,
     build_redactor,
 };
-pub use pty::{INPUT_CHUNK, OUTPUT_LIMIT, OuterTerminal};
+pub use pty::{EXIT_READ_LIMIT, INPUT_CHUNK, OUTPUT_LIMIT, OuterTerminal};
 
 /// A command started on a pseudo-terminal of its own (PTY mode; M2 task
 /// M2-17 starts it, M2-19 relays it): the PTY's master side, which carries
