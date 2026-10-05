@@ -18,9 +18,13 @@ architectures, a forbidden entitlement present with the value false, and an
 entitlement no tier signs; then one executable built for another
 architecture, a code directory with no flags, entitlements that are not a
 property list, and a boolean in the LaunchAgent or the helper's Info.plist
-written as an integer. Every case also checks that the checker asked
-exactly its ten questions: one signature display, one entitlement read and
-one architecture read per executable, and one verification of the bundle.
+written as an integer; and the answers of a broken signature or tool: an
+executable codesign cannot display, entitlements it cannot read or that
+are not a dictionary, and lipo failing. Every case also checks that the
+checker asked exactly its ten questions: one signature display, one
+entitlement read and one architecture read per executable, and one
+verification of the bundle (an executable it cannot display is asked
+nothing more).
 
 Usage: python3 scripts/macos/tests/test_sign_check_policy.py
 """
@@ -61,6 +65,12 @@ OTHER_MUTATIONS = {
     "entitlements-not-a-plist": (0, "entitlements are not a property list"),
     "agent-boolean-as-integer": (None, "KeepAlive is not what the agent's plist sets"),
     "helper-boolean-as-integer": (None, "the helper is not background-only"),
+    # Answers a broken signature or tool gives: each is a refusal that says
+    # which question failed, never a pass.
+    "not-signed": (1, "Contents/MacOS/envcloak: not signed (codesign --display: "),
+    "entitlements-unreadable": (0, "Contents/MacOS/EnvCloakApp: cannot read its entitlements"),
+    "entitlements-not-a-dictionary": (2, "envcloakd: entitlements are not a dictionary"),
+    "lipo-fails": (1, "Contents/MacOS/envcloak: lipo cannot read its architectures"),
 }
 
 
@@ -126,6 +136,8 @@ class Policy(unittest.TestCase):
             index = RELS.index(os.path.relpath(target, app))
             if args[:3] == ["codesign", "--display", "--verbose=4"]:
                 asked.append(("display", index))
+                if mutation == "not-signed" and index == role:
+                    return 1, b"", (target + ": code object is not signed at all\n").encode()
                 lines = ["Identifier=" + IDENTIFIERS[index]]
                 if not (mutation == "no-flags" and index == role):
                     flags = "0x0" if mutation == "no-runtime" and index == role else "0x10000"
@@ -135,6 +147,10 @@ class Policy(unittest.TestCase):
                 asked.append(("entitlements", index))
                 if index == role and mutation == "entitlements-not-a-plist":
                     return 0, b"\0", b""
+                if index == role and mutation == "entitlements-unreadable":
+                    return 1, b"", b"codesign: cannot read entitlement data\n"
+                if index == role and mutation == "entitlements-not-a-dictionary":
+                    return 0, plistlib.dumps(["com.apple.security.app-sandbox"]), b""
                 body = {}
                 if index == role and mutation == "forbidden-false":
                     body = {"com.apple.security.get-task-allow": False}
@@ -143,6 +159,8 @@ class Policy(unittest.TestCase):
                 return 0, plistlib.dumps(body), b""
             if args[:2] == ["lipo", "-archs"]:
                 asked.append(("archs", index))
+                if index == role and mutation == "lipo-fails":
+                    return 1, b"", b"fatal error: lipo: can't figure out the architecture type\n"
                 archs = arch
                 if index == role and mutation == "two-architectures":
                     archs = "arm64 x86_64"
@@ -165,8 +183,10 @@ class Policy(unittest.TestCase):
             subprocess.Popen = saved
         self.assertEqual(sum(1 for q in asked if q[0] == "verify"), 1, asked)
         for index in range(3):
-            self.assertEqual(sorted(q[0] for q in asked if q[1] == index), ["archs", "display", "entitlements"], asked)
-        self.assertEqual(len(asked), 10, asked)
+            # An executable codesign cannot display is asked nothing more.
+            want = ["display"] if mutation == "not-signed" and index == role else ["archs", "display", "entitlements"]
+            self.assertEqual(sorted(q[0] for q in asked if q[1] == index), want, asked)
+        self.assertEqual(len(asked), 8 if mutation == "not-signed" else 10, asked)
         return code, err.getvalue()
 
     def test_positive_controls_pass(self):

@@ -15,14 +15,17 @@ Usage: python3 scripts/macos/tests/test_sign_check.py [--app path/to/EnvCloak.ap
 Fixtures live under a short temporary directory that is removed afterwards.
 """
 
+import importlib.util
 import json
 import os
 import plistlib
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 
 sys.dont_write_bytecode = True
@@ -331,7 +334,7 @@ class SignCheck(unittest.TestCase):
                 info["CFBundleURLTypes"] = [{"CFBundleURLSchemes": ["envcloak"]}]
                 write_plist(b.path(rel), info)
                 b.sign()
-                self.refused(b, rel + ": holds CFBundleURLTypes")
+                self.refused(b, rel + ": holds CFBundleURLTypes, a side door")
 
     def test_a_helper_that_is_not_background_only_is_refused(self):
         b = Bundle()
@@ -427,6 +430,67 @@ class SignCheck(unittest.TestCase):
         b = Bundle(cli_arch="x86").sign()
         self.refused(b, "the executables are built for different architectures")
 
+    # Each finding sign-check can report, made to report (none is reached
+    # only through another).
+
+    def test_a_cli_with_no_signature_at_all_is_refused(self):
+        # The linker signs what it links (ad hoc); with that removed,
+        # codesign has nothing to display.
+        b = Bundle().sign()
+        p = run(["codesign", "--remove-signature", b.path(CLI_EXE)])
+        self.assertEqual(p.returncode, 0, p.stderr.decode())
+        self.assertFalse(b.oracle(CLI_EXE)["valid"])
+        self.refused(b, CLI_EXE + ": not signed (codesign --display: ")
+
+    def test_a_file_that_is_not_regular_is_refused(self):
+        # A socket (opening it fails at once, where a FIFO would block a
+        # reader), made after signing.
+        b = Bundle().sign()
+        path = b.path("Contents/Resources/s")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(path)
+        finally:
+            sock.close()
+        self.refused(b, "Contents/Resources/s: not a regular file")
+
+    def test_a_launch_agent_that_cannot_be_read_is_refused(self):
+        cases = (
+            ("missing", None, ": missing"),
+            ("not a property list", b"not a property list\n", ": not a property list"),
+            ("not a dictionary", plistlib.dumps(["Label"]), ": not a dictionary"),
+        )
+        for name, data, needle in cases:
+            with self.subTest(case=name):
+                b = Bundle()
+                if data is None:
+                    os.remove(b.path(AGENT_PLIST))
+                else:
+                    with open(b.path(AGENT_PLIST), "wb") as f:
+                        f.write(data)
+                b.sign()
+                self.refused(b, AGENT_PLIST + needle)
+
+    def test_a_helper_of_another_identity_is_refused(self):
+        b = Bundle()
+        b.edit_plist(HELPER + "/Contents/Info.plist", lambda info: info.__setitem__("CFBundleIdentifier", "ai.envcloak.other"))
+        b.sign()
+        self.refused(b, HELPER + "/Contents/Info.plist: not ai.envcloak.agent with the executable envcloakd")
+
+    def test_a_side_door_in_a_nested_bundle_is_refused(self):
+        # Every Info.plist in the bundle is read for side doors, not only
+        # the two whose keys are held to their sources.
+        b = Bundle()
+        rel = "Contents/Resources/Extra.bundle/Contents/Info.plist"
+        write_plist(b.path(rel), {"CFBundleIdentifier": "ai.envcloak.extra", "NSServices": [{"NSMessage": "approve"}]})
+        b.sign()
+        self.refused(b, rel + ": holds NSServices, a side door")
+
+    def test_a_launch_agent_whose_program_is_missing_is_refused(self):
+        b = Bundle().sign()
+        os.remove(b.path(DAEMON_EXE))
+        self.refused(b, "BundleProgram names a file the bundle lacks")
+
 
 class CaseClashes(unittest.TestCase):
     """Names that differ only in case cannot both exist on this Mac's
@@ -442,6 +506,29 @@ class CaseClashes(unittest.TestCase):
         self.assertEqual(sign_check.case_clashes(["EnvCloak", "envcloak", "envcloakd"]), [["EnvCloak", "envcloak"]])
         self.assertEqual(sign_check.case_clashes(["EnvCloakApp", "envcloak"]), [])
         self.assertEqual(sign_check.case_clashes(["Info.plist", "info.PLIST", "PkgInfo"]), [["Info.plist", "info.PLIST"]])
+
+    def test_a_clash_in_a_bundle_is_reported(self):
+        # This volume cannot hold both names, so the walk is modeled: the
+        # bundle's directory lists `envcloak` and `EnvCloak`, which the
+        # case-insensitive volume finds as one file.
+        spec = importlib.util.spec_from_file_location("sign_check_clash", os.path.join(SCRIPTS, "sign_check.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        base = tempfile.mkdtemp(prefix="ecsc", dir="/tmp")
+        try:
+            app = os.path.join(base, "Clash.app")
+            os.makedirs(app)
+            with open(os.path.join(app, "envcloak"), "w") as f:
+                f.write("x\n")
+
+            def walk(top):
+                yield app, [], ["envcloak", "EnvCloak"]
+
+            module.os = types.SimpleNamespace(walk=walk, path=os.path, lstat=os.lstat)
+            module.inventory(app)
+        finally:
+            shutil.rmtree(base)
+        self.assertIn(".: names that differ only in case: EnvCloak, envcloak", module.problems)
 
 
 class BuiltApp(unittest.TestCase):
