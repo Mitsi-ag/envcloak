@@ -11,11 +11,14 @@ a local named `rawValue`, an option set's implicit `.init(rawValue: 1)` in
 a file without System, SwiftUI's `extension ShapeStyle where Self ==
 Color`, buttons with ordinary actions and a text-and-image label given
 shortcuts directly, `onSubmit` and `onExitCommand` that search, an empty
-AppKit key equivalent, ECLog's Logger from a constant subsystem and a
-category enum, the brand's icon group, an SDK framework, settings that
-name files inside apps/macos, a scheme and a JSON file with escapes that
-spell nothing refused) sit in the clean tree, so a rule that refuses too
-much fails here too.
+AppKit key equivalent, an alert whose Remove button is destructive (with a
+gated title and message, which are not buttons), an NSAlert button titled
+OK and a cleared default button, a descriptor computed to 3 and a write of
+length 1, `try?` and `init(_:uniquingKeysWith:)`, ECLog's Logger from a
+constant subsystem and a category enum, the brand's icon group, an SDK
+framework, settings that name files inside apps/macos, a scheme and a JSON
+file with escapes that spell nothing refused) sit in the clean tree, so a
+rule that refuses too much fails here too.
 
 The fixture trees are written at run time under a short temporary
 directory: the key-literal case needs a key-shaped string, which is never
@@ -118,6 +121,14 @@ struct View: SwiftUI.View {
             Divider().background(Color.clear)
         }
         .onExitCommand { search() }
+        // A destructive button answers no key (measured), so an alert may
+        // hold Remove there; its title and message are not buttons.
+        .alert("Remove the key?", isPresented: .constant(false)) {
+            Button("Remove", role: .destructive) { removeKey() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Remove it from the vault")
+        }
         .environment(\\.locale, Locale(identifier: "en_GB"))
         .padding(total > 2 ? 8 : 4)
     }
@@ -157,6 +168,15 @@ public struct Client {
     public func random() -> FileHandle? { FileHandle(forReadingAtPath: "/dev/urandom") }
     // An empty AppKit key equivalent binds no key.
     public func item() -> NSMenuItem { NSMenuItem(title: "Go", action: nil, keyEquivalent: "") }
+    // A descriptor computed to 3 is no standard stream; a length of 1 is no
+    // descriptor.
+    public func third() -> FileHandle { FileHandle(fileDescriptor: 1 + 2) }
+    public func put(_ b: UnsafeRawPointer) -> Int { write(3, b, 1) }
+    // Traps that print nothing they caught: `try?` and a merge that keeps one.
+    public func parse(_ d: Data) -> Any? { try? JSONSerialization.jsonObject(with: d) }
+    public func merged(_ p: [(String, Int)]) -> [String: Int] { Dictionary(p, uniquingKeysWith: { a, _ in a }) }
+    // An alert button that says nothing gated, and no default button.
+    public func ask(_ a: NSAlert, _ w: NSWindow) { a.addButton(withTitle: "OK"); w.defaultButtonCell = nil }
 }
 
 // A key method that does nothing gated.
@@ -402,6 +422,21 @@ SWIFT_REFUSALS = [
     ("reveal in a keyDown override", "gated-key", KIT, append(KIT, "final class V: NSView { override func keyDown(with event: NSEvent) { revealValue() } }\n")),
     ("a menu item bound to a key", "gated-key", KIT, append(KIT, "let i = NSMenuItem(title: \"Approve\", action: nil, keyEquivalent: \"a\")\n")),
     ("Return as a key equivalent in parentheses", "gated-key", KIT, append(KIT, "func b(x: NSButton) { x.keyEquivalent = (\"\\r\") }\n")),
+    # The system binds an alert's and a dialog's buttons to keys (measured:
+    # Return fired the first button without a role, the cancel role answers
+    # Escape, and a destructive button answers neither).
+    ("Approve first in an alert", "gated-key", VIEW, in_view('.alert("Request", isPresented: .constant(true)) { Button("Approve") {}; Button("Cancel", role: .cancel) {} }')),
+    ("Approve as an alert button's label", "gated-key", VIEW, in_view('.alert("Request", isPresented: .constant(true)) { Button {} label: { Text("Approve") } }')),
+    ("a plain Remove in a confirmation dialog", "gated-key", VIEW, in_view('.confirmationDialog("Key", isPresented: .constant(true)) { Button("Remove") {}; Button("Cancel", role: .cancel) {} }')),
+    ("Remove as an alert's cancel button", "gated-key", VIEW, in_view('.alert("Key", isPresented: .constant(true)) { Button("Remove", role: .cancel) {} }')),
+    ("Reveal in an alert's actions argument", "gated-key", VIEW, in_view('.alert("Key", isPresented: .constant(true), actions: { Button("Reveal") {} }, message: { Text("m") })')),
+    ("a gated view in an alert's actions", "gated-key", VIEW, in_view('.alert("Key", isPresented: .constant(true)) { ApproveButton() }')),
+    ("Approve as a deprecated Alert's default button", "gated-key", VIEW, in_view('.alert(isPresented: .constant(true)) { Alert(title: Text("Request"), primaryButton: .default(Text("Approve")), secondaryButton: .cancel()) }')),
+    ("Approve as an NSAlert button", "gated-key", KIT, append(KIT, 'func ask(a: NSAlert) { a.addButton(withTitle: "Approve") }\n')),
+    ("an NSAlert button retitled Reveal", "gated-key", KIT, append(KIT, 'func ask(a: NSAlert) { a.buttons[0].title = "Reveal" }\n')),
+    ("a window's default button", "gated-key", KIT, append(KIT, "func set(w: NSWindow, c: NSButtonCell) { w.defaultButtonCell = c }\n")),
+    ("Replace as a file dialog's confirming label", "gated-key", VIEW, in_view('.fileDialogConfirmationLabel("Replace")')),
+    ("Approve as a panel's prompt", "gated-key", KIT, append(KIT, 'func ask(p: NSSavePanel) { p.prompt = "Approve" }\n')),
     ("zoom action", "a11y-action", VIEW, in_view(".accessibilityZoomAction { _ in }")),
     ("an AppKit accessibility override", "a11y-action", KIT, append(KIT, "import AppKit\nfinal class B: NSButton { override func accessibilityPerformPress() -> Bool { true } }\n")),
     # log: other writers
@@ -419,6 +454,15 @@ SWIFT_REFUSALS = [
     ("a child given the app's standard error", "log", KIT, append(KIT, "func c(p: Process) { p.standardError = FileHandle.standardError }\n")),
     ("standard error by descriptor", "log", KIT, append(KIT, "func p() { FileHandle(fileDescriptor: 2).write(Data()) }\n")),
     ("standard output by descriptor, through init", "log", KIT, append(KIT, "let h = FileHandle.init(fileDescriptor: 1)\n")),
+    # Descriptors computed from literals, and the other calls that take one.
+    ("standard error by a computed descriptor", "log", KIT, append(KIT, "func w() { _ = FileHandle(fileDescriptor: 1 + 1) }\n")),
+    ("standard error by a negated descriptor", "log", KIT, append(KIT, "func w() { _ = FileHandle(fileDescriptor: -(-2)) }\n")),
+    ("standard error by an exact conversion", "log", KIT, append(KIT, "func w() { _ = FileHandle(fileDescriptor: Int32(exactly: 2)!) }\n")),
+    ("standard error through DispatchIO.write", "log", KIT, append(KIT, "func w() { DispatchIO.write(toFileDescriptor: 2, data: .empty, runningHandlerOn: .main) { _, _ in } }\n")),
+    ("standard input through DispatchIO.read", "launch-input", KIT, append(KIT, "func r() { DispatchIO.read(fromFileDescriptor: 0, maxLength: 1, runningHandlerOn: .main) { _, _ in } }\n")),
+    ("the terminal of standard input", "launch-input", KIT, append(KIT, "func t() { _ = ttyname(0) }\n")),
+    ("standard error replaced through dup2", "log", KIT, append(KIT, "func d() { _ = dup2(3, 2) }\n")),
+    ("standard input mapped", "launch-input", KIT, append(KIT, "func m() { _ = mmap(nil, 1, PROT_READ, MAP_PRIVATE, 0, 0) }\n")),
     ("a write to descriptor 2", "log", KIT, append(KIT, "func p(b: UnsafeRawPointer) { _ = write(2, b, 1) }\n")),
     ("a write to standard error by name", "log", KIT, append(KIT, "func p(b: UnsafeRawPointer) { _ = Darwin.write(STDERR_FILENO, b, 1) }\n")),
     ("C standard output", "log", KIT, append(KIT, "func p() { fflush(stdout) }\n")),
@@ -475,6 +519,13 @@ SWIFT_REFUSALS = [
     # The log's metadata: only ECLog builds a Logger, from fixed words.
     ("a Logger built in the app", "log", APP, append(APP, "import os\nlet extra = Logger(subsystem: \"ai.envcloak.app\", category: \"x\")\n")),
     ("a Logger built by an implicit init", "log", KIT, append(KIT, "import os\nlet l: Logger = .init(subsystem: \"a\", category: \"b\")\n")),
+    # Traps that print a value (measured).
+    ("an error printed by try!", "log", KIT, append(KIT, "func t() { _ = try! JSONSerialization.data(withJSONObject: [:]) }\n")),
+    ("a duplicate key printed by a dictionary", "log", KIT, append(KIT, "func d(k: String) -> [String: Int] { Dictionary(uniqueKeysWithValues: [(k, 1)]) }\n")),
+    # The type by another name.
+    ("a Logger's metatype", "log", KIT, append(KIT, "import os\nlet loggerType: Logger.Type = Logger.self\n")),
+    ("a typealias for Logger", "log", KIT, append(KIT, "import os\ntypealias AppLog = os.Logger\n")),
+    ("an init given a subsystem on another receiver", "log", KIT, append(KIT, "import os\nfunc mk(s: String) { _ = type(of: ECLog.logger(.app)).init(subsystem: s, category: s) }\n")),
     ("a run-time subsystem", "log", TOKEN_FILE, replace(TOKEN_FILE, "Logger(subsystem: subsystem,", "Logger(subsystem: NSUserName(),")),
     ("a run-time category", "log", TOKEN_FILE, replace(TOKEN_FILE, "category: category.rawValue)", "category: ProcessInfo.processInfo.hostName)")),
     ("a category of a type not declared there", "log", TOKEN_FILE, replace(TOKEN_FILE, "_ category: ECLogCategory", "_ category: Wordy")),
