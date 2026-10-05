@@ -2592,7 +2592,12 @@ fn surface_line(v: &Value, agent: &str, surface: &str) -> String {
         s.push_str(&reasons.join(", "));
         s.push_str("; ");
     }
-    s.push_str(&format!("probe={})", e["probe"].as_str().unwrap()));
+    s.push_str(&format!("probe={}", e["probe"].as_str().unwrap()));
+    // A case not run, named after the outcome as the human report names it.
+    for c in e["skipped"].as_array().into_iter().flatten() {
+        s.push_str(&format!(", {} skipped", c.as_str().unwrap()));
+    }
+    s.push(')');
     s
 }
 
@@ -2825,7 +2830,7 @@ fn status_reads_each_switch_from_the_persons_files() {
 #[test]
 fn status_uses_a_probe_result_only_for_what_it_was_for() {
     use envcloak_agents::coverage::{
-        Cache, ConfigSet, Observed, Outcome, ProbeRecord, Sentinel, ServerObserved, Surface,
+        Cache, Case, ConfigSet, Observed, Outcome, ProbeRecord, Sentinel, ServerObserved, Surface,
         claude_managed_dir, file_sha256,
     };
     use envcloak_agents::hook::Host;
@@ -2861,7 +2866,12 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
             },
             persisted: *s == Surface::Transcript,
             why: Vec::new(),
-            skipped: Vec::new(),
+            // As the transcript probe records it (round 4).
+            skipped: if *s == Surface::Transcript {
+                vec![Case::InteractiveHistory]
+            } else {
+                Vec::new()
+            },
         })
         .collect();
     let mut cache = Cache::default();
@@ -2896,13 +2906,19 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
     assert_eq!(a["surfaces"][0]["surface"], "transcript", "{a}");
     assert_eq!(
         surface_line(&v, "claude-code", "transcript"),
-        "unsupported (persists_blocked_prompt; probe=failed)"
+        "unsupported (persists_blocked_prompt; probe=failed, interactive_history skipped)"
     );
     assert_eq!(a["envcloak_server"]["sentinel"], "appeared", "{a}");
     let out = f.agents(&["status"]);
     let text = stdout(&out);
     let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s}: {text}"));
     assert!(at("transcript") < at("prompt-to-model"), "{text}");
+    assert!(
+        text.contains(
+            "unsupported (persists_blocked_prompt; probe=failed, interactive_history skipped)"
+        ),
+        "{text}"
+    );
     assert!(
         text.contains(
             "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
