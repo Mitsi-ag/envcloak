@@ -4,25 +4,34 @@
 //! what `envcloak agents status --json` then reports from their results,
 //! and the probes' own controls.
 //!
-//! - Each pinned host is probed on every surface and for EnvCloak's server;
-//!   each surface's outcome is the one integrations/compat/matrix.toml
-//!   publishes for this host version and system, and `agents status`
-//!   reports, from the cached results and the home's real configuration,
-//!   exactly the matrix's states and tokens, which are what the probes
-//!   observed (the test fails if a claim differs from the observation),
-//!   with `outside_host_sandbox` and the sentinel's evidence on EnvCloak's
-//!   server line in both the human and the `--json` report.
+//! - Each pinned host is probed on every surface; each surface's outcome is
+//!   the one integrations/compat/matrix.toml publishes for this host
+//!   version and system, and `agents status` reports, from the cached
+//!   results and the home's real configuration, exactly the matrix's
+//!   states and tokens, which are what the probes observed (the test fails
+//!   if a claim differs from the observation); the probe context is the
+//!   same before and after the probe.
+//! - Each pinned host's sentinel probe, its evidence read on disk, gives
+//!   the matrix's server line with `outside_host_sandbox` in both the human
+//!   and the `--json` report; on Linux it runs again outside CI's user
+//!   namespace, inside which Claude Code's sandboxed shell cannot start and
+//!   the probe must fail through its shell's run witness.
 //! - Each hook surface's probe fails when EnvCloak's hook for it is taken
-//!   out of the installed configuration; Claude Code's `@.env` case fails
-//!   when the `Read(**/.env*)` deny rule is; Codex's hooks, left untrusted
-//!   (no trust bypass), fail every hook probe and read `degraded
-//!   (fails_open_on_timeout, hooks_untrusted; probe=failed)`.
+//!   out of the installed configuration, while the rule's cases still pass,
+//!   refused by EnvCloak's host rules in the hosts' own words; Claude
+//!   Code's `@.env` case fails when the `Read(**/.env*)` deny rule is taken
+//!   out; Codex's hooks, left untrusted (no trust bypass), fail every hook
+//!   probe and read `degraded (fails_open_on_timeout, hooks_untrusted;
+//!   probe=failed)`.
 //! - A hook that outlives the host's timeout lets the prompt it would block
 //!   through, on both hosts: `fails_open_on_timeout` is what the pinned
 //!   hosts do.
 //! - A stand-in host (`ec-fake-host`) failing each control or each probe
 //!   gives the outcome, state and reasons it must, and one pointed at a
-//!   dead base URL fails every probe through its control.
+//!   dead base URL fails every probe through its control; its sentinel
+//!   needs its shell to run and write, its file read takes the hook where
+//!   the rule leaves it, and a mention it does not expand is reported
+//!   skipped.
 #![allow(clippy::unwrap_used)]
 
 use std::ffi::OsString;
