@@ -30,12 +30,42 @@
 # any cfg, and every lint attribute, #[path], include! and clippy cfg they
 # can see, but not what a macro assembles from pieces.
 #
+#
+# 3. With `--swift`, the macOS app instead (M3 plan §5 rule 7, task M3-02):
+#    after an xcodebuild of apps/macos, every Swift file the compiler was
+#    given (the build's *.SwiftFileList files) must be one
+#    scripts/macos/check-swift.sh reads, or one of the two files the build
+#    generates for a package with resources (SwiftPM's
+#    resource_bundle_accessor.swift and Xcode's GeneratedAssetSymbols.swift,
+#    in the build's own DerivedSources/). So a file referenced from outside
+#    apps/macos, linked in from elsewhere or written by a build phase is
+#    refused, and check-swift.sh's rules hold for everything compiled into
+#    the app. The generated accessor's Debug-only environment override never
+#    ships: scripts/macos/sign-check.sh refuses an artifact that holds it.
+#    scripts/macos/check_compiled_swift.py does the comparison.
+#
 # Usage: scripts/check-sources.sh [workspace-root]
+#        scripts/check-sources.sh --swift <xcodebuild derived data> [workspace-root]
 # Runs $CARGO (default: cargo) with the caller's environment, so it checks
 # the configuration CI's clippy steps lint when run with the same RUSTFLAGS.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
+
+if [ "${1:-}" = "--swift" ]; then
+  [ $# -ge 2 ] || {
+    echo "usage: scripts/check-sources.sh --swift <xcodebuild derived data> [workspace-root]" >&2
+    exit 2
+  }
+  derived="$(cd "$2" && pwd -P)"
+  root="$(cd "${3:-$here/..}" && pwd -P)"
+  listed="$(mktemp "${TMPDIR:-/tmp}/check-sources-swift.XXXXXX")"
+  trap 'rm -f "$listed"' EXIT
+  bash "$here/macos/check-swift.sh" --list-swift --root "$root" >"$listed"
+  python3 "$here/macos/check_compiled_swift.py" "$derived" "$listed"
+  exit 0
+fi
+
 root="$(cd "${1:-$here/..}" && pwd -P)"
 cd "$root"
 
