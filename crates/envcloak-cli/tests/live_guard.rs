@@ -7,8 +7,10 @@
 //! same provider's test item and how to bind it for the layer the live
 //! binding came from, waiting or not, and following that, from any
 //! directory, binds the test item in the requested project; `envcloak
-//! items reclassify` tightens with no proof and loosens only with one.
-//! The daemon's side is in `crates/envcloak-daemon/tests/live_guard.rs`.
+//! items reclassify` tightens with no proof and loosens only with one. A
+//! command that must not read the passphrase is given one it cannot read
+//! without blocking ([`unread`]). The daemon's side is in
+//! `crates/envcloak-daemon/tests/live_guard.rs`.
 //!
 //! The requesters are `envcloak run` without a terminal (an unknown
 //! subject) and `envcloak run` as the command of the fixture agent on a
@@ -26,7 +28,7 @@ use std::time::Duration;
 
 use common::{
     MANIFEST, cli, cli_command, data_dir, finish_within, on_terminal_program, outside_dir, project,
-    run, run_on_terminal, secret_file, seed_vault, start_daemon, stderr, stdout,
+    python3, run, run_on_terminal, secret_file, seed_vault, start_daemon, stderr, stdout,
 };
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::AuditKind;
@@ -182,30 +184,85 @@ fn request_id(err: &str) -> String {
     id.to_owned()
 }
 
+/// A descriptor a command cannot read without blocking: a FIFO under
+/// `dir` whose write end this test holds open and never writes, so a read
+/// of it waits for as long as the test holds it (Codex, round 3: a file
+/// holding a wrong passphrase proved nothing, since the daemon refuses an
+/// unticked approval before it verifies a passphrase, so one read and sent
+/// was refused and uncounted all the same). The command is given it as
+/// `--passphrase-fd`; [`Unread::check`] after the command, which must have
+/// ended within its limit, says that the command opened it. Nothing is
+/// ever written to it.
+struct Unread {
+    path: PathBuf,
+    writer: std::thread::JoinHandle<std::fs::File>,
+}
+
+fn unread(dir: &Path, name: &str) -> Unread {
+    let path = dir.join(name);
+    let made = std::process::Command::new(python3())
+        .args(["-c", "import os, sys\nos.mkfifo(sys.argv[1], 0o600)\n"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let at = path.clone();
+    // Opening the write end waits for the reader, the command's wrapper,
+    // which opens it before the command starts.
+    let writer =
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(&at).unwrap());
+    Unread { path, writer }
+}
+
+impl Unread {
+    /// The command opened the descriptor (and, having ended, read
+    /// nothing from it: a read would still be waiting). Lets go of the
+    /// write end.
+    fn check(self) {
+        // Its open returned when the command's wrapper opened the read
+        // end, before the command started; the thread may be scheduled
+        // late on a loaded machine.
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while !self.writer.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            self.writer.is_finished(),
+            "the command never opened the descriptor"
+        );
+        drop(self.writer.join().unwrap());
+    }
+}
+
 /// Gate 40, sentence 1, through the CLI: an unknown process's request
 /// binding the live OpenAI key. `envcloak approve` without `--live`
 /// shows the statement, which names the tick it lacks and says that
-/// nothing is approved, reads no passphrase, and asks the daemon without
-/// one: the daemon refuses `live_not_ticked` and audits it (Codex, round
-/// 2: the CLI's own refusal was never audited), a wrong passphrase given
-/// is not counted, and no grant is made. With no test key proposed, the
-/// failure names none. With `--live OPENAI_API_KEY` it approves, the
-/// statement saying the tick is the person's.
+/// nothing is approved, reads no passphrase (its descriptor is one a read
+/// of would block, [`unread`], and the refusal comes within the limit),
+/// and asks the daemon without one: the daemon refuses `live_not_ticked`
+/// and audits it (Codex, round 2: the CLI's own refusal was never
+/// audited), and no grant is made. With no test key proposed, the failure
+/// names none. With `--live OPENAI_API_KEY` it approves, the statement
+/// saying the tick is the person's.
 ///
 /// Mutations: drop `envcloak approve`'s check (`unticked_live` answering
-/// none in the CLI): the passphrase is sent, the daemon refuses, the
-/// wrong one is counted, and this fails; refuse in the CLI alone, as round
-/// 1 did (the check never sent): nothing is audited, and this fails.
+/// none in the CLI): the passphrase is read, which blocks, and this fails
+/// at the limit; read the passphrase before the check (`read_secret_fd`
+/// above `unticked_live`), with the check and its refusal kept: the same;
+/// refuse in the CLI alone, as round 1 did (the check never sent): nothing
+/// is audited, and this fails.
 #[test]
 fn approve_refuses_an_unticked_live_key_before_the_passphrase() {
     let f = Fixture::new();
     let out = f.unknown_run(&[]);
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     let id = request_id(&stderr(&out));
+    let fd = unread(f.files.path(), "unread-approve");
     let refused = f.person(
         &["approve", &id, "--for", "1h", "--passphrase-fd", "3"],
-        &f.wrong,
+        &fd.path,
     );
+    fd.check();
     assert_eq!(refused.status.code(), Some(1));
     let (shown, err) = (stdout(&refused), stderr(&refused));
     assert!(err.starts_with("envcloak: live_not_ticked: "), "{err}");
@@ -577,7 +634,9 @@ fn the_approval_required_line_names_the_test_item() {
 ///
 /// Mutation: read the passphrase towards live too, or take none towards
 /// test: the agent's tightening, or the wrong passphrase's count, fails
-/// this.
+/// this; read it before asking whether the item is test already: the
+/// last reclassification blocks on its descriptor ([`unread`]) and this
+/// fails at the limit.
 #[test]
 fn items_reclassify_tightens_freely_and_loosens_with_a_proof() {
     let f = Fixture::new();
@@ -638,8 +697,10 @@ fn items_reclassify_tightens_freely_and_loosens_with_a_proof() {
         serde_json::json!({"slug": "stripe/acme-web", "classification": "test",
             "reclassified_from": "live", "grants_ended": 0})
     );
-    // Already test: nothing asked for (a wrong passphrase is never read),
+    // Already test: nothing asked for (the passphrase's descriptor is one
+    // a read of would block, and the command ends within its limit),
     // nothing changed.
+    let fd = unread(f.files.path(), "unread-reclassify");
     let out = f.person(
         &[
             "items",
@@ -649,8 +710,9 @@ fn items_reclassify_tightens_freely_and_loosens_with_a_proof() {
             "--passphrase-fd",
             "3",
         ],
-        &f.wrong,
+        &fd.path,
     );
+    fd.check();
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert_eq!(
         stdout(&out),
