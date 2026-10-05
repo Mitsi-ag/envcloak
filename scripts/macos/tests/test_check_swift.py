@@ -2,7 +2,11 @@
 """Tests for scripts/macos/check-swift.sh: a clean tree passes, and each
 refusal fixture (one change to that tree) fails with the rule it breaks,
 pinned to the changed file. Negative controls (code that looks close but
-is allowed) must pass, so a rule that refuses everything fails here too.
+is allowed: a child process's streams and working directory, an implicit
+`.error(...)` case, a descriptor in a variable, the temporary directory,
+a token enum's case forms, a struct with its own `rawValue`, the brand's
+icon group, an SDK framework) sit in the clean tree, so a rule that
+refuses too much fails here too.
 
 The fixture trees are written at run time under a short temporary
 directory: the key-literal case needs a key-shaped string, which is never
@@ -18,8 +22,11 @@ import re
 import shutil
 import string
 import subprocess
+import sys
 import tempfile
 import unittest
+
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
@@ -36,6 +43,7 @@ INFO = "apps/macos/Support/EnvCloak-Info.plist"
 ENTITLEMENTS = "apps/macos/Support/EnvCloak.entitlements"
 MANIFEST = "apps/macos/Packages/EnvCloakKit/Package.swift"
 PBXPROJ = "apps/macos/EnvCloak.xcodeproj/project.pbxproj"
+XCCONFIG = "apps/macos/Config/Base.xcconfig"
 EXPOSE = "apps/macos/security/expose-allowlist.txt"
 RULES = "apps/macos/security/check-swift-allowlist.txt"
 BRAND_SWIFT = "assets/brand/motion/swiftui/Motion.swift"
@@ -58,14 +66,19 @@ struct DemoApp: App {
     @Environment(\\.openWindow) private var openWindow
     init() {
         ECLog.logger(.app).notice("\\(AppEvent.launched.logToken, privacy: .public)")
+        ECLog.logger(.app).log(level: .info, "count \\(AppEvent.other.logToken)")
     }
     var body: some Scene {
         Window("Demo", id: "main") { View() }
     }
+    func stop() -> Never {
+        fatalError("stopped \\(AppEvent.third.logToken)")
+    }
 }
 
 enum AppEvent: String, LogToken {
-    case launched = "launched"
+    case launched = "launched", other
+    case third
 }
 """,
     VIEW: """import SwiftUI
@@ -94,15 +107,30 @@ struct View: SwiftUI.View {
 public struct Client {
     public init() {}
     public func size(_ n: Int) -> Int { n / 2 }
-    // A child's streams are not the app's own.
+    // A child's streams and working directory are not the app's own.
     public func child() -> Process {
         let p = Process()
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = Pipe()
         p.standardError = Pipe()
+        p.currentDirectoryURL = URL(fileURLWithPath: "/")
         return p
     }
+    // A descriptor the client opened, not a standard stream.
+    public func handle(_ fd: Int32) -> FileHandle { FileHandle(fileDescriptor: fd, closeOnDealloc: true) }
+    // The temporary directory does not follow the environment (measured).
+    public func scratch() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent(NSTemporaryDirectory()) }
+    public func outcome() -> Outcome { return .error(1) }
+    public func checked(_ n: Int) { precondition(n >= 0, "negative count") }
 }
+
+public enum Outcome { case ok, error(Int) }
+
+public struct Slug: RawRepresentable { public let rawValue: String; public init?(rawValue: String) { self.rawValue = rawValue } }
+
+public struct Box<T: LogToken> { let token: T }
+
+final class Holder { class func make(t: some LogToken) {} }
 """,
     TOKEN_FILE: """import os
 
@@ -156,10 +184,24 @@ let package = Package(
     targets: [.target(name: "EnvCloakKit")]
 )
 """,
-    PBXPROJ: "// !$*UTF8*$!\n{\n\tobjects = {\n\t\tEC01 = {isa = XCLocalSwiftPackageReference; relativePath = Packages/EnvCloakKit; };\n\t};\n}\n",
+    PBXPROJ: (
+        "// !$*UTF8*$!\n{\n\tobjects = {\n"
+        "\t\tEC01 = {isa = XCLocalSwiftPackageReference; relativePath = Packages/EnvCloakKit; };\n"
+        "\t\tEC02 = {isa = PBXGroup; name = Brand; path = ../../assets/brand/icon; sourceTree = \"<group>\"; };\n"
+        "\t\tEC03 = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; "
+        "path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };\n"
+        "\t\tEC04 = {isa = PBXFileReference; explicitFileType = wrapper.application; path = EnvCloak.app; sourceTree = BUILT_PRODUCTS_DIR; };\n"
+        "\t\tEC05 = {isa = XCBuildConfiguration; buildSettings = {LD_RUNPATH_SEARCH_PATHS = \"@executable_path/../Frameworks\"; }; };\n"
+        "\t};\n}\n"
+    ),
+    XCCONFIG: "SWIFT_VERSION = 6.0\nLD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks\n",
     EXPOSE: "# path  # reason\n",
     RULES: "# rule path  # reason\n",
 }
+
+# The clean tree's product Swift files: App, View, Client, LogToken, Tokens
+# and the brand link.
+PRODUCT_FILES = 6
 
 
 def key_shaped():
@@ -181,8 +223,29 @@ def write(path, text):
     return ("write", path, text)
 
 
+def write_bytes(path, data):
+    return ("bytes", path, data)
+
+
 def link(path, target):
     return ("link", path, target)
+
+
+def both(*changes):
+    return ("both", changes)
+
+
+def in_view(modifier):
+    """A modifier on the view's stack."""
+    return replace(VIEW, "        .padding(total > 2 ? 8 : 4)\n", "        .padding(total > 2 ? 8 : 4)\n        %s\n" % modifier)
+
+
+def in_manifest(target_args):
+    return replace(MANIFEST, '.target(name: "EnvCloakKit")', '.target(name: "EnvCloakKit", %s)' % target_args)
+
+
+def in_pbxproj(line):
+    return replace(PBXPROJ, "\t};\n}", "\t\t%s\n\t};\n}" % line)
 
 
 SWIFT_REFUSALS = [
@@ -191,6 +254,7 @@ SWIFT_REFUSALS = [
     ("mutable unsafe bytes", "unsafe-bytes", KIT, append(KIT, "func f(d: inout Data) { d.withUnsafeMutableBytes { _ in } }\n")),
     ("scene storage", "storage", VIEW, replace(VIEW, "    let total: Int\n", "    let total: Int\n    @SceneStorage(\"draft\") var draft = \"\"\n")),
     ("ubiquitous store", "storage", KIT, append(KIT, "let s = NSUbiquitousKeyValueStore.default\n")),
+    # launch inputs: arguments, environment, defaults
     ("command line", "launch-input", APP, append(APP, "let args = CommandLine.arguments\n")),
     ("environment", "launch-input", KIT, append(KIT, "let e = ProcessInfo.processInfo.environment[\"X\"]\n")),
     ("environment through a name", "launch-input", KIT, append(KIT, "let info = ProcessInfo.processInfo\nlet e = info.environment\n")),
@@ -198,40 +262,129 @@ SWIFT_REFUSALS = [
     ("getenv", "launch-input", KIT, append(KIT, "let h = getenv(\"HOME\")\n")),
     ("user defaults", "launch-input", KIT, append(KIT, "let d = UserDefaults.standard.string(forKey: \"socket\")\n")),
     ("app storage", "launch-input", VIEW, replace(VIEW, "    let total: Int\n", "    let total: Int\n    @AppStorage(\"vault\") var vault = \"\"\n")),
+    ("default app storage", "launch-input", VIEW, in_view(".defaultAppStorage(store)")),
+    ("CFPreferences", "launch-input", KIT, append(KIT, "let v = CFPreferencesCopyAppValue(\"socket\" as CFString, kCFPreferencesCurrentApplication)\n")),
+    ("defaults controller", "launch-input", KIT, append(KIT, "import AppKit\nlet c = NSUserDefaultsController.shared\n")),
+    ("global domain", "launch-input", KIT, append(KIT, "let g = NSGlobalDomain\n")),
+    # launch inputs: standard input
     ("standard input", "launch-input", KIT, append(KIT, "let line = readLine()\n")),
     ("the app's standard input handle", "launch-input", KIT, append(KIT, "let h = FileHandle.standardInput\n")),
+    ("standard input as an implicit member", "launch-input", KIT, append(KIT, "let h: FileHandle = .standardInput\n")),
     ("the C standard input", "launch-input", KIT, append(KIT, "let c = getc(stdin)\n")),
+    ("the C standard input, module-qualified", "launch-input", KIT, append(KIT, "let c = getc(Darwin.stdin)\n")),
+    ("standard input by descriptor", "launch-input", KIT, append(KIT, "let h = FileHandle(fileDescriptor: 0)\n")),
+    ("standard input read by descriptor", "launch-input", KIT, append(KIT, "func r(p: UnsafeMutableRawPointer) { _ = read(0, p, 1) }\n")),
+    ("standard input by its name", "launch-input", KIT, append(KIT, "func r(p: UnsafeMutableRawPointer) { _ = read(STDIN_FILENO, p, 1) }\n")),
+    # launch inputs: home as Foundation finds it (CFFIXED_USER_HOME)
+    ("NSHomeDirectory", "launch-input", KIT, append(KIT, "let h = NSHomeDirectory()\n")),
+    ("NSHomeDirectoryForUser", "launch-input", KIT, append(KIT, "let h = NSHomeDirectoryForUser(\"x\")\n")),
+    ("homeDirectoryForCurrentUser", "launch-input", KIT, append(KIT, "let h = FileManager.default.homeDirectoryForCurrentUser\n")),
+    ("homeDirectory(forUser:)", "launch-input", KIT, append(KIT, "let h = FileManager.default.homeDirectory(forUser: \"x\")\n")),
+    ("URL.homeDirectory", "launch-input", KIT, append(KIT, "let h = URL.homeDirectory\n")),
+    ("URL.applicationSupportDirectory", "launch-input", KIT, append(KIT, "let h = URL.applicationSupportDirectory\n")),
+    ("urls(for:in:)", "launch-input", KIT, append(KIT, "func u(d: FileManager.SearchPathDirectory, m: FileManager.SearchPathDomainMask) -> [URL] { FileManager.default.urls(for: d, in: m) }\n")),
+    ("url(for:in:...)", "launch-input", KIT, append(KIT, "func u(d: FileManager.SearchPathDirectory, m: FileManager.SearchPathDomainMask) throws -> URL { try FileManager.default.url(for: d, in: m, appropriateFor: nil, create: false) }\n")),
+    ("user domain mask", "launch-input", KIT, append(KIT, "let m: FileManager.SearchPathDomainMask = .userDomainMask\n")),
+    ("search path function", "launch-input", KIT, append(KIT, "func s(d: FileManager.SearchPathDirectory, m: FileManager.SearchPathDomainMask) -> [String] { NSSearchPathForDirectoriesInDomains(d, m, true) }\n")),
+    ("CFCopyHomeDirectoryURL", "launch-input", KIT, append(KIT, "let h = CFCopyHomeDirectoryURL()\n")),
+    ("group container", "launch-input", KIT, append(KIT, "let g = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: \"g\")\n")),
+    ("tilde expansion", "launch-input", KIT, append(KIT, "func t(s: String) -> String { (s as NSString).expandingTildeInPath }\n")),
+    ("tilde abbreviation", "launch-input", KIT, append(KIT, "func t(s: String) -> String { (s as NSString).abbreviatingWithTildeInPath }\n")),
+    ("standardizing a path", "launch-input", KIT, append(KIT, "func t(s: String) -> String { (s as NSString).standardizingPath }\n")),
+    ("resolving links", "launch-input", KIT, append(KIT, "func t(u: URL) -> URL { u.resolvingSymlinksInPath() }\n")),
+    ("a standardized URL", "launch-input", KIT, append(KIT, "func t(u: URL) -> URL { u.standardized }\n")),
+    ("a tilde path", "launch-input", KIT, append(KIT, "let r = URL(fileURLWithPath: \"~/Library/Application Support/EnvCloak/run\")\n")),
+    # launch inputs: working directory
+    ("the working directory", "launch-input", KIT, append(KIT, "let d = FileManager.default.currentDirectoryPath\n")),
+    ("getcwd", "launch-input", KIT, append(KIT, "let d = getcwd(nil, 0)\n")),
+    # side doors and gated keys
     ("app intents", "side-door", APP, replace(APP, "import SwiftUI\n", "import SwiftUI\nimport AppIntents\n")),
-    ("open url", "side-door", VIEW, replace(VIEW, "        .padding(total > 2 ? 8 : 4)\n", "        .padding(total > 2 ? 8 : 4)\n        .onOpenURL { _ in }\n")),
+    ("open url", "side-door", VIEW, in_view(".onOpenURL { _ in }")),
     ("external events", "side-door", APP, replace(APP, "Window(\"Demo\", id: \"main\") { View() }", "Window(\"Demo\", id: \"main\") { View() }.handlesExternalEvents(matching: [])")),
     ("apple events", "side-door", KIT, append(KIT, "func h() { NSAppleEventManager.shared().setEventHandler(nil, andSelector: Selector((\"x\")), forEventClass: 0, andEventID: 0) }\n")),
     ("delegate open", "side-door", KIT, append(KIT, "final class D { func application(_ a: AnyObject, open urls: [URL]) {} }\n")),
-    ("user activity", "side-door", VIEW, replace(VIEW, "        .padding(total > 2 ? 8 : 4)\n", "        .padding(total > 2 ? 8 : 4)\n        .onContinueUserActivity(\"x\") { _ in }\n")),
+    ("user activity", "side-door", VIEW, in_view(".onContinueUserActivity(\"x\") { _ in }")),
     ("accessibility action", "a11y-action", VIEW, replace(VIEW, "            Divider()", "            Text(\"x\").accessibilityAction(named: \"Approve\") {}\n            Divider()")),
     ("approve on a key", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}", "            Button(\"Approve with Touch ID\") {}")),
     ("reveal on a key, title in the label", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}", "            Button { } label: { Text(\"Reveal\") }")),
     ("remove on a key press", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            Button(\"Remove key\") {}\n                .padding(2)\n                .onKeyPress(.delete) { .handled }")),
+    # log: other writers
     ("print", "log", KIT, append(KIT, "func p() { print(\"x\") }\n")),
     ("swift print", "log", KIT, append(KIT, "func p() { Swift.print(\"x\") }\n")),
+    ("module-qualified puts", "log", KIT, append(KIT, "func p() { Darwin.puts(\"x\") }\n")),
+    ("module-qualified NSLog", "log", KIT, append(KIT, "func p() { Foundation.NSLog(\"x\") }\n")),
     ("debugPrint", "log", KIT, append(KIT, "func p(x: Int) { debugPrint(x) }\n")),
     ("dump", "log", KIT, append(KIT, "func p(x: Int) { dump(x) }\n")),
     ("NSLog", "log", KIT, append(KIT, "func p() { NSLog(\"x\") }\n")),
+    ("err(3)", "log", KIT, append(KIT, "func p() { warnx(\"x\") }\n")),
+    ("syslog", "log", KIT, append(KIT, "func p() { withVaList([]) { vsyslog(3, \"x\", $0) } }\n")),
     ("standard error", "log", KIT, append(KIT, "func p() { FileHandle.standardError.write(Data()) }\n")),
+    ("standard error as an implicit member", "log", KIT, append(KIT, "let h: FileHandle = .standardError\n")),
+    ("a child given the app's standard error", "log", KIT, append(KIT, "func c(p: Process) { p.standardError = FileHandle.standardError }\n")),
+    ("standard error by descriptor", "log", KIT, append(KIT, "func p() { FileHandle(fileDescriptor: 2).write(Data()) }\n")),
+    ("standard output by descriptor, through init", "log", KIT, append(KIT, "let h = FileHandle.init(fileDescriptor: 1)\n")),
+    ("a write to descriptor 2", "log", KIT, append(KIT, "func p(b: UnsafeRawPointer) { _ = write(2, b, 1) }\n")),
+    ("a write to standard error by name", "log", KIT, append(KIT, "func p(b: UnsafeRawPointer) { _ = Darwin.write(STDERR_FILENO, b, 1) }\n")),
     ("C standard output", "log", KIT, append(KIT, "func p() { fflush(stdout) }\n")),
+    ("C standard output, module-qualified", "log", KIT, append(KIT, "func p() { fflush(Darwin.stdout) }\n")),
     ("print in an interpolation", "log", KIT, append(KIT, "let s = \"\\(print(\"x\"))\"\n")),
+    # log: other log APIs
+    ("os_log", "log", KIT, append(KIT, "import os\nfunc p(v: String) { os_log(\"x \\(v)\") }\n")),
+    ("os_log with format arguments", "log", KIT, append(KIT, "import os\nfunc p(v: String) { os_log(\"%@\", v) }\n")),
+    ("os_log with a type and format arguments", "log", KIT, append(KIT, "import os\nfunc p(v: String) { os_log(\"%{private}@\", log: .default, type: .info, v) }\n")),
+    ("os_signpost", "log", KIT, append(KIT, "import os\nfunc p(l: OSLog, v: String) { os_signpost(.event, log: l, name: \"n\", \"%@\", v) }\n")),
+    ("OSSignposter", "log", KIT, append(KIT, "import os\nlet s = OSSignposter()\n")),
+    ("an OSLog object", "log", KIT, append(KIT, "import os\nlet l = OSLog(subsystem: \"x\", category: \"y\")\n")),
+    ("a message built away from its call", "log", KIT, append(KIT, "import os\nfunc m(name: String) -> OSLogMessage { \"x \\(name)\" }\n")),
+    ("a log message that is not a literal", "log", APP, append(APP, "func m(s: String) { ECLog.logger(.app).info(s) }\n")),
+    ("a log message after level: that is not a literal", "log", APP, append(APP, "func m(s: String) { ECLog.logger(.app).log(level: .info, s) }\n")),
+    # log: the message
     ("a value in a log message", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.logToken, privacy: .public) \\(Secret.value)")),
     ("a public value", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.rawValue, privacy: .public)")),
     ("a private value", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.rawValue)")),
-    ("public privacy outside a log call", "log", KIT, append(KIT, "import os\nfunc m(name: String) -> OSLogMessage { \"x \\(name, privacy: .public)\" }\n")),
-    ("os_log value", "log", KIT, append(KIT, "import os\nfunc p(v: String) { os_log(\"x \\(v)\") }\n")),
+    ("public privacy outside a log call", "log", KIT, append(KIT, "func m(name: String) -> String { \"x \\(name, privacy: .public)\" }\n")),
     ("public format", "log", KIT, append(KIT, "let f = \"%{public}s\"\n")),
+    ("a value in fatalError", "log", APP, replace(APP, "fatalError(\"stopped \\(AppEvent.third.logToken)\")", "fatalError(\"stopped \\(total)\")")),
+    ("a message variable in fatalError", "log", APP, replace(APP, "fatalError(\"stopped \\(AppEvent.third.logToken)\")", "fatalError(reason)")),
+    ("a value in precondition", "log", KIT, replace(KIT, "precondition(n >= 0, \"negative count\")", "precondition(n >= 0, \"negative count \\(n)\")")),
+    ("a value in assertionFailure", "log", KIT, append(KIT, "func a(n: Int) { assertionFailure(\"n \\(n)\") }\n")),
+    # log: the token
     ("a struct token", "log", KIT, append(KIT, "struct Word: RawRepresentable, LogToken { var rawValue: String }\n")),
     ("an extension token", "log", KIT, append(KIT, "extension Client: LogToken {}\n")),
+    ("a protocol refining the token", "log", KIT, append(KIT, "protocol Wordy: LogToken {}\n")),
     ("a second logToken", "log", KIT, append(KIT, "extension Client { var logToken: String { \"x\" } }\n")),
+    # Measured: with no raw type, an enum of plain cases takes its rawValue
+    # from another protocol's extension, here the user's name.
+    ("a token enum without a raw type", "log", KIT, append(KIT, "protocol Raw {}\nextension Raw { var rawValue: String { NSUserName() }\n  init?(rawValue: String) { nil } }\nenum Leak: Raw, LogToken { case a }\n")),
+    ("a token enum whose body writes rawValue and init", "log", KIT, append(KIT, "enum Leak: String, LogToken { case a\n  init?(rawValue: String) { nil } }\n")),
+    ("a token enum that writes its own rawValue", "log", KIT, append(KIT, "nonisolated(unsafe) var leaked = \"\"\nenum Leak: String, LogToken { case a\n  var rawValue: String { leaked } }\n")),
+    ("a token enum with an associated value", "log", KIT, append(KIT, "enum Leak: String, LogToken { case a(String) }\n")),
+    ("a token enum's rawValue in another file's extension", "log", VIEW, both(
+        append(KIT, "public enum Leak: String, LogToken { case a }\n"),
+        append(VIEW, "nonisolated(unsafe) var leaked = \"\"\nextension Leak { var rawValue: String { leaked } }\n"),
+    )),
+    ("a token enum's init in an extension", "log", KIT, append(KIT, "enum Leak: String, LogToken { case a }\nextension Leak { init?(rawValue: String) { self = .a } }\n")),
+    ("an extension of LogToken", "log", KIT, append(KIT, "extension LogToken { var shown: String { rawValue } }\n")),
+    ("a typealias for the token", "log", KIT, append(KIT, "typealias Word = LogToken\n")),
+    ("dynamic member lookup", "log", KIT, append(KIT, "@dynamicMemberLookup struct Any2 { subscript(dynamicMember m: String) -> String { m } }\n")),
+    # indirect calls
+    ("silgen name", "indirect", KIT, append(KIT, "@_silgen_name(\"puts\") func say(_ s: UnsafePointer<CChar>) -> Int32\n")),
+    ("extern", "indirect", KIT, append(KIT, "@_extern(c, \"getenv\") func look(_ n: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?\n")),
+    ("dlsym", "indirect", KIT, append(KIT, "let f = dlsym(UnsafeMutableRawPointer(bitPattern: -2), \"getenv\")\n")),
+    ("a class by name", "indirect", KIT, append(KIT, "let c: AnyClass? = NSClassFromString(\"NSProcessInfo\")\n")),
+    ("a selector from a string", "indirect", KIT, append(KIT, "let s = Selector(\"environment\")\n")),
+    ("key-value coding", "indirect", KIT, append(KIT, "let e = ProcessInfo.processInfo.value(forKey: \"environment\")\n")),
+    # daemon text
     ("raw daemon text", "daemon-text", VIEW, replace(VIEW, "Text(\"Open the folder\")", "Text(item.title.unescaped)")),
+    # colour
     ("component colour", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color(red: 1, green: 0, blue: 0))")),
     ("colour space colour", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color(.sRGB, red: 1, green: 0, blue: 0))")),
     ("init colour", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color.init(white: 0.5))")),
+    ("init colour with a colour space", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color.init(.sRGB, red: 1, green: 0, blue: 0))")),
+    ("implicit init with components", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(.init(red: 1, green: 0, blue: 0))")),
+    ("a resolved colour", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color(Color.Resolved(red: 1, green: 0, blue: 0)))")),
+    ("white after a colour space by its type", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color(Color.RGBColorSpace.sRGB, white: 0.5, opacity: 1))")),
+    ("a module-qualified colour", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(SwiftUI.Color(white: 0.5))")),
     ("AppKit colour", "color", KIT, append(KIT, "import AppKit\nlet c = NSColor(calibratedRed: 1, green: 0, blue: 0, alpha: 1)\n")),
     ("colour literal", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color(#colorLiteral(red: 1, green: 0, blue: 0, alpha: 1)))")),
     ("system colour", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color.red)")),
@@ -239,6 +392,7 @@ SWIFT_REFUSALS = [
     ("system NSColor", "color", KIT, append(KIT, "import AppKit\nlet c = NSColor.systemRed\n")),
     ("CGColor", "color", KIT, append(KIT, "import CoreGraphics\nlet c = CGColor(gray: 0.5, alpha: 1)\n")),
     ("catalog colour outside the design package", "color", VIEW, replace(VIEW, ".foregroundStyle(ECToken.text.color)", ".foregroundStyle(Color(\"background\", bundle: .main))")),
+    # the lexer
     ("unterminated string", "lex", KIT, append(KIT, "let s = \"open\n")),
     ("unterminated comment", "lex", KIT, append(KIT, "/* open\n")),
     ("bare regex", "lex", KIT, append(KIT, "let r = /a+b/\n")),
@@ -250,12 +404,40 @@ OTHER_REFUSALS = [
     ("AppleScript in Info.plist", "side-door", INFO, replace(INFO, "</dict>", "\t<key>NSAppleScriptEnabled</key>\n\t<true/>\n</dict>")),
     ("scripting definition", "side-door", INFO, replace(INFO, "</dict>", "\t<key>OSAScriptingDefinition</key>\n\t<string>x.sdef</string>\n</dict>")),
     ("services", "side-door", INFO, replace(INFO, "</dict>", "\t<key>NSServices</key>\n\t<array/>\n</dict>")),
-    ("a key set by a build setting", "side-door", PBXPROJ, replace(PBXPROJ, "\t};\n}", "\t\tINFOPLIST_KEY_NSServices = x;\n\t};\n}")),
+    ("a key set by a build setting", "side-door", PBXPROJ, in_pbxproj("INFOPLIST_KEY_NSServices = x;")),
+    ("an environment in Info.plist", "launch-input", INFO, replace(INFO, "</dict>", "\t<key>LSEnvironment</key>\n\t<dict/>\n</dict>")),
     ("get-task-allow", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.get-task-allow</key>\n\t<true/>\n")),
     ("a runtime exception", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.cs.allow-jit</key>\n\t<true/>\n")),
+    ("an entitlement no tier signs", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.network.client</key>\n\t<true/>\n")),
+    ("entitlements that do not parse", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>open\n")),
+    # packages from outside the tree
     ("a remote package", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(url: "https://example.invalid/sdk.git", from: "1.0.0")')),
     ("a registry package", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(id: "example.sdk", from: "1.0.0")')),
+    ("a package path outside the packages", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(path: "../../../../vendor/sdk")')),
+    ("an absolute package path", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(path: "/opt/sdk")')),
     ("a remote package in the project", "remote-package", PBXPROJ, replace(PBXPROJ, "XCLocalSwiftPackageReference", "XCRemoteSwiftPackageReference")),
+    ("a local package outside the tree in the project", "remote-package", PBXPROJ, replace(PBXPROJ, "relativePath = Packages/EnvCloakKit;", "relativePath = ../../vendor/sdk;")),
+    # code other than the Swift this check reads
+    ("a remote binary target", "linked-code", MANIFEST, replace(MANIFEST, "targets: [", 'targets: [.binaryTarget(name: "SDK", url: "https://example.invalid/sdk.zip", checksum: "0"), ')),
+    ("a local binary target", "linked-code", MANIFEST, replace(MANIFEST, "targets: [", 'targets: [.binaryTarget(name: "SDK", path: "SDK.xcframework"), ')),
+    ("a system library target", "linked-code", MANIFEST, replace(MANIFEST, "targets: [", 'targets: [.systemLibrary(name: "Lib"), ')),
+    ("unsafe flags", "linked-code", MANIFEST, in_manifest('linkerSettings: [.unsafeFlags(["-L/opt/lib"])]')),
+    ("a linked library", "linked-code", MANIFEST, in_manifest('linkerSettings: [.linkedLibrary("analytics")]')),
+    ("a linked framework", "linked-code", MANIFEST, in_manifest('linkerSettings: [.linkedFramework("Analytics")]')),
+    ("a build plugin", "linked-code", MANIFEST, in_manifest('plugins: ["Gen"]')),
+    ("a script phase", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXShellScriptBuildPhase; shellScript = \"true\"; };")),
+    ("a build rule", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXBuildRule; script = \"true\"; };")),
+    ("a static library reference", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libsdk.a; sourceTree = \"<group>\"; };")),
+    ("a framework from outside the SDK", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXFileReference; lastKnownFileType = wrapper.xcframework; path = SDK.xcframework; sourceTree = SOURCE_ROOT; };")),
+    ("an absolute reference", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXFileReference; lastKnownFileType = text; path = notes.txt; sourceTree = \"<absolute>\"; };")),
+    ("a group outside the tree", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXGroup; path = ../../../vendor; sourceTree = \"<group>\"; };")),
+    ("linker flags in the project", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = XCBuildConfiguration; buildSettings = {OTHER_LDFLAGS = \"-lanalytics\"; }; };")),
+    ("library search paths in a configuration", "linked-code", XCCONFIG, append(XCCONFIG, "LIBRARY_SEARCH_PATHS[config=Release] = /opt/lib\n")),
+    ("Swift flags in a configuration", "linked-code", XCCONFIG, append(XCCONFIG, "OTHER_SWIFT_FLAGS = -Xlinker -lanalytics\n")),
+    ("a static library in the tree", "linked-code", "apps/macos/Vendor/libsdk.a", write("apps/macos/Vendor/libsdk.a", "not really\n")),
+    ("a framework in the tree", "linked-code", "apps/macos/Vendor/SDK.framework/Info.plist", write("apps/macos/Vendor/SDK.framework/Info.plist", PLIST % "")),
+    ("a Mach-O file in the tree", "linked-code", "apps/macos/Vendor/tool", write_bytes("apps/macos/Vendor/tool", b"\xcf\xfa\xed\xfe" + bytes(28))),
+    # the tree
     ("a stray Swift file", "stray-swift", "apps/macos/Tools/gen.swift", write("apps/macos/Tools/gen.swift", "let x = 1\n")),
     ("a link out of the brand", "symlink", "apps/macos/EnvCloak/App/Hosts.swift", link("apps/macos/EnvCloak/App/Hosts.swift", "/etc/hosts")),
     ("an allowlist entry without a reason", "allowlist", EXPOSE, append(EXPOSE, KIT + "\n")),
@@ -275,10 +457,13 @@ class Tree:
         shutil.copytree(os.path.join(ROOT, "providers"), os.path.join(self.root, "providers"))
 
     def write(self, rel, text):
+        self.write_bytes(rel, text.encode())
+
+    def write_bytes(self, rel, data):
         path = os.path.join(self.root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
-            f.write(text)
+        with open(path, "wb") as f:
+            f.write(data)
 
     def read(self, rel):
         with open(os.path.join(self.root, rel)) as f:
@@ -295,10 +480,17 @@ class Tree:
             self.write(change[1], text.replace(change[2], change[3], 1))
         elif kind == "write":
             self.write(change[1], change[2])
+        elif kind == "bytes":
+            self.write_bytes(change[1], change[2])
         elif kind == "link":
             path = os.path.join(self.root, change[1])
             os.makedirs(os.path.dirname(path), exist_ok=True)
             os.symlink(change[2], path)
+        elif kind == "both":
+            for c in change[1]:
+                self.apply(c)
+        else:
+            raise AssertionError("unknown fixture change %r" % kind)
 
     def check(self):
         p = subprocess.run([CHECK, "--root", self.root], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -318,9 +510,10 @@ class CheckSwift(unittest.TestCase):
         return [(m.group(1), m.group(2)) for m in FINDING.finditer(out)]
 
     def test_the_clean_tree_passes(self):
+        # The negative controls are in it: a rule that refuses one fails here.
         code, out = Tree(self.base).check()
         self.assertEqual(code, 0, out)
-        self.assertIn("check-swift: ok (6 product Swift files", out)
+        self.assertIn("check-swift: ok (%d product Swift files" % PRODUCT_FILES, out)
 
     def test_the_repository_passes(self):
         p = subprocess.run([CHECK], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -344,6 +537,10 @@ class CheckSwift(unittest.TestCase):
         for name, rule, where, change in OTHER_REFUSALS:
             with self.subTest(fixture=name):
                 self.refusal(name, rule, where, change)
+
+    def test_fixture_names_are_unique(self):
+        names = [f[0] for f in SWIFT_REFUSALS + OTHER_REFUSALS]
+        self.assertEqual(len(names), len(set(names)))
 
     def test_a_key_shaped_literal_fails_anywhere(self):
         for rel in (TEST, INFO, "apps/macos/notes.md"):
@@ -380,12 +577,13 @@ class CheckSwift(unittest.TestCase):
         code, out = tree.check()
         self.assertIn(("color", KIT), self.findings(out))
 
-    def test_listing_names_every_swift_file_read(self):
+    def test_listing_names_every_swift_file_read_with_its_class(self):
         tree = Tree(self.base)
         p = subprocess.run([CHECK, "--list-swift", "--root", tree.root], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(p.returncode, 0, p.stderr.decode())
-        listed = set(p.stdout.decode().split())
-        want = {os.path.realpath(os.path.join(tree.root, rel)) for rel in (APP, VIEW, KIT, TOKEN_FILE, DESIGN, TEST, BRAND_SWIFT)}
+        listed = {tuple(line.split(" ", 1)) for line in p.stdout.decode().splitlines()}
+        product = {os.path.realpath(os.path.join(tree.root, rel)) for rel in (APP, VIEW, KIT, TOKEN_FILE, DESIGN, BRAND_SWIFT)}
+        want = {("product", path) for path in product} | {("test", os.path.realpath(os.path.join(tree.root, TEST)))}
         self.assertEqual(listed, want)
 
 

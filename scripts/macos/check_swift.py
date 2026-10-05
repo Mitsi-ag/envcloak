@@ -16,7 +16,9 @@ Product code is the app target (apps/macos/EnvCloak/) and the local
 packages' sources (apps/macos/Packages/*/Sources/); it is what ships.
 Test code (the three test targets and the packages' Tests/) is held only to
 the key-literal rule. A Swift file anywhere else under apps/macos fails, so
-a new source root is classified here before anything can compile it.
+a new source root is classified here before anything can compile it, and
+scripts/check-sources.sh --swift fails a build that compiles a test file
+into a shipping target.
 
 Rules (the id is what a finding and an allowlist entry name):
 
@@ -25,13 +27,40 @@ Rules (the id is what a finding and an allowlist entry name):
                  apps/macos/security/expose-allowlist.txt (rule 1).
   storage        `@SceneStorage` and `NSUbiquitousKeyValueStore`: state the
                  system saves for the app (rule 1).
-  launch-input   anything the starter of the app controls: `CommandLine`,
-                 `.arguments`, `.environment` (other than SwiftUI's
-                 `.environment(...)` modifier), `getenv`, `environ`,
-                 `_NSGetArgv`, `_NSGetArgc`, `_NSGetEnviron`, the app's own
-                 standard input (`FileHandle.standardInput`, `stdin`,
-                 `readLine`), `UserDefaults` and `@AppStorage` (launch arguments
-                 `-key value` land in the defaults' argument domain).
+  launch-input   anything the starter of the app controls (docs/APP.md "The
+                 app run by an agent"):
+                 - arguments and environment: `CommandLine`, `.arguments`,
+                   `.environment` (other than SwiftUI's `.environment(...)`
+                   modifier), `getenv`, `environ`, `_NSGetArgv`,
+                   `_NSGetArgc`, `_NSGetEnviron`, an `LSEnvironment` key;
+                 - the defaults, whose argument domain launch arguments
+                   (`-key value`) set: `UserDefaults`, `NSUserDefaults`,
+                   `NSUserDefaultsController`, `@AppStorage`,
+                   `defaultAppStorage`, any `CFPreferences...` function,
+                   `NSGlobalDomain`, the argument domain;
+                 - the app's own standard input: `FileHandle.standardInput`
+                   or any `.standardInput` that is not a child process's
+                   being set, `stdin`, `__stdinp`, `STDIN_FILENO`,
+                   `readLine`, and a descriptor-0 handle or read;
+                 - the home directory as Foundation finds it, which follows
+                   the environment's `CFFIXED_USER_HOME` (measured on macOS
+                   26.4.1): `NSHomeDirectory`, `NSHomeDirectoryForUser`,
+                   `homeDirectoryForCurrentUser`, any `homeDirectory`,
+                   `CFCopyHomeDirectoryURL`, `NSSearchPathForDirectoriesInDomains`,
+                   `.userDomainMask`, `.allDomainsMask`, the user-domain
+                   directories (`applicationSupportDirectory`,
+                   `libraryDirectory`, `cachesDirectory` and the rest),
+                   `url(for:in:...)` and `urls(for:in:)`, `containerURL`,
+                   `expandingTildeInPath`, `abbreviatingWithTildeInPath`,
+                   `standardizingPath`, `resolvingSymlinksInPath`,
+                   `standardized`, `standardizedFileURL`, and a string
+                   literal that starts with `~` (`URL(fileURLWithPath:)` and
+                   `URL(filePath:)` expand it from the same lookup). Home
+                   comes from `getpwuid_r` only;
+                 - the working directory: `getcwd`, `getwd`,
+                   `changeCurrentDirectoryPath`, and any
+                   `currentDirectoryPath` or `currentDirectoryURL` that is
+                   not a child process's being set.
   side-door      SPEC §12 "No side doors": Info.plist keys for URL schemes,
                  AppleScript, Services, documents, exported types, Handoff
                  and extensions (in every file), and in Swift: App Intents,
@@ -42,35 +71,88 @@ Rules (the id is what a finding and an allowlist entry name):
                  (rule 2: none may approve, reveal or write).
   gated-key      a keyboard shortcut on a button whose title starts with
                  Approve, Reveal, Replace or Remove (rule 2).
-  log            `print`, `debugPrint`, `dump`, `NSLog`, the C stdio
-                 writers and the app's own `FileHandle.standardError` and
-                 `.standardOutput` (a child's streams are fine); in a log call (`os_log`, or a `Logger` level
-                 method given a string literal) every interpolation is
-                 `\\(x.logToken)` (rule 3: a launch environment can make the
-                 log store "private" arguments in the clear, docs/APP.md
-                 "Logging"); `privacy: .public` only on such a token;
-                 `%{public}` nowhere; only an `enum` conforms to `LogToken`
-                 and only EnvCloakKit's Log/LogToken.swift declares
-                 `logToken`.
+  log            the app logs only through `Logger` with `LogToken` words
+                 (rule 3: a launch environment can make the log store
+                 "private" arguments in the clear, docs/APP.md "Logging"):
+                 - no other writer: `print`, `debugPrint`, `dump`, `NSLog`,
+                   the C stdio and err(3) writers, `syslog`, also when
+                   module-qualified (`Darwin.puts`); the app's own
+                   `FileHandle.standardError` and `.standardOutput` (any
+                   such member that is not a child's stream being set),
+                   `stderr`, `stdout`, `STDOUT_FILENO`, `STDERR_FILENO`,
+                   and a descriptor-1 or -2 handle or write;
+                 - no other log API: `os_log`, `os_signpost`, `os_trace`,
+                   `os_activity` (any spelling), `OSLog`, `OSLogMessage`,
+                   `OSSignposter`, `OSSignpostID`, `OSLogStore`;
+                 - a `Logger` call (a level method on a receiver) takes its
+                   message as a string literal at the call, and each
+                   interpolation in it is `\\(x.logToken)`;
+                   `privacy: .public` only on such a token; `%{public}`
+                   nowhere;
+                 - `fatalError`, `precondition`, `preconditionFailure`,
+                   `assert` and `assertionFailure` (which write their
+                   message to standard error and the crash report) take a
+                   literal message with the same interpolation rule;
+                 - `LogToken`: only an `enum` whose raw type, written first,
+                   is `String` and whose body holds only cases with literal
+                   raw values conforms; no extension of such an enum, and
+                   no extension of `LogToken`, declares `rawValue`, an
+                   `init` or anything else outside Log/LogToken.swift; only
+                   EnvCloakKit's Log/LogToken.swift declares `logToken`;
+                   no `@dynamicMemberLookup` type (whose `x.logToken` could
+                   be any string).
+  indirect       a call by a name the other rules cannot see:
+                 `@_silgen_name`, `@_extern`, `dlopen`, `dlsym`,
+                 `NSClassFromString`, `NSSelectorFromString`, the
+                 Objective-C runtime's lookups and `objc_msgSend`,
+                 `Selector("...")` from a string, `value(forKey:)` and
+                 `setValue(_:forKey:)` (and their key-path forms).
   daemon-text    `.unescaped`, the raw text of a string the daemon sent
                  (`DaemonText`, M3-03), outside the allowlist: views show
                  daemon text only through `Escape.display` (rule 4).
-  color          a colour not from EnvCloakDesign's tokens: colour
-                 initialisers from components, `#colorLiteral`, CGColor,
-                 CIColor, UIColor, named system colours, and catalog
-                 lookups by name outside EnvCloakDesign (rule 5).
-  remote-package a Swift package from anywhere but this tree (rule:
-                 no third-party code and no analytics SDK, R-M3-24).
-  entitlement    `com.apple.security.get-task-allow`, any
-                 `com.apple.security.cs.` (hardened-runtime exception) or
-                 `com.apple.security.temporary-exception.` key in an
-                 entitlements file (D3-05, D3-06).
+  color          a colour not from EnvCloakDesign's tokens: any call with a
+                 colour-component label (`red:`, `hue:`, `srgbRed:`,
+                 `cgColor:` and the rest, so `Color.Resolved(red:...)` and
+                 `.init(red:...)` too), `Color` or `NSColor` (or its `init`)
+                 built from components, `white:` or a colour space, `#colorLiteral`, CGColor, CIColor,
+                 UIColor, named system colours, and catalog lookups by name
+                 outside EnvCloakDesign (rule 5).
+  remote-package a Swift package from anywhere but this tree: a manifest's
+                 `.package(url:)`, `.package(id:)` or `.package(path:)`
+                 outside apps/macos/Packages, and a project's remote
+                 package or local package outside apps/macos/Packages
+                 (R-M3-24: no third-party code, no analytics SDK).
+  linked-code    code that reaches the app other than from the Swift this
+                 check reads (R-M3-24): a manifest's `.binaryTarget`,
+                 `.systemLibrary`, `unsafeFlags`, `linkedLibrary`,
+                 `linkedFramework` or plugin; a project's script phase,
+                 build rule, legacy or aggregate target, a library or
+                 framework file reference other than the SDK's, an absolute
+                 path, a path outside apps/macos and assets/brand, or a
+                 linker or include search setting (`OTHER_LDFLAGS`, the
+                 search paths, `OTHER_SWIFT_FLAGS`, `OTHER_CFLAGS`); and
+                 any Mach-O, archive, library or framework file in the
+                 tree.
+  entitlement    any key in an entitlements file, which must parse as a
+                 property list: no tier signs one yet (M3-10 adds the
+                 keychain group's, as scripts/macos/sign_check.py's list
+                 does), and `com.apple.security.get-task-allow`, any
+                 `com.apple.security.cs.` (hardened-runtime exception) and
+                 any `com.apple.security.temporary-exception.` key are
+                 never signed (D3-05, D3-06).
   key-literal    a string matching a provider's key pattern
                  (providers/*.toml) in any text file (rule 7).
   symlink        a symbolic link that does not resolve inside assets/brand/.
   stray-swift    a Swift file outside the product and test roots.
   lex            a Swift file the lexer cannot read whole.
   allowlist      a malformed, unknown, missing or unused allowlist entry.
+
+Limits (what a review still looks for): the rules read names, so a
+`typealias` or a wrapper that renames a refused API (other than the ones
+above), a shadowing `String` type, Objective-C or C sources (none may be
+added: stray files fail only for Swift, so a review refuses them) and a
+path built at run time that starts with `~` and reaches
+`URL(fileURLWithPath:)` are not seen; key-literal reads text files only.
 
 The brand's own Swift (assets/brand/motion/swiftui/EnvCloakMotion.swift,
 reached through a symlink in EnvCloakDesign) is product code and held to
@@ -79,13 +161,16 @@ every rule but `color`: it defines the brand colours.
 Usage: check-swift.sh [--root DIR]       check the tree (default: the repo)
        check-swift.sh --list-swift [--root DIR]
                                          print every Swift file read, one per
-                                         line, as the real path, and check
+                                         line, as `<class> <real path>` with
+                                         class `product` or `test`, and check
                                          nothing (scripts/check-sources.sh
                                          --swift compares it with what the
-                                         compiler read)
+                                         compiler read, target by target)
 """
 
 import os
+import plistlib
+import posixpath
 import re
 import subprocess
 import sys
@@ -96,6 +181,7 @@ except ImportError:  # pragma: no cover
     tomllib = None
 
 APP = "apps/macos"
+PACKAGES = APP + "/Packages/"
 EXPOSE_ALLOWLIST = APP + "/security/expose-allowlist.txt"
 RULE_ALLOWLIST = APP + "/security/check-swift-allowlist.txt"
 ALLOWLISTABLE = {"launch-input", "storage", "a11y-action", "daemon-text"}
@@ -116,6 +202,8 @@ SIDE_DOOR_KEYS = (
     "NSUserActivityTypes",
     "NSExtension",
 )
+# Info.plist keys that hand the app input from its starter.
+LAUNCH_KEYS = ("LSEnvironment",)
 SIDE_DOOR_IMPORTS = {"AppIntents", "Intents", "CoreSpotlight", "IntentsUI"}
 SIDE_DOOR_NAMES = {
     "AppIntent",
@@ -163,59 +251,201 @@ PRINTERS = {
     "NSLogv",
     "puts",
     "fputs",
+    "fputc",
+    "putc",
+    "putw",
     "printf",
     "fprintf",
+    "dprintf",
     "vprintf",
     "vfprintf",
+    "vdprintf",
     "putchar",
     "perror",
+    "psignal",
     "fwrite",
+    "warn",
+    "warnx",
+    "vwarn",
+    "vwarnx",
+    "err",
+    "errx",
+    "verr",
+    "verrx",
+    "syslog",
+    "vsyslog",
 }
-# The process's own standard streams: FileHandle.standardError and
-# .standardOutput, and the C globals. Setting a child's streams
-# (`process.standardOutput = pipe`) is not writing to the app's own.
-FILEHANDLE_WRITERS = {"standardError", "standardOutput"}
-C_STREAM_WRITERS = {"stderr", "stdout"}
+# Modules a writer can be qualified with (`Darwin.puts`): these, and every
+# module the file imports.
+SYSTEM_MODULES = {
+    "Swift",
+    "Foundation",
+    "Darwin",
+    "Glibc",
+    "os",
+    "OSLog",
+    "CoreFoundation",
+    "ObjectiveC",
+    "Dispatch",
+    "SwiftUI",
+    "AppKit",
+    "Cocoa",
+    "Combine",
+    "_Concurrency",
+    "System",
+    "Observation",
+    "CoreGraphics",
+    "CoreServices",
+    "Security",
+}
+# Words after which `.name(` is an implicit member (`return .error(x)`),
+# not a call on a receiver.
+KEYWORDS = {
+    "return",
+    "case",
+    "in",
+    "where",
+    "if",
+    "guard",
+    "while",
+    "throw",
+    "try",
+    "await",
+    "else",
+    "is",
+    "as",
+    "let",
+    "var",
+    "switch",
+    "repeat",
+    "defer",
+    "do",
+}
+# The process's own standard streams. Setting a child's
+# (`process.standardOutput = pipe`) is not reading or writing the app's own.
+STREAM_MEMBERS = {"standardError": "log", "standardOutput": "log", "standardInput": "launch-input"}
+C_STREAM_WRITERS = {"stderr", "stdout", "__stderrp", "__stdoutp", "STDOUT_FILENO", "STDERR_FILENO"}
+C_STREAM_READERS = {"stdin", "__stdinp", "STDIN_FILENO"}
+# Calls whose first argument is a descriptor: 0 is the app's standard
+# input, 1 and 2 its output and error.
+FD_CALLS = {"FileHandle", "write", "read", "pwrite", "pread", "writev", "readv", "fdopen", "dup", "dup2", "send", "recv"}
 LOG_LEVELS = {"debug", "info", "notice", "error", "warning", "fault", "critical", "trace", "log"}
+LOG_APIS = {"OSLog", "OSLogMessage", "OSSignposter", "OSSignpostID", "OSLogStore", "OSLogInterpolation"}
+LOG_API_PREFIXES = ("os_log", "_os_log", "os_signpost", "_os_signpost", "os_trace", "_os_trace", "os_activity", "_os_activity")
+# Calls that write their message to standard error and the crash report,
+# with the index of the message among the unlabelled arguments.
+FAIL_CALLS = {"fatalError": 0, "preconditionFailure": 0, "assertionFailure": 0, "precondition": 1, "assert": 1}
 LAUNCH_NAMES = {
-    "CommandLine",
-    "getenv",
-    "secure_getenv",
-    "environ",
-    "_NSGetEnviron",
-    "_NSGetArgv",
-    "_NSGetArgc",
-    "readLine",
-    "NSArgumentDomain",
-    "argumentDomain",
-    "UserDefaults",
-    "NSUserDefaults",
+    # arguments and environment
+    "CommandLine": "reads the launch arguments",
+    "getenv": "reads the environment",
+    "secure_getenv": "reads the environment",
+    "environ": "reads the environment",
+    "_NSGetEnviron": "reads the environment",
+    "_NSGetArgv": "reads the launch arguments",
+    "_NSGetArgc": "reads the launch arguments",
+    # standard input
+    "readLine": "reads the app's own standard input",
+    # the defaults
+    "NSArgumentDomain": "reads the defaults, which launch arguments set",
+    "argumentDomain": "reads the defaults, which launch arguments set",
+    "NSGlobalDomain": "reads the defaults, which launch arguments set",
+    "UserDefaults": "reads the defaults, which launch arguments set",
+    "NSUserDefaults": "reads the defaults, which launch arguments set",
+    "NSUserDefaultsController": "reads the defaults, which launch arguments set",
+    "defaultAppStorage": "reads the defaults, which launch arguments set",
+    # home, as Foundation finds it (CFFIXED_USER_HOME)
+    "NSHomeDirectory": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "NSHomeDirectoryForUser": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "homeDirectoryForCurrentUser": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "homeDirectory": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "CFCopyHomeDirectoryURL": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "NSSearchPathForDirectoriesInDomains": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "userDomainMask": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "allDomainsMask": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "containerURL": "follows CFFIXED_USER_HOME (home comes from getpwuid_r)",
+    "expandingTildeInPath": "expands `~` from CFFIXED_USER_HOME",
+    "abbreviatingWithTildeInPath": "abbreviates with a home from CFFIXED_USER_HOME",
+    "standardizingPath": "expands `~` from CFFIXED_USER_HOME",
+    "resolvingSymlinksInPath": "expands `~` from CFFIXED_USER_HOME",
+    "standardized": "expands `~` from CFFIXED_USER_HOME",
+    "standardizedFileURL": "expands `~` from CFFIXED_USER_HOME",
+    # working directory
+    "getcwd": "reads the working directory, which the starter sets",
+    "getwd": "reads the working directory, which the starter sets",
+    "changeCurrentDirectoryPath": "changes the working directory relative paths resolve against",
 }
+LAUNCH_PREFIXES = {"CFPreferences": "reads the defaults, which launch arguments set"}
+# The user-domain directories URL and FileManager name, each under the home
+# Foundation finds.
+USER_DIRECTORIES = {
+    "applicationSupportDirectory",
+    "libraryDirectory",
+    "cachesDirectory",
+    "documentsDirectory",
+    "documentDirectory",
+    "desktopDirectory",
+    "downloadsDirectory",
+    "moviesDirectory",
+    "musicDirectory",
+    "picturesDirectory",
+    "sharedPublicDirectory",
+    "trashDirectory",
+    "applicationDirectory",
+    "autosavedInformationDirectory",
+    "applicationScriptsDirectory",
+    "inputMethodsDirectory",
+    "preferencePanesDirectory",
+}
+# Members that read the working directory unless a child's is being set.
+CWD_MEMBERS = {"currentDirectoryPath", "currentDirectoryURL"}
+INDIRECT_NAMES = {
+    "dlopen",
+    "dlsym",
+    "dlvsym",
+    "NSClassFromString",
+    "NSSelectorFromString",
+    "NSProtocolFromString",
+    "objc_getClass",
+    "objc_lookUpClass",
+    "objc_getRequiredClass",
+    "objc_msgSend",
+    "objc_msgSendSuper",
+    "class_getInstanceMethod",
+    "class_getClassMethod",
+    "class_getMethodImplementation",
+    "method_getImplementation",
+    "method_setImplementation",
+    "method_exchangeImplementations",
+}
+INDIRECT_ATTRS = {"_silgen_name", "_extern"}
+KVC_CALLS = {"value": ("forKey", "forKeyPath"), "setValue": ("forKey", "forKeyPath")}
 STORAGE_NAMES = {"NSUbiquitousKeyValueStore"}
 COLOR_TYPES = {"Color", "NSColor"}
+# Labels that build a colour from components whatever the callee.
 COLOR_COMPONENT_LABELS = {
     "red",
     "srgbRed",
     "calibratedRed",
     "deviceRed",
     "displayP3Red",
-    "white",
-    "calibratedWhite",
-    "deviceWhite",
-    "genericGamma22White",
+    "colorLiteralRed",
     "hue",
     "calibratedHue",
     "deviceHue",
     "deviceCyan",
-    "colorSpace",
+    "calibratedWhite",
+    "deviceWhite",
+    "genericGamma22White",
     "cgColor",
     "ciColor",
     "nsColor",
     "uiColor",
-    "hex",
     "catalogName",
     "patternImage",
 }
+# Labels that build a colour on a colour type or its init.
+COLOR_TYPE_LABELS = COLOR_COMPONENT_LABELS | {"white", "colorSpace", "hex"}
 COLOR_NAME_LABELS = {"named", "name"}
 SYSTEM_COLORS = {
     "red",
@@ -244,8 +474,35 @@ IMPLICIT_COLORS = SYSTEM_COLORS - {"black", "white", "darkGray", "lightGray"}
 FORBIDDEN_ENTITLEMENT = re.compile(
     r"com\.apple\.security\.(?:get-task-allow|cs\.[A-Za-z0-9.-]+|temporary-exception\.[A-Za-z0-9.-]+)"
 )
+# Project build settings that link or include code from outside the
+# reviewed sources.
+LINK_SETTINGS = re.compile(
+    r"(?<![A-Za-z0-9_])(OTHER_LDFLAGS|LIBRARY_SEARCH_PATHS|FRAMEWORK_SEARCH_PATHS|SYSTEM_FRAMEWORK_SEARCH_PATHS"
+    r"|SWIFT_INCLUDE_PATHS|HEADER_SEARCH_PATHS|OTHER_SWIFT_FLAGS|OTHER_CFLAGS|OTHER_LIBTOOLFLAGS)"
+    r"(?:\[[^\]\n]*\])*\s*="
+)
+PBX_CODE_OBJECTS = ("PBXShellScriptBuildPhase", "PBXBuildRule", "PBXLegacyTarget", "PBXAggregateTarget")
+LINKABLE_TYPE = re.compile(
+    r"(?:lastKnownFileType|explicitFileType) = \"?(archive\.ar|wrapper\.framework|wrapper\.xcframework"
+    r"|compiled\.mach-o[^\";]*|sourcecode\.text-based-dylib-definition|wrapper\.plug-in)\"?;"
+)
+BINARY_SUFFIXES = (".a", ".dylib", ".so", ".o", ".tbd", ".framework", ".xcframework")
+MACHO_MAGIC = {
+    b"\xfe\xed\xfa\xce",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
+}
 
 findings = []
+# Cross-file facts for the LogToken rule: enums that conform, and every
+# extension's (file, line, extended type's last name, body tokens).
+log_token_enums = set()
+extensions = []
 
 
 def find(rule, path, line, msg):
@@ -262,13 +519,14 @@ class LexError(Exception):
 
 
 class Tok:
-    __slots__ = ("kind", "text", "line", "parts")
+    __slots__ = ("kind", "text", "line", "parts", "level")
 
     def __init__(self, kind, text, line, parts=None):
         self.kind = kind  # id, num, str, op, punct, attr, pound, regex
         self.text = text
         self.line = line
         self.parts = parts  # for str: [("lit", text) | ("interp", [Tok])]
+        self.level = 0  # how many interpolations deep (set by flatten)
 
     def __repr__(self):  # pragma: no cover
         return "Tok(%s,%r,%d)" % (self.kind, self.text, self.line)
@@ -498,24 +756,24 @@ class Lexer:
         if buf:
             parts.append(("lit", "".join(buf)))
         text = "".join(p[1] for p in parts if p[0] == "lit")
+        if multiline:
+            # A multi-line literal's text starts after its opening line.
+            text = text[1:] if text.startswith("\n") else text
         return Tok("str", text, start_line, parts), j
 
 
-def flatten(toks):
-    """Every code token, descending into interpolations, in source order."""
+def flatten(toks, level=0):
+    """Every code token, descending into interpolations, in source order;
+    each token's `level` says how many interpolations deep it is."""
     out = []
     for t in toks:
+        t.level = level
         out.append(t)
         if t.kind == "str":
             for kind, part in t.parts:
                 if kind == "interp":
-                    out.extend(flatten(part))
+                    out.extend(flatten(part, level + 1))
     return out
-
-
-def strings(toks):
-    """Every string literal, inside interpolations too."""
-    return [t for t in flatten(toks) if t.kind == "str"]
 
 
 def interpolations(tok):
@@ -554,6 +812,37 @@ def matching(toks, i):
             if depth == 0:
                 return j
     return len(toks) - 1
+
+
+def call_args(flat, lp):
+    """The top-level arguments of the call whose `(` is flat[lp], each as
+    (label or None, tokens after the label)."""
+    rp = matching(flat, lp)
+    # A string's interpolations follow it in `flat`; they are part of that
+    # argument, not arguments of their own.
+    inner = [t for t in flat[lp + 1 : rp] if t.level == flat[lp].level]
+    if not inner:
+        return []
+    out = []
+    for arg in split_top(inner):
+        if len(arg) >= 2 and arg[0].kind == "id" and arg[1].kind == "punct" and arg[1].text == ":":
+            out.append((arg[0].text, arg[2:]))
+        else:
+            out.append((None, arg))
+    return out
+
+
+def is_literal(expr):
+    """Whether an argument is one string literal, perhaps in parentheses."""
+    while len(expr) >= 3 and expr[0].text == "(" and expr[-1].text == ")" and matching(expr, 0) == len(expr) - 1:
+        expr = expr[1:-1]
+    return len(expr) == 1 and expr[0].kind == "str"
+
+
+def unwrap(expr):
+    while len(expr) >= 3 and expr[0].text == "(" and expr[-1].text == ")" and matching(expr, 0) == len(expr) - 1:
+        expr = expr[1:-1]
+    return expr
 
 
 # ---------------------------------------------------------------- the tree
@@ -623,22 +912,51 @@ def read_text(path):
 
 def check_product_swift(rel, toks, brand):
     flat = flatten(toks)
-    ids = [(k, t) for k, t in enumerate(flat)]
+    modules = set(SYSTEM_MODULES)
+    for k, t in enumerate(flat):
+        if t.kind == "id" and t.text == "import":
+            j = k + 1
+            if j < len(flat) and flat[j].kind == "id" and flat[j].text in ("struct", "class", "enum", "protocol", "func", "var", "let", "typealias"):
+                j += 1
+            if j < len(flat) and flat[j].kind == "id":
+                modules.add(flat[j].text)
 
-    def prev(k, back=1):
-        return flat[k - back] if k - back >= 0 else None
-
-    def nxt(k, ahead=1):
-        return flat[k + ahead] if k + ahead < len(flat) else None
+    def at(j):
+        return flat[j] if 0 <= j < len(flat) else None
 
     def is_member(k):
-        p = prev(k)
+        p = at(k - 1)
         return p is not None and p.kind == "op" and p.text.endswith(".")
 
-    for k, t in ids:
+    def receiver(k):
+        """For flat[k] after a `.`: "module" (`Darwin.puts`), "explicit"
+        (`logger.info`, `f().x`) or "implicit" (`.error(x)`)."""
+        r = at(k - 2)
+        if r is None:
+            return "implicit"
+        if r.kind == "id" and r.text in modules and (at(k - 3) is None or not (at(k - 3).kind == "op" and at(k - 3).text.endswith("."))):
+            return "module"
+        if r.kind == "id" and r.text not in KEYWORDS:
+            return "explicit"
+        if r.kind in ("str", "num") or (r.kind == "punct" and r.text in (")", "]")):
+            return "explicit"
+        return "implicit"
+
+    def bare(k):
+        """A free function or global: not a member, or qualified only by a
+        module."""
+        return not is_member(k) or receiver(k) == "module"
+
+    def assigned_on_receiver(k):
+        """`x.member = ...`: a child process's stream or directory being
+        set, not the app's own being read."""
+        a = at(k + 1)
+        return is_member(k) and receiver(k) == "explicit" and a is not None and a.kind == "op" and a.text == "="
+
+    for k, t in enumerate(flat):
         if t.kind == "id":
             name = t.text
-            after = nxt(k)
+            after = at(k + 1)
             calls = after is not None and after.kind == "punct" and after.text == "("
             # rule 1
             if name in ("withUnsafeBytes", "withUnsafeMutableBytes"):
@@ -647,19 +965,32 @@ def check_product_swift(rel, toks, brand):
                 find("storage", rel, t.line, "`%s` keeps state the system saves for the app" % name)
             # launch inputs
             if name in LAUNCH_NAMES:
-                find("launch-input", rel, t.line, "`%s` reads what the app's starter controls" % name)
+                find("launch-input", rel, t.line, "`%s` %s" % (name, LAUNCH_NAMES[name]))
+            for prefix, why in LAUNCH_PREFIXES.items():
+                if name.startswith(prefix):
+                    find("launch-input", rel, t.line, "`%s` %s" % (name, why))
+            if name in USER_DIRECTORIES:
+                find("launch-input", rel, t.line, "`%s` is under the home Foundation finds, which follows CFFIXED_USER_HOME" % name)
+            if name in ("url", "urls") and calls:
+                labels = [label for label, _ in call_args(flat, k + 1)]
+                if labels[:1] == ["for"] and "in" in labels:
+                    find("launch-input", rel, t.line, "`%s(for:in:)` looks up a directory under the home Foundation finds" % name)
+            if name in CWD_MEMBERS and not assigned_on_receiver(k):
+                find("launch-input", rel, t.line, "`%s` reads the working directory, which the starter sets" % name)
             if name == "arguments" and is_member(k):
                 find("launch-input", rel, t.line, "`.arguments` (the app reads no launch argument)")
             if name == "environment" and is_member(k) and not calls:
                 find("launch-input", rel, t.line, "`.environment` (the app reads no environment variable)")
+            if name in C_STREAM_READERS and bare(k):
+                find("launch-input", rel, t.line, "`%s` reads the app's own standard input" % name)
             # rule 2
             if name in SIDE_DOOR_NAMES:
                 find("side-door", rel, t.line, "`%s` is a way in that skips the gated sheets (SPEC §12)" % name)
             if name == "import":
-                mod = nxt(k)
+                mod = at(k + 1)
                 if mod is not None and mod.kind == "id" and mod.text in SIDE_DOOR_IMPORTS:
                     find("side-door", rel, t.line, "`import %s` (SPEC §12 \"No side doors\")" % mod.text)
-            if name == "func" and nxt(k) is not None and nxt(k).text == "application":
+            if name == "func" and at(k + 1) is not None and at(k + 1).text == "application":
                 lp = k + 2
                 if lp < len(flat) and flat[lp].text == "(":
                     rp = matching(flat, lp)
@@ -671,33 +1002,45 @@ def check_product_swift(rel, toks, brand):
                 find("a11y-action", rel, t.line, "`%s`: another program can perform it" % name)
             if name == "Button" and after is not None and after.kind == "punct" and after.text in ("(", "{"):
                 check_gated_button(rel, flat, k)
-            # rule 3
-            if name in PRINTERS and calls:
-                p = prev(k)
-                member_of_other = p is not None and p.kind == "op" and p.text == "." and not (prev(k, 2) is not None and prev(k, 2).text == "Swift")
-                if not member_of_other:
-                    find("log", rel, t.line, "`%s` writes outside the unified log (use Logger with LogToken)" % name)
-            if name in PRINTERS and prev(k) is not None and prev(k).text == "func":
+            # rule 3: other writers
+            if name in PRINTERS and calls and bare(k):
+                find("log", rel, t.line, "`%s` writes outside the unified log (use Logger with LogToken)" % name)
+            if name in PRINTERS and at(k - 1) is not None and at(k - 1).text == "func":
                 find("log", rel, t.line, "a function named `%s`" % name)
-            own_handle = is_member(k) and prev(k, 2) is not None and prev(k, 2).text == "FileHandle"
-            if name in FILEHANDLE_WRITERS and own_handle:
-                find("log", rel, t.line, "`FileHandle.%s` writes to the app's own standard stream" % name)
-            if name in C_STREAM_WRITERS and not is_member(k):
+            if name in STREAM_MEMBERS and is_member(k) and not assigned_on_receiver(k):
+                what = "writes to" if STREAM_MEMBERS[name] == "log" else "reads"
+                find(STREAM_MEMBERS[name], rel, t.line, "`.%s` %s the app's own standard stream (only a child's may be set)" % (name, what))
+            if name in C_STREAM_WRITERS and bare(k):
                 find("log", rel, t.line, "`%s` writes to the app's own standard stream" % name)
-            if name == "standardInput" and own_handle:
-                find("launch-input", rel, t.line, "`FileHandle.standardInput` reads what the app's starter controls")
-            if name == "stdin" and not is_member(k):
-                find("launch-input", rel, t.line, "`stdin` reads what the app's starter controls")
+            if name in FD_CALLS and calls and (bare(k) or name == "FileHandle"):
+                check_descriptor_call(rel, flat, k)
+            if name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "FileHandle":
+                check_descriptor_call(rel, flat, k)
+            # rule 3: other log APIs
+            if (name in LOG_APIS and not (at(k - 1) is not None and at(k - 1).text == "import")) or name.startswith(LOG_API_PREFIXES):
+                find("log", rel, t.line, "`%s`: the app logs only through Logger with LogToken words" % name)
+            if name in LOG_LEVELS and calls and is_member(k) and receiver(k) == "explicit":
+                check_log_call(rel, flat, k + 1)
+            if name in FAIL_CALLS and calls and bare(k):
+                check_fail_call(rel, flat, k + 1, FAIL_CALLS[name], name)
+            # rule 3: the token
             if name == "logToken" and rel != LOG_TOKEN_FILE:
-                p = prev(k)
+                p = at(k - 1)
                 if p is not None and p.kind == "id" and p.text in ("var", "let", "func", "case", "subscript"):
                     find("log", rel, t.line, "`logToken` is declared only in %s" % LOG_TOKEN_FILE)
-            if name in ("enum", "struct", "class", "actor", "extension", "protocol", "typealias") and rel != LOG_TOKEN_FILE:
-                check_log_token_conformance(rel, flat, k)
-            if name == "os_log" and calls:
-                check_log_call(rel, flat, k + 1)
-            if name in LOG_LEVELS and calls and is_member(k):
-                check_log_call(rel, flat, k + 1)
+            if name in ("enum", "struct", "class", "actor", "extension", "protocol", "typealias") and not (at(k - 1) is not None and at(k - 1).text == "."):
+                check_declaration(rel, flat, k)
+            # indirect calls
+            if name in INDIRECT_NAMES:
+                find("indirect", rel, t.line, "`%s` reaches code by a name the other rules cannot see" % name)
+            if name == "Selector" and calls:
+                args = call_args(flat, k + 1)
+                if args and args[0][0] is None and is_literal(args[0][1]):
+                    find("indirect", rel, t.line, "`Selector(\"...\")` names a method by a string (use #selector)")
+            if name in KVC_CALLS and calls:
+                labels = {label for label, _ in call_args(flat, k + 1)}
+                if labels & set(KVC_CALLS[name]):
+                    find("indirect", rel, t.line, "`%s(forKey:)` reaches a property by a string" % name)
             # rule 4
             if name == "unescaped" and is_member(k):
                 find("daemon-text", rel, t.line, "`.unescaped` reads a daemon string's raw text (show it with Escape.display)")
@@ -709,12 +1052,18 @@ def check_product_swift(rel, toks, brand):
                 find("storage", rel, t.line, "`@SceneStorage` saves view state with the window")
             if t.text == "AppStorage":
                 find("launch-input", rel, t.line, "`@AppStorage` reads the defaults, which launch arguments set")
+            if t.text in INDIRECT_ATTRS:
+                find("indirect", rel, t.line, "`@%s` binds a symbol under another name" % t.text)
+            if t.text == "dynamicMemberLookup":
+                find("log", rel, t.line, "`@dynamicMemberLookup`: its `x.logToken` could be any string")
         elif t.kind == "pound":
             if t.text == "#colorLiteral" and not brand:
                 find("color", rel, t.line, "`#colorLiteral` (use an EnvCloakDesign token)")
         elif t.kind == "str":
             if "%{public" in t.text:
                 find("log", rel, t.line, "`%{public}` in a format string")
+            if t.text.startswith("~"):
+                find("launch-input", rel, t.line, "a path that starts with `~`, which Foundation expands from CFFIXED_USER_HOME")
             for inner in interpolations(t):
                 args = split_top(inner)
                 if len(args) > 1 and any(is_public_privacy(a) for a in args[1:]) and not is_log_token_expr(args[0]):
@@ -735,64 +1084,187 @@ def is_log_token_expr(expr):
     return expr[-1].kind == "id" and expr[-1].text == "logToken" and expr[-2].kind == "op" and expr[-2].text.endswith(".")
 
 
-def check_log_call(rel, flat, lp):
-    """flat[lp] is the `(` of a log call. Its first top-level string
-    argument is the message; each interpolation must be `x.logToken`."""
-    if lp >= len(flat) or flat[lp].text != "(":
+def check_message(rel, message, line, what):
+    """A message argument: one string literal whose every interpolation is
+    `x.logToken`."""
+    if not is_literal(message):
+        find("log", rel, line, "%s whose message is not a string literal at the call, which this check cannot read" % what)
         return
-    rp = matching(flat, lp)
-    # The message is a direct argument: a string literal at depth 1, alone
-    # or after a label.
-    depth = 0
-    message = None
-    for j in range(lp, rp + 1):
-        t = flat[j]
-        if t.kind == "punct" and t.text in "([{":
-            depth += 1
-            continue
-        if t.kind == "punct" and t.text in ")]}":
-            depth -= 1
-            continue
-        if depth == 1 and t.kind == "str":
-            message = t
-            break
-    if message is None:
-        return
-    for inner in interpolations(message):
+    lit = unwrap(message)[0]
+    for inner in interpolations(lit):
         args = split_top(inner)
         if not is_log_token_expr(args[0]):
             find(
                 "log",
                 rel,
-                message.line,
-                "a log message interpolates something other than `x.logToken` (a launch environment can make private arguments public)",
+                lit.line,
+                "%s interpolates something other than `x.logToken` (a launch environment can make private arguments public)" % what,
             )
 
 
-def check_log_token_conformance(rel, flat, k):
-    kw = flat[k].text
-    if kw == "typealias":
-        j = k + 1
-        while j < len(flat) and flat[j].line == flat[k].line:
-            if flat[j].kind == "id" and flat[j].text == "LogToken":
-                find("log", rel, flat[k].line, "a typealias for LogToken")
-                return
-            j += 1
+def check_log_call(rel, flat, lp):
+    """flat[lp] is the `(` of a level method called on a receiver, a Logger
+    call as far as the text shows. Its message is the first argument other
+    than `level:`, a string literal at the call."""
+    args = [a for a in call_args(flat, lp) if a[0] != "level"]
+    if not args:
+        find("log", rel, flat[lp].line, "a log call with no message this check can read")
         return
+    label, message = args[0]
+    if label is not None:
+        find("log", rel, flat[lp].line, "a log call whose first argument is `%s:`, not the message" % label)
+        return
+    check_message(rel, message, flat[lp].line, "a log message")
+
+
+def check_fail_call(rel, flat, lp, index, name):
+    positional = [expr for label, expr in call_args(flat, lp) if label is None]
+    if len(positional) > index:
+        check_message(rel, positional[index], flat[lp].line, "`%s`, whose message reaches standard error and the crash report," % name)
+
+
+def check_descriptor_call(rel, flat, k):
+    args = call_args(flat, k + 1)
+    if not args:
+        return
+    expr = unwrap(args[0][1])
+    if len(expr) == 1 and expr[0].kind == "num" and expr[0].text in ("0", "1", "2"):
+        fd = expr[0].text
+        if fd == "0":
+            find("launch-input", rel, flat[k].line, "descriptor 0 is the app's own standard input")
+        else:
+            find("log", rel, flat[k].line, "descriptor %s is the app's own standard %s" % (fd, "output" if fd == "1" else "error"))
+
+
+def declaration(flat, k):
+    """For a type declaration keyword at flat[k]: (name tokens, inheritance
+    clause entries, index of the body's `{` or None, whether it has
+    generic parameters)."""
     j = k + 1
+    name = []
+    while j < len(flat) and (flat[j].kind == "id" or (flat[j].kind == "op" and flat[j].text == ".")):
+        if flat[j].kind == "id" and flat[j].text == "where":
+            break
+        name.append(flat[j])
+        j += 1
+    inherits = []
+    generic = False
+    if j < len(flat) and flat[j].kind == "op" and flat[j].text.startswith("<"):
+        # Generic parameters (`<T: LogToken>`) are not the inheritance clause.
+        generic = True
+        depth = 0
+        while j < len(flat):
+            if flat[j].kind == "op":
+                depth += flat[j].text.count("<") - flat[j].text.count(">")
+            j += 1
+            if depth <= 0:
+                break
+    clause = []
     seen_colon = False
     while j < len(flat):
         t = flat[j]
         if t.kind == "punct" and t.text in ("{", ";"):
             break
         if t.kind == "id" and t.text == "where":
+            while j < len(flat) and not (flat[j].kind == "punct" and flat[j].text in ("{", ";")):
+                j += 1
             break
-        if t.kind == "punct" and t.text == ":":
+        if t.kind == "punct" and t.text == ":" and not seen_colon:
             seen_colon = True
-        if seen_colon and t.kind == "id" and t.text == "LogToken" and kw != "enum":
-            find("log", rel, flat[k].line, "only an enum declaration may conform to LogToken (this is a %s)" % kw)
-            return
+        elif seen_colon:
+            clause.append(t)
         j += 1
+    if clause:
+        inherits = split_top(clause)
+    lbrace = j if j < len(flat) and flat[j].kind == "punct" and flat[j].text == "{" else None
+    return name, inherits, lbrace, generic
+
+
+DECL_MODIFIED = {"func", "var", "let", "subscript", "init", "deinit", "case", "static", "final", "override", "convenience", "required"}
+
+
+def names_log_token(entry):
+    ids = [t.text for t in entry if t.kind == "id"]
+    return bool(ids) and ids[-1] == "LogToken"
+
+
+def check_declaration(rel, flat, k):
+    kw = flat[k].text
+    line = flat[k].line
+    if kw == "typealias":
+        j = k + 1
+        while j < len(flat) and flat[j].line == line:
+            if flat[j].kind == "id" and flat[j].text == "LogToken":
+                if rel != LOG_TOKEN_FILE:
+                    find("log", rel, line, "a typealias for LogToken")
+                return
+            j += 1
+        return
+    nxt = flat[k + 1] if k + 1 < len(flat) else None
+    if nxt is None or nxt.kind != "id" or nxt.text in DECL_MODIFIED:
+        # `class func`, `class var`: a modifier, not a type declaration.
+        return
+    name, inherits, lbrace, generic = declaration(flat, k)
+    simple = name[-1].text if name and name[-1].kind == "id" else None
+    if kw == "extension":
+        body = flat[lbrace + 1 : matching(flat, lbrace)] if lbrace is not None else []
+        if rel != LOG_TOKEN_FILE:
+            extensions.append((rel, line, simple, body))
+            if simple == "LogToken":
+                find("log", rel, line, "an extension of LogToken outside %s" % LOG_TOKEN_FILE)
+    if rel == LOG_TOKEN_FILE or not any(names_log_token(e) for e in inherits):
+        return
+    if kw != "enum":
+        find("log", rel, line, "only an enum declaration may conform to LogToken (this is a %s)" % kw)
+        return
+    raw = [t.text for t in inherits[0]] if inherits else []
+    if raw not in (["String"], ["Swift", ".", "String"]) or generic:
+        find("log", rel, line, "a LogToken enum has the raw type String, written first, so its words are the compiler's raw values")
+    if lbrace is None:
+        find("log", rel, line, "a LogToken enum without a body this check can read")
+        return
+    body = flat[lbrace + 1 : matching(flat, lbrace)]
+    if not cases_only(body):
+        find("log", rel, line, "a LogToken enum holds only cases with literal raw values (no rawValue, init or other member)")
+    if simple:
+        log_token_enums.add(simple)
+
+
+def cases_only(body):
+    """`case a, b = "b"; case c` and nothing else: names, each with an
+    optional raw value that is a plain string literal."""
+    i = 0
+    n = len(body)
+    while i < n:
+        if body[i].kind == "punct" and body[i].text == ";":
+            i += 1
+            continue
+        if not (body[i].kind == "id" and body[i].text == "case"):
+            return False
+        i += 1
+        while True:
+            if i >= n or body[i].kind != "id":
+                return False
+            i += 1
+            if i < n and body[i].kind == "op" and body[i].text == "=":
+                if i + 1 >= n or body[i + 1].kind != "str" or interpolations(body[i + 1]):
+                    return False
+                i += 2
+            if i < n and body[i].kind == "punct" and body[i].text == ",":
+                i += 1
+                continue
+            break
+    return True
+
+
+def check_log_token_extensions():
+    for rel, line, simple, body in extensions:
+        if simple not in log_token_enums:
+            continue
+        for j, t in enumerate(body):
+            declared = t.kind == "id" and t.text == "rawValue" and j > 0 and body[j - 1].kind == "id" and body[j - 1].text in ("var", "let", "func", "subscript")
+            if declared or (t.kind == "id" and t.text == "init"):
+                find("log", rel, t.line, "an extension of the LogToken enum `%s` declares `%s`, which would change its words" % (simple, t.text))
 
 
 def check_gated_button(rel, flat, k):
@@ -846,22 +1318,33 @@ def check_color(rel, flat, k):
     def at(j):
         return flat[j] if 0 <= j < len(flat) else None
 
-    if name in COLOR_TYPES or (name == "init" and at(k - 1) is not None and at(k - 1).text == "."):
-        lp = at(k + 1)
-        if lp is not None and lp.text == "(":
-            first = at(k + 2)
-            label = first.text if first is not None and first.kind == "id" and at(k + 3) is not None and at(k + 3).text == ":" else None
-            if label in COLOR_COMPONENT_LABELS:
-                find("color", rel, t.line, "`%s(%s:...)` builds a colour from components (use an EnvCloakDesign token)" % (name, label))
-            elif first is not None and first.kind == "op" and first.text == "." and name != "init":
+    lp = at(k + 1)
+    calls = lp is not None and lp.kind == "punct" and lp.text == "("
+    member = at(k - 1) is not None and at(k - 1).kind == "op" and at(k - 1).text.endswith(".")
+    # `Color(`, `NSColor(`, `SwiftUI.Color(` and `Color.init(`; any other
+    # callee, `.init(` and `Color.Resolved(` included, is judged by its
+    # component labels alone.
+    color_init = name == "init" and member and at(k - 2) is not None and at(k - 2).text in COLOR_TYPES
+    qualified = member and at(k - 2) is not None and at(k - 2).text in SYSTEM_MODULES
+    color_callee = (name in COLOR_TYPES and (not member or qualified)) or color_init
+    if calls:
+        args = call_args(flat, k + 1)
+        labels = {label for label, _ in args if label is not None}
+        first = args[0][1] if args else []
+        if color_callee:
+            if labels & COLOR_TYPE_LABELS:
+                find("color", rel, t.line, "`%s(%s:...)` builds a colour from components (use an EnvCloakDesign token)" % (name, sorted(labels & COLOR_TYPE_LABELS)[0]))
+            elif args and args[0][0] is None and first and first[0].kind == "op" and first[0].text == ".":
                 find("color", rel, t.line, "`%s(.colorSpace, ...)` builds a colour from components" % name)
-            elif (first is not None and first.kind == "str") or label in COLOR_NAME_LABELS or has_label(flat, k + 1, "bundle"):
-                if name != "init" and not rel.startswith(DESIGN_SOURCES):
+            elif (args and args[0][0] is None and is_literal(first)) or labels & COLOR_NAME_LABELS or "bundle" in labels:
+                if not rel.startswith(DESIGN_SOURCES):
                     find("color", rel, t.line, "a catalog colour looked up by name outside EnvCloakDesign")
-        if name in COLOR_TYPES and at(k + 1) is not None and at(k + 1).kind == "op" and at(k + 1).text == ".":
-            member = at(k + 2)
-            if member is not None and member.kind == "id" and (member.text in SYSTEM_COLORS or member.text.startswith("system")):
-                find("color", rel, t.line, "`%s.%s` (use an EnvCloakDesign token)" % (name, member.text))
+        elif labels & COLOR_COMPONENT_LABELS:
+            find("color", rel, t.line, "`%s(%s:...)` builds a colour from components (use an EnvCloakDesign token)" % (name, sorted(labels & COLOR_COMPONENT_LABELS)[0]))
+    if name in ("Color", "NSColor") and at(k + 1) is not None and at(k + 1).kind == "op" and at(k + 1).text == ".":
+        m = at(k + 2)
+        if m is not None and m.kind == "id" and (m.text in SYSTEM_COLORS or m.text.startswith("system")):
+            find("color", rel, t.line, "`%s.%s` (use an EnvCloakDesign token)" % (name, m.text))
     if name in ("CGColor", "CIColor", "UIColor"):
         find("color", rel, t.line, "`%s` (use an EnvCloakDesign token)" % name)
     if name in IMPLICIT_COLORS:
@@ -873,32 +1356,42 @@ def check_color(rel, flat, k):
             find("color", rel, t.line, "`.%s` is a system colour (use an EnvCloakDesign token)" % name)
 
 
-def has_label(flat, lp, label):
-    """Whether the call whose `(` is flat[lp] has a top-level `label:`."""
-    rp = matching(flat, lp)
-    depth = 0
-    for j in range(lp, rp):
-        t = flat[j]
-        if t.kind == "punct" and t.text in "([{":
-            depth += 1
-        elif t.kind == "punct" and t.text in ")]}":
-            depth -= 1
-        elif depth == 1 and t.kind == "id" and t.text == label and flat[j + 1].text == ":":
-            return True
-    return False
+def inside(path, prefixes):
+    norm = posixpath.normpath(path)
+    return any(norm == p.rstrip("/") or norm.startswith(p) for p in prefixes)
 
 
 def check_manifest(rel, toks):
     flat = flatten(toks)
+    base = posixpath.dirname(rel)
     for k, t in enumerate(flat):
-        if t.kind == "id" and t.text == "package" and k > 0 and flat[k - 1].text == "." and k + 1 < len(flat) and flat[k + 1].text == "(":
-            rp = matching(flat, k + 1)
-            labels = {x.text for x in flat[k + 2 : rp] if x.kind == "id"}
-            if labels & {"url", "id"}:
-                find("remote-package", rel, t.line, "a package from outside this tree (only `.package(path:)`)")
+        if t.kind != "id":
+            continue
+        member = k > 0 and flat[k - 1].kind == "op" and flat[k - 1].text == "."
+        calls = k + 1 < len(flat) and flat[k + 1].text == "("
+        if t.text == "package" and member and calls:
+            args = dict((label, expr) for label, expr in call_args(flat, k + 1) if label is not None)
+            if "url" in args or "id" in args:
+                find("remote-package", rel, t.line, "a package from outside this tree (only `.package(path:)` into %s)" % PACKAGES)
+            elif "path" in args:
+                path = unwrap(args["path"])
+                if not is_literal(path) or path[0].parts and any(kind == "interp" for kind, _ in path[0].parts):
+                    find("remote-package", rel, t.line, "a package path this check cannot read")
+                elif path[0].text.startswith("/") or not inside(posixpath.join(base, path[0].text), [PACKAGES]):
+                    find("remote-package", rel, t.line, "a package path outside %s" % PACKAGES)
+            else:
+                find("remote-package", rel, t.line, "a package this check cannot place")
+        if t.text in ("binaryTarget", "systemLibrary", "plugin") and member:
+            find("linked-code", rel, t.line, "`.%s`: code that is not Swift this check reads" % t.text)
+        if t.text in ("unsafeFlags", "linkedLibrary", "linkedFramework", "plugins"):
+            find("linked-code", rel, t.line, "`%s`: links or runs code this check does not read" % t.text)
 
 
 PLIST_INPUTS = (".plist", ".entitlements", ".xcconfig", ".pbxproj", ".xcscheme", ".json", ".strings", ".xcstrings")
+
+
+def line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
 
 
 def check_text_file(rel, text):
@@ -907,13 +1400,65 @@ def check_text_file(rel, text):
     for key in SIDE_DOOR_KEYS:
         # `_` may come before a key: INFOPLIST_KEY_<Key> sets it from a build setting.
         for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
-            find("side-door", rel, text.count("\n", 0, m.start()) + 1, "`%s` (SPEC §12 \"No side doors\")" % key)
-    if rel.endswith(".pbxproj") and "XCRemoteSwiftPackageReference" in text:
-        find("remote-package", rel, 1, "a remote Swift package reference (only local packages)")
-    if rel.endswith(".entitlements") or rel.endswith(".plist") or rel.endswith(".xcconfig") or rel.endswith(".pbxproj"):
+            find("side-door", rel, line_of(text, m.start()), "`%s` (SPEC §12 \"No side doors\")" % key)
+    for key in LAUNCH_KEYS:
+        for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
+            find("launch-input", rel, line_of(text, m.start()), "`%s` sets the app's environment" % key)
+    if rel.endswith((".pbxproj", ".xcconfig")):
+        for m in LINK_SETTINGS.finditer(text):
+            find("linked-code", rel, line_of(text, m.start()), "`%s` links or includes code from outside the reviewed sources" % m.group(1))
+    if rel.endswith(".pbxproj"):
+        check_pbxproj(rel, text)
+    if rel.endswith(".entitlements"):
         for m in FORBIDDEN_ENTITLEMENT.finditer(text):
-            if rel.endswith(".entitlements"):
-                find("entitlement", rel, text.count("\n", 0, m.start()) + 1, "`%s` is never signed into EnvCloak (D3-05, D3-06)" % m.group(0))
+            find("entitlement", rel, line_of(text, m.start()), "`%s` is never signed into EnvCloak (D3-05, D3-06)" % m.group(0))
+        try:
+            ents = plistlib.loads(text.encode("utf-8", "surrogateescape"))
+        except Exception:  # noqa: BLE001 - any parse failure is a finding
+            ents = None
+        if not isinstance(ents, dict):
+            find("entitlement", rel, 0, "not a property list dictionary this check can read")
+        else:
+            for key in sorted(ents):
+                if not FORBIDDEN_ENTITLEMENT.fullmatch(key):
+                    find("entitlement", rel, 0, "`%s`: no signing tier signs an entitlement yet (M3-10 adds the keychain group's)" % key)
+
+
+def check_pbxproj(rel, text):
+    project_dir = posixpath.dirname(posixpath.dirname(rel))  # apps/macos
+    if "XCRemoteSwiftPackageReference" in text:
+        find("remote-package", rel, line_of(text, text.index("XCRemoteSwiftPackageReference")), "a remote Swift package reference (only local packages)")
+    for m in re.finditer(r"isa = XCLocalSwiftPackageReference;\s*relativePath = (\"?)([^\";\n]*)\1;", text):
+        target = m.group(2)
+        if target.startswith("/") or not inside(posixpath.join(project_dir, target), [PACKAGES]):
+            find("remote-package", rel, line_of(text, m.start()), "a local package outside %s" % PACKAGES)
+    for name in PBX_CODE_OBJECTS:
+        for m in re.finditer(r"isa = %s;" % name, text):
+            find("linked-code", rel, line_of(text, m.start()), "a `%s` runs code this check does not read" % name)
+    for m in re.finditer(r"\{[^{}]*isa = PBXFileReference;[^{}]*\}", text):
+        ref = m.group(0)
+        if LINKABLE_TYPE.search(ref) and not re.search(r"sourceTree = (SDKROOT|BUILT_PRODUCTS_DIR);", ref):
+            find("linked-code", rel, line_of(text, m.start()), "a library or framework reference other than the SDK's")
+    for m in re.finditer(r"sourceTree = \"?<absolute>\"?;", text):
+        find("linked-code", rel, line_of(text, m.start()), "a reference by absolute path")
+    for m in re.finditer(r"(?<![A-Za-z])path = (\"?)([^\";\n]*)\1;", text):
+        path = m.group(2)
+        if path.startswith("/") or (".." in path.split("/") and not inside(posixpath.join(project_dir, path), [APP + "/", BRAND])):
+            find("linked-code", rel, line_of(text, m.start()), "a path outside %s/ and %s: `%s`" % (APP, BRAND, path))
+
+
+def check_committed_binary(rel, real):
+    segments = rel.split("/")
+    if any(s.endswith((".framework", ".xcframework")) for s in segments[:-1]) or rel.endswith(BINARY_SUFFIXES):
+        find("linked-code", rel, 0, "a library or framework in the tree")
+        return
+    try:
+        with open(real, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return
+    if head[:4] in MACHO_MAGIC or head == b"!<arch>\n":
+        find("linked-code", rel, 0, "a Mach-O or archive file in the tree")
 
 
 def key_patterns(root):
@@ -942,7 +1487,7 @@ def key_patterns(root):
 def check_key_literals(rel, text, pats):
     for name, pat in pats:
         for m in pat.finditer(text):
-            find("key-literal", rel, text.count("\n", 0, m.start()) + 1, "a string shaped like a key (%s); generate test values at run time" % name)
+            find("key-literal", rel, line_of(text, m.start()), "a string shaped like a key (%s); generate test values at run time" % name)
 
 
 def read_allowlist(root, path, with_rule):
@@ -1024,11 +1569,12 @@ def main(argv):
     if list_only:
         for rel, real, cls, brand in swift:
             if cls in ("product", "test"):
-                print(real)
+                print("%s %s" % (cls, real))
         return 0
 
     pats = key_patterns(root)
     for rel, real in texts:
+        check_committed_binary(rel, real)
         text = read_text(real)
         if text is None:
             continue
@@ -1054,6 +1600,7 @@ def main(argv):
             check_manifest(rel, toks)
         else:
             check_product_swift(rel, toks, brand)
+    check_log_token_extensions()
 
     # Allowlists: each entry needs a reason, names a product file, and must
     # still be needed; a finding it covers is dropped.
