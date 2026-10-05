@@ -1365,9 +1365,9 @@ fn a_stand_in_that_holds_passes_every_probe_it_runs() {
 /// probe fails through its control, none passes, and every surface reads
 /// `probe=failed`, listed first.
 ///
-/// Mutation checked: the prompt probe without its control (`blocked`
-/// alone deciding): a host that sends nothing passes the prompt guard and
-/// this fails.
+/// Mutation checked: the prompt probe deciding on the token's absence
+/// alone (its controls and the block's witness dropped): a host that sends
+/// nothing passes the prompt guard and this fails.
 #[test]
 fn a_dead_base_url_fails_every_probe_through_its_control() {
     let r = fake_probe(&json!({"url": "dead"}));
