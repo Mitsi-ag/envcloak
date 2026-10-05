@@ -1,0 +1,349 @@
+{
+  "platform": "macOS aarch64",
+  "count": 34,
+  "receipts": [
+    {
+      "mutation": "disconnect-catalog-scanner",
+      "failed_tests": [
+        "fixture_catalog_sources_produce_a_finding"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/disconnect-catalog-scanner.log",
+      "log_sha256": "afcd37749793f2be69a8ea57eef22408f0fc0bf2bc3b5ae5a7e9c580f2a22a83"
+    },
+    {
+      "mutation": "drop-envfile-template-name",
+      "failed_tests": [
+        "envfile_templates_links_and_limits_remain_visible"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/drop-envfile-template-name.log",
+      "log_sha256": "d7922a7322c2c8a6338d3ffcc882929aac0e206205361f4796ca345679d33f37"
+    },
+    {
+      "mutation": "drop-json-backslash-unescaping",
+      "failed_tests": [
+        "scanners::gate8_serializer_escapes_retain_the_raw_span"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/drop-json-backslash-unescaping.log",
+      "log_sha256": "d78343d6d59d2f6780930365cc39b8298ad25a8bf281b3b6b6d5271f2639fc31"
+    },
+    {
+      "mutation": "drop-json-unescaping",
+      "failed_tests": [
+        "json_escapes_keep_exact_raw_ranges_and_decoded_forms"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/drop-json-unescaping.log",
+      "log_sha256": "5f82a2ce7be92f5cdbde23818604e7cf35e204c10a9346fdfa6a005c8fbc9907"
+    },
+    {
+      "mutation": "follow-symlinked-profile",
+      "failed_tests": [
+        "profile_roots_refuse_links_fifo_and_report_unreadable"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/follow-symlinked-profile.log",
+      "log_sha256": "3db7bedf4fba97b95d936850fe44ceafce08426139e47cdf31497ab21248d950"
+    },
+    {
+      "mutation": "hide-retained-restores",
+      "failed_tests": [
+        "displaced_foreign_save_is_reported_without_cleanup",
+        "actual_restore_leftovers_remain_visible_after_refusal_and_other_restore"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/hide-retained-restores.log",
+      "log_sha256": "102f1dedb7b7c4bfec699cbed8b77903e2213dd65a31a5185184399b113f5fd7"
+    },
+    {
+      "mutation": "ignore-shared-config-file-cap",
+      "failed_tests": [
+        "envfile_templates_links_and_limits_remain_visible"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/ignore-shared-config-file-cap.log",
+      "log_sha256": "7f1967bc0e48117efe82816f87a7c931f26f23d4b2c40ae18f0d1e1ccd02855b"
+    },
+    {
+      "mutation": "inherit-git-environment",
+      "failed_tests": [
+        "deleted_history_is_found_and_limits_are_partial"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/inherit-git-environment.log",
+      "log_sha256": "638542ced53eb06a1002f44a9dc3a1d8c4b5e0b8a95f836cf204db16141a69fe"
+    },
+    {
+      "mutation": "omit-envfile-hardlink-report",
+      "failed_tests": [
+        "envfile_templates_links_and_limits_remain_visible"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/omit-envfile-hardlink-report.log",
+      "log_sha256": "633d7a982b6a880696cc011db7a7aca34290e85545bf60f572f41c60ed2ee5b5"
+    },
+    {
+      "mutation": "omit-host-config-values",
+      "failed_tests": [
+        "scanners::codex_config_and_transcript_are_scanned",
+        "scanners::claude_config_and_transcript_are_scanned"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/omit-host-config-values.log",
+      "log_sha256": "269ab649e10968aaf20151f2a7e7467652ddd48e1db0de89d1329bc1c0afc855"
+    },
+    {
+      "mutation": "omit-host-transcript-tokens",
+      "failed_tests": [
+        "scanners::codex_config_and_transcript_are_scanned",
+        "scanners::claude_config_and_transcript_are_scanned"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/omit-host-transcript-tokens.log",
+      "log_sha256": "ef074c624a808c4d7a9a5c92cdc268e02bf542c7a5a50a6e1b49e83d8697ad9c"
+    },
+    {
+      "mutation": "omit-json-bindings",
+      "failed_tests": [
+        "config_slots_templates_and_envfile_are_found"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/omit-json-bindings.log",
+      "log_sha256": "57f211ffa22fcff5f52cf79c8f629632c0e491fdeb02d14f618677e1aabadb02"
+    },
+    {
+      "mutation": "omit-provider-key-reader",
+      "failed_tests": [
+        "provider_config_paths_stay_in_the_catalog"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/omit-provider-key-reader.log",
+      "log_sha256": "d6ab8a13ac2cb45d06d321dcfb9289e1fceedb8c453cbad19b99577c2bd51db6"
+    },
+    {
+      "mutation": "omit-restore-leftovers",
+      "failed_tests": [
+        "leftovers_are_ambiguous_metadata_only_and_never_removed"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/omit-restore-leftovers.log",
+      "log_sha256": "c17ab72a89f9c56af07e1867f66a776daa7feca0a49874fb13f2fcd51f1c693a"
+    },
+    {
+      "mutation": "panic-on-malformed-json",
+      "failed_tests": [
+        "hostile_parser_bytes_are_bounded_and_errors_are_value_free"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/panic-on-malformed-json.log",
+      "log_sha256": "a291c269564a745ba08b4eff42001116a22452716f4d24d612808adea91b15a1"
+    },
+    {
+      "mutation": "recurse-assignment-readings",
+      "failed_tests": [
+        "repeated_assignment_separators_do_not_multiply_readings"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/recurse-assignment-readings.log",
+      "log_sha256": "4f78abc3932ae90ca6961e9054d051a230dd232053393a7500985bd677aecb00"
+    },
+    {
+      "mutation": "remove-leaf-device-guard",
+      "failed_tests": [
+        "root::scanner_device_tests::leaf_mount_is_refused_before_reading"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/remove-leaf-device-guard.log",
+      "log_sha256": "4c45293c1dd74e7033ed30d5698a820fec1c687e4f5499b6073ce3cc30922750"
+    },
+    {
+      "mutation": "remove-leftover-file-budget",
+      "failed_tests": [
+        "leftover_discovery_obeys_the_shared_file_budget"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/remove-leftover-file-budget.log",
+      "log_sha256": "83443707a5701958e9fbe87c41c9341ec4ac57d80cf1d45e635508ed4ec4007a"
+    },
+    {
+      "mutation": "remove-production-allocator-wipe",
+      "failed_tests": [
+        "three_parsers_leave_no_fixture_in_freed_memory"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/remove-production-allocator-wipe.log",
+      "log_sha256": "db47ae3fd9b235a36c8c2c84742d96a934a4cb06975c83508677990cff5b0d0d"
+    },
+    {
+      "mutation": "reopen-git-root-by-path",
+      "failed_tests": [
+        "git_scans_the_held_root_after_its_path_is_replaced"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/reopen-git-root-by-path.log",
+      "log_sha256": "2f4acd272847c6e0be3ed016db93e4fa8a8e922e4662bbddd14dd783d7aad854"
+    },
+    {
+      "mutation": "send-duplicate-candidates",
+      "failed_tests": [
+        "repeated_token_is_compared_once_with_every_occurrence"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/send-duplicate-candidates.log",
+      "log_sha256": "878c4285eaab732b2cc1da90c0527d45956e57d025fd64da86960bf938e4d6ee"
+    },
+    {
+      "mutation": "silence-byte-budget",
+      "failed_tests": [
+        "stream_caps_and_malformed_input_never_report_complete"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-byte-budget.log",
+      "log_sha256": "55af5822eea98680f1fb24e19f051add12530d3b2600db5a8a899ffcb3dc391f"
+    },
+    {
+      "mutation": "silence-database-omission",
+      "failed_tests": [
+        "config_links_and_unsupported_stores_are_visible"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-database-omission.log",
+      "log_sha256": "86e9105af8888051f0f54726aa5daaafe4575612cbd23c3e2d5b459f6a08c671"
+    },
+    {
+      "mutation": "silence-git-limits",
+      "failed_tests": [
+        "deleted_history_is_found_and_limits_are_partial"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-git-limits.log",
+      "log_sha256": "39c3e78596aac688fe16218b142a2cdc65e5a6046f42c656e5863c9b09bd437a"
+    },
+    {
+      "mutation": "silence-hardlink-report",
+      "failed_tests": [
+        "new_roots_report_fifo_links_unreadable_and_stream_two_gib_within_budget"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-hardlink-report.log",
+      "log_sha256": "db6162974e29ad73d6e2f3fd12d037e15615b359d7a7ff4ed794a0ae471edeb1"
+    },
+    {
+      "mutation": "silence-line-overflow",
+      "failed_tests": [
+        "oversized_jsonl_line_is_counted_and_following_line_still_scans"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-line-overflow.log",
+      "log_sha256": "7e0716bdb02ffdb17ef1fdf6ce854fa72f1ce148f52ce0564d6f818597ec9a1c"
+    },
+    {
+      "mutation": "silence-stream-read-error",
+      "failed_tests": [
+        "read_failure_retains_consumed_bytes_and_reports_partial"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-stream-read-error.log",
+      "log_sha256": "93d84c0d2b2bd994e827e0f470c328513079618a05cf13e35444c45d80095a0e"
+    },
+    {
+      "mutation": "silence-unreadable-profile",
+      "failed_tests": [
+        "profile_roots_refuse_links_fifo_and_report_unreadable"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/silence-unreadable-profile.log",
+      "log_sha256": "5265ba83b409b949f565dba0657ead3aa9b346e49827ed78545e1ace6e9b752b"
+    },
+    {
+      "mutation": "skip-encoded-forms",
+      "failed_tests": [
+        "encoded_tokens_keep_their_full_raw_span_without_claiming_rewrite"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/skip-encoded-forms.log",
+      "log_sha256": "7f8c60de83ac25f9edf9d9870a45c5ec5cbd92d374184292672ef16c768a1396"
+    },
+    {
+      "mutation": "skip-inner-decoded-tokens",
+      "failed_tests": [
+        "encoded_tokens_keep_their_full_raw_span_without_claiming_rewrite"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/skip-inner-decoded-tokens.log",
+      "log_sha256": "fe2639821cc9a09e9d51bbee6998213a9c975f9f5f0a414f51657ca60dada60d"
+    },
+    {
+      "mutation": "skip-profile-file-cap",
+      "failed_tests": [
+        "profile_count_fish_literals_and_ambiguous_context_are_conservative"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/skip-profile-file-cap.log",
+      "log_sha256": "3c7b98e579b60febb27c1039f563010c982c65f1ae386b3c38ee78b6ddd3e211"
+    },
+    {
+      "mutation": "skip-source-depth-limit",
+      "failed_tests": [
+        "source_expansion_depth_and_count_are_bounded_without_execution"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/skip-source-depth-limit.log",
+      "log_sha256": "16b7347172fb5e7223b5543330744f7e240f00834834d58de2ddbaf70ae3d762"
+    },
+    {
+      "mutation": "skip-stream-stamp-recheck",
+      "failed_tests": [
+        "replaced_directory_is_refused_and_live_file_change_is_not_complete"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/skip-stream-stamp-recheck.log",
+      "log_sha256": "b7a6c52610e43d3d14a2c6dfab5854ef6192700194b98b501550b7b35763f5eb"
+    },
+    {
+      "mutation": "unescape-all-double-quoted-backslashes",
+      "failed_tests": [
+        "profiles_match_independent_bash_oracle_and_keep_removal_separate"
+      ],
+      "exit": 101,
+      "restored": true,
+      "log": "/tmp/ec-target-E/m2-12/unescape-all-double-quoted-backslashes.log",
+      "log_sha256": "8d4193e7e1b4c5a8e7d0b5559293e6dddff68fb93d3c3714bbf8300d46e08401"
+    }
+  ]
+}
