@@ -210,8 +210,9 @@ pub fn check_declaration(d: &LaunchDecl) -> Result<(), DeclError> {
             return Err(DeclError::NotAbsolute);
         }
     }
-    if let Some(path) = &d.path_env
-        && (path.len() > MAX_TEXT || path.contains('\0'))
+    if d.path_env
+        .as_ref()
+        .is_some_and(|path| path.len() > MAX_TEXT || path.contains('\0'))
     {
         return Err(DeclError::TooLarge);
     }

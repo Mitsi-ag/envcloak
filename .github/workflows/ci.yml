@@ -231,6 +231,9 @@ jobs:
             # The fixture story and gate 12's release run are in
             # envcloak-e2e; they run on main, nightly and on demand.
             cargo test --workspace --locked --no-fail-fast --exclude envcloak-e2e
+            # Gate 39 is end to end: the managed-server tests (M2 task
+            # M2-27) run on pull requests too.
+            cargo test --locked -p envcloak-e2e --no-fail-fast --test managed_launch --test managed_runner
           fi
       # M2-19's job-control gate through the whole of `envcloak run --pty`
       # (crates/envcloak-e2e/tests/pty_job_control.rs) on pull requests
