@@ -283,6 +283,18 @@ const REASON_TEXTS: &[(&str, &str)] = &[
     ),
     // A comparison budget stopped a scan (`too_many_checks` from
     // `scan.match`): the run is incomplete.
+    // A managed launch declaration refused (`code_selecting_env`, M2-27):
+    // the server is reported manual.
+    (
+        "code_selecting_variable",
+        "the launch sets a variable that selects code (a loader, interpreter or runtime \
+         variable such as NODE_OPTIONS or LD_PRELOAD), so EnvCloak cannot check what runs",
+    ),
+    (
+        "interpreter_option",
+        "the launch gives its interpreter an option that loads other code (such as node -r), \
+         so EnvCloak cannot check what runs",
+    ),
     (
         "limited",
         "this process tree has used an hour's comparisons with the vault (100,000 short values \

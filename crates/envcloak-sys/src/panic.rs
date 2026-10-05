@@ -112,6 +112,22 @@ pub fn test_trace() -> bool {
     }
 }
 
+/// The test hooks' variables (`ENVCLOAK_TEST_*`) this process has, in a
+/// test build (the `testing` feature, which only tests enable): the daemon
+/// passes them to the processes it starts itself (M2 task M2-27), so a
+/// test can stop or fail those too. Empty in a shipped build, which holds
+/// none of their names.
+pub fn test_hook_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::hook_vars()
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Writes `envcloak test: <what>` on standard error when the test trace
 /// is on ([`test_trace`]), so a test can count what a process does that it
 /// cannot otherwise see, such as each Argon2id run. Nothing in a build

@@ -1406,6 +1406,9 @@ fn a_grant_for_the_terminal_does_not_cover_the_agent() {
         env_file: None,
         argv: vec!["./emit".to_owned()],
         claims: Vec::new(),
+        launch: None,
+        bridge: None,
+        fds: Vec::new(),
     };
     let id = match c.run_request(&params).unwrap().decision {
         DecisionView::Pending { request } => request,

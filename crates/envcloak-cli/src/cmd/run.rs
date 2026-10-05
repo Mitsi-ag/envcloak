@@ -72,24 +72,11 @@
 //!    the run after it exited). A command that is not found exits 127, and
 //!    one that cannot be run 126, as with `env(1)`. The command sees pipes
 //!    rather than a terminal, so programs that color their output only on
-//!    a terminal print plain text, unless the run is in PTY mode (below).
+//!    a terminal print plain text; PTY mode is M2's (`--pty`, docs/RUN.md).
 //!
-//! `--pty` runs the command on a pseudo-terminal of its own (docs/RUN.md
-//! "PTY mode"): its standard output and standard error merged, through one
-//! stream of the redactor (which also matches the CR LF form a terminal
-//! shows of a value holding LF), the person's terminal in raw mode so
-//! every key reaches the command's terminal as a byte, the terminal's
-//! suspend character stopping the command and suspending `envcloak run`
-//! in the person's shell, and SIGINT, SIGQUIT, SIGTERM and SIGHUP sent by
-//! another process forwarded to the command's terminal's foreground job.
-//! It needs a terminal on standard input and standard output: without
-//! one it exits 125 with `pty_unavailable` before anything is sent, and
-//! never falls back to pipe mode. When the PTY monitor dies before it
-//! reports the command's exit, the run restores the terminal, drains the
-//! output redacted and exits 125 with `pty_monitor_lost`; when the
-//! person's terminal cannot be put back in raw mode after a stop, the
-//! command is not continued and the run exits 125 with `run_failed`.
-//! After `--`, `--pty` is the command's.
+//! `--pty` (M2) is parsed and refused with exit 125 and
+//! `not_in_this_build` until its task lands (M2-19), before anything is
+//! sent; after `--` it is the command's.
 //!
 //! `--status-fd N` is for a program that starts `envcloak run` and must
 //! know how it ended (`envcloak mcp`; docs/RUN.md "Status descriptor"):
@@ -102,9 +89,8 @@
 //! ([`envcloak_client::run_status`]): refused before the command started
 //! (with the token, and the request id for `approval_required`), the
 //! command's exit, or unknown when the runner failed after the command
-//! may have started. In pipe mode, a run without `--status-fd` passes
-//! inherited descriptors on to its command, as `env(1)` does. PTY mode
-//! always closes inherited descriptors above the standard streams.
+//! may have started. A run without `--status-fd` passes inherited
+//! descriptors on to its command, as `env(1)` does.
 //!
 //! No argument is ever echoed, and no value is ever accepted on the
 //! command line (gate 13): `--ref` names an item, never a value. The
@@ -126,9 +112,7 @@ use envcloak_client::render::{looks_like_value, proposal_text};
 use envcloak_client::run_status::{Exit, RunStatus};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
-use envcloak_exec::{
-    ChildExit, CoverageReport, ExecError, Label, OuterTerminal, RunSpec, ShortPolicy,
-};
+use envcloak_exec::{ChildExit, CoverageReport, ExecError, Label, RunSpec, ShortPolicy};
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
 use envcloak_ipc::wait::{
@@ -143,22 +127,7 @@ use zeroize::Zeroize;
 
 const USAGE_TEXT: &str = "envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] \
      [--manifest /absolute/path/envcloak.toml] [--wait DURATION (1s to 10m) [--wait-grace 1s..5s]] \
-     [--status-fd N] [--pty] -- <cmd...>";
-
-/// What `envcloak run --help` adds about `--pty` (SPEC §6.1 steps 7 and 8,
-/// docs/RUN.md "PTY mode"): what it does, and the signals some systems
-/// narrow (M2 plan D-35, as task M2-17 measured).
-const PTY_HELP: &str = "--pty runs the command on a terminal of its own: its output and errors merged, \
-     redacted on the way to yours (output a program rebuilds on the screen by moving the cursor \
-     is not covered). Your terminal is raw while it runs, so every key reaches the command, \
-     Ctrl-C included. The suspend key (Ctrl-Z, or whatever `stty susp` sets) stops the command \
-     and gives your shell its prompt back; `fg` resumes both. SIGINT, SIGQUIT, SIGTERM and SIGHUP \
-     sent to envcloak run by another process reach the command's foreground job (a nested \
-     shell's job included); a second SIGTERM kills the command. On Linux kernels before 6.9 \
-     (Ubuntu 24.04's original 6.8, Debian 12, RHEL 9), and for a job whose first process has \
-     ended, SIGTERM and SIGHUP go to the command's own process group instead: with a nested \
-     shell that is the shell, not its job. --pty needs a terminal on standard input and standard \
-     output, and exits 125 with pty_unavailable without one.";
+     [--status-fd N] -- <cmd...>";
 
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -175,8 +144,6 @@ struct RunArgs {
     wait_grace: Option<Duration>,
     /// `--status-fd`: the inherited descriptor the status record goes to.
     status_fd: Option<i32>,
-    /// `--pty`: the command on a pseudo-terminal of its own.
-    pty: bool,
     argv: Vec<String>,
 }
 
@@ -225,6 +192,8 @@ fn words(d: Duration) -> String {
 enum ParseError {
     /// A usage error: what was wrong, as fixed text.
     Usage(&'static str),
+    /// An option of a later task (M2 plan D-23), named as fixed text.
+    NotInThisBuild(&'static str),
 }
 
 impl From<&'static str> for ParseError {
@@ -309,11 +278,10 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
                     .ok_or("--status-fd needs a descriptor number of 3 or more")?;
                 a.status_fd = Some(n);
             }
-            Some(&"--pty") => {
-                if a.pty {
-                    return Err("--pty is given twice".into());
-                }
-                a.pty = true;
+            // M2's PTY mode, refused before anything is read.
+            Some(&"--pty") => return Err(ParseError::NotInThisBuild("`envcloak run --pty`")),
+            Some(&"--launch") => {
+                return Err("--launch takes nothing else: envcloak run --launch <id>".into());
             }
             Some(_) => return Err("unknown option; see envcloak run --help".into()),
         }
@@ -330,11 +298,16 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
 
 pub fn run(args: &[&str]) -> ExitCode {
     if args == ["--help"] || args == ["-h"] {
-        println!("usage: {USAGE_TEXT}\n\n{PTY_HELP}");
+        println!("usage: {USAGE_TEXT}");
         return ExitCode::SUCCESS;
+    }
+    // The runner the daemon starts for a managed server (M2 task M2-27).
+    if let ["--launch", launch] = args {
+        return run_launch(launch);
     }
     let a = match parse(args) {
         Ok(a) => a,
+        Err(ParseError::NotInThisBuild(what)) => return super::not_in_this_build(what),
         Err(ParseError::Usage(why)) => {
             eprintln!("envcloak: {why}");
             return usage(USAGE_TEXT);
@@ -467,18 +440,7 @@ fn checked(a: RunArgs) -> Ended {
     if let Err(f) = super::refuse_value_like(&names) {
         return Ended::refused(f, USAGE);
     }
-    // PTY mode needs the person's terminal on standard input and standard
-    // output, opened for the relay now, before the daemon is asked: without
-    // one, nothing is sent and nothing falls back to pipe mode.
-    let terminal = if a.pty {
-        match OuterTerminal::open(std::io::stdin().as_fd(), std::io::stdout().as_fd()) {
-            Ok(t) => Some(t),
-            Err(e) => return Ended::exec(e),
-        }
-    } else {
-        None
-    };
-    match request(a, terminal) {
+    match request(a) {
         Ok(ended) => ended,
         Err(f) => Ended::refused(f, RUN_FAILURE),
     }
@@ -493,7 +455,7 @@ enum Ask {
     Waiting(Duration, Duration),
 }
 
-fn request(a: RunArgs, terminal: Option<OuterTerminal>) -> Result<Ended, Failure> {
+fn request(a: RunArgs) -> Result<Ended, Failure> {
     refuse_if_traced()?;
     // Only a verified daemon is ever asked; with none, run says how to
     // start one and starts nothing. A waiting run connects only within its
@@ -517,6 +479,9 @@ fn request(a: RunArgs, terminal: Option<OuterTerminal>) -> Result<Ended, Failure
         env_file: env_file.as_ref().map(|f| EnvFileParams::from(&f.names())),
         argv: a.argv.clone(),
         claims: claims(),
+        launch: None,
+        bridge: None,
+        fds: Vec::new(),
     };
     let answer = match ask {
         Ask::Now(mut client) => {
@@ -550,6 +515,9 @@ fn request(a: RunArgs, terminal: Option<OuterTerminal>) -> Result<Ended, Failure
                 printed: false,
             })
         }
+        // `started` answers a managed server's launch, which this request
+        // does not name: no daemon sends it here.
+        DecisionView::Started {} => Err(protocol()),
         DecisionView::Denied { .. } => {
             let message = decision
                 .deny_reason()
@@ -566,7 +534,7 @@ fn request(a: RunArgs, terminal: Option<OuterTerminal>) -> Result<Ended, Failure
             // The answer's `redact` is always true in M1, which has no way
             // to turn redaction off; the runner redacts whatever it says.
             let plain = env_file.map(|f| f.plain).unwrap_or_default();
-            start(answer.values, plain, a.argv, terminal)
+            start(answer.values, plain, a.argv)
         }
     }
 }
@@ -744,14 +712,12 @@ fn printed_already(
 }
 
 /// Runs `argv` with the released values and the env file's ordinary
-/// variables in its environment, its output redacted: on pipes, or on a
-/// pseudo-terminal relayed to `terminal` (PTY mode). Returns how the run
-/// ended.
+/// variables in its environment, its output redacted. Returns how the
+/// run ended.
 fn start(
     values: Vec<ReleasedValue>,
     plain: Vec<PlainVar>,
     argv: Vec<String>,
-    terminal: Option<OuterTerminal>,
 ) -> Result<Ended, Failure> {
     let mut bound: Vec<(EnvName, Slug, SecretBytes, ShortPolicy)> =
         Vec::with_capacity(values.len());
@@ -774,13 +740,7 @@ fn start(
                 short: *short,
             })
             .collect();
-        // PTY mode also redacts the CR LF form a terminal shows of a value
-        // holding LF.
-        if terminal.is_some() {
-            envcloak_exec::build_pty_redactor(&labels)
-        } else {
-            envcloak_exec::build_redactor(&labels)
-        }
+        envcloak_exec::build_redactor(&labels)
     };
     let (redactor, report) = match built {
         Ok(b) => b,
@@ -790,7 +750,7 @@ fn start(
     // Gate 12: a test build panics here on request, holding the values and
     // the redactor built from them.
     envcloak_sys::panic_point("cli.run.released");
-    print_coverage(&report, terminal.is_some());
+    print_coverage(&report);
     let out = |fd: std::os::fd::BorrowedFd<'_>| {
         fd.try_clone_to_owned().map_err(|_| {
             Failure::new(
@@ -804,19 +764,14 @@ fn start(
     let mut injected: Vec<(EnvName, SecretBytes)> =
         plain.into_iter().map(|p| (p.name, p.value)).collect();
     injected.extend(bound.into_iter().map(|(name, _, value, _)| (name, value)));
-    let argv: Vec<OsString> = argv.into_iter().map(OsString::from).collect();
-    // The idle flush is IDLE_FLUSH; on pipes, standard input is this
-    // process's own.
-    let spec = match terminal {
-        Some(t) => RunSpec::pty(argv, injected, redactor, t),
-        None => RunSpec::new(
-            argv,
-            injected,
-            redactor,
-            out(std::io::stdout().as_fd())?,
-            out(std::io::stderr().as_fd())?,
-        ),
-    };
+    // The idle flush is IDLE_FLUSH, and standard input this process's own.
+    let spec = RunSpec::new(
+        argv.into_iter().map(OsString::from).collect(),
+        injected,
+        redactor,
+        out(std::io::stdout().as_fd())?,
+        out(std::io::stderr().as_fd())?,
+    );
     match envcloak_exec::run(spec) {
         Ok(exit) => Ok(Ended::Ran(exit)),
         Err(e) => Ok(Ended::exec(e)),
@@ -837,15 +792,8 @@ fn too_short(r: &CoverageReport) -> Failure {
 }
 
 /// What the redactor covers less than fully, one line per item on
-/// standard error, before the command starts; in PTY mode also what no
-/// redactor of a terminal's output covers (SPEC §6.1 "Redaction coverage").
-fn print_coverage(r: &CoverageReport, pty: bool) {
-    if pty {
-        eprintln!(
-            "envcloak: coverage: PTY mode: output a program rebuilds on the terminal by moving the \
-             cursor (a value redrawn from pieces) is not redacted"
-        );
-    }
+/// standard error, before the command starts.
+fn print_coverage(r: &CoverageReport) {
     for s in &r.warned_short {
         eprintln!(
             "envcloak: coverage: {s} is 8 to 15 bytes (allowed short): the value and its \
@@ -903,6 +851,220 @@ fn read_env_file(path: &str) -> Result<EnvFileRefs, Failure> {
 
 fn protocol() -> Failure {
     Failure::new("protocol_error", "the daemon's answer was malformed")
+}
+
+/// `envcloak run --launch <id>`: EnvCloak's runner for a managed stdio
+/// server (SPEC §6.6; M2 plan D-33, D-36; task M2-27), which only the
+/// daemon starts, from its own retained image, on the pipe ends a client
+/// handed over.
+///
+/// Before it reads anything it checks that the daemon started it: its
+/// descriptor 3 must be a Unix socket whose peer is its parent, and the
+/// daemon serving the socket must be its parent too. Anything else (a
+/// person, an agent or a test program starting it) exits 125 with
+/// `not_started_by_daemon`, having received nothing; nothing is started.
+/// Then it reads the daemon's `Release` from that channel: the values and
+/// the launch, which must be the one it was started for. It builds the
+/// server's environment from the release and the fixed passthrough list
+/// only (`envcloak_policy::managed::launch_environment`), refuses values
+/// too short to redact, as `run` does, and serves the server
+/// ([`envcloak_exec::launch::serve`]): from the sealed copy the daemon
+/// checked (Linux), the checked descriptor once its stamp is the same, or
+/// the registered path (on macOS started suspended, and resumed only on
+/// the daemon's `Confirmed`), in the checked working directory, its
+/// output redacted onto the client's pipes. It exits with the server's
+/// code, or 125 with `managed_launch_changed` when the file changed after
+/// the daemon's check or the daemon refused the started server.
+fn run_launch(launch: &str) -> ExitCode {
+    use envcloak_ipc::control::{
+        self, CWD_FD, ExecSpec, FromRunner, IMAGE_FD, LIFELINE_FD, Recipient, ToRunner,
+    };
+    // Blocked before any thread starts, so the serving loop takes them.
+    let Ok(signals) = envcloak_sys::TerminationSignals::block() else {
+        return Failure::new("run_failed", "the runner's signals could not be set up")
+            .report(RUN_FAILURE);
+    };
+    if let Err(f) = refuse_if_traced() {
+        return f.report(RUN_FAILURE);
+    }
+    let not_started = || {
+        Failure::new(
+            "not_started_by_daemon",
+            "envcloak run --launch is started only by envcloakd, for a managed server; nothing \
+             was received and nothing was started",
+        )
+        .report(RUN_FAILURE)
+    };
+    let changed = || {
+        Failure::new(
+            "managed_launch_changed",
+            "the managed server's program changed after EnvCloak checked it; nothing was \
+             started. Run envcloak migrate-mcp --update to register it again",
+        )
+        .report(RUN_FAILURE)
+    };
+    let failed = |what: &'static str| Failure::new("run_failed", what).report(RUN_FAILURE);
+    let Some(control) = started_by_daemon() else {
+        return not_started();
+    };
+    let _ = control.set_read_timeout(Some(Duration::from_secs(30)));
+    let release = match control::receive::<ToRunner>(&control) {
+        Ok(ToRunner::Release(r)) => r,
+        _ => return not_started(),
+    };
+    let control::Release { bindings, to } = *release;
+    let Recipient::Runner {
+        launch: given,
+        spec,
+    } = to
+    else {
+        return not_started();
+    };
+    if given != launch {
+        return not_started();
+    }
+    let claim = |n: i32| envcloak_sys::claim_inherited_fd(n).ok();
+    let (Some(lifeline), Some(cwd)) = (claim(LIFELINE_FD), claim(CWD_FD)) else {
+        return failed("the runner's descriptors are not all open; nothing was started");
+    };
+    let image = claim(IMAGE_FD);
+    let (program, suspended) = match (spec.exec, image) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        (ExecSpec::Image, Some(fd)) => {
+            (envcloak_exec::launch::ServerProgram::Descriptor(fd), false)
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        (ExecSpec::Descriptor { stamp }, Some(fd)) => {
+            // Checked at rest: run from the checked descriptor only while
+            // the file is still as the daemon saw it.
+            let same = envcloak_exec::launch::same_stamp(
+                fd.as_fd(),
+                stamp.dev,
+                stamp.ino,
+                stamp.size,
+                stamp.mtime_ns,
+                stamp.ctime_ns,
+            );
+            if !matches!(same, Ok(true)) {
+                return changed();
+            }
+            (envcloak_exec::launch::ServerProgram::Descriptor(fd), false)
+        }
+        (ExecSpec::Path { confirm }, _) => (
+            envcloak_exec::launch::ServerProgram::Path(spec.executable.as_bytes().to_vec()),
+            confirm,
+        ),
+        _ => return failed("the launch the daemon sent cannot be run here; nothing was started"),
+    };
+    // The values: each under its variable, with its slug for the redactor.
+    let mut bound: Vec<(EnvName, Slug, SecretBytes, ShortPolicy)> =
+        Vec::with_capacity(bindings.len());
+    for v in bindings {
+        let (Ok(name), Ok(slug)) = (EnvName::new(&v.env_name), Slug::new(&v.slug)) else {
+            return failed("the daemon's release was not well formed; nothing was started");
+        };
+        bound.push((
+            name,
+            slug,
+            v.value.into_inner(),
+            ShortPolicy::from(v.allow_short),
+        ));
+    }
+    let built = {
+        let labels: Vec<Label<'_>> = bound
+            .iter()
+            .map(|(_, slug, value, short)| Label {
+                slug,
+                value,
+                short: *short,
+            })
+            .collect();
+        envcloak_exec::build_redactor(&labels)
+    };
+    let redactor = match built {
+        Ok((r, report)) => {
+            print_coverage(&report);
+            r
+        }
+        Err(ExecError::ValueTooShort(r)) => return too_short(&r).report(RUN_FAILURE),
+        Err(_) => return failed("the redactor could not be built; nothing was started"),
+    };
+    let env = {
+        let inherited: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            std::env::vars_os().collect();
+        let values: Vec<(EnvName, SecretBytes)> = bound
+            .drain(..)
+            .map(|(name, _, value, _)| (name, value))
+            .collect();
+        envcloak_exec::launch::server_env(&inherited, spec.path_env.as_bytes(), &spec.vars, &values)
+    };
+    drop(bound);
+    let own = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().ok();
+    let (Some(input), Some(output), Some(errors)) = (
+        own(std::io::stdin().as_fd()),
+        own(std::io::stdout().as_fd()),
+        own(std::io::stderr().as_fd()),
+    ) else {
+        return failed("the runner's standard streams are not open; nothing was started");
+    };
+    let server = envcloak_exec::launch::ServerLaunch {
+        program,
+        argv: spec.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        env,
+        cwd,
+        suspended,
+        redactor,
+        idle_flush: envcloak_exec::IDLE_FLUSH,
+    };
+    let io = envcloak_exec::launch::RunnerIo {
+        input,
+        output,
+        errors,
+        lifeline,
+    };
+    // macOS: the daemon checks the suspended server's code directory hash
+    // before it may run.
+    let confirm = |pid: u32| {
+        control::send(&control, &FromRunner::ConfirmSpawn(pid)).is_ok()
+            && matches!(
+                control::receive::<ToRunner>(&control),
+                Ok(ToRunner::Confirmed)
+            )
+    };
+    match envcloak_exec::launch::serve(server, io, signals, confirm) {
+        Ok(exit) => ExitCode::from(exit.shell_code()),
+        Err(envcloak_exec::launch::LaunchError::Refused) => changed(),
+        Err(e) => Failure::new(
+            e.token(),
+            "the managed server could not be started or followed",
+        )
+        .report(RUN_FAILURE),
+    }
+}
+
+/// The runner's control channel, when the daemon started this process:
+/// descriptor 3 a Unix socket whose peer is the parent, and the parent
+/// the process that serves the daemon's socket. `None` otherwise; nothing
+/// was read from descriptor 3.
+fn started_by_daemon() -> Option<std::os::unix::net::UnixStream> {
+    use envcloak_sys::fdpass::{DescriptorKind, descriptor_kind};
+    let parent = i32::try_from(std::os::unix::process::parent_id()).ok()?;
+    if parent <= 1 {
+        return None;
+    }
+    let fd = envcloak_sys::claim_inherited_fd(envcloak_ipc::control::CONTROL_FD).ok()?;
+    let (kind, _) = descriptor_kind(fd.as_fd()).ok()?;
+    if kind != DescriptorKind::Socket {
+        return None;
+    }
+    if envcloak_sys::peer_identity(fd.as_fd()).ok()?.pid != parent {
+        return None;
+    }
+    let daemon = connect().ok()?;
+    if envcloak_sys::peer_identity(daemon.as_fd()).ok()?.pid != parent {
+        return None;
+    }
+    Some(std::os::unix::net::UnixStream::from(fd))
 }
 
 #[cfg(test)]
@@ -1179,52 +1341,25 @@ mod tests {
         assert_eq!(words(Duration::from_secs(90)), "1m 30s");
         assert_eq!(words(Duration::from_secs(600)), "10m");
         assert_eq!(words(Duration::from_secs(45)), "45s");
-        // PTY mode, wherever it comes before `--`, once; after `--` it is
-        // the command's.
-        assert_eq!(
-            parse(&["--manifest", "/p/envcloak.toml", "--pty", "--", "true"]).unwrap(),
-            RunArgs {
-                manifest: Some("/p/envcloak.toml".into()),
-                pty: true,
-                argv: vec!["true".into()],
-                ..RunArgs::default()
-            }
-        );
-        assert!(parse(&["--pty", "--wait", "5s", "--", "true"]).unwrap().pty);
-        for bad in [
-            &["--pty", "--pty", "--", "true"][..],
-            &["--profile", "a", "--pty"],
-            &["--pty"],
+        // M2's PTY mode is refused as not in this build, wherever it comes
+        // before `--` and whatever follows it; after `--` it is the
+        // command's.
+        for (bad, what) in [
+            (&["--pty", "--", "true"][..], "`envcloak run --pty`"),
+            (&["--profile", "a", "--pty"], "`envcloak run --pty`"),
+            (
+                &["--manifest", "/p/envcloak.toml", "--pty", "--", "true"],
+                "`envcloak run --pty`",
+            ),
         ] {
-            assert!(matches!(parse(bad), Err(ParseError::Usage(_))), "{bad:?}");
+            assert_eq!(parse(bad), Err(ParseError::NotInThisBuild(what)), "{bad:?}");
         }
-        assert!(!parse(&["--", "sh", "--pty"]).unwrap().pty);
         assert_eq!(
             parse(&["--", "sh", "--pty", "--wait", "--manifest"])
                 .unwrap()
                 .argv,
             vec!["sh", "--pty", "--wait", "--manifest"]
         );
-    }
-
-    /// `run --help` says what PTY mode does not cover and where D-35
-    /// narrows a forwarded signal (M2-17 measured it): SIGTERM and SIGHUP
-    /// on Linux kernels before 6.9, named, go to the command's own group,
-    /// with a nested shell the shell and not its job; and it names
-    /// `pty_unavailable`. docs/RUN.md says the same
-    /// (`crates/envcloak-exec/tests/pty_relay.rs` checks it).
-    #[test]
-    fn the_help_names_what_pty_mode_narrows() {
-        for said in [
-            "SIGTERM and SIGHUP",
-            "Linux kernels before 6.9",
-            "Ubuntu 24.04's original 6.8, Debian 12, RHEL 9",
-            "the shell, not its job",
-            "moving the cursor is not covered",
-            "pty_unavailable",
-        ] {
-            assert!(PTY_HELP.contains(said), "{said}");
-        }
     }
 
     /// `--env-file` is read only from a regular file of at most 1 MiB, a

@@ -1,0 +1,435 @@
+//! The runner's core (SPEC §6.6; M2 plan D-33, D-34, D-36; task M2-27):
+//! what `envcloak run --launch <id>` does once the daemon that started it
+//! has given it a managed server's launch and values. `cmd/run.rs` reads
+//! the control channel (`envcloak_ipc::control`) and hands this module
+//! plain types, so this crate depends on no IPC (D-02).
+//!
+//! [`serve`] starts the registered server as an [`OwnedChild`] leading a
+//! process group of its own, with the environment it is given (the
+//! launch's, built by `envcloak_policy::managed::launch_environment`:
+//! nothing of this process's is added), in the working directory the
+//! daemon checked (a descriptor), from:
+//! - on Linux, for a `bound` launch, the sealed copy the daemon checked
+//!   ([`ServerProgram::Descriptor`], `execveat`); for a launch checked at
+//!   rest, the checked descriptor, once its stamp is read again
+//!   (`cmd/run.rs` compares it);
+//! - otherwise the registered path ([`ServerProgram::Path`]); on macOS,
+//!   with the daemon's check, started suspended: [`serve`] calls `confirm`
+//!   with its pid, and resumes it only on `true`; on `false` it kills it
+//!   through its handle before it runs ([`confirm_or_kill`]) and fails with
+//!   [`LaunchError::Refused`] (`managed_launch_changed`).
+//!
+//! A start that fails is a failure: nothing is started again from another
+//! file.
+//!
+//! The server's standard output and error are separate pipes, each read
+//! through a stream of the run's [`Redactor`] and written to this
+//! process's standard output and error, which are the client's pipes;
+//! what the client writes to this process's standard input is copied to
+//! the server's. When the client is gone (the lifeline's end of file),
+//! its input ends, or a termination signal arrives, the server's group is
+//! stopped through its handle: SIGTERM, then SIGKILL after
+//! [`STOP_GRACE`]. Its output is then read until its end, at most
+//! [`crate::DRAIN_LIMIT`] longer, and it is reaped.
+
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::mpsc;
+use std::time::Duration;
+
+use envcloak_sys::launch::{Program, Session, Spawn, spawn};
+use envcloak_sys::{OwnedChild, ProcessOps, TerminationSignals};
+use zeroize::Zeroizing;
+
+use crate::pump::{Cutoff, pump};
+use crate::{ChildExit, DRAIN_LIMIT, Redactor};
+
+/// How long a server has to exit after SIGTERM before SIGKILL.
+pub const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// What the server runs.
+#[derive(Debug)]
+pub enum ServerProgram {
+    /// Linux: an open executable (the sealed copy, or the descriptor
+    /// checked at rest), run with `execveat`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Descriptor(OwnedFd),
+    /// The registered path.
+    Path(Vec<u8>),
+}
+
+/// A registered launch, as the runner starts it. Its `Debug` shows counts
+/// only: the environment holds the values.
+pub struct ServerLaunch {
+    pub program: ServerProgram,
+    /// `argv[0]` first.
+    pub argv: Vec<Vec<u8>>,
+    /// The whole environment, each `NAME=value`, wiped when dropped.
+    pub env: Vec<Zeroizing<Vec<u8>>>,
+    /// The working directory the daemon checked.
+    pub cwd: OwnedFd,
+    /// macOS: start suspended for the daemon's check (see the module
+    /// documentation).
+    pub suspended: bool,
+    pub redactor: Redactor,
+    /// [`crate::IDLE_FLUSH`], or shorter in tests.
+    pub idle_flush: Duration,
+}
+
+impl core::fmt::Debug for ServerLaunch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ServerLaunch")
+            .field("program", &self.program)
+            .field("args", &self.argv.len())
+            .field("env", &self.env.len())
+            .field("suspended", &self.suspended)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The runner's own descriptors: the client's pipe ends and the lifeline.
+#[derive(Debug)]
+pub struct RunnerIo {
+    pub input: OwnedFd,
+    pub output: OwnedFd,
+    pub errors: OwnedFd,
+    pub lifeline: OwnedFd,
+}
+
+/// Why a launch did not run to its end.
+#[derive(Debug)]
+pub enum LaunchError {
+    /// The server could not be started; nothing ran, and nothing is
+    /// started in its place.
+    Start(io::Error),
+    /// The daemon refused the started server (macOS): it was killed before
+    /// it ran.
+    Refused,
+    /// Setting up the pipes, threads or signals failed before the server
+    /// started.
+    Setup(io::Error),
+    /// The server started, but waiting for it failed.
+    Followed(io::Error),
+}
+
+impl LaunchError {
+    /// The token printed with the failure.
+    pub fn token(&self) -> &'static str {
+        match self {
+            LaunchError::Refused => "managed_launch_changed",
+            LaunchError::Start(_) | LaunchError::Setup(_) | LaunchError::Followed(_) => {
+                "run_failed"
+            }
+        }
+    }
+}
+
+/// Resumes `child`, started suspended, when `confirmed`; otherwise kills
+/// it through its handle (it never ran) and reaps it, so no signal can
+/// reach its number afterwards.
+///
+/// # Errors
+/// [`LaunchError::Refused`] when not confirmed; [`LaunchError::Start`]
+/// when it could not be resumed (it is then killed).
+pub fn confirm_or_kill<O: ProcessOps>(
+    child: OwnedChild<O>,
+    confirmed: bool,
+) -> Result<OwnedChild<O>, LaunchError> {
+    if !confirmed {
+        let _ = child.kill_and_reap();
+        return Err(LaunchError::Refused);
+    }
+    match child.resume() {
+        Ok(()) => Ok(child),
+        Err(e) => {
+            let _ = child.kill_and_reap();
+            Err(LaunchError::Start(e))
+        }
+    }
+}
+
+/// What ends the wait for the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// The client's input ended.
+    Input,
+    /// The lifeline ended: the client is gone.
+    Lifeline,
+    /// A termination signal.
+    Signal(i32),
+}
+
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    envcloak_sys::pipe_cloexec()
+}
+
+/// Copies the client's input to the server's until it ends, then closes
+/// the server's input and says so.
+fn relay_input(input: OwnedFd, to_server: OwnedFd, tx: &mpsc::Sender<Ending>) {
+    let mut from = File::from(input);
+    let mut to = File::from(to_server);
+    let mut buf = Zeroizing::new(vec![0u8; 16 * 1024]);
+    loop {
+        match from.read(&mut buf[..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                if to.write_all(buf.get(..n).unwrap_or_default()).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    drop(to);
+    let _ = tx.send(Ending::Input);
+}
+
+/// Waits for the lifeline's end of file. Bytes written on it (the client
+/// never writes it) are read and ignored.
+fn watch_lifeline(lifeline: OwnedFd, tx: &mpsc::Sender<Ending>) {
+    let mut f = File::from(lifeline);
+    let mut buf = [0u8; 64];
+    loop {
+        match f.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    let _ = tx.send(Ending::Lifeline);
+}
+
+/// Starts the server of `l` on `io`'s descriptors and serves it until it
+/// exits or is stopped (see the module documentation). `signals` must be
+/// blocked already, before any thread was started; `confirm` is asked
+/// with the pid of a server started suspended.
+///
+/// # Errors
+/// [`LaunchError`].
+pub fn serve(
+    l: ServerLaunch,
+    io: RunnerIo,
+    signals: TerminationSignals,
+    confirm: impl FnOnce(u32) -> bool,
+) -> Result<ChildExit, LaunchError> {
+    let ServerLaunch {
+        program,
+        argv,
+        env,
+        cwd,
+        suspended,
+        redactor,
+        idle_flush,
+    } = l;
+    let (server_in, to_server) = pipe().map_err(LaunchError::Setup)?;
+    let (from_out, server_out) = pipe().map_err(LaunchError::Setup)?;
+    let (from_err, server_err) = pipe().map_err(LaunchError::Setup)?;
+    // A test makes the start fail here, as a refused `execveat` would: no
+    // other file is started in its place.
+    envcloak_sys::fail_point("launch.server_exec").map_err(LaunchError::Start)?;
+    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+    let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_slice()).collect();
+    let fds = [
+        (server_in.as_fd(), 0),
+        (server_out.as_fd(), 1),
+        (server_err.as_fd(), 2),
+    ];
+    let program = match &program {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        ServerProgram::Descriptor(fd) => Program::Descriptor(fd.as_fd()),
+        ServerProgram::Path(p) => Program::Path(p),
+    };
+    let child = spawn(&Spawn {
+        program,
+        argv: &argv_refs,
+        env: &env_refs,
+        fds: &fds,
+        cwd: Some(cwd.as_fd()),
+        session: Session::Group,
+        suspended,
+    })
+    .map_err(|e| LaunchError::Start(io::Error::new(e.io().kind(), "spawn")))?;
+    drop(env);
+    drop(server_in);
+    drop(server_out);
+    drop(server_err);
+    let child = if suspended {
+        let ok = confirm(child.id());
+        confirm_or_kill(child, ok)?
+    } else {
+        child
+    };
+
+    let (tx, rx) = mpsc::channel::<Ending>();
+    let redactor = Arc::new(redactor);
+    let cutoff = Arc::new(Cutoff::default());
+    let mut pumps = Vec::new();
+    for (source, sink) in [(from_out, io.output), (from_err, io.errors)] {
+        let redactor = Arc::clone(&redactor);
+        let cutoff = Arc::clone(&cutoff);
+        pumps.push(
+            std::thread::Builder::new()
+                .name("server-output".into())
+                .spawn(move || {
+                    let token = cutoff.pump_token();
+                    pump(File::from(source), sink, &redactor, idle_flush, token)
+                })
+                .map_err(LaunchError::Followed)?,
+        );
+    }
+    let input_tx = tx.clone();
+    let input = io.input;
+    std::thread::Builder::new()
+        .name("server-input".into())
+        .spawn(move || relay_input(input, to_server, &input_tx))
+        .map_err(LaunchError::Followed)?;
+    let life_tx = tx.clone();
+    let lifeline = io.lifeline;
+    std::thread::Builder::new()
+        .name("lifeline".into())
+        .spawn(move || watch_lifeline(lifeline, &life_tx))
+        .map_err(LaunchError::Followed)?;
+    let sig_tx = tx;
+    std::thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            while let Ok(sig) = signals.wait() {
+                if sig_tx.send(Ending::Signal(sig)).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(LaunchError::Followed)?;
+
+    let stopped_by = loop {
+        if child.has_exited().map_err(LaunchError::Followed)? {
+            break None;
+        }
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(end) => break Some(end),
+            Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    };
+    if let Some(end) = stopped_by {
+        envcloak_sys::test_event(match end {
+            Ending::Input => "runner: input ended, stopping the server",
+            Ending::Lifeline => "runner: lifeline ended, stopping the server",
+            Ending::Signal(_) => "runner: signal, stopping the server",
+        });
+        child
+            .stop_group(STOP_GRACE)
+            .map_err(LaunchError::Followed)?;
+    }
+    cutoff.start(DRAIN_LIMIT);
+    for p in pumps {
+        let _ = p.join();
+    }
+    let status = child.reap().map_err(LaunchError::Followed)?;
+    Ok(match stopped_by {
+        Some(Ending::Signal(sig)) => ChildExit::Stopped(sig),
+        _ => ChildExit::from(status),
+    })
+}
+
+/// The server's whole environment, each `NAME=value`, wiped when
+/// dropped: `envcloak_policy::managed::launch_environment` of `inherited`
+/// (this process's own, which the daemon set), the recorded `PATH` and
+/// variables, and the bindings' values. Nothing else of this process's
+/// environment passes.
+#[allow(clippy::disallowed_methods)] // The values go to the server's environment.
+pub fn server_env(
+    inherited: &[(std::ffi::OsString, std::ffi::OsString)],
+    path_env: &[u8],
+    vars: &[(String, String)],
+    bindings: &[(envcloak_policy::EnvName, envcloak_core::SecretBytes)],
+) -> Vec<Zeroizing<Vec<u8>>> {
+    use secrecy::ExposeSecret;
+    use std::os::unix::ffi::OsStrExt;
+    let values: Vec<(&str, &[u8])> = bindings
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.expose_secret()))
+        .collect();
+    envcloak_policy::managed::launch_environment(
+        inherited.iter().map(|(k, v)| (k.as_bytes(), v.as_bytes())),
+        path_env,
+        vars,
+        &values,
+    )
+    .into_iter()
+    .map(|(k, v)| {
+        let v = Zeroizing::new(v);
+        Zeroizing::new([k.as_slice(), b"=", v.as_slice()].concat())
+    })
+    .collect()
+}
+
+/// Whether `fd` is still the file `stamp` describes (device, inode, size
+/// and change times): a launch checked at rest is run from its checked
+/// descriptor only then.
+///
+/// # Errors
+/// `fstat`'s.
+pub fn same_stamp(
+    fd: BorrowedFd<'_>,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    ctime_ns: i128,
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let f = File::from(fd.try_clone_to_owned()?);
+    let m = f.metadata()?;
+    let ns = |s: i64, n: i64| i128::from(s) * 1_000_000_000 + i128::from(n);
+    Ok(m.dev() == dev
+        && m.ino() == ino
+        && m.len() == size
+        && ns(m.mtime(), m.mtime_nsec()) == mtime_ns
+        && ns(m.ctime(), m.ctime_nsec()) == ctime_ns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use envcloak_sys::owned::{Recorded, RecordingProcesses};
+
+    /// D-34: a refused suspended child is signalled through its unreaped
+    /// handle only, then reaped; no call names its pid after that (the
+    /// handle is consumed: `OwnedChild`'s compile-fail test). A confirmed
+    /// one is resumed and nothing else.
+    ///
+    /// Mutation checked: signal the refused child by its numeric pid after
+    /// reaping (`libc::kill` after `reap`): the recorded calls end in a
+    /// reap no more, and the clippy ban refuses the call.
+    #[test]
+    fn a_refused_child_is_killed_through_its_handle_before_it_is_reaped() {
+        let ops = RecordingProcesses::new();
+        let child = ops.child(4242);
+        assert!(matches!(
+            confirm_or_kill(child, false),
+            Err(LaunchError::Refused)
+        ));
+        let calls = ops.calls();
+        assert_eq!(
+            calls,
+            vec![
+                Recorded::Signal(4242, false, libc::SIGKILL),
+                Recorded::Reap(4242)
+            ],
+            "{calls:?}"
+        );
+        let ops = RecordingProcesses::new();
+        let child = ops.child(4343);
+        let child = confirm_or_kill(child, true).unwrap();
+        assert_eq!(
+            ops.calls(),
+            vec![Recorded::Signal(4343, false, libc::SIGCONT)]
+        );
+        ops.exit(4343);
+        child.reap().unwrap();
+    }
+}

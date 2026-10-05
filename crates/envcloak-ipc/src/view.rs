@@ -303,6 +303,11 @@ pub enum DecisionView {
     },
     /// Denied without a prompt; `reason` is a `DenyReason` token.
     Denied { reason: String },
+    /// A grant covers a managed server's request (SPEC §6.6, M2 task
+    /// M2-27): the daemon started EnvCloak's runner (or relay) on the pipe
+    /// ends the request handed over and gave it the values. None comes
+    /// back to the client.
+    Started {},
 }
 
 impl DecisionView {
@@ -661,9 +666,6 @@ pub struct ItemView {
     pub updated_secs: u64,
     pub rotated_secs: Option<u64>,
     pub expires_secs: Option<u64>,
-    /// Recorded use in long inventories, without the inspector's full detail.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_used_secs: Option<u64>,
     /// Who owns or pays for the key: personal, so filled only for
     /// `ls --long` and `show`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -802,9 +804,6 @@ impl ItemView {
             updated_secs: m.updated_at,
             rotated_secs: d.rotated_at,
             expires_secs: d.expires_at,
-            last_used_secs: (detail != ItemDetail::Summary)
-                .then_some(d.last_used_at)
-                .flatten(),
             account,
             detail: full,
             exposed: m.exposure.as_ref().map(|e| ExposedView {
@@ -1877,62 +1876,100 @@ pub struct BackupListView {
     pub open_leases: u32,
 }
 
-/// Position in descending `(last_seen, id)` order, exclusive on continuation.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A managed server's launch receipt (SPEC §6.6, M2 plan D-33): what was
+/// registered and what its binding strength binds, never a value. The
+/// person reads it when `migrate-mcp` registers or updates a server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectCursor {
-    pub last_seen: u64,
+pub struct LaunchReceiptView {
+    /// `<agent>/<server>`.
+    pub server: String,
+    /// `stdio` or `bridge`.
+    pub transport: String,
+    /// `native`, `script` or `package_runner`, for a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// `bound` or `checked_at_rest`, for a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<String>,
+    /// The absolute executable the launch was resolved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// Its identity: `sha256:<hex>` or `cdhash:<hex>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// A script's entry file and its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_identity: Option<String>,
+    /// The working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The launch environment's variables, by name.
+    #[serde(default)]
+    pub env_names: Vec<String>,
+    /// The variables the managed project binds.
+    #[serde(default)]
+    pub bindings: Vec<String>,
+    /// A bridged server's origin and header names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub header_names: Vec<String>,
+    /// What the strength binds and does not (`envcloak_policy::managed::
+    /// receipt_sentences`), and what no registration stops.
+    pub sentences: Vec<String>,
+}
+
+/// `managed.register`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRegisteredView {
+    /// The record's id (26 Crockford base32 characters).
     pub id: String,
+    /// A stdio server's launch id and revision (1 for a new launch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    pub receipt: LaunchReceiptView,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `managed.unregister`'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectBindingView {
-    pub env_name: String,
-    pub reference: String,
+pub struct ManagedUnregisteredView {
+    pub removed: bool,
 }
 
-/// Adopted metadata, not a fresh read of the project's manifest.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// An update statement (CR-2): the launch as it is and as the update would
+/// make it, and the digest `managed.update` sends back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectView {
-    pub dir: String,
-    pub manifest_sha256: String,
-    pub bindings: Vec<ProjectBindingView>,
-    pub last_seen_secs: u64,
+pub struct UpdateStatementView {
+    pub launch: String,
+    /// The revision now; the update makes the next.
+    pub revision: u64,
+    pub old: LaunchReceiptView,
+    pub new: LaunchReceiptView,
+    /// SHA-256 of `envcloak-update-statement/1`, 64 hex characters.
+    pub digest: String,
 }
 
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `managed.update_plan`'s answer: no statement for a caller whose proof
+/// the daemon would refuse, or for a launch id no record has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectsView {
-    pub projects: Vec<ProjectView>,
-    pub next: Option<ProjectCursor>,
+pub struct ManagedUpdatePlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<UpdateStatementView>,
 }
 
-/// The removed binding, for a caller's undo action. No value crosses.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `managed.update`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RefUnsetView {
-    pub profile: Option<String>,
-    pub env_name: String,
-    pub reference: String,
+pub struct ManagedUpdatedView {
+    pub revision: u64,
+    pub receipt: LaunchReceiptView,
 }
-
-macro_rules! project_debug {
-    ($($t:ty),* $(,)?) => {$(
-        impl core::fmt::Debug for $t {
-            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                f.write_str(stringify!($t))?;
-                f.write_str(" { .. }")
-            }
-        }
-    )*};
-}
-project_debug!(
-    ProjectCursor,
-    ProjectBindingView,
-    ProjectView,
-    ProjectsView,
-    RefUnsetView
-);
-views!(ProjectsView, RefUnsetView);

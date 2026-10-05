@@ -97,9 +97,6 @@ pub enum AuditKind {
     /// The request id is the backup's; the count says how many items the
     /// restored vault holds.
     Recover = 21,
-    /// A Linux terminal reveal, durably recorded before value release,
-    /// or a failed reveal proof.
-    Reveal = 22,
     // M2 and M2b: each kind joins `ALL`, which `verify` reads, with the task
     // that writes it (docs/VAULT.md "Reserved for M2 and M2b").
     /// Candidate tokens were compared with the vault by keyed hash
@@ -118,6 +115,12 @@ pub enum AuditKind {
     /// first chunk is read; or the proof failed. The request id is the
     /// backup's; the count says how many files.
     RestoreV2 = 26,
+    /// A managed MCP server registered, updated (a new revision of its
+    /// launch) or removed, with a proof, or the proof failed. The request
+    /// id is the launch's; the named counts hold its revision, how many
+    /// arguments, variables and bindings it has, and the first 8 bytes of
+    /// the launch's digest: never an argument or a value.
+    ManagedRegister = 29,
     /// An item's classification was set by hand (`items.reclassify`): the
     /// item; the reason names the change (`test_to_live`), and the count
     /// how many grants that bound it ended. Towards `test` or `unknown`
@@ -126,11 +129,19 @@ pub enum AuditKind {
     /// An approval was refused by the live-key guard (`live_not_ticked`):
     /// the request id, and the items whose live bindings it left unticked.
     LiveRefused = 31,
+    /// A request against a managed MCP server's project refused before any
+    /// pending request: not its registered launch
+    /// (`managed_command_mismatch`), a launch that changed
+    /// (`managed_launch_changed`, the reason naming the executable, the
+    /// entry file or the working directory, the named counts the old and
+    /// new device, inode and digest prefix), or a runner the daemon could
+    /// not start (`runner_unavailable`).
+    ManagedLaunch = 43,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 28] = [
+    pub const ALL: [AuditKind; 29] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -152,13 +163,14 @@ impl AuditKind {
         AuditKind::RecoveryConfirm,
         AuditKind::Backup,
         AuditKind::Recover,
-        AuditKind::Reveal,
         AuditKind::ScanMatch,
         AuditKind::MarkExposed,
         AuditKind::BackupV2,
         AuditKind::RestoreV2,
+        AuditKind::ManagedRegister,
         AuditKind::Reclassify,
         AuditKind::LiveRefused,
+        AuditKind::ManagedLaunch,
     ];
 
     /// The kind's stable token.
@@ -185,13 +197,14 @@ impl AuditKind {
             AuditKind::RecoveryConfirm => "recovery_confirm",
             AuditKind::Backup => "backup",
             AuditKind::Recover => "recover",
-            AuditKind::Reveal => "reveal",
             AuditKind::ScanMatch => "scan_match",
             AuditKind::MarkExposed => "mark_exposed",
             AuditKind::BackupV2 => "backup_v2",
             AuditKind::RestoreV2 => "restore_v2",
+            AuditKind::ManagedRegister => "managed_register",
             AuditKind::Reclassify => "reclassify",
             AuditKind::LiveRefused => "live_refused",
+            AuditKind::ManagedLaunch => "managed_launch",
         }
     }
 
@@ -531,8 +544,9 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        // These kinds remain reserved for later tasks.
-        for n in [27, 46] {
+        // Kind 22 and kinds from 27 on are reserved for later tasks, not
+        // written by this build.
+        for n in [22, 27, 46] {
             assert_eq!(AuditKind::from_u8(n), None, "{n}");
         }
         // Numbers in order, each token its own.
@@ -549,7 +563,6 @@ mod tests {
         // The backup v2 kinds are read back: `verify` takes their entries.
         assert_eq!(AuditKind::from_u8(25), Some(AuditKind::BackupV2));
         assert_eq!(AuditKind::from_u8(26), Some(AuditKind::RestoreV2));
-        assert_eq!(AuditKind::from_u8(22), Some(AuditKind::Reveal));
         // And M2-11's.
         assert_eq!(AuditKind::from_u8(23), Some(AuditKind::ScanMatch));
         assert_eq!(AuditKind::from_u8(24), Some(AuditKind::MarkExposed));
