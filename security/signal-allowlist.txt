@@ -1,0 +1,16 @@
+# Files allowed to call libc::kill or libc::killpg, which clippy.toml
+# otherwise forbids (M2 plan D-34: EnvCloak signals a process only through
+# an owned handle, envcloak_sys::owned::OwnedChild, a child it started and
+# has not reaped, or the group that child leads).
+#
+# One repo-relative path per line, followed by `#` and the reason. Every
+# call site still needs `#[allow(clippy::disallowed_methods)]`, and
+# scripts/check-unsafe.sh fails on such an allow in any file not listed here
+# or in security/expose-allowlist.txt. A file listed here alone still may
+# not name expose_secret: the two lists share clippy's lint, not what each
+# allows. Adding a line needs review: each one is a place a signal can reach
+# a process by its number. A test harness that must signal by number (itself,
+# its own group, a child it holds unreaped) calls
+# envcloak_sys::testing::kill_raw, which the `testing` feature alone builds.
+
+crates/envcloak-sys/src/owned.rs           # the one kill call: kill_number, behind kill_owned's checks and the M1 runner's signal_process and signal_group

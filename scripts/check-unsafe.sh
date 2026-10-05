@@ -14,11 +14,15 @@
 #    - no package has a build script, is a proc-macro crate or points a
 #      target at a file that is not a `.rs` file inside it; no manifest sets
 #      rustflags, [patch] or [replace]; and the tree holds no cargo config.
-# 2. clippy.toml forbids secrecy's expose_secret methods, and no other clippy
-#    config exists. `disallowed_methods` may be allowed only in files listed
-#    in security/expose-allowlist.txt (whose entries must exist), and those
-#    files may not declare out-of-line modules that would inherit an allow,
-#    or macros that could carry a call into another file.
+# 2. clippy.toml forbids secrecy's expose_secret methods and `libc::kill`
+#    and `libc::killpg` (M2 plan D-34: signals go only through an owned
+#    handle, envcloak-sys/src/owned.rs), and no other clippy config exists.
+#    `disallowed_methods` may be allowed only in files listed in
+#    security/expose-allowlist.txt or security/signal-allowlist.txt (whose
+#    entries must exist), and those files may not declare out-of-line
+#    modules that would inherit an allow, or macros that could carry a call
+#    into another file. A file on the signal list alone still may not name
+#    expose_secret (below): the two lists share the lint, never the names.
 #    Nothing may allow `warnings`, `clippy::all` or `clippy::style`.
 #    Clippy lints only the configurations CI compiles, so a call under
 #    another target's cfg (`#[cfg(target_arch = "x86")]`) needs no allow
@@ -110,6 +114,7 @@ SYS = "crates/envcloak-sys/Cargo.toml"
 TOOLS = ("rust", "clippy", "rustdoc")
 LEVELS = ("allow", "warn", "deny", "forbid")
 EXPOSE = ("secrecy::ExposeSecret::expose_secret", "secrecy::ExposeSecretMut::expose_secret_mut")
+SIGNALS = ("libc::kill", "libc::killpg")
 TARGETS = ("lib", "bin", "test", "bench", "example")
 CANARIES = {"envcloak-lint-canary": "security/lint-canary", "envcloak-unsafe-canary": "security/unsafe-canary"}
 DEPS = ("dependencies", "dev-dependencies", "dev_dependencies", "build-dependencies", "build_dependencies")
@@ -324,7 +329,7 @@ else:
                     paths.add(entry["path"])
         elif len(keys) > 1:
             fail("clippy.toml", "set disallowed-methods once")
-        for need in EXPOSE:
+        for need in EXPOSE + SIGNALS:
             if need not in paths:
                 fail("clippy.toml", "disallowed-methods must list " + need)
 '
@@ -357,6 +362,19 @@ while IFS= read -r entry; do
   [ -n "$entry" ] || continue
   [ -f "$entry" ] || fail "$allowlist: listed file $entry does not exist"
 done <<<"$allowed"
+
+signal_allowlist=security/signal-allowlist.txt
+signal_allowed=""
+if [ -f "$signal_allowlist" ]; then
+  signal_allowed="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' "$signal_allowlist" | grep -v '^$' || true)"
+else
+  fail "$signal_allowlist is missing"
+fi
+
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  [ -f "$entry" ] || fail "$signal_allowlist: listed file $entry does not exist"
+done <<<"$signal_allowed"
 
 # 2 and 3. Rust source. Prints "LINE: problem" lines.
 rust_lints_awk='
@@ -407,7 +425,7 @@ function check(level, lint, ln, relax) {
   } else if (lint == "clippy::all" || lint == "clippy::style") {
     if (relax) report(ln, "clippy::all and clippy::style may not be allowed (they include disallowed_methods)")
   } else if (lint == "clippy::disallowed_methods" || lint == "clippy::disallowed_method") {
-    if (relax && !allowlisted) report(ln, "allows disallowed_methods but is not listed in " allowlist)
+    if (relax && !may_allow) report(ln, "allows disallowed_methods but is not listed in " allowlist " or " signal_allowlist)
   }
 }
 BEGIN { state = "code" }
@@ -571,19 +589,19 @@ END {
   }
   # An allow in a listed file would reach the modules it declares out of
   # line, and a macro it defines would put its calls in other files.
-  if (allowlisted) {
+  if (may_allow) {
     pos = 1
     while (match(substr(masked, pos), /mod[ \t\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\n]*;/)) {
       s = pos + RSTART - 1
       if (s == 1 || !ident(substr(masked, s - 1, 1)))
-        report(line_of(s), "files listed in " allowlist " may not declare out-of-line modules")
+        report(line_of(s), "files listed in " allowlist " or " signal_allowlist " may not declare out-of-line modules")
       pos = s + RLENGTH
     }
     pos = 1
     while (match(substr(masked, pos), /macro_rules[ \t\n]*!/)) {
       s = pos + RSTART - 1
       if (s == 1 || !ident(substr(masked, s - 1, 1)))
-        report(line_of(s), "files listed in " allowlist " may not define macros (one could open a secret in another file)")
+        report(line_of(s), "files listed in " allowlist " or " signal_allowlist " may not define macros (one could carry a call into another file)")
       pos = s + RLENGTH
     }
   }
@@ -603,7 +621,7 @@ END {
       report(q, "mentions unsafe_code outside a lint attribute")
     if (lines[q] ~ /(^|[^A-Za-z0-9_])clippy[ \t]*::[ \t]*(all|style)([^A-Za-z0-9_]|$)/)
       report(q, "mentions clippy::all or clippy::style outside a lint attribute")
-    if (!allowlisted && lines[q] ~ /(^|[^A-Za-z0-9_])disallowed_methods?([^A-Za-z0-9_]|$)/)
+    if (!may_allow && lines[q] ~ /(^|[^A-Za-z0-9_])disallowed_methods?([^A-Za-z0-9_]|$)/)
       report(q, "mentions disallowed_methods outside a lint attribute")
     if (lines[q] ~ /(^|[^A-Za-z0-9_])include([^A-Za-z0-9_]|$)/)
       report(q, "include! compiles a file this check does not read")
@@ -619,6 +637,10 @@ while IFS= read -r file; do
   if printf '%s\n' "$allowed" | grep -qxF "$file"; then
     listed=1
   fi
+  may_allow="$listed"
+  if printf '%s\n' "$signal_allowed" | grep -qxF "$file"; then
+    may_allow=1
+  fi
   canary=0
   if [ "$file" = security/lint-canary/src/lib.rs ]; then
     canary=1
@@ -626,6 +648,7 @@ while IFS= read -r file; do
   while IFS= read -r msg; do
     fail "$file:$msg"
   done < <(LC_ALL=C awk -v in_sys="$in_sys" -v allowlisted="$listed" -v allowlist="$allowlist" \
+    -v may_allow="$may_allow" -v signal_allowlist="$signal_allowlist" \
     -v canary="$canary" "$rust_lints_awk" "$file")
 done < <(rust_files)
 

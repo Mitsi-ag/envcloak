@@ -28,10 +28,20 @@
 //! first that this process still does not reap on its own and that the
 //! child is still its own, unreaped one (`waitid` with `WNOWAIT`).
 //!
-//! This is the part of the owned-handle API the PTY monitor needs
-//! (`crate::pty`, M2 task M2-17): the CLI's handle on the monitor it
-//! forks. M2 task M2-27 extends it (spawning through `Command`, its
-//! `ProcessOps` seam and the clippy ban on `kill` elsewhere).
+//! The PTY monitor (`crate::pty`, M2 task M2-17) was the first user: the
+//! CLI's handle on the monitor it forks. M2 task M2-27 adds the starts of
+//! the processes a value goes into ([`crate::launch::spawn`], which
+//! returns the handle: the daemon's runner, and the runner's server), the
+//! resumption of a child started suspended ([`OwnedChild::resume`]), the
+//! stop of a child's group with a grace period ([`OwnedChild::stop_group`])
+//! and the [`ProcessOps`] seam every call goes through, so a recording
+//! model ([`RecordingProcesses`]) shows what a handle signals and that it
+//! signals nothing once reaped. `libc::kill` and `libc::killpg` are
+//! called in this file alone: `clippy.toml` bans them everywhere else
+//! (`security/signal-allowlist.txt` names the few test harnesses that
+//! signal processes of their own by number), and the M1 runner's
+//! [`crate::signal_process`] and [`crate::signal_group`] come through
+//! [`kill_number`] here.
 //!
 //! `OwnedSession` (Linux) is D-34's one bounded exception, for the PTY
 //! monitor's session: it signals the terminal's foreground job when that
@@ -70,18 +80,234 @@
 use std::io;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
-/// A child process this process started and has not reaped.
-pub struct OwnedChild {
+/// What an [`OwnedChild`] asks of the system: every signal, wait and reap
+/// a handle makes goes through one of these, by the child's pid (and, on
+/// Linux, the pidfd taken while it was unreaped). [`SystemProcesses`] is
+/// the system; [`RecordingProcesses`] records the calls instead, for
+/// tests of what a handle's user signals and when. Only a handle calls
+/// these, and a handle exists only for a child this process started and
+/// has not reaped.
+pub trait ProcessOps {
+    /// Sends `sig` to the child: through its pidfd when it has one,
+    /// otherwise by number once the number is checked to be still the
+    /// child's ([`kill_owned`]).
+    ///
+    /// # Errors
+    /// The system's, or the model's.
+    fn signal(&self, pid: libc::pid_t, pidfd: Option<Pidfd<'_>>, sig: i32) -> io::Result<()>;
+    /// Sends `sig` to the process group the child leads, by number, once
+    /// the number is checked to be still the child's.
+    ///
+    /// # Errors
+    /// The system's, or the model's.
+    fn signal_group(&self, pid: libc::pid_t, sig: i32) -> io::Result<()>;
+    /// Whether the child has exited, without waiting and without reaping.
+    ///
+    /// # Errors
+    /// The system's, or the model's.
+    fn has_exited(&self, pid: libc::pid_t) -> io::Result<bool>;
+    /// Waits until the child has exited, and leaves it unreaped.
+    ///
+    /// # Errors
+    /// The system's, or the model's.
+    fn wait_exit(&self, pid: libc::pid_t) -> io::Result<()>;
+    /// Waits for the child to exit and reaps it.
+    ///
+    /// # Errors
+    /// The system's, or the model's.
+    fn reap(&self, pid: libc::pid_t) -> io::Result<ExitStatus>;
+}
+
+/// A child's pidfd, as [`ProcessOps::signal`] receives it (Linux; on
+/// macOS, which has none, it is never made).
+#[cfg(target_os = "linux")]
+pub type Pidfd<'a> = BorrowedFd<'a>;
+/// A child's pidfd, as [`ProcessOps::signal`] receives it (Linux; on
+/// macOS, which has none, it is never made).
+#[cfg(not(target_os = "linux"))]
+pub type Pidfd<'a> = core::marker::PhantomData<&'a ()>;
+
+/// The system: `pidfd_send_signal`, or `kill` after [`kill_owned`]'s
+/// checks; `waitid` with `WNOWAIT`; `waitpid`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SystemProcesses;
+
+impl ProcessOps for SystemProcesses {
+    fn signal(&self, pid: libc::pid_t, pidfd: Option<Pidfd<'_>>, sig: i32) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = pidfd {
+            return pidfd_send_signal(fd.as_raw_fd(), sig);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = pidfd;
+        kill_owned(&mut SysKill, pid, false, sig)
+    }
+
+    fn signal_group(&self, pid: libc::pid_t, sig: i32) -> io::Result<()> {
+        kill_owned(&mut SysKill, pid, true, sig)
+    }
+
+    fn has_exited(&self, pid: libc::pid_t) -> io::Result<bool> {
+        crate::has_exited(pid)
+    }
+
+    fn wait_exit(&self, pid: libc::pid_t) -> io::Result<()> {
+        crate::wait_for_exit(pid)
+    }
+
+    fn reap(&self, pid: libc::pid_t) -> io::Result<ExitStatus> {
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: `status` is writable; the child is this process's own
+            // and unreaped.
+            let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if rc == pid {
+                return Ok(ExitStatus::from_raw(status));
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+}
+
+/// One call a [`RecordingProcesses`] model received.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Recorded {
+    /// [`ProcessOps::signal`]: the pid, whether a pidfd came with it, the
+    /// signal.
+    Signal(libc::pid_t, bool, i32),
+    SignalGroup(libc::pid_t, i32),
+    HasExited(libc::pid_t),
+    WaitExit(libc::pid_t),
+    Reap(libc::pid_t),
+}
+
+/// A model of the system for tests: it records every call and changes
+/// nothing. A child it holds a handle for has exited once
+/// [`RecordingProcesses::exit`] says so, and reaps to status 0.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Debug, Clone, Default)]
+pub struct RecordingProcesses {
+    log: std::sync::Arc<std::sync::Mutex<Vec<Recorded>>>,
+    exited: std::sync::Arc<std::sync::Mutex<Vec<libc::pid_t>>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl RecordingProcesses {
+    /// A model with nothing recorded.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The calls so far, in order.
+    pub fn calls(&self) -> Vec<Recorded> {
+        self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// From now on, child `pid` has exited.
+    pub fn exit(&self, pid: libc::pid_t) {
+        if let Ok(mut e) = self.exited.lock() {
+            e.push(pid);
+        }
+    }
+
+    /// A handle on the model's child `pid`: test support only, for a pid
+    /// the model stands in for. No handle on the system can be made this
+    /// way.
+    pub fn child(&self, pid: libc::pid_t) -> OwnedChild<RecordingProcesses> {
+        OwnedChild {
+            pid,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+            ops: self.clone(),
+        }
+    }
+
+    fn record(&self, r: Recorded) {
+        if let Ok(mut l) = self.log.lock() {
+            l.push(r);
+        }
+    }
+
+    fn has(&self, pid: libc::pid_t) -> bool {
+        self.exited
+            .lock()
+            .map(|e| e.contains(&pid))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl ProcessOps for RecordingProcesses {
+    fn signal(&self, pid: libc::pid_t, pidfd: Option<Pidfd<'_>>, sig: i32) -> io::Result<()> {
+        self.record(Recorded::Signal(pid, pidfd.is_some(), sig));
+        if sig == libc::SIGKILL {
+            self.exit(pid);
+        }
+        Ok(())
+    }
+
+    fn signal_group(&self, pid: libc::pid_t, sig: i32) -> io::Result<()> {
+        self.record(Recorded::SignalGroup(pid, sig));
+        if sig == libc::SIGKILL {
+            self.exit(pid);
+        }
+        Ok(())
+    }
+
+    fn has_exited(&self, pid: libc::pid_t) -> io::Result<bool> {
+        self.record(Recorded::HasExited(pid));
+        Ok(self.has(pid))
+    }
+
+    fn wait_exit(&self, pid: libc::pid_t) -> io::Result<()> {
+        self.record(Recorded::WaitExit(pid));
+        Ok(())
+    }
+
+    fn reap(&self, pid: libc::pid_t) -> io::Result<ExitStatus> {
+        self.record(Recorded::Reap(pid));
+        Ok(ExitStatus::from_raw(0))
+    }
+}
+
+/// A child process this process started and has not reaped, and the
+/// system its calls go to ([`ProcessOps`]; the real one by default).
+///
+/// Reaping consumes the handle, so no signal call exists after it:
+///
+/// ```compile_fail
+/// fn after_reap(c: envcloak_sys::OwnedChild) {
+///     let _ = c.reap();
+///     // The handle was moved into `reap`: this does not compile.
+///     let _ = c.signal(libc::SIGKILL);
+/// }
+/// ```
+///
+/// Before the reap the same call compiles:
+///
+/// ```
+/// fn before_reap(c: envcloak_sys::OwnedChild) {
+///     let _ = c.signal(libc::SIGKILL);
+///     let _ = c.reap();
+/// }
+/// ```
+pub struct OwnedChild<O: ProcessOps = SystemProcesses> {
     pid: libc::pid_t,
     #[cfg(target_os = "linux")]
     pidfd: Option<OwnedFd>,
+    ops: O,
 }
 
-impl core::fmt::Debug for OwnedChild {
+impl<O: ProcessOps> core::fmt::Debug for OwnedChild<O> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("OwnedChild")
             .field("pid", &self.pid)
@@ -89,17 +315,19 @@ impl core::fmt::Debug for OwnedChild {
     }
 }
 
-impl OwnedChild {
-    /// Takes ownership of `pid`, a child `fork` just returned and nothing
-    /// has waited for, in a process that called [`keep_children_unreaped`]
-    /// before the fork. On Linux a pidfd is opened at once, while the child
-    /// cannot have been reaped; where `pidfd_open` is not available the
-    /// handle signals by pid, which ownership keeps valid.
+impl OwnedChild<SystemProcesses> {
+    /// Takes ownership of `pid`, a child `fork` (or `posix_spawn`) just
+    /// returned and nothing has waited for, in a process that called
+    /// [`keep_children_unreaped`] before. On Linux a pidfd is opened at
+    /// once, while the child cannot have been reaped; where `pidfd_open`
+    /// is not available the handle signals by pid, which ownership keeps
+    /// valid.
     pub(crate) fn from_fork(pid: libc::pid_t) -> Self {
         OwnedChild {
             pid,
             #[cfg(target_os = "linux")]
             pidfd: pidfd_open(pid).ok(),
+            ops: SystemProcesses,
         }
     }
 
@@ -114,13 +342,27 @@ impl OwnedChild {
             pid,
             #[cfg(target_os = "linux")]
             pidfd: None,
+            ops: SystemProcesses,
         }
     }
+}
 
+impl<O: ProcessOps> OwnedChild<O> {
     /// The child's pid, for display and for reading what the kernel
     /// reports about it; never a signal target outside this handle.
     pub fn id(&self) -> u32 {
         self.pid.unsigned_abs()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pidfd(&self) -> Option<Pidfd<'_>> {
+        use std::os::fd::AsFd;
+        self.pidfd.as_ref().map(AsFd::as_fd)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn pidfd(&self) -> Option<Pidfd<'_>> {
+        None
     }
 
     /// Sends `sig` to the child: through its pidfd on Linux, otherwise by
@@ -133,11 +375,7 @@ impl OwnedChild {
     /// reaps its children on its own, or the child was reaped); and the
     /// other errors of `pidfd_send_signal` or `kill`.
     pub fn signal(&self, sig: i32) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = &self.pidfd {
-            return pidfd_send_signal(fd.as_raw_fd(), sig);
-        }
-        kill_owned(&mut SysKill, self.pid, false, sig)
+        self.ops.signal(self.pid, self.pidfd(), sig)
     }
 
     /// Sends `sig` to the process group the child leads. Only a child that
@@ -150,7 +388,17 @@ impl OwnedChild {
     /// `ECHILD` as for [`OwnedChild::signal`]; `ESRCH` when the group is
     /// empty, and `kill`'s other errors.
     pub fn signal_group(&self, sig: i32) -> io::Result<()> {
-        kill_owned(&mut SysKill, self.pid, true, sig)
+        self.ops.signal_group(self.pid, sig)
+    }
+
+    /// Lets a child started suspended ([`crate::launch::Spawn::suspended`],
+    /// macOS) run: `SIGCONT` through the handle, the call measured to
+    /// resume a task `posix_spawn` created suspended (macOS 26.4).
+    ///
+    /// # Errors
+    /// As [`OwnedChild::signal`].
+    pub fn resume(&self) -> io::Result<()> {
+        self.signal(libc::SIGCONT)
     }
 
     /// Whether the child has exited, without waiting and without reaping
@@ -159,7 +407,7 @@ impl OwnedChild {
     /// # Errors
     /// `waitid`'s errors.
     pub fn has_exited(&self) -> io::Result<bool> {
-        crate::has_exited(self.pid)
+        self.ops.has_exited(self.pid)
     }
 
     /// Waits until the child has exited, and leaves it unreaped.
@@ -167,7 +415,33 @@ impl OwnedChild {
     /// # Errors
     /// `waitid`'s errors.
     pub fn wait_exit(&self) -> io::Result<()> {
-        crate::wait_for_exit(self.pid)
+        self.ops.wait_exit(self.pid)
+    }
+
+    /// Stops the process group the child leads: SIGTERM, then, unless the
+    /// child has exited within `grace`, SIGKILL; and SIGKILL to the group
+    /// once more after it exited, for a member that ignored the SIGTERM.
+    /// The child stays unreaped through all of it, so the group's number
+    /// is still its own; the caller reaps it. Returns whether the child
+    /// exited within the grace period.
+    ///
+    /// # Errors
+    /// `waitid`'s errors. A group with no process left (`ESRCH`) is no
+    /// error.
+    pub fn stop_group(&self, grace: Duration) -> io::Result<bool> {
+        let quiet = |r: io::Result<()>| match r {
+            Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            other => other,
+        };
+        quiet(self.signal_group(libc::SIGTERM))?;
+        let end = Instant::now() + grace;
+        let mut exited = self.has_exited()?;
+        while !exited && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+            exited = self.has_exited()?;
+        }
+        quiet(self.signal_group(libc::SIGKILL))?;
+        Ok(exited)
     }
 
     /// Waits for the child to exit and reaps it, consuming the handle.
@@ -175,19 +449,7 @@ impl OwnedChild {
     /// # Errors
     /// `waitpid`'s errors.
     pub fn reap(self) -> io::Result<ExitStatus> {
-        let mut status: libc::c_int = 0;
-        loop {
-            // SAFETY: `status` is writable; the child is this process's own
-            // and unreaped.
-            let rc = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-            if rc == self.pid {
-                return Ok(ExitStatus::from_raw(status));
-            }
-            let err = io::Error::last_os_error();
-            if err.kind() != io::ErrorKind::Interrupted {
-                return Err(err);
-            }
-        }
+        self.ops.reap(self.pid)
     }
 
     /// Kills the child with SIGKILL and reaps it.
@@ -342,13 +604,27 @@ impl KillOps for SysKill {
     }
 
     fn kill(&mut self, target: i32, sig: i32) -> io::Result<()> {
-        // SAFETY: kill has no memory effects; the caller checked that
-        // `target` names its own unreaped child or the group it leads.
-        if unsafe { libc::kill(target, sig) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
+        kill_number(target, sig)
     }
+}
+
+/// `kill(target, sig)`: the one call of `libc::kill` EnvCloak makes
+/// (`clippy.toml` bans it elsewhere). Its callers are [`kill_owned`],
+/// after its checks, and the M1 runner's [`crate::signal_process`] and
+/// [`crate::signal_group`], which signal a child the runner holds
+/// unreaped (`crate::wait_for_exit` leaves it a zombie) and refuse the
+/// numbers that name more than one process or group. Async-signal-safe.
+///
+/// # Errors
+/// `kill`'s.
+#[allow(clippy::disallowed_methods)] // The one kill call (D-34).
+pub(crate) fn kill_number(target: i32, sig: i32) -> io::Result<()> {
+    // SAFETY: kill has no memory effects; each caller checked that
+    // `target` names its own unreaped child or the group it leads.
+    if unsafe { libc::kill(target, sig) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

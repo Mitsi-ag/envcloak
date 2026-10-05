@@ -1,6 +1,6 @@
 [package]
 name = "envcloak-lint-canary"
-description = "A deliberate expose_secret violation that proves clippy's disallowed-methods lint is active for workspace crates"
+description = "Deliberate expose_secret and kill violations that prove clippy's disallowed-methods lint is active for workspace crates"
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -16,4 +16,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+libc.workspace = true
 secrecy.workspace = true

@@ -1,0 +1,263 @@
+//! The day-one measurements of M2 task M2-27, kept as tests (M2 plan
+//! M2-27 "Spike first"; D-33, D-36): on macOS, a child started suspended
+//! runs no instruction until it is resumed, is killed through its handle
+//! without running one, and reports the code directory hash the static
+//! reading of its file gives, as `codesign` (an independent tool) gives
+//! it; on Linux, a sealed copy is what runs whatever happens to the file
+//! after the copy was made.
+#![allow(clippy::unwrap_used)]
+
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
+#[cfg(target_os = "macos")]
+use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
+
+use envcloak_sys::launch::{Program, Session, Spawn, spawn};
+
+#[cfg(target_os = "macos")]
+fn wait_for(path: &Path, limit: Duration) -> bool {
+    let end = Instant::now() + limit;
+    while Instant::now() < end {
+        if path.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    path.exists()
+}
+
+/// A shell that writes `marker` as its first act: a witness of whether
+/// any of its code ran.
+#[cfg(target_os = "macos")]
+fn marker_shell(marker: &Path) -> Vec<u8> {
+    format!("echo ran > '{}'", marker.display()).into_bytes()
+}
+
+/// macOS: a suspended child writes nothing until it is resumed, and once
+/// it is, it runs; a suspended child killed through its handle never
+/// runs. Its cdhash, read from the kernel while it is suspended, is the
+/// one the static reading of `/bin/sh` gives and the one `codesign`
+/// prints.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_suspended_child_runs_only_once_resumed_and_reports_its_cdhash() {
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    let script = marker_shell(&marker);
+    let start = || {
+        spawn(&Spawn {
+            program: Program::Path(b"/bin/sh"),
+            argv: &[b"sh", b"-c", &script],
+            env: &[],
+            fds: &[],
+            cwd: None,
+            session: Session::Group,
+            suspended: true,
+        })
+        .unwrap()
+    };
+
+    // Killed while suspended: nothing ran.
+    let child = start();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!marker.exists(), "a suspended child ran");
+    let status = child.kill_and_reap().unwrap();
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(libc::SIGKILL)
+    );
+    assert!(
+        !wait_for(&marker, Duration::from_millis(300)),
+        "a killed suspended child ran"
+    );
+
+    // Resumed: it runs. Its cdhash first, while it is suspended.
+    let child = start();
+    let pid = i32::try_from(child.id()).unwrap();
+    let kernel = envcloak_sys::proc_info(pid)
+        .unwrap()
+        .exe
+        .and_then(|e| e.signature)
+        .and_then(|s| s.cdhash)
+        .expect("the kernel reports a suspended child's cdhash");
+    let file = std::fs::File::open("/bin/sh").unwrap();
+    let cd = envcloak_sys::codesign::code_directory(&file)
+        .unwrap()
+        .expect("/bin/sh is signed");
+    assert_eq!(cd.hash_type, 2, "/bin/sh's best code directory is SHA-256");
+    let digest = Sha256::digest(cd.cdhash_input());
+    assert_eq!(
+        &digest[..20],
+        &kernel[..],
+        "static and kernel cdhash differ"
+    );
+    // The independent oracle: codesign's own reading of the file.
+    let out = std::process::Command::new("/usr/bin/codesign")
+        .args(["-dvvv", "/bin/sh"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stderr);
+    let printed = text
+        .lines()
+        .find_map(|l| l.strip_prefix("CDHash="))
+        .expect("codesign prints CDHash=");
+    let hex: String = kernel.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(printed, hex, "codesign and the kernel disagree");
+    assert!(!marker.exists());
+    child.resume().unwrap();
+    assert!(
+        wait_for(&marker, Duration::from_secs(10)),
+        "a resumed child did not run"
+    );
+    assert!(child.reap().unwrap().success());
+}
+
+/// Linux: the sealed copy runs as it was when copied, after the file it
+/// came from is rewritten in place (the source's inode changed, which the
+/// test checks happened) and after another file is renamed over it; and a
+/// copy of a file that changes while it is read holds what was read.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sealed_copy_runs_the_copied_image_whatever_the_file_becomes() {
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use envcloak_sys::launch::SealedImage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("prog");
+    // A native program is what a sealed copy is for; /bin/true and
+    // /bin/false stand in for two builds: the copy is of `true`.
+    std::fs::copy("/bin/true", &path).unwrap();
+    let src = std::fs::File::open(&path).unwrap();
+    let image = SealedImage::copy_from(src.as_fd(), 512 << 20).unwrap();
+    let ino = std::fs::metadata(&path).unwrap().ino();
+    // Rewritten in place with another build: the same inode, new bytes.
+    let other = std::fs::read("/bin/false").unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    f.write_all(&other).unwrap();
+    drop(f);
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+    assert_eq!(std::fs::read(&path).unwrap(), other, "the rewrite happened");
+    let run = |image: &SealedImage| {
+        spawn(&Spawn {
+            program: Program::Descriptor(image.as_fd()),
+            argv: &[b"prog"],
+            env: &[],
+            fds: &[],
+            cwd: None,
+            session: Session::Group,
+            suspended: false,
+        })
+        .unwrap()
+        .reap()
+        .unwrap()
+        .code()
+    };
+    assert_eq!(run(&image), Some(0), "the copy ran the rewritten file");
+    // The file moved away and another put in its place: the copy still
+    // runs `true`.
+    std::fs::rename(&path, dir.path().join("moved")).unwrap();
+    std::fs::copy("/bin/false", &path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(run(&image), Some(0));
+    // The control: the source file, run by its path, is `false` now.
+    let by_path = spawn(&Spawn {
+        program: Program::Path(path.as_os_str().as_encoded_bytes()),
+        argv: &[b"prog"],
+        env: &[],
+        fds: &[],
+        cwd: None,
+        session: Session::Group,
+        suspended: false,
+    })
+    .unwrap()
+    .reap()
+    .unwrap()
+    .code();
+    assert_eq!(by_path, Some(1), "the control: the file itself changed");
+}
+
+/// The precondition of D-36 on Linux (CR-1): a process that made itself
+/// non-dumpable, as EnvCloak's CLI and bridge do first thing
+/// (`envcloak_sys::harden_process`), hides its executable from another
+/// process of the same user (`/proc/<pid>/exe` refuses both `readlink`
+/// and `open`), while one that did not is readable. So no release can rest
+/// on reading a requester's executable. Both are copies of this test
+/// binary, one hardened ([`hardened_helper`]) and one not.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_hardened_process_hides_its_executable_and_a_control_does_not() {
+    use std::io::BufRead;
+
+    let start = |harden: &str| {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "hardened_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("ENVCLOAK_TEST_HARDEN_HELPER", harden)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        while out.read_line(&mut line).unwrap() > 0 && !line.contains("helper ready") {
+            line.clear();
+        }
+        assert!(line.contains("helper ready"), "the helper did not start");
+        (child, out)
+    };
+    let probe = |pid: u32| -> (Result<(), Option<i32>>, Result<(), Option<i32>>) {
+        let link = std::fs::read_link(format!("/proc/{pid}/exe"));
+        let open = std::fs::File::open(format!("/proc/{pid}/exe"));
+        (
+            link.map(|_| ()).map_err(|e| e.raw_os_error()),
+            open.map(|_| ()).map_err(|e| e.raw_os_error()),
+        )
+    };
+    let (mut hardened, _h) = start("hardened");
+    let (mut control, _c) = start("control");
+    let (link, open) = probe(hardened.id());
+    let (clink, copen) = probe(control.id());
+    let _ = hardened.kill();
+    let _ = hardened.wait();
+    let _ = control.kill();
+    let _ = control.wait();
+    let refused = |e: &Result<(), Option<i32>>| matches!(e, Err(Some(libc::EACCES | libc::EPERM)));
+    assert!(
+        refused(&link),
+        "readlink of a hardened process's exe: {link:?}"
+    );
+    assert!(refused(&open), "open of a hardened process's exe: {open:?}");
+    assert!(
+        clink.is_ok() && copen.is_ok(),
+        "the control is readable: {clink:?} {copen:?}"
+    );
+}
+
+/// Not a test of its own: with `ENVCLOAK_TEST_HARDEN_HELPER` set, the copy
+/// of this binary [`a_hardened_process_hides_its_executable_and_a_control_does_not`]
+/// starts makes itself non-dumpable (`hardened`) or not (`control`), says
+/// so, and waits to be killed.
+#[test]
+fn hardened_helper() {
+    let Ok(mode) = std::env::var("ENVCLOAK_TEST_HARDEN_HELPER") else {
+        return;
+    };
+    if mode == "hardened" {
+        let _ = envcloak_sys::harden_process();
+    }
+    println!("helper ready");
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}

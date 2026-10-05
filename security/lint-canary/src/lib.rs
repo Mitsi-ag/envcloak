@@ -1,6 +1,8 @@
-//! A deliberate violation: every way this file opens a secret must be
-//! reported by clippy's disallowed-methods lint, configured in the root
-//! clippy.toml, at the lint levels every workspace crate inherits.
+//! A deliberate violation: every way this file opens a secret, and every
+//! call of `libc::kill` and `libc::killpg` (M2 plan D-34: signals go only
+//! through an owned handle), must be reported by clippy's disallowed-methods
+//! lint, configured in the root clippy.toml, at the lint levels every
+//! workspace crate inherits.
 //! scripts/check-expose-lint.sh counts the reports against the
 //! EXPECT-DISALLOWED markers. Never add this file to the expose allowlist.
 //!
@@ -42,4 +44,16 @@ pub fn through_wrapper(w: &Wrapper) -> u8 {
 
 pub fn by_reference(v: &[SecretBox<[u8; 4]>]) -> usize {
     v.iter().map(ExposeSecret::expose_secret).count() // EXPECT-DISALLOWED
+}
+
+/// A signal by number, which only `envcloak_sys::owned` may send. The
+/// canary inherits `unsafe_code = "forbid"`, so it names the functions
+/// rather than calling them; the lint reports a path as it reports a call.
+pub fn kill_by_number() -> unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int {
+    libc::kill // EXPECT-DISALLOWED
+}
+
+/// A group signal by number.
+pub fn killpg_by_number() -> unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int {
+    libc::killpg // EXPECT-DISALLOWED
 }
