@@ -394,7 +394,10 @@ mod scanner_device_tests {
     /// from the held root. No mounts or privileged host state are changed.
     #[test]
     fn leaf_mount_is_refused_before_reading() {
-        let dir = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).expect("temporary root")).expect("fixture");
+        let dir = tempfile::tempdir_in(
+            std::fs::canonicalize(std::env::temp_dir()).expect("temporary root"),
+        )
+        .expect("fixture");
         std::fs::write(dir.path().join("profile"), b"fixture-value").expect("write");
         let mut root = open_root(dir.path()).expect("root");
         assert!(read_capped(&root, Path::new("profile"), 64).is_ok());

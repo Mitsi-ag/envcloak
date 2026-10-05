@@ -126,7 +126,7 @@ pub(crate) fn walk_sources(
             Ok(_) | Err(_) => {
                 // Sibling candidates are reported even when the original file
                 // is missing after a stopped restore.
-                inspect_siblings(&root, Some(name), report);
+                inspect_siblings(&root, Some(name), budget, &mut attempts, report);
                 process(
                     &root,
                     Path::new(name),
@@ -142,7 +142,13 @@ pub(crate) fn walk_sources(
         }
     }
 }
-fn inspect_siblings(root: &ScanRoot, base: Option<&std::ffi::OsStr>, report: &mut ScanReport) {
+fn inspect_siblings(
+    root: &ScanRoot,
+    base: Option<&std::ffi::OsStr>,
+    budget: Budget,
+    attempts: &mut usize,
+    report: &mut ScanReport,
+) {
     match list_dir(root.dir(), envcloak_sys::MAX_DIR_ENTRIES) {
         Ok(entries) => {
             for e in entries {
@@ -160,6 +166,11 @@ fn inspect_siblings(root: &ScanRoot, base: Option<&std::ffi::OsStr>, report: &mu
                         continue;
                     }
                 }
+                if *attempts >= budget.files {
+                    report.issue(root.path(), "file_budget");
+                    break;
+                }
+                *attempts += 1;
                 leftover(root, Path::new(&e.name), report);
             }
         }
@@ -172,7 +183,9 @@ fn leftover(root: &ScanRoot, rel: &Path, report: &mut ScanReport) {
         .and_then(|(d, n)| crate::root::open_file(&d, &n, crate::MAX_DOTENV))
     {
         Ok((_, m)) => {
-            if m.nlink() > 1 {
+            if m.dev() != root.dev() {
+                "mount_point"
+            } else if m.nlink() > 1 {
                 "hard_link"
             } else {
                 "possible_leftover"

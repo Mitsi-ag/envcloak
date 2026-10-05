@@ -197,10 +197,22 @@ pub fn scan_config_sources_with_budget(
 ) -> Result<ScanReport, ScanError> {
     let mut report = ScanReport::default();
     crate::sources::walk_sources(sources, budget, &mut report, |root, rel, source, report| {
+        if report.files >= budget.files as u64 {
+            report.issue(root.path().join(rel), "file_budget");
+            return;
+        }
         let remaining = budget.bytes.saturating_sub(report.bytes);
         let (bytes, stamp) = match read_capped(root, rel, MAX_DOTENV.min(remaining as usize)) {
             Ok(v) => v,
             Err(e) => {
+                // A failed read may have consumed bytes before the error.
+                // Reserve its whole allowance so repeated failures stay bounded.
+                if matches!(
+                    e.kind,
+                    crate::ScanErrorKind::Changed | crate::ScanErrorKind::Io(_)
+                ) {
+                    report.bytes += remaining.min(MAX_DOTENV as u64);
+                }
                 report.issue(
                     root.path().join(rel),
                     if remaining < MAX_DOTENV as u64 {
@@ -228,16 +240,18 @@ pub fn scan_config_sources_with_budget(
                 if let Some(v) = &f.value {
                     #[allow(clippy::disallowed_methods)]
                     includes.push(SecretBytes::copy_from(v.expose_secret()));
+                    false
+                } else {
+                    true
                 }
-                false
             } else {
                 true
             }
         });
         report.append(parsed);
-        for include in includes {
+        for included in includes {
             #[allow(clippy::disallowed_methods)]
-            let text = std::str::from_utf8(include.expose_secret());
+            let text = std::str::from_utf8(included.expose_secret());
             let Ok(text) = text else {
                 report.issue(root.path().join(rel), "invalid_env_file");
                 continue;
@@ -265,6 +279,9 @@ pub fn scan_config_sources_with_budget(
             let remain = budget.bytes.saturating_sub(report.bytes);
             match read_capped(root, &path, MAX_DOTENV.min(remain as usize)) {
                 Ok((b, stamp)) => {
+                    if stamp.nlink > 1 {
+                        report.issue(root.path().join(&path), "hard_link");
+                    }
                     report.files += 1;
                     report.bytes += b.len() as u64;
                     match parse_dotenv(&b) {
@@ -292,7 +309,15 @@ pub fn scan_config_sources_with_budget(
                         Err(_) => report.issue(root.path().join(&path), "invalid_dotenv"),
                     }
                 }
-                Err(e) => report.issue(root.path().join(&path), e.kind.token()),
+                Err(e) => {
+                    if matches!(
+                        e.kind,
+                        crate::ScanErrorKind::Changed | crate::ScanErrorKind::Io(_)
+                    ) {
+                        report.bytes += remain.min(MAX_DOTENV as u64);
+                    }
+                    report.issue(root.path().join(&path), e.kind.token());
+                }
             }
         }
     });
