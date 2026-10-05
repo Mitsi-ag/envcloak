@@ -40,8 +40,11 @@
 #    in the build's own DerivedSources/). So a file referenced from outside
 #    apps/macos, linked in from elsewhere or written by a build phase is
 #    refused, and check-swift.sh's rules hold for everything compiled into
-#    the app. The generated accessor's Debug-only environment override never
-#    ships: scripts/macos/sign-check.sh refuses an artifact that holds it.
+#    the app. Each list is a target's: one that ships (any whose name does
+#    not end in `Tests`) may compile only files check-swift.sh holds to the
+#    product rules, so a test file compiled into the app is refused. The
+#    generated accessor's Debug-only environment override never ships:
+#    scripts/macos/sign-check.sh refuses an artifact that holds it.
 #    scripts/macos/check_compiled_swift.py does the comparison.
 #
 # Usage: scripts/check-sources.sh [workspace-root]
