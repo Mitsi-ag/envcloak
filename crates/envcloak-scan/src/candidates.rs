@@ -26,7 +26,7 @@ pub struct Found {
     pub stamp: Option<FileStamp>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Source {
     pub path: PathBuf,
     pub object: Option<String>,
@@ -102,7 +102,10 @@ pub struct Leftover {
 pub struct Budget {
     pub bytes: u64,
     pub candidates: usize,
+    /// Maximum emissions accepted, independent of retention mode.
     pub occurrences: usize,
+    /// Maximum retained ranges, or (candidate, source) pairs in count mode.
+    pub retained: usize,
     pub files: usize,
     pub objects: usize,
 }
@@ -112,8 +115,21 @@ impl Default for Budget {
             bytes: 1 << 30,
             candidates: 2_000_000,
             occurrences: 4_000_000,
+            retained: 4_000_000,
             files: 10_000,
             objects: 100_000,
+        }
+    }
+}
+
+impl Budget {
+    /// Count-only callers allow repeated readings without retaining each range.
+    /// At two readings per token this covers the measured 12,700 tokens/MiB
+    /// through the 1 GiB byte limit; distinct candidates remain independently bounded.
+    pub fn for_counts() -> Self {
+        Self {
+            occurrences: 128_000_000,
+            ..Self::default()
         }
     }
 }
@@ -158,7 +174,11 @@ pub struct DistinctCandidate {
     pub id: u64,
     pub value: SecretBytes,
     pub form: Form,
+    /// Populated by `Candidates::new`, empty in count-only mode.
     pub occurrences: Vec<Occurrence>,
+    /// Populated by `Candidates::counted`, without ranges or rewrite authority.
+    /// A Git object is a separate source from another object at the same path.
+    pub counts: HashMap<Source, u64>,
 }
 
 /// Kept until the scan finishes. Keyed hashes are local, never persisted.
@@ -168,6 +188,8 @@ pub struct Candidates {
     entries: Vec<DistinctCandidate>,
     budget: Budget,
     occurrences: usize,
+    retained: usize,
+    count_only: bool,
     limited: bool,
 }
 impl std::fmt::Debug for Candidates {
@@ -197,8 +219,17 @@ impl Candidates {
             entries: Vec::new(),
             budget,
             occurrences: 0,
+            retained: 0,
+            count_only: false,
             limited: false,
         })
+    }
+    /// Aggregate per candidate and file/object for doctor; retain no ranges.
+    /// Use the same `Budget::for_counts()` for the stream and this collector.
+    pub fn counted(budget: Budget) -> std::io::Result<Self> {
+        let mut result = Self::new(budget)?;
+        result.count_only = true;
+        Ok(result)
     }
     pub fn entries(&self) -> &[DistinctCandidate] {
         &self.entries
@@ -217,22 +248,38 @@ impl Candidates {
         #[allow(clippy::disallowed_methods)]
         hasher.update(c.value.expose_secret());
         let digest = *hasher.finalize().as_bytes();
-        if let Some(&i) = self.index.get(&digest) {
-            self.entries[i].occurrences.push(c.occurrence);
+        let existing = self.index.get(&digest).copied();
+        let new_record = !self.count_only
+            || existing.is_none_or(|i| !self.entries[i].counts.contains_key(&c.occurrence.source));
+        if (new_record && self.retained >= self.budget.retained)
+            || (existing.is_none() && self.entries.len() >= self.budget.candidates)
+        {
+            self.limited = true;
+            return false;
+        }
+        let i = if let Some(i) = existing {
+            i
         } else {
-            if self.entries.len() >= self.budget.candidates {
-                self.limited = true;
-                return false;
-            }
             let id = self.entries.len();
             self.index.insert(digest, id);
             self.entries.push(DistinctCandidate {
                 id: id as u64,
                 value: c.value,
                 form: c.form,
-                occurrences: vec![c.occurrence],
+                occurrences: Vec::new(),
+                counts: HashMap::new(),
             });
+            id
+        };
+        if self.count_only {
+            *self.entries[i]
+                .counts
+                .entry(c.occurrence.source)
+                .or_default() += 1;
+        } else {
+            self.entries[i].occurrences.push(c.occurrence);
         }
+        self.retained += usize::from(new_record);
         self.occurrences += 1;
         true
     }
