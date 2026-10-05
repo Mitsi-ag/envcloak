@@ -5,7 +5,8 @@ use envcloak_scan::{
     source::{ConfigFormat, ConfigSource, SourceKind},
     transcript::scan_transcript_sources,
 };
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::collections::BTreeSet;
+use std::os::unix::fs::{FileExt, PermissionsExt, symlink};
 fn source(path: std::path::PathBuf) -> ConfigSource {
     ConfigSource {
         path,
@@ -37,37 +38,59 @@ fn new_roots_report_fifo_links_unreadable_and_stream_two_gib_within_budget() {
         std::fs::Permissions::from_mode(0o000),
     )
     .unwrap();
-    let f = std::fs::File::create(store.join("z-large")).unwrap();
+    // Directory entry order is unspecified. Keep the sparse file in a
+    // separate, later source so it cannot spend the readable files' budget.
+    // Both sources still share one byte allowance and one report.
+    let large = d.path().join("large");
+    let f = std::fs::File::create(&large).unwrap();
     f.set_len(2 * 1024 * 1024 * 1024).unwrap();
-    let mut values = 0;
+    f.write_all_at(b"fixtureZlargeStreamValue\n", 0).unwrap();
+    f.write_all_at(b"fixtureZpastBudgetValue\n", 65536).unwrap();
+    let mut paths = BTreeSet::new();
+    let mut streamed = false;
     let report = scan_transcript_sources(
-        &[source(store)],
+        &[source(store.clone()), source(large.clone())],
         Budget {
             bytes: 65536,
             ..Budget::default()
         },
         &mut |c| {
             if c.value.ct_eq(b"fixtureZnormalStreamValue") {
-                values += 1;
+                paths.insert(c.occurrence.source.path.clone());
                 assert!(!c.occurrence.rewritable);
             }
+            if c.value.ct_eq(b"fixtureZlargeStreamValue") {
+                assert_eq!(c.occurrence.source.path, large);
+                streamed = true;
+            }
+            assert!(!c.value.ct_eq(b"fixtureZpastBudgetValue"));
+            assert!(!c.value.ct_eq(b"fixtureZunreadableValue"));
             true
         },
     )
     .unwrap();
-    assert!(values >= 1);
-    assert!(report.bytes <= 65536);
+    assert_eq!(
+        paths,
+        BTreeSet::from([store.join("a.txt"), store.join("b.txt")])
+    );
+    assert!(streamed, "the sparse file's prefix was not scanned");
+    assert_eq!(report.bytes, 65536);
     assert!(!report.complete());
-    for reason in [
-        "symlink",
-        "hard_link",
-        "not_regular",
-        "unreadable",
-        "byte_budget",
+    for (path, reason) in [
+        (store.join("loop"), "symlink"),
+        (store.join("a.txt"), "hard_link"),
+        (store.join("b.txt"), "hard_link"),
+        (store.join("fifo"), "not_regular"),
+        (store.join("unreadable"), "unreadable"),
+        (large, "byte_budget"),
     ] {
         assert!(
-            report.issues.iter().any(|i| i.reason == reason),
-            "missing {reason}"
+            report
+                .issues
+                .iter()
+                .any(|i| i.source.path == path && i.reason == reason),
+            "missing {reason} for {}",
+            path.display()
         );
     }
 }
