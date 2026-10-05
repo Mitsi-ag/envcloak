@@ -61,6 +61,13 @@
 //! aside by the relay and read here like the others, on its side of the
 //! mark (review F-71), so a SIGTERM behind a flood of another signal is
 //! not lost.
+//!
+//! Once the forwarding thread has ended, [`Forwarder::close`] draws the
+//! line before the run's result is chosen: the four get their earlier
+//! dispositions back, and one caught after the thread's last read stops
+//! the run all the same, so none is caught and then left unread (Codex's
+//! review of M2-19, swept from PTY mode); one sent after the line acts as
+//! it would without the relay.
 
 use std::io;
 use std::sync::Mutex;
@@ -245,6 +252,30 @@ impl Forwarder {
     pub(crate) fn child_exited(&self) {
         if self.relay.mark().is_err() {
             self.mark_lost.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The line drawn before the run's result is chosen, once the
+    /// forwarding thread has ended (Codex's review of M2-19, swept from PTY
+    /// mode): the caught signals get their dispositions from before the
+    /// run back, and one of the four caught after the stop and not read
+    /// (while the forwarder ended, or before the child is reaped) stops the
+    /// run as any after the exit does; a SIGTERM among them also has the
+    /// run end what the child left in its group
+    /// ([`Forwarder::ends_childs_group`]). One sent after this acts as it
+    /// would without the relay, as it did once the run had returned.
+    pub(crate) fn close(&self, cutoff: &Cutoff) {
+        self.relay.restore_dispositions();
+        while let Ok(Some(caught)) = self.relay.try_next() {
+            let Relayed::Signal { number, .. } = caught else {
+                continue;
+            };
+            if CAUGHT.contains(&number) {
+                if number == libc::SIGTERM {
+                    self.term_seen.store(true, Ordering::SeqCst);
+                }
+                cutoff.stop_now(number);
+            }
         }
     }
 

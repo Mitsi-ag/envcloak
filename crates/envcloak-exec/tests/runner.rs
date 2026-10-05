@@ -39,6 +39,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -248,6 +249,10 @@ const TESTS: &[Test] = &[
     (
         "a_prompt_shows_and_the_start_of_a_value_waits",
         a_prompt_shows_and_the_start_of_a_value_waits,
+    ),
+    (
+        "a_signal_caught_after_the_forwarder_ended_still_stops_the_run",
+        a_signal_caught_after_the_forwarder_ended_still_stops_the_run,
     ),
     (
         "a_lost_reader_closes_the_childs_pipe",
@@ -1983,14 +1988,16 @@ fn exit_codes_pass_through() {
 
 /// A prompt without a newline shows while the child waits for its
 /// answer (the answer is only typed once it has): the idle flush releases
-/// it. It is timed from a marker the child prints just before it, in the
+/// it. Each is timed from a marker the child prints just before it, in the
 /// same write, followed by more than any value's longest encoding, so the
 /// redactor releases the marker at once and holds the prompt until the
-/// idle flush: the prompt shows within 400 ms of it, which a longer idle
-/// flush than SPEC's 40 ms fails (review T12-4). The first bytes of a
-/// value, written without a newline, are held while the pipe is quiet,
-/// and released as they were once what follows shows they are not the
-/// value.
+/// idle flush. Five prompts, the fastest shown within 100 ms of its marker
+/// (SPEC's bound for the 40 ms flush): a load spike can delay one, never
+/// the flush itself; a 110 ms flush fails (review T12-4, and the
+/// verifier's and Codex's reviews of M2-19, which found the bound of
+/// 400 ms this had let a 300 ms flush pass). The first bytes of a value,
+/// written without a newline, are held while the pipe is quiet, and
+/// released as they were once what follows shows they are not the value.
 fn a_prompt_shows_and_the_start_of_a_value_waits() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -2001,24 +2008,40 @@ fn a_prompt_shows_and_the_start_of_a_value_waits() {
         values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
         files: &[],
     };
-    let script = r#"printf 'mark%8192sPassword: ' ''
-read answer
-printf 'got %s\n' "$answer"
+    let script = r#"i=0
+while [ $i -lt 5 ]; do
+  printf 'mark-%d%8192sPassword-%d: ' $i '' $i
+  read answer
+  printf 'got-%d %s\n' $i "$answer"
+  i=$((i+1))
+done
 printf '%.12s' "$OPENAI_API_KEY"
 read more
 printf '!\n'"#;
     let mut p = Proc::spawn(detached(&home, &setup, &os(&sh(script))));
-    assert!(p.wait_for(0, b"mark", Duration::from_secs(60)));
-    let t0 = Instant::now();
-    assert!(
-        p.wait_for(0, b"Password: ", Duration::from_secs(10)),
-        "the prompt did not show while the child waited"
-    );
-    let took = t0.elapsed();
-    println!("prompt: shown {took:?} after the marker before it");
-    assert!(took < Duration::from_millis(400), "{took:?}");
-    p.write(b"yes\n");
-    assert!(p.wait_for(0, b"got yes\n", Duration::from_secs(10)));
+    let mut took = Vec::new();
+    for i in 0..5 {
+        assert!(p.wait_for(0, format!("mark-{i}").as_bytes(), Duration::from_secs(60)));
+        let t0 = Instant::now();
+        assert!(
+            p.wait_for(
+                0,
+                format!("Password-{i}: ").as_bytes(),
+                Duration::from_secs(10)
+            ),
+            "the prompt did not show while the child waited"
+        );
+        took.push(t0.elapsed());
+        p.write(b"yes\n");
+        assert!(p.wait_for(
+            0,
+            format!("got-{i} yes\n").as_bytes(),
+            Duration::from_secs(10)
+        ));
+    }
+    let fastest = took.iter().min().copied().unwrap();
+    println!("prompt: shown {took:?} after the marker before it (fastest {fastest:?})");
+    assert!(fastest <= Duration::from_millis(100), "{took:?}");
     let prefix = &by_label(&cs, labels::OPENAI_API_KEY).value()[..12];
     assert!(
         !p.wait_for(0, prefix, Duration::from_millis(300)),
@@ -2029,6 +2052,46 @@ printf '!\n'"#;
     assert_eq!(status.code(), Some(0));
     assert!(contains(&out, &[prefix, b"!\n"].concat()));
     assert_no_canary(&out, &cs);
+}
+
+/// Codex's review of M2-19, swept from PTY mode into pipe mode: a SIGTERM
+/// caught once the signal forwarder has ended, before the run's result is
+/// chosen (the runner held there, `exec.follow.ended`), still stops the
+/// run, 128 plus its number (or, had it come after the line the runner
+/// draws there, ends the runner by SIGTERM itself), never the child's
+/// status.
+///
+/// Mutation checked: choose the result without reading the signals caught
+/// after the forwarder's stop (no `Forwarder::close` in `follow`): the run
+/// exits 3, and this fails.
+fn a_signal_caught_after_the_forwarder_ended_still_stops_the_run() {
+    let seed = fresh_seed();
+    let home = TestHome::new();
+    let setup = Setup {
+        seed,
+        idle_ms: None,
+        values: &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        files: &[],
+    };
+    let release = home.root().join("go");
+    let mut cmd = detached(&home, &setup, &os(&sh("echo last-line; exit 3")));
+    cmd.env("ENVCLOAK_TEST_PAUSE", "exec.follow.ended")
+        .env("ENVCLOAK_TEST_PAUSE_RELEASE", &release);
+    let p = Proc::spawn(cmd);
+    assert!(
+        p.wait_for(1, b"paused at exec.follow.ended", Duration::from_secs(60)),
+        "the runner was not held: {}",
+        lossy(&p.captured(1))
+    );
+    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    std::fs::write(&release, b"").unwrap();
+    let (status, out, err) = p.finish(Duration::from_secs(60));
+    assert!(
+        status.code() == Some(128 + libc::SIGTERM) || status.signal() == Some(libc::SIGTERM),
+        "{status:?}: {}",
+        lossy(&err)
+    );
+    assert!(contains(&out, b"last-line\n"), "{}", lossy(&out));
 }
 
 /// When the runner's standard output has no reader, the child's pipe is
