@@ -152,6 +152,15 @@ pub enum AuditEvent {
     },
     /// An `approve` failed its proof.
     ApproveFailed { pid: i32, reason: &'static str },
+    /// An `approve` was refused by the live-key guard (`live_not_ticked`,
+    /// SPEC §10b): the request, and the items whose live bindings the
+    /// approval left unticked. No grant was made.
+    LiveRefused {
+        pid: i32,
+        subject: SubjectSummary,
+        request: String,
+        items: Vec<(ItemId, Slug)>,
+    },
     /// A proof was refused because of the caller's evidence, for the
     /// reason's token (`envcloak_policy::ProofRefusal::token`).
     ProofRefused {
@@ -200,6 +209,20 @@ pub enum AuditEvent {
         /// any).
         grants: usize,
     },
+    /// An item's classification was set by hand (`items.reclassify`):
+    /// towards `live` with no proof, otherwise with one. `from` equal to
+    /// `to` when it had that classification already and nothing changed.
+    Reclassified {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+        /// `test`, `live` or `unknown`.
+        from: &'static str,
+        to: &'static str,
+        /// Grants that bound it and ended.
+        grants: usize,
+    },
     /// An item was removed, with a proof, after a backup (`items.remove`).
     Removed {
         pid: i32,
@@ -209,15 +232,17 @@ pub enum AuditEvent {
         /// Grants that bound it and ended.
         grants: usize,
     },
-    /// A rotation or removal failed its proof: the passphrase was wrong.
-    /// `write` is [`AuditKind::Rotate`] or [`AuditKind::Remove`].
+    /// A rotation, removal or loosening reclassification failed its
+    /// proof: the passphrase was wrong. `write` is [`AuditKind::Rotate`],
+    /// [`AuditKind::Remove`] or [`AuditKind::Reclassify`].
     ItemProofFailed {
         pid: i32,
         write: AuditKind,
         item: ItemId,
         slug: Slug,
     },
-    /// A rotation or removal passed its proof and then changed nothing:
+    /// A rotation, removal or loosening reclassification passed its proof
+    /// and then changed nothing:
     /// the vault locked meanwhile (`vault_locked`), the backup could not be
     /// written (`backup_failed`), the target changed (`item_changed`), or
     /// the write failed (the vault's error token). Never
@@ -381,6 +406,16 @@ impl AuditEvent {
             AuditEvent::ApproveFailed { pid, reason } => {
                 format!("envcloakd: audit: approve failed reason={reason} pid={pid}")
             }
+            AuditEvent::LiveRefused {
+                pid,
+                request,
+                items,
+                ..
+            } => format!(
+                "envcloakd: audit: approve refused reason=live_not_ticked request={request} \
+                 unticked={} pid={pid}",
+                items.len()
+            ),
             AuditEvent::ProofRefused {
                 pid,
                 method,
@@ -435,6 +470,17 @@ impl AuditEvent {
                 ),
                 None => format!("envcloakd: audit: item rotated id={item} pid={pid}"),
             },
+            AuditEvent::Reclassified {
+                pid,
+                item,
+                from,
+                to,
+                grants,
+                ..
+            } => format!(
+                "envcloakd: audit: item reclassified id={item} from={from} to={to} \
+                 grants_ended={grants} pid={pid}"
+            ),
             AuditEvent::Removed {
                 pid, item, grants, ..
             } => {
@@ -621,6 +667,23 @@ impl AuditEvent {
                 decision: decision("failed", Some(reason), None, None),
                 ..AuditRecord::new(AuditKind::Approve, "failed")
             },
+            AuditEvent::LiveRefused {
+                subject,
+                request,
+                items,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                subject: subject.clone(),
+                items: items.clone(),
+                decision: decision(
+                    "refused",
+                    Some("live_not_ticked"),
+                    Some("approve"),
+                    Some(u64::try_from(items.len()).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::LiveRefused, "refused")
+            },
             AuditEvent::ProofRefused {
                 pid,
                 method,
@@ -702,6 +765,41 @@ impl AuditEvent {
                         Some(u64::from(*prior_count)),
                     ),
                     ..AuditRecord::new(AuditKind::Rotate, "rotated")
+                }
+            }
+            AuditEvent::Reclassified {
+                subject,
+                item,
+                slug,
+                from,
+                to,
+                grants,
+                ..
+            } => {
+                // The reason names the change: `test_to_live`, or
+                // `live_to_live` when nothing changed.
+                let reason = format!("{from}_to_{to}");
+                AuditRecord {
+                    subject: subject.clone(),
+                    items: vec![(*item, slug.clone())],
+                    decision: decision(
+                        if from == to {
+                            "unchanged"
+                        } else {
+                            "reclassified"
+                        },
+                        Some(&reason),
+                        Some("items.reclassify"),
+                        Some(u64::try_from(*grants).unwrap_or(u64::MAX)),
+                    ),
+                    ..AuditRecord::new(
+                        AuditKind::Reclassify,
+                        if from == to {
+                            "unchanged"
+                        } else {
+                            "reclassified"
+                        },
+                    )
                 }
             }
             AuditEvent::Removed {

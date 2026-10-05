@@ -88,6 +88,7 @@ fn answer_len(values: &[(String, &str, usize)]) -> usize {
                 value: WireSecret::new(SecretBytes::copy_from(&vec![b'a'; *len])),
             })
             .collect(),
+        proposals: Vec::new(),
     };
     result_frame(ID, &answer).unwrap().len()
 }
