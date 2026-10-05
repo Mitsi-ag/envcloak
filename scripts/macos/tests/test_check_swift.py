@@ -441,6 +441,13 @@ SWIFT_REFUSALS = [
     ("an AppKit accessibility override", "a11y-action", KIT, append(KIT, "import AppKit\nfinal class B: NSButton { override func accessibilityPerformPress() -> Bool { true } }\n")),
     # log: other writers
     ("print", "log", KIT, append(KIT, "func p() { print(\"x\") }\n")),
+    ("a function named like a writer", "log", KIT, append(KIT, "func print<T>(_ x: T) {}\n")),
+    ("a log call with no message", "log", KIT, append(KIT, "func l(x: Logger) { x.info() }\n")),
+    ("a log call whose message is labelled", "log", KIT, append(KIT, "func l(x: Logger) { x.error(note: \"stopped\") }\n")),
+    ("a Logger without subsystem and category", "log", TOKEN_FILE, replace(TOKEN_FILE, 'Logger(subsystem: "ai.envcloak.app", category: "fixed")', "Logger()")),
+    ("a token enum of plain cases", "log", KIT, append(KIT, "enum Moment: LogToken { case started }\n")),
+    ("a token enum without a body", "log", KIT, append(KIT, "enum Moment: String, LogToken;\n")),
+    ("a colour from an implicit member", "color", VIEW, replace(VIEW, "Divider().background(Color.clear)", "Divider().background(Color(.brandRed))")),
     ("swift print", "log", KIT, append(KIT, "func p() { Swift.print(\"x\") }\n")),
     ("module-qualified puts", "log", KIT, append(KIT, "func p() { Darwin.puts(\"x\") }\n")),
     ("module-qualified NSLog", "log", KIT, append(KIT, "func p() { Foundation.NSLog(\"x\") }\n")),
@@ -621,6 +628,13 @@ OTHER_REFUSALS = [
     # Keys as each format's own grammar reads them.
     ("an escaped key in the project", "side-door", PBXPROJ, in_pbxproj("EC09 = {isa = XCBuildConfiguration; buildSettings = {\"INFOPLIST_KEY_\\U004eSServices\" = x; }; };")),
     ("an escaped key in a strings file", "side-door", "apps/macos/Support/InfoPlist.strings", write("apps/macos/Support/InfoPlist.strings", "\"\\U004eSServices\" = \"x\";\n")),
+    ("LSEnvironment in a strings file", "launch-input", "apps/macos/Support/InfoPlist.strings", write("apps/macos/Support/InfoPlist.strings", "\"LSEnvironment\" = \"x\";\n")),
+    ("a provider file that does not parse", "key-literal", "providers/zz-broken.toml", write("providers/zz-broken.toml", "key_patterns = [\n")),
+    ("a provider pattern that does not compile", "key-literal", "providers/zz-broken.toml", write("providers/zz-broken.toml", "key_patterns = [\"(unclosed\"]\n")),
+    ("a malformed rule allowlist entry", "allowlist", RULES, write(RULES, "launch-input  # a reason without a path\n")),
+    ("a malformed expose allowlist entry", "allowlist", EXPOSE, write(EXPOSE, "one two  # two paths\n")),
+    ("a link to a brand directory", "symlink", "apps/macos/brand-motion", link("apps/macos/brand-motion", "../../assets/brand/motion")),
+    ("a product Swift file that is not text", "lex", "apps/macos/EnvCloak/Features/Binary.swift", write_bytes("apps/macos/EnvCloak/Features/Binary.swift", b"struct B {}\n\0\n")),
     ("a key in a scheme through a character reference", "side-door", SCHEME, replace(SCHEME, "<LaunchAction", "<EnvironmentVariable key = \"&#67;FBundleURLTypes\"/>\n   <LaunchAction")),
     ("an escaped key in JSON", "side-door", ASSET_JSON, write(ASSET_JSON, "{\"\\u0043FBundleURLTypes\": []}\n")),
     ("JSON that does not parse", "unreadable", ASSET_JSON, write(ASSET_JSON, "{\"info\": \n")),
@@ -653,6 +667,11 @@ OTHER_REFUSALS = [
     ("a registry package", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(id: "example.sdk", from: "1.0.0")')),
     ("a package path outside the packages", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(path: "../../../../vendor/sdk")')),
     ("an absolute package path", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(path: "/opt/sdk")')),
+    # Read as its value: the source text `\u{2E}\u{2E}/../../Elsewhere`
+    # stays inside the packages, the value `../../../Elsewhere` does not.
+    ("an escaped package path outside the packages", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(path: "\\u{2E}\\u{2E}/../../Elsewhere")')),
+    ("a package path built at run time", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(path: root + "/sdk")')),
+    ("a package of no kind this check knows", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(name: "Analytics")')),
     ("a remote package in the project", "remote-package", PBXPROJ, replace(PBXPROJ, "XCLocalSwiftPackageReference", "XCRemoteSwiftPackageReference")),
     ("a local package outside the tree in the project", "remote-package", PBXPROJ, replace(PBXPROJ, "relativePath = Packages/EnvCloakKit;", "relativePath = ../../vendor/sdk;")),
     # code other than the Swift this check reads
@@ -789,6 +808,33 @@ class CheckSwift(unittest.TestCase):
         for name, rule, where, change in OTHER_REFUSALS:
             with self.subTest(fixture=name):
                 self.refusal(name, rule, where, change)
+
+    def test_a_missing_input_is_a_finding(self):
+        # Each allowlist, the provider directory and its key patterns: a
+        # missing one is a finding, never a skip.
+        cases = (
+            ("rule allowlist", ("allowlist", RULES)),
+            ("expose allowlist", ("allowlist", EXPOSE)),
+            ("provider directory", ("key-literal", "providers/")),
+            ("provider patterns", ("key-literal", "providers/")),
+        )
+        for what, want in cases:
+            with self.subTest(missing=what):
+                tree = Tree(self.base)
+                providers = os.path.join(tree.root, "providers")
+                if what == "rule allowlist":
+                    os.remove(os.path.join(tree.root, RULES))
+                elif what == "expose allowlist":
+                    os.remove(os.path.join(tree.root, EXPOSE))
+                elif what == "provider directory":
+                    shutil.rmtree(providers)
+                else:
+                    for name in os.listdir(providers):
+                        os.remove(os.path.join(providers, name))
+                    tree.write("providers/none.toml", 'name = "none"\n')
+                code, out = tree.check()
+                self.assertEqual(code, 1, "%s: passed\n%s" % (what, out))
+                self.assertIn(want, self.findings(out), out)
 
     def test_fixture_names_are_unique(self):
         names = [f[0] for f in SWIFT_REFUSALS + OTHER_REFUSALS]

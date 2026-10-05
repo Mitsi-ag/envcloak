@@ -277,7 +277,9 @@ Rules (the id is what a finding and an allowlist entry name):
                  is not UTF-8 or UTF-16 text. Never skipped.
   key-literal    a string matching a provider's key pattern
                  (providers/*.toml) in any file, a file that is not text
-                 read byte for byte (rule 7).
+                 read byte for byte (rule 7); a provider file whose
+                 patterns cannot be read or compiled, and no pattern at
+                 all, are findings too.
   symlink        a symbolic link that does not resolve inside assets/brand/.
   stray-swift    a Swift file outside the product and test roots.
   lex            a Swift file the lexer cannot read whole.
@@ -2593,7 +2595,7 @@ def check_manifest(rel, toks):
                 path = unwrap(args["path"])
                 if not is_literal(path) or path[0].parts and any(kind == "interp" for kind, _ in path[0].parts):
                     find("remote-package", rel, t.line, "a package path this check cannot read")
-                elif path[0].text.startswith("/") or not inside(posixpath.join(base, path[0].text), [PACKAGES]):
+                elif literal_value(path[0]).startswith("/") or not inside(posixpath.join(base, literal_value(path[0])), [PACKAGES]):
                     find("remote-package", rel, t.line, "a package path outside %s" % PACKAGES)
             else:
                 find("remote-package", rel, t.line, "a package this check cannot place")
@@ -2853,15 +2855,26 @@ def key_patterns(root):
     for name in sorted(os.listdir(pdir)):
         if not name.endswith(".toml"):
             continue
-        with open(os.path.join(pdir, name), "rb") as f:
-            data = tomllib.load(f)
-        for p in data.get("key_patterns", []):
-            body = p
-            if body.startswith("^"):
-                body = body[1:]
-            if body.endswith("$"):
-                body = body[:-1]
-            pats.append((name, re.compile(body)))
+        # A provider file this check cannot read is a finding: its patterns
+        # would go unscanned.
+        try:
+            with open(os.path.join(pdir, name), "rb") as f:
+                data = tomllib.load(f)
+            found = data.get("key_patterns", [])
+            if not isinstance(found, list) or not all(isinstance(p, str) for p in found):
+                raise ValueError("key_patterns is not a list of strings")
+            compiled = []
+            for p in found:
+                body = p
+                if body.startswith("^"):
+                    body = body[1:]
+                if body.endswith("$"):
+                    body = body[:-1]
+                compiled.append((name, re.compile(body)))
+        except (OSError, ValueError, re.error) as e:
+            find("key-literal", "providers/" + name, 0, "cannot read its key patterns (%s), so they would go unscanned" % type(e).__name__)
+            continue
+        pats.extend(compiled)
     if not pats:
         find("key-literal", "providers/", 0, "no provider key pattern found, so nothing was scanned")
     return pats
