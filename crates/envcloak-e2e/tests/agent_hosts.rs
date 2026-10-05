@@ -4067,9 +4067,14 @@ with open(out, "wb") as f:
 "#;
 
     /// The options every approval here asks for: a session grant of an
-    /// hour, as `envcloak approve <id> --for 1h` does.
+    /// hour with the live OpenAI key ticked, as `envcloak approve <id> --for
+    /// 1h --live OPENAI_API_KEY` does (SPEC §10b "Live-key guard": the
+    /// fixture agent's request binds it, and a person's approval without
+    /// the tick makes no grant).
     fn approval_options() -> ApprovalOptions {
-        ApprovalOptions::session(Duration::from_secs(3600))
+        let mut o = ApprovalOptions::session(Duration::from_secs(3600));
+        o.live = vec![envcloak_policy::EnvName::new("OPENAI_API_KEY").unwrap()];
+        o
     }
 
     /// A daemon with an unlocked vault, a project (the canary

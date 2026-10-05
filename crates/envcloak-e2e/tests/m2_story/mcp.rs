@@ -45,7 +45,7 @@ use envcloak_testkit::transcripts::Sweep;
 use envcloak_testkit::{Canary, fresh_seed, labels, testkit_bin};
 use serde_json::{Value, json};
 
-use super::skeleton::{approve, last_tool_output, vault_and_import, write_repo};
+use super::skeleton::{LIVE_APPROVAL, approve, last_tool_output, vault_and_import, write_repo};
 
 /// The tools the server lists, in order.
 const TOOLS: [&str; 5] = [
@@ -137,7 +137,7 @@ fn approve_after_a_wrong_passphrase(h: &mut Harness, repo: &Path, id: &str) {
     let typed = format!("{}\r", h.canary(WRONG_PASSPHRASE).as_str());
     let wrong = h.human(
         repo,
-        &["approve", id, "--for", "1h"],
+        &LIVE_APPROVAL.map(|a| if a == "ID" { id } else { a }),
         &[],
         &[("Vault passphrase to approve this: ", &typed)],
     );
