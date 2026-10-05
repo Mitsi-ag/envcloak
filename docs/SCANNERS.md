@@ -46,7 +46,21 @@ skipped, and later lines are still scanned. Invalid JSON, invalid text and
 oversized tokens produce fixed reasons. Strings are decoded with raw offsets
 for their escape sequences. Tokens of at least 16 characters yield raw,
 base64, hex and percent-decoded candidates, with a 4 KiB candidate cap. Raw
-stores use the same token rules without JSON decoding. Decoded runs are marked
+stores use the same token rules without JSON decoding. Each bounded token
+retains its whole spelling, plus punctuation-trimmed and punctuation-separated
+readings, assignment right-hand sides and query values. Short JSON strings
+also retain whole-string and whitespace-word readings. URL user information,
+Go DSN passwords and `password`/`passwd`/`pwd` connection fields carry their
+specific password forms to the daemon, including on decoded readings.
+Alternatives are capped at 256 per reading; exhausting this or an emission
+budget makes the report incomplete. Binary boundaries record `invalid_text`
+while still scanning adjacent UTF-8 text.
+
+This is a bounded tokenizer, not a complete shell or connection-string parser.
+Raw values spanning whitespace, dialect-specific backslash or doubled-quote
+escapes, nested encodings and every interpretation of ambiguous punctuation
+are not reconstructed. Readings may overlap. Scrub must use confirmed,
+non-overlapping ranges or a structured rewrite, never replace every alternative. Decoded runs are marked
 not directly rewritable: a base64 run may contain more than the matched value.
 A read file's stamp travels with occurrences; a change during the read makes
 the scan incomplete. Scrub must re-check that stamp at use.

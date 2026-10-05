@@ -175,12 +175,7 @@ pub fn scan_reader(
     Ok(report)
 }
 fn delimiter(b: u8) -> bool {
-    b.is_ascii_whitespace()
-        || b < 32
-        || matches!(
-            b,
-            b'"' | b'\'' | b',' | b'{' | b'}' | b'[' | b']' | b';' | b'<' | b'>'
-        )
+    b.is_ascii_whitespace() || b < 32
 }
 fn json_line(
     bytes: &[u8],
@@ -211,26 +206,8 @@ fn json_tokens(
 ) -> bool {
     match node {
         crate::json::Node::Text(t) => {
-            let bytes = t.value.expose_secret();
-            let mut start = 0;
-            for i in 0..=bytes.len() {
-                if i == bytes.len() || delimiter(bytes[i]) {
-                    if i > start
-                        && !token(
-                            &bytes[start..i],
-                            base,
-                            Some(&t.offsets[start..=i]),
-                            source,
-                            Encoding::Json,
-                            report,
-                            budget,
-                            emit,
-                        )
-                    {
-                        return false;
-                    }
-                    start = i + 1;
-                }
+            if !text_tokens(t, base, source, report, budget, emit) {
+                return false;
             }
         }
         crate::json::Node::Object(fields) => {
@@ -263,6 +240,18 @@ fn text_tokens(
     emit: &mut impl FnMut(Candidate) -> bool,
 ) -> bool {
     let bytes = t.value.expose_secret();
+    if bytes.len() <= MAX_CANDIDATE && bytes.iter().any(|b| delimiter(*b)) {
+        return token(
+            bytes,
+            base,
+            Some(&t.offsets),
+            source,
+            Encoding::Json,
+            report,
+            budget,
+            emit,
+        );
+    }
     let mut start = 0;
     for i in 0..=bytes.len() {
         if i == bytes.len() || delimiter(bytes[i]) {
@@ -296,124 +285,102 @@ fn token(
     budget: Budget,
     emit: &mut impl FnMut(Candidate) -> bool,
 ) -> bool {
-    token_reading(
-        bytes, base, map, source, encoding, report, budget, emit, true,
-    )
-}
-#[allow(clippy::too_many_arguments)]
-fn token_reading(
-    bytes: &[u8],
-    base: u64,
-    map: Option<&[usize]>,
-    source: &Source,
-    encoding: Encoding,
-    report: &mut StreamReport,
-    budget: Budget,
-    emit: &mut impl FnMut(Candidate) -> bool,
-    assignment: bool,
-) -> bool {
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        report.not_scanned += 1;
-        report.issue(source, "invalid_text");
-        return true;
-    };
     if bytes.len() > MAX_CANDIDATE {
         report.not_scanned += 1;
         report.issue(source, "token_too_large");
         return true;
     }
-    // An assignment includes its RHS as a second token without losing a
-    // padded base64 run. The whole reading stays, for URL/DSN filtering.
-    if let Some(eq) = bytes.iter().position(|b| *b == b'=') {
-        if assignment
-            && eq + 1 < bytes.len()
-            && bytes[..eq]
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-        {
-            let next = map.map(|m| &m[eq + 1..]);
-            if !token_reading(
-                &bytes[eq + 1..],
-                if map.is_some() {
-                    base
-                } else {
-                    base + eq as u64 + 1
-                },
-                next,
-                source,
+    let mut at = 0;
+    while at < bytes.len() {
+        let (end, skip) = match std::str::from_utf8(&bytes[at..]) {
+            Ok(_) => (bytes.len(), 0),
+            Err(e) => {
+                report.not_scanned += 1;
+                report.issue(source, "invalid_text");
+                let end = at + e.valid_up_to();
+                (end, e.error_len().unwrap_or(bytes.len() - end))
+            }
+        };
+        let (ranges, limited) = crate::token_readings::ranges(&bytes[at..end]);
+        if limited {
+            report.not_scanned += 1;
+            report.issue(source, "reading_budget");
+        }
+        for (r, form) in ranges {
+            let a = at + r.start;
+            let b = at + r.end;
+            let range = if let Some(m) = map {
+                base + m[a] as u64..base + m[b] as u64
+            } else {
+                base + a as u64..base + b as u64
+            };
+            let occurrence = Occurrence {
+                source: source.clone(),
+                range,
                 encoding,
+                stamp: None,
+                rewritable: true,
+            };
+            if !send(
+                SecretBytes::copy_from(&bytes[a..b]),
+                occurrence.clone(),
+                form,
                 report,
                 budget,
                 emit,
-                false,
             ) {
                 return false;
             }
+            for (value, encoding) in decoded(&bytes[a..b]) {
+                let mut encoded = occurrence.clone();
+                encoded.encoding = encoding;
+                encoded.rewritable = false;
+                if !decoded_tokens(&value, &encoded, form, report, budget, emit) {
+                    return false;
+                }
+            }
         }
-    }
-    if text.chars().count() < 16 {
-        return true;
-    }
-    let range = if let Some(m) = map {
-        base + m[0] as u64..base + m[m.len() - 1] as u64
-    } else {
-        base..base + bytes.len() as u64
-    };
-    let occurrence = Occurrence {
-        source: source.clone(),
-        range,
-        encoding,
-        stamp: None,
-        rewritable: true,
-    };
-    if !send(
-        SecretBytes::copy_from(bytes),
-        occurrence.clone(),
-        report,
-        budget,
-        emit,
-    ) {
-        return false;
-    }
-    for (value, form) in decoded(bytes) {
-        let mut at = occurrence.clone();
-        at.encoding = form;
-        at.rewritable = false;
-        if !decoded_tokens(&value, &at, report, budget, emit)
-            || !send(value, at, report, budget, emit)
-        {
-            return false;
+        if skip == 0 {
+            break;
         }
+        at = end + skip;
     }
     true
 }
-#[allow(clippy::disallowed_methods)] // Tokens inside an encoded run retain its whole raw span.
+#[allow(clippy::disallowed_methods)] // Decoded readings retain the whole encoded source range.
 fn decoded_tokens(
     value: &SecretBytes,
     at: &Occurrence,
+    form: Form,
     report: &mut StreamReport,
     budget: Budget,
     emit: &mut impl FnMut(Candidate) -> bool,
 ) -> bool {
     let bytes = value.expose_secret();
-    let mut start = 0;
-    for end in 0..=bytes.len() {
-        if end == bytes.len() || delimiter(bytes[end]) {
-            if (start != 0 || end != bytes.len()) && end > start {
-                let part = &bytes[start..end];
-                if std::str::from_utf8(part).is_ok_and(|s| s.chars().count() >= 16)
-                    && !send(
-                        SecretBytes::copy_from(part),
-                        at.clone(),
-                        report,
-                        budget,
-                        emit,
-                    )
-                {
-                    return false;
-                }
-            }
-            start = end + 1;
+    // An incidental base64 decoding of ordinary text is not an input error.
+    if std::str::from_utf8(bytes).is_err() {
+        return true;
+    }
+    let (ranges, limited) = crate::token_readings::ranges(bytes);
+    if limited {
+        report.not_scanned += 1;
+        report.issue(&at.source, "reading_budget");
+    }
+    for (r, reading_form) in ranges {
+        let form = if reading_form == Form::Raw {
+            form
+        } else {
+            reading_form
+        };
+        if !send(
+            SecretBytes::copy_from(&bytes[r]),
+            at.clone(),
+            form,
+            report,
+            budget,
+            emit,
+        ) {
+            return false;
         }
     }
     true
@@ -422,10 +389,14 @@ fn decoded_tokens(
 fn send(
     value: SecretBytes,
     occurrence: Occurrence,
+    form: Form,
     report: &mut StreamReport,
     budget: Budget,
     emit: &mut impl FnMut(Candidate) -> bool,
 ) -> bool {
+    if !value.utf8_chars().is_some_and(|n| n >= 16) {
+        return true;
+    }
     if report.candidates >= budget.occurrences as u64 {
         report.issue(&occurrence.source, "occurrence_budget");
         return false;
@@ -436,7 +407,7 @@ fn send(
     if !emit(Candidate {
         id,
         value,
-        form: Form::Raw,
+        form,
         occurrence,
     }) {
         report.issue(&source, "candidate_budget");
@@ -446,6 +417,11 @@ fn send(
 }
 fn decoded(bytes: &[u8]) -> Vec<(SecretBytes, Encoding)> {
     let mut out = Vec::new();
+    // Decode bounded spellings, not an entire message with several spellings.
+    // Otherwise a percent escape anywhere could claim unrelated text's range.
+    if bytes.iter().any(u8::is_ascii_whitespace) {
+        return out;
+    }
     if bytes.len() % 2 == 0 && bytes.iter().all(|b| crate::json::hex(*b).is_some()) {
         let mut b = SecretBuf::with_capacity(bytes.len() / 2);
         for pair in bytes.chunks_exact(2) {
