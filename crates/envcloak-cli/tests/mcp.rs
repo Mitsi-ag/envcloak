@@ -2612,6 +2612,102 @@ fn project_status_shows_only_the_grants_that_cover_this_agent() {
     f.sweep();
 }
 
+/// SPEC §10b "Live-key guard" through `run_with_secrets` (verifier and
+/// Codex, round 2: the MCP answer dropped the test key the CLI names): the
+/// `approval_required` message names, for the live Stripe binding, the
+/// same provider's test item and how to bind it for the layer the binding
+/// came from (`[env]`, or the profile the call names), from the run's
+/// status record; it still says nothing of `envcloak approve`. Following
+/// it with `add_reference`, as the message says, the next call's request
+/// binds the test item and names no test key. The control: a project whose
+/// live key's provider has no test item names none.
+///
+/// Mutation: the message without the proposals (`test_keys` answering
+/// nothing): no test key is named and this fails; and the record without
+/// them (`RunStatus::approval_required` naming none): the same.
+#[test]
+fn run_with_secrets_names_the_test_key_for_a_live_one() {
+    let mut f = Fixture::new();
+    let files = outside_dir();
+    for kind in ["test", "live"] {
+        let tail: String = format!("{:032x}", fresh_seed()).chars().take(32).collect();
+        let key = format!("{}_{kind}_{tail}", concat!("s", "k"));
+        let file = secret_file(files.path(), kind, key.as_bytes());
+        f.cs.push(Canary::new(format!("STRIPE_{kind}"), key));
+        let slug = format!("stripe/acme-{kind}");
+        let out = common::run(
+            &f.home,
+            &["add", "stripe", "--slug", &slug, "--stdin"],
+            &[(0, &file, true)],
+        );
+        assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
+    }
+    let live = project(
+        &f.home,
+        "acme-live",
+        "[project]\nname = \"acme-live\"\n\n[env]\nSTRIPE_SECRET_KEY = \"stripe/acme-live\"\n\n\
+         [env.dev]\nSTRIPE_SECRET_KEY = \"stripe/acme-live\"\n",
+    );
+    let mut m = Mcp::start(&f.home, &live, &["--wait-ms", "1000"], &f.cs);
+    m.initialize();
+    let dir = live.to_str().unwrap();
+    let call = |m: &mut Mcp, extra: Value| {
+        let mut args = json!({"project_dir": dir, "argv": ["/usr/bin/true"]});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let r = m.call("run_with_secrets", args);
+        let s = structured(&r).clone();
+        assert_eq!(s["status"], "approval_required", "{s}");
+        assert!(!r.to_string().contains("envcloak approve"), "{r}");
+        s["message"].as_str().unwrap().to_owned()
+    };
+    let named = |advice: &str| {
+        format!(
+            "STRIPE_SECRET_KEY is bound to the live key stripe/acme-live: to use the test key \
+             stripe/acme-test instead, {advice}, and call run_with_secrets again (add_reference \
+             binds a variable as `envcloak ref` does)."
+        )
+    };
+    let message = call(&mut m, json!({}));
+    assert!(
+        message.contains("EnvCloak proposes test keys of the same provider in place of live ones"),
+        "{message}"
+    );
+    assert!(
+        message.contains(&named(
+            "run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`"
+        )),
+        "{message}"
+    );
+    let message = call(&mut m, json!({"profile": "dev"}));
+    assert!(
+        message.contains(&named(
+            "run `envcloak ref --profile dev STRIPE_SECRET_KEY=stripe/acme-test`"
+        )),
+        "{message}"
+    );
+    // Followed with add_reference, in the profile: the test item is bound.
+    let r = m.call(
+        "add_reference",
+        json!({"project_dir": dir, "env_name": "STRIPE_SECRET_KEY",
+            "slug": "stripe/acme-test", "profile": "dev"}),
+    );
+    assert_eq!(structured(&r)["change"], "replaced", "{r}");
+    let message = call(&mut m, json!({"profile": "dev"}));
+    assert!(!message.contains("test key"), "{message}");
+    // The control: the live OpenAI key's provider has no test item.
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": f.project.to_str().unwrap(), "argv": ["/usr/bin/true"]}),
+    );
+    let s = structured(&r);
+    assert_eq!(s["status"], "approval_required", "{s}");
+    assert!(!s["message"].as_str().unwrap().contains("test key"), "{s}");
+    m.finish();
+    f.sweep();
+}
+
 /// Items that are not secrets (a card, an issuer credential) are named
 /// and never bound (R-M2-34): `list_secrets` shows each by its slug and
 /// class alone (no provider, classification or field names), and

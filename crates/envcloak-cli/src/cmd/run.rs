@@ -344,6 +344,9 @@ enum Ended {
         failure: Failure,
         code: u8,
         request: Option<PendingId>,
+        /// With `approval_required`: the test items the daemon proposed in
+        /// place of live ones, which the record names for `envcloak mcp`.
+        proposals: Vec<Proposal>,
         printed: bool,
     },
     /// The command was started and followed to its end.
@@ -359,6 +362,7 @@ impl Ended {
             failure,
             code,
             request: None,
+            proposals: Vec::new(),
             printed: false,
         }
     }
@@ -382,14 +386,17 @@ impl Ended {
                 failure,
                 code,
                 request,
+                proposals,
                 printed,
             } => {
                 if !printed {
                     failure.report(code);
                 }
-                let record = RunStatus::NotStarted {
-                    token: failure.token().to_owned(),
-                    request,
+                let record = match request {
+                    Some(id) if failure.token() == "approval_required" => {
+                        RunStatus::approval_required(id, &proposals)
+                    }
+                    _ => RunStatus::not_started(failure.token()),
                 };
                 (record, code)
             }
@@ -494,6 +501,7 @@ fn request(a: RunArgs) -> Result<Ended, Failure> {
                 ),
                 code: RUN_FAILURE,
                 request: Some(id),
+                proposals: answer.proposals,
                 printed: false,
             })
         }
@@ -608,10 +616,12 @@ fn wait_for(
             "approval_denied",
             format!("request={id} was denied; nothing was started"),
         )),
-        Waited::Expired(id) | Waited::TimedOut(id) => {
-            Ok(Err(printed_already("approval_required", Some(id))))
-        }
-        Waited::TooManyPending(_) => Ok(Err(printed_already("too_many_pending", None))),
+        Waited::Expired(id) | Waited::TimedOut(id) => Ok(Err(printed_already(
+            "approval_required",
+            Some(id),
+            latest.take(),
+        ))),
+        Waited::TooManyPending(_) => Ok(Err(printed_already("too_many_pending", None, Vec::new()))),
         // A tracer attached while it waited: no request that could carry
         // values was sent.
         Waited::Traced => Err(traced()),
@@ -665,12 +675,18 @@ impl Transport for Proposing<'_> {
 }
 
 /// A wait that ended with nothing decided: the line it printed for the
-/// request (or for the pending cap), `token`'s, is the failure.
-fn printed_already(token: &'static str, request: Option<PendingId>) -> Ended {
+/// request (or for the pending cap), `token`'s, is the failure; the
+/// request's latest answer proposed `proposals`.
+fn printed_already(
+    token: &'static str,
+    request: Option<PendingId>,
+    proposals: Vec<Proposal>,
+) -> Ended {
     Ended::NotStarted {
         failure: Failure::new(token, ""),
         code: RUN_FAILURE,
         request,
+        proposals,
         printed: true,
     }
 }
@@ -841,26 +857,17 @@ mod tests {
             ),
             (
                 ExecError::NotFound,
-                RunStatus::NotStarted {
-                    token: "command_not_found".into(),
-                    request: None,
-                },
+                RunStatus::not_started("command_not_found"),
                 127,
             ),
             (
                 ExecError::NotExecutable(std::io::ErrorKind::PermissionDenied),
-                RunStatus::NotStarted {
-                    token: "command_not_executable".into(),
-                    request: None,
-                },
+                RunStatus::not_started("command_not_executable"),
                 126,
             ),
             (
                 ExecError::Setup(std::io::ErrorKind::OutOfMemory),
-                RunStatus::NotStarted {
-                    token: "run_failed".into(),
-                    request: None,
-                },
+                RunStatus::not_started("run_failed"),
                 125,
             ),
         ] {
