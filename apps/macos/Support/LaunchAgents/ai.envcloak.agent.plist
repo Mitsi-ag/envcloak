@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>ai.envcloak.agent</string>
+	<key>BundleProgram</key>
+	<string>Contents/Helpers/EnvCloakAgent.app/Contents/MacOS/envcloakd</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>envcloakd</string>
+		<string>--foreground</string>
+	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>ai.envcloak.app</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>Umask</key>
+	<integer>63</integer>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>Core</key>
+		<integer>0</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>Core</key>
+		<integer>0</integer>
+	</dict>
+</dict>
+</plist>
