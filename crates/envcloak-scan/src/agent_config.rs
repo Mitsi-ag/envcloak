@@ -1,5 +1,5 @@
 //! Host-neutral config readers. Paths and host versions belong to the caller.
-//! Unsupported syntax and credential stores always produce an incomplete report.
+//! Unsupported syntax produces an incomplete report; reference values stay names-only.
 use crate::candidates::{Budget, Disposition, Found, ScanReport, Source};
 use crate::json::{Node, Text};
 use crate::source::{ConfigFormat, ConfigSource};
@@ -10,6 +10,10 @@ use std::path::{Component, Path};
 
 #[allow(clippy::disallowed_methods)] // Bounded config parsing, fixed errors only.
 pub fn parse_config(bytes: &SecretBytes, format: ConfigFormat) -> ScanReport {
+    parse_config_limited(bytes, format, Budget::default())
+}
+#[allow(clippy::disallowed_methods)]
+fn parse_config_limited(bytes: &SecretBytes, format: ConfigFormat, budget: Budget) -> ScanReport {
     let mut report = ScanReport::default();
     if bytes.len() > MAX_DOTENV {
         report.issue("", "too_large");
@@ -17,7 +21,7 @@ pub fn parse_config(bytes: &SecretBytes, format: ConfigFormat) -> ScanReport {
     }
     match format {
         ConfigFormat::Json => match crate::json::parse(bytes.expose_secret()) {
-            Ok(node) => json(&node, false, &mut report),
+            Ok(node) => json(&node, false, &mut report, budget),
             Err(()) => report.issue("", "invalid_json"),
         },
         ConfigFormat::Toml => {
@@ -28,7 +32,7 @@ pub fn parse_config(bytes: &SecretBytes, format: ConfigFormat) -> ScanReport {
             // toml_edit's transient parsing allocations are covered by the
             // binary's mandatory wiping allocator, including failure paths.
             match toml_edit::Document::parse(text) {
-                Ok(doc) => toml_table(doc.as_table(), false, &mut report),
+                Ok(doc) => toml_table(doc.as_table(), false, &mut report, budget),
                 Err(_) => report.issue("", "invalid_toml"),
             }
         }
@@ -36,50 +40,113 @@ pub fn parse_config(bytes: &SecretBytes, format: ConfigFormat) -> ScanReport {
     }
     report
 }
-fn push(report: &mut ScanReport, name: &[u8], value: &[u8], range: std::ops::Range<u64>) {
-    let template = value.contains(&b'$') || value.starts_with(b"envcloak://");
+fn room(report: &mut ScanReport, budget: Budget, path: &Path) -> bool {
+    let reason = if report.findings.len() >= budget.candidates {
+        "candidate_budget"
+    } else if report.findings.len() >= budget.occurrences {
+        "occurrence_budget"
+    } else {
+        return true;
+    };
+    if !report
+        .issues
+        .iter()
+        .any(|i| i.reason == reason && i.source.path == path)
+    {
+        report.issue(path, reason);
+    }
+    false
+}
+fn reference(value: &[u8]) -> Disposition {
+    if value.starts_with(b"envcloak://") {
+        return Disposition::Template;
+    }
+    let mut tail = value;
+    let mut found = false;
+    while let Some(at) = tail.windows(2).position(|w| w == b"${") {
+        tail = &tail[at + 2..];
+        let Some(end) = tail.iter().position(|b| *b == b'}') else {
+            return Disposition::Manual;
+        };
+        let body = &tail[..end];
+        let n = body
+            .iter()
+            .position(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+            .unwrap_or(body.len());
+        if n == 0
+            || !body[0].is_ascii_alphabetic() && body[0] != b'_'
+            || !(n == body.len() || body[n..].starts_with(b":-"))
+            || body.contains(&b'{')
+        {
+            return Disposition::Manual;
+        }
+        found = true;
+        tail = &tail[end + 1..];
+    }
+    if found {
+        Disposition::Template
+    } else {
+        Disposition::Literal
+    }
+}
+fn push(
+    report: &mut ScanReport,
+    name: &[u8],
+    value: &[u8],
+    range: std::ops::Range<u64>,
+    budget: Budget,
+) -> bool {
+    if !room(report, budget, Path::new("")) {
+        return false;
+    }
+    let disposition = reference(value);
+    if disposition == Disposition::Manual {
+        report.issue("", "unsupported_reference");
+    }
     report.findings.push(Found {
         name: SecretBytes::copy_from(name),
-        value: if template {
-            None
-        } else {
-            Some(SecretBytes::copy_from(value))
-        },
-        disposition: if template {
-            Disposition::Template
-        } else {
-            Disposition::Literal
-        },
+        value: (disposition == Disposition::Literal).then(|| SecretBytes::copy_from(value)),
+        disposition,
         range,
         single_complete_line: false,
         source: Source::default(),
         stamp: None,
     });
+    true
 }
 #[allow(clippy::disallowed_methods)]
-fn field(report: &mut ScanReport, k: &Text, v: &Text) {
+fn field(report: &mut ScanReport, k: &Text, v: &Text, budget: Budget) -> bool {
     push(
         report,
         k.value.expose_secret(),
         v.value.expose_secret(),
         v.range.start as u64..v.range.end as u64,
-    );
+        budget,
+    )
 }
-fn json(node: &Node, servers: bool, report: &mut ScanReport) {
+fn json(node: &Node, servers: bool, report: &mut ScanReport, budget: Budget) {
     if let Some(fields) = node.object() {
         for (k, v) in fields {
+            if !room(report, budget, Path::new("")) {
+                return;
+            }
             if k.value.ct_eq(b"mcpServers")
                 || k.value.ct_eq(b"mcp_servers")
                 || k.value.ct_eq(b"mcp")
+                || k.value.ct_eq(b"servers")
             {
                 if let Some(entries) = v.object() {
                     for (_, server) in entries {
-                        json(server, true, report);
+                        if server.object().is_some() {
+                            json(server, true, report, budget);
+                        } else {
+                            report.issue("", "invalid_server");
+                        }
                     }
                 } else {
                     report.issue("", "invalid_servers");
                 }
-            } else if servers
+            } else if (servers || k.value.ct_eq(b"env"))
                 && (k.value.ct_eq(b"env")
                     || k.value.ct_eq(b"environment")
                     || k.value.ct_eq(b"headers")
@@ -89,7 +156,7 @@ fn json(node: &Node, servers: bool, report: &mut ScanReport) {
                 if let Some(entries) = v.object() {
                     for (name, value) in entries {
                         if let Some(t) = value.text() {
-                            field(report, name, t);
+                            field(report, name, t, budget);
                         } else {
                             report.issue("", "non_string_binding");
                         }
@@ -102,11 +169,13 @@ fn json(node: &Node, servers: bool, report: &mut ScanReport) {
                 .any(|name| k.value.ct_eq(name))
             {
                 if let Some(t) = v.text() {
-                    field(report, k, t);
+                    field(report, k, t, budget);
+                } else {
+                    report.issue("", "non_string_binding");
                 }
             } else if servers && k.value.ct_eq(b"envFile") {
                 if let Some(t) = v.text() {
-                    field(report, k, t);
+                    field(report, k, t, budget);
                 } else {
                     report.issue("", "invalid_env_file");
                 }
@@ -116,30 +185,43 @@ fn json(node: &Node, servers: bool, report: &mut ScanReport) {
                 if let Node::Array(args) = v {
                     for arg in args {
                         if let Some(t) = arg.text() {
-                            field(report, k, t);
-                            if let Some(f) = report.findings.last_mut() {
-                                f.disposition = Disposition::Manual;
+                            if field(report, k, t, budget) {
+                                if let Some(f) = report.findings.last_mut() {
+                                    f.disposition = Disposition::Manual;
+                                }
                             }
+                        } else {
+                            report.issue("", "invalid_argument");
                         }
                     }
+                } else {
+                    report.issue("", "invalid_arguments");
                 }
             } else {
-                json(v, servers, report);
+                json(v, servers, report, budget);
             }
         }
     } else if let Node::Array(values) = node {
         for value in values {
-            json(value, servers, report);
+            json(value, servers, report, budget);
         }
     }
 }
-fn toml_table(table: &dyn toml_edit::TableLike, servers: bool, report: &mut ScanReport) {
+fn toml_table(
+    table: &dyn toml_edit::TableLike,
+    servers: bool,
+    report: &mut ScanReport,
+    budget: Budget,
+) {
     for (key, item) in table.iter() {
-        if matches!(key, "mcp_servers" | "mcpServers" | "mcp") {
+        if !room(report, budget, Path::new("")) {
+            return;
+        }
+        if matches!(key, "mcp_servers" | "mcpServers" | "mcp" | "servers") {
             if let Some(entries) = item.as_table_like() {
                 for (_, server) in entries.iter() {
                     if let Some(t) = server.as_table_like() {
-                        toml_table(t, true, report);
+                        toml_table(t, true, report, budget);
                     } else {
                         report.issue("", "invalid_server");
                     }
@@ -147,7 +229,7 @@ fn toml_table(table: &dyn toml_edit::TableLike, servers: bool, report: &mut Scan
             } else {
                 report.issue("", "invalid_servers");
             }
-        } else if servers
+        } else if (servers || key == "env")
             && matches!(
                 key,
                 "env" | "environment" | "headers" | "http_headers" | "auth"
@@ -162,6 +244,7 @@ fn toml_table(table: &dyn toml_edit::TableLike, servers: bool, report: &mut Scan
                             name.as_bytes(),
                             v.as_bytes(),
                             span.start as u64..span.end as u64,
+                            budget,
                         );
                     } else {
                         report.issue("", "non_string_binding");
@@ -178,12 +261,36 @@ fn toml_table(table: &dyn toml_edit::TableLike, servers: bool, report: &mut Scan
                     b"envFile",
                     v.as_bytes(),
                     span.start as u64..span.end as u64,
+                    budget,
                 );
             } else {
                 report.issue("", "invalid_env_file");
             }
+        } else if servers && key == "args" {
+            if let Some(args) = item.as_array() {
+                for arg in args.iter() {
+                    if let Some(v) = arg.as_str() {
+                        let span = arg.span().unwrap_or(0..0);
+                        if push(
+                            report,
+                            b"args",
+                            v.as_bytes(),
+                            span.start as u64..span.end as u64,
+                            budget,
+                        ) {
+                            if let Some(f) = report.findings.last_mut() {
+                                f.disposition = Disposition::Manual;
+                            }
+                        }
+                    } else {
+                        report.issue("", "invalid_argument");
+                    }
+                }
+            } else {
+                report.issue("", "invalid_arguments");
+            }
         } else if let Some(t) = item.as_table_like() {
-            toml_table(t, servers, report);
+            toml_table(t, servers, report, budget);
         }
     }
 }
@@ -226,7 +333,15 @@ pub fn scan_config_sources_with_budget(
         };
         report.files += 1;
         report.bytes += bytes.len() as u64;
-        let mut parsed = parse_config(&bytes, source.format);
+        let mut parsed = parse_config_limited(
+            &bytes,
+            source.format,
+            Budget {
+                candidates: budget.candidates.saturating_sub(report.findings.len()),
+                occurrences: budget.occurrences.saturating_sub(report.findings.len()),
+                ..budget
+            },
+        );
         for f in &mut parsed.findings {
             f.source.path = root.path().join(rel);
             f.stamp = Some(stamp);
@@ -248,6 +363,11 @@ pub fn scan_config_sources_with_budget(
                 true
             }
         });
+        for f in &parsed.findings {
+            if f.name.ct_eq(b"envFile") && f.value.is_none() {
+                report.issue(root.path().join(rel), "unread_env_file");
+            }
+        }
         report.append(parsed);
         for included in includes {
             #[allow(clippy::disallowed_methods)]
@@ -287,7 +407,12 @@ pub fn scan_config_sources_with_budget(
                     match parse_dotenv(&b) {
                         Ok(entries) => {
                             for e in entries {
-                                let template = e.kind != crate::EntryKind::Plain;
+                                if !room(report, budget, &root.path().join(&path)) {
+                                    break;
+                                }
+                                let template = e.kind != crate::EntryKind::Plain
+                                    || path.file_name().and_then(crate::dotenv_kind)
+                                        == Some(Ok(crate::FileKind::Template));
                                 report.findings.push(Found {
                                     name: SecretBytes::copy_from(e.name.as_str().as_bytes()),
                                     value: if template { None } else { Some(e.value) },

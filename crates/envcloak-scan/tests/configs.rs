@@ -97,12 +97,60 @@ fn config_links_and_unsupported_stores_are_visible() {
     std::fs::write(d.path().join("target"), b"{}").unwrap();
     symlink("target", d.path().join("linked")).unwrap();
     let mut db = source(d.path().join("state.sqlite"), ConfigFormat::Raw);
+    std::fs::write(&db.path, b"not parsed").unwrap();
     db.source_kind = SourceKind::Database;
     let report =
         scan_config_sources(&[source(d.path().join("linked"), ConfigFormat::Json), db]).unwrap();
     assert!(report.issues.iter().any(|i| i.reason == "symlink"));
-    assert!(report.issues.iter().any(|i| i.reason == "database"));
+    assert!(report.notes.iter().any(|i| i.reason == "database"));
     assert!(!report.complete());
+}
+
+#[test]
+fn leftover_metadata_reports_links_fifo_unreadable_and_oversized() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let d = dir();
+    let original = d.path().join("config.json");
+    std::fs::write(&original, b"{}").unwrap();
+    let name = |suffix| {
+        d.path()
+            .join(format!(".config.json.envcloak-new-{suffix}.tmp"))
+    };
+    std::fs::write(name("01"), b"foreign").unwrap();
+    std::fs::hard_link(&original, name("02")).unwrap();
+    symlink("config.json", name("03")).unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .env_clear()
+            .arg(name("04"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::File::create(name("05"))
+        .unwrap()
+        .set_len(2 * envcloak_scan::MAX_DOTENV as u64)
+        .unwrap();
+    std::fs::write(name("06"), b"foreign").unwrap();
+    std::fs::set_permissions(name("06"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let r = scan_config_sources(&[source(original, ConfigFormat::Json)]).unwrap();
+    assert_eq!(r.leftovers.len(), 6);
+    assert!(!r.complete());
+    for (suffix, reason) in [
+        ("01", "possible_leftover"),
+        ("02", "hard_link"),
+        ("03", "symlink"),
+        ("04", "not_regular"),
+        ("05", "too_large"),
+        ("06", "unreadable"),
+    ] {
+        assert!(
+            r.leftovers
+                .iter()
+                .any(|l| l.source.path == name(suffix) && l.inspection == reason)
+        );
+        assert!(std::fs::symlink_metadata(name(suffix)).is_ok());
+    }
 }
 
 #[test]

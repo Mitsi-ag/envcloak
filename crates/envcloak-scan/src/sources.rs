@@ -71,14 +71,6 @@ pub(crate) fn walk_sources(
     let mut visited = std::collections::HashSet::new();
     let mut attempts = 0usize;
     for source in sources {
-        if source.source_kind == SourceKind::Database {
-            report.issue(&source.path, "database");
-            continue;
-        }
-        if source.source_kind == SourceKind::Credentials {
-            report.issue(&source.path, "manual_credentials");
-            continue;
-        }
         let Some(parent) = source.path.parent() else {
             report.issue(&source.path, "invalid_path");
             continue;
@@ -111,6 +103,15 @@ pub(crate) fn walk_sources(
                         continue;
                     }
                 };
+                if source.source_kind == SourceKind::Credentials && source.names.is_none() {
+                    if attempts >= budget.files {
+                        report.issue(&source.path, "file_budget");
+                    } else {
+                        attempts += 1;
+                        note_omitted(source, sub.path(), report);
+                    }
+                    continue;
+                }
                 walk(
                     &sub,
                     Path::new(""),
@@ -322,6 +323,9 @@ fn process(
     if !visited.insert(root.path().join(rel)) {
         return;
     }
+    if note_omitted(source, &root.path().join(rel), report) {
+        return;
+    }
     let stamp = FileStamp::of(&m);
     let before = report.findings.len();
     read(root, rel, source, report);
@@ -331,4 +335,26 @@ fn process(
             f.single_complete_line = false;
         }
     }
+}
+
+fn note_omitted(source: &ConfigSource, path: &Path, report: &mut ScanReport) -> bool {
+    let reason = match source.source_kind {
+        SourceKind::Database => "database",
+        SourceKind::Credentials => "manual_credentials",
+        _ => return false,
+    };
+    let source = Source {
+        path: path.to_path_buf(),
+        object: None,
+    };
+    if !report
+        .notes
+        .iter()
+        .any(|n| n.source == source && n.reason == reason)
+    {
+        report
+            .notes
+            .push(crate::candidates::Issue { source, reason });
+    }
+    true
 }

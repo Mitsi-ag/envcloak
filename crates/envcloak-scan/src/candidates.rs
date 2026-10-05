@@ -55,6 +55,9 @@ pub struct Issue {
 pub struct ScanReport {
     pub findings: Vec<Found>,
     pub issues: Vec<Issue>,
+    /// Existing stores deliberately outside this scanner's coverage.
+    /// These notes do not make an otherwise successful scan incomplete.
+    pub notes: Vec<Issue>,
     pub leftovers: Vec<Leftover>,
     pub files: u64,
     /// Budget charged: successful bytes, or the allowance of a failed config read.
@@ -65,17 +68,23 @@ impl ScanReport {
         self.issues.is_empty()
     }
     pub(crate) fn issue(&mut self, path: impl Into<PathBuf>, reason: &'static str) {
+        let path = path.into();
+        if self
+            .issues
+            .iter()
+            .any(|i| i.reason == reason && i.source.path == path)
+        {
+            return;
+        }
         self.issues.push(Issue {
-            source: Source {
-                path: path.into(),
-                object: None,
-            },
+            source: Source { path, object: None },
             reason,
         });
     }
     pub(crate) fn append(&mut self, mut other: Self) {
         self.findings.append(&mut other.findings);
         self.issues.append(&mut other.issues);
+        self.notes.append(&mut other.notes);
         self.leftovers.append(&mut other.leftovers);
         self.files += other.files;
         self.bytes += other.bytes;
