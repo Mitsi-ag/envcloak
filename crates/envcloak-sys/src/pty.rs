@@ -45,7 +45,8 @@
 //! side is handed over as a plain descriptor: there is no writer object
 //! here, so nothing writes into the PTY when it closes (`portable-pty`'s
 //! writer sends VEOF on drop, D-19); the relay that writes the person's
-//! input to it is M2-19's.
+//! input to it is `envcloak_exec`'s (M2-19), which writes keys only, and
+//! nothing at its end.
 //!
 //! Before it forks the monitor, [`spawn_session`] makes sure this process
 //! does not reap its children on its own
@@ -618,6 +619,43 @@ impl SessionMonitor {
             }
         }
         Ok(())
+    }
+
+    /// Closes the CLI's end of the control channel once the monitor has
+    /// reported the command's exit, keeping the monitor unreaped (its
+    /// [`SessionMonitor::finish`] reaps it later): the monitor, which has
+    /// waited for what the command wrote to be read and closed its own
+    /// descriptors on the slave, reaps the command and exits, which ends
+    /// the session. Without that the PTY can stay open as long as the
+    /// monitor lives: on macOS the session keeps the slave from closing
+    /// after a command such as `/bin/sh` (bash) has run on it (measured on
+    /// macOS 26.4: no end on the master side until the session's leader
+    /// exits), so a run would always wait out its 2-second cutoff. At the
+    /// session's end the kernel sends the terminal's foreground process
+    /// group (the command's, with what it left in it) SIGHUP; macOS also
+    /// revokes the terminal for every process still holding it
+    /// (`proc_exit`), Linux leaves it to them. No command can be sent
+    /// after this.
+    pub fn end_channel(&mut self) {
+        self.control = None;
+    }
+
+    /// A place where a test build kills the monitor (SIGKILL, through its
+    /// own handle, unreaped), as if it had died: when `ENVCLOAK_TEST_FAIL`
+    /// names `site` ([`crate::fail_point`]). Nothing in a build without the
+    /// `testing` feature, which only tests enable (release builds never
+    /// have it). `envcloak run --pty`'s relay has two (M2-19): where it has
+    /// read keys and not yet passed them on, and where the monitor has
+    /// reported the command's exit.
+    pub fn kill_point(&self, site: &str) {
+        #[cfg(feature = "testing")]
+        if crate::fail_point(site).is_err() {
+            if let Some(m) = self.monitor.as_ref() {
+                let _ = m.signal(libc::SIGKILL);
+            }
+        }
+        #[cfg(not(feature = "testing"))]
+        let _ = site;
     }
 
     /// Ends the session: closes the channel, so the monitor reaps the

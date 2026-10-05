@@ -62,12 +62,14 @@
 //! - **The command continues** (`Continued`) or **exits** (`Exited`): an
 //!   exit is observed with `WNOWAIT`, so the command stays unreaped and
 //!   its group's number cannot be reused: `Signal(n)` still reaches what
-//!   is left of the group. The monitor waits (up to 2 s) until the master
-//!   side has read what the command wrote, since macOS discards unread
-//!   output at the slave's last close, then closes its slave descriptors
-//!   (so the master sees the end once no descendant holds the slave),
-//!   reports the status, and reaps the command when the CLI closes the
-//!   channel. The CLI reads the master while it waits for reports.
+//!   is left of the group. The monitor reports the status at once, so the
+//!   CLI's 2-second cutoff for a descendant's output counts from the exit;
+//!   then it waits (up to 2 s, inside that cutoff) until the master side
+//!   has read what the command wrote, since macOS discards unread output
+//!   at the slave's last close, closes its slave descriptors (so the
+//!   master sees the end once no descendant holds the slave), and reaps
+//!   the command when the CLI closes the channel. The CLI reads the
+//!   master while it waits for reports and after the exit's.
 //! - **The channel ends** while the command runs (the CLI is gone): SIGHUP
 //!   then SIGCONT to the command's group, as a hangup would, and the
 //!   monitor waits for the command to exit before it reaps it and exits.
@@ -327,10 +329,16 @@ pub(crate) fn run<O: MonitorOps>(ops: &mut O, me: i32, child: i32) -> i32 {
                 }
                 Some(ChildChange::Exited(status)) => {
                     exited = true;
-                    ops.close_terminal();
+                    // Reported first, so the CLI's 2-second cutoff for
+                    // output still held by a descendant counts from the
+                    // exit, and the monitor's wait below for the CLI to
+                    // read the command's last output runs inside it rather
+                    // than before it (M2-19: one deadline, never two in a
+                    // row).
                     if control && !ops.write_control(&encode_report(Report::Exited(status))) {
                         control = false;
                     }
+                    ops.close_terminal();
                 }
             }
         }
@@ -629,10 +637,11 @@ const DRAIN_LIMIT_MS: libc::time_t = 2000;
 /// read yet (measured: macOS's `/bin/cat`, stopped and continued, writes
 /// its last line and exits; a reader that comes to it after the monitor's
 /// close finds the terminal ended and the line gone). Linux keeps the
-/// bytes readable, and reports 0 here at once. Bounded, so a command whose
-/// descendants keep writing does not hold the exit report back past the
-/// CLI's own cutoff. Async-signal-safe: `ioctl`, `clock_gettime` and
-/// `nanosleep` only.
+/// bytes readable, and reports 0 here at once. Bounded, and started once
+/// the exit is reported, so it runs inside the CLI's own 2-second cutoff
+/// rather than before it, and a command whose descendants keep writing
+/// never holds the run past that cutoff. Async-signal-safe: `ioctl`,
+/// `clock_gettime` and `nanosleep` only.
 fn drain_output() {
     let now_ms = || {
         // SAFETY: timespec is plain data; clock_gettime fills it in.
@@ -1404,8 +1413,8 @@ mod tests {
                 Did::Foreground(CHILD),
                 Did::Signal(CHILD, libc::SIGCONT),
                 Did::Report(Report::Continued),
-                Did::CloseTerminal,
                 Did::Report(Report::Exited(0)),
+                Did::CloseTerminal,
                 Did::Reap(CHILD),
             ]
         );
@@ -1670,8 +1679,8 @@ mod tests {
                         F(CHILD),
                         S(CHILD, cont),
                         R(Report::Continued, true),
-                        C,
                         R(Report::Exited(0), true),
+                        C,
                         P(CHILD),
                     ],
                 ),
@@ -1714,7 +1723,7 @@ mod tests {
                 (
                     vec![Step::Child(Exited(0)), Step::End],
                     Some(1),
-                    vec![C, R(Report::Exited(0), false), P(CHILD)],
+                    vec![R(Report::Exited(0), false), C, P(CHILD)],
                 ),
                 // A whole frame that is not a command.
                 (
@@ -1724,7 +1733,7 @@ mod tests {
                         Step::End,
                     ],
                     None,
-                    vec![C, R(Report::Exited(0), true), P(CHILD)],
+                    vec![R(Report::Exited(0), true), C, P(CHILD)],
                 ),
                 // Half a command, then the channel ends.
                 (
@@ -1740,7 +1749,7 @@ mod tests {
                 command(Command::Resume),
                 command(Command::Suspend),
             ];
-            let mut events = vec![C, R(Report::Exited(0), true)];
+            let mut events = vec![R(Report::Exited(0), true), C];
             for sig in [
                 libc::SIGINT,
                 libc::SIGQUIT,
