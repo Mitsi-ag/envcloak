@@ -130,7 +130,7 @@ pub fn scan_git_history(
             report.issue(&source, "byte_budget");
             break;
         }
-        if fields[1] == "blob" {
+        if matches!(fields[1], "blob" | "commit" | "tag") {
             // One extra byte of allowance lets the size-limited object reader
             // prove EOF without a false exact-budget failure.
             let slice_budget = Budget {
@@ -157,15 +157,20 @@ pub fn scan_git_history(
             report.bytes += part.bytes;
             report.candidates += part.candidates;
             report.not_scanned += part.not_scanned;
-            let complete = part.complete();
+            let stopped = part.issues.iter().any(|i| {
+                matches!(
+                    i.reason,
+                    "byte_budget" | "occurrence_budget" | "candidate_budget" | "unreadable"
+                )
+            });
             report.issues.extend(part.issues);
-            if !complete || part.bytes != size {
+            if stopped || part.bytes != size {
                 if part.bytes != size {
                     report.issue(&source, "truncated_git_object");
                 }
                 break;
             }
-        } else if matches!(fields[1], "tree" | "commit" | "tag") {
+        } else if fields[1] == "tree" {
             let count = std::io::copy(&mut reader.by_ref().take(size), &mut std::io::sink())
                 .map_err(|_| error())?;
             report.bytes += count;
