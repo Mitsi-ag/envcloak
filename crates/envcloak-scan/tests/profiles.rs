@@ -90,7 +90,7 @@ fn profile_roots_refuse_links_fifo_and_report_unreadable() {
     std::fs::write(dir.path().join(".bashrc"), b"A=fixture\n").unwrap();
     std::fs::set_permissions(
         dir.path().join(".bashrc"),
-        std::fs::Permissions::from_mode(0),
+        std::fs::Permissions::from_mode(0o000),
     )
     .unwrap();
     std::fs::write(dir.path().join(".zshrc"), b"B=control\n").unwrap();

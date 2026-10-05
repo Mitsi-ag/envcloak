@@ -1,4 +1,4 @@
-//! Bounded parser fuzz targets. PROPTEST_CASES raises the nightly run budget.
+//! Bounded parser fuzz targets; longer campaigns belong to milestone hardening.
 #![allow(clippy::unwrap_used)]
 use envcloak_core::SecretBytes;
 use envcloak_scan::{

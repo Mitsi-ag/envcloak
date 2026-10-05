@@ -32,7 +32,11 @@ fn new_roots_report_fifo_links_unreadable_and_stream_two_gib_within_budget() {
         .unwrap();
     assert!(o.status.success());
     std::fs::write(store.join("unreadable"), b"fixtureZunreadableValue").unwrap();
-    std::fs::set_permissions(store.join("unreadable"), std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(
+        store.join("unreadable"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
     let f = std::fs::File::create(store.join("z-large")).unwrap();
     f.set_len(2 * 1024 * 1024 * 1024).unwrap();
     let mut values = 0;
