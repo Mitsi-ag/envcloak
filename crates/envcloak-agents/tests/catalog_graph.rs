@@ -43,6 +43,98 @@ fn catalog(home: &Path) -> Locations {
     .unwrap()
 }
 
+#[test]
+fn catalog_settings_and_project_servers_produce_values() {
+    let home = fixture_home();
+    let project = home.path().join("project");
+    std::fs::create_dir_all(project.join(".vscode")).unwrap();
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        br#"{"env":{"A":"fixtureZsettingsValue"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".vscode/mcp.json"),
+        br#"{"servers":{"s":{"env":{"B":"fixtureZprojectValue"},"envFile":"values.env"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".vscode/values.env"),
+        b"C=fixtureZincludedValue\n",
+    )
+    .unwrap();
+    let mut sources = catalog(home.path()).config_sources();
+    sources.extend(Locations::project_config_sources(&project));
+    let report = envcloak_scan::scan_config_sources(&sources).unwrap();
+    for expected in [
+        b"fixtureZsettingsValue".as_slice(),
+        b"fixtureZprojectValue",
+        b"fixtureZincludedValue",
+    ] {
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.value.as_ref().is_some_and(|v| v.ct_eq(expected)))
+        );
+    }
+}
+
+#[test]
+fn absent_catalog_stores_are_complete_and_present_omissions_are_notes() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let locations = catalog(d.path());
+    let configs = locations.config_sources();
+    let transcripts = locations.transcript_sources();
+    let config = envcloak_scan::scan_config_sources(&configs).unwrap();
+    let transcript = envcloak_scan::transcript::scan_transcript_sources(
+        &transcripts,
+        Default::default(),
+        &mut |_| panic!("empty home emitted a value"),
+    )
+    .unwrap();
+    assert!(config.complete() && transcript.complete());
+    assert!(config.notes.is_empty() && transcript.notes.is_empty());
+    for s in configs.iter().chain(&transcripts).filter(|s| {
+        matches!(
+            s.source_kind,
+            SourceKind::Database | SourceKind::Credentials
+        )
+    }) {
+        std::fs::create_dir_all(s.path.parent().unwrap()).unwrap();
+        if let Some(name) = &s.names {
+            std::fs::create_dir_all(&s.path).unwrap();
+            std::fs::write(s.path.join(format!("{name}fixture.sqlite")), b"not read").unwrap();
+        } else {
+            std::fs::write(&s.path, b"not read").unwrap();
+        }
+    }
+    let config = envcloak_scan::scan_config_sources(&configs).unwrap();
+    let transcript = envcloak_scan::transcript::scan_transcript_sources(
+        &transcripts,
+        Default::default(),
+        &mut |_| panic!("omitted store emitted a value"),
+    )
+    .unwrap();
+    assert!(config.complete() && transcript.complete());
+    assert_eq!(
+        config
+            .notes
+            .iter()
+            .filter(|n| n.reason == "manual_credentials")
+            .count(),
+        2
+    );
+    assert_eq!(
+        transcript
+            .notes
+            .iter()
+            .filter(|n| n.reason == "database")
+            .count(),
+        1
+    );
+}
+
 /// What the scanner gets: its own type, by name, from the catalog.
 fn present(sources: Vec<ConfigSource>) -> Vec<(PathBuf, ConfigFormat, SourceKind, String)> {
     sources
