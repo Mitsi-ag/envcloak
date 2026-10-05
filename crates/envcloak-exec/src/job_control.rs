@@ -16,8 +16,12 @@
 //!    action, so the person's shell sees its job stopped and takes the
 //!    terminal back. The command is stopped already, so it never runs
 //!    while its terminal is restored;
-//! 4. on SIGCONT (the person's `fg`) the CLI returns from its stop, puts
-//!    the outer terminal back in raw mode and sends the PTY the outer
+//! 4. on SIGCONT (the person's `fg`) the CLI returns from its stop, reads
+//!    the outer terminal's settings again (the person's shell had it, and
+//!    a `stty susp ^X` or `stty -echo` made meanwhile is what later
+//!    restores put back; a control character the person changed is copied
+//!    to the PTY, so the remapped suspend character suspends), puts the
+//!    outer terminal back in raw mode and sends the PTY the outer
 //!    terminal's size again;
 //! 5. only then does it send `Resume`, after which the monitor hands the
 //!    slave back to the command's group and continues it. Resumed first,
@@ -26,7 +30,13 @@
 //!
 //! A terminal that cannot be restored is never left raw under the
 //! person's shell: the CLI then does not stop itself, and resumes the
-//! command at once.
+//! command at once (the terminal raw all along). A terminal that cannot be
+//! put back in raw mode is never handed to the command: the command is not
+//! resumed, no key is read or passed on any more, and the run ends
+//! ([`Halt::Raw`]); the command, still stopped, is hung up with its
+//! session. Resumed with the outer terminal cooked, the command would ask
+//! for a password with its own echo off while the person's terminal
+//! showed every key (Codex's review of M2-19).
 //!
 //! SIGTSTP sent to the CLI by another process ([`stop_requested`]) only
 //! asks the monitor to stop the command (`Suspend`): the outer terminal
@@ -56,6 +66,10 @@ pub(crate) trait Suspension {
     /// Stops this process's own group with SIGTSTP at its default action;
     /// returns once it is continued.
     fn stop_self(&mut self) -> io::Result<()>;
+    /// Reads the outer terminal's settings again, after the person's shell
+    /// had it, and keeps them for later restores and raw mode; copies a
+    /// control character the person changed to the PTY.
+    fn refresh_settings(&mut self);
     /// Puts the outer terminal back in raw mode.
     fn enter_raw(&mut self) -> io::Result<()>;
     /// Sets the PTY's size to the outer terminal's.
@@ -67,15 +81,32 @@ pub(crate) trait Suspension {
     fn resume(&mut self) -> io::Result<()>;
     /// Asks the monitor to stop the command's group (`Suspend`).
     fn suspend(&mut self) -> io::Result<()>;
+    /// Raw mode could not be taken again: no key is read from the outer
+    /// terminal or passed to the command from now on, and those read and
+    /// not yet passed on are wiped.
+    fn end_input(&mut self);
+}
+
+/// Why [`command_stopped`] did not resume the command.
+#[derive(Debug)]
+pub(crate) enum Halt {
+    /// The outer terminal could not be put back in raw mode: the command
+    /// stays stopped, input has ended, and the run must end.
+    Raw(io::Error),
+    /// The monitor could not be asked to resume the command (it is gone;
+    /// the relay then sees its channel end).
+    Monitor,
 }
 
 /// The monitor reported the command stopped: steps 1 to 5 of the module
-/// documentation. Returns how `Resume` went.
+/// documentation.
 ///
 /// # Errors
-/// The monitor could not be asked to resume the command (it is gone; the
-/// relay then sees its channel end).
-pub(crate) fn command_stopped(s: &mut impl Suspension) -> io::Result<()> {
+/// [`Halt::Raw`] when the outer terminal could not be put back in raw
+/// mode: the command was not resumed and input has ended
+/// ([`Suspension::end_input`]); [`Halt::Monitor`] when `Resume` could not
+/// be sent.
+pub(crate) fn command_stopped(s: &mut impl Suspension) -> Result<(), Halt> {
     s.barrier("exec.pty.stopped");
     s.flush_output();
     // Never stopped with the terminal raw: a terminal that cannot be put
@@ -85,14 +116,20 @@ pub(crate) fn command_stopped(s: &mut impl Suspension) -> io::Result<()> {
         // Not stopped (an orphaned group, which SIGTSTP does not stop, or
         // a failure): the command is resumed all the same.
         let _ = s.stop_self();
+        // The person's shell had the terminal: what it holds now is what
+        // later restores put back.
+        s.refresh_settings();
     }
-    // Raw again before the command can read: a failure here (the terminal
-    // gone) leaves nothing to protect, and the command is resumed so it
-    // can end.
-    let _ = s.enter_raw();
+    // Raw again before the command can read, or the command is never
+    // resumed: in the person's cooked mode the outer terminal would show
+    // every key the command reads with its own echo off.
+    if let Err(e) = s.enter_raw() {
+        s.end_input();
+        return Err(Halt::Raw(e));
+    }
     s.resend_size();
     s.barrier("exec.pty.resume");
-    s.resume()
+    s.resume().map_err(|_| Halt::Monitor)
 }
 
 /// SIGTSTP from another process: the command is stopped first, through the
@@ -114,11 +151,13 @@ mod tests {
         Flush,
         Restore,
         StopSelf,
+        Refresh,
         Raw,
         Size,
         Barrier(&'static str),
         Resume,
         Suspend,
+        EndInput,
     }
 
     #[derive(Default)]
@@ -143,6 +182,9 @@ mod tests {
             self.did.push(Did::StopSelf);
             Ok(())
         }
+        fn refresh_settings(&mut self) {
+            self.did.push(Did::Refresh);
+        }
         fn enter_raw(&mut self) -> io::Result<()> {
             self.did.push(Did::Raw);
             if self.raw_fails {
@@ -164,15 +206,20 @@ mod tests {
             self.did.push(Did::Suspend);
             Ok(())
         }
+        fn end_input(&mut self) {
+            self.did.push(Did::EndInput);
+        }
     }
 
     /// The order of D-35: output first, the terminal restored before the
-    /// CLI stops, and raw mode and the size back before `Resume`.
+    /// CLI stops, its settings read again once the person's shell had it,
+    /// and raw mode and the size back before `Resume`.
     ///
     /// Mutations checked: stop the CLI before restoring the outer terminal
-    /// (the person's shell would get a raw terminal), and send `Resume`
-    /// before re-entering raw mode (the command would read and echo in a
-    /// cooked terminal): each fails this.
+    /// (the person's shell would get a raw terminal); send `Resume` before
+    /// re-entering raw mode (the command would read and echo in a cooked
+    /// terminal); take raw mode from the settings saved at the start (no
+    /// refresh, review of M2-19, L-09): each fails this.
     #[test]
     fn a_stop_restores_before_the_cli_stops_and_resumes_only_once_raw_again() {
         let mut m = Model::default();
@@ -184,6 +231,7 @@ mod tests {
                 Did::Flush,
                 Did::Restore,
                 Did::StopSelf,
+                Did::Refresh,
                 Did::Raw,
                 Did::Size,
                 Did::Barrier("exec.pty.resume"),
@@ -193,7 +241,8 @@ mod tests {
     }
 
     /// A terminal that cannot be restored is never left raw under the
-    /// person's shell: the CLI does not stop, and resumes the command.
+    /// person's shell: the CLI does not stop, reads no settings the
+    /// person's shell never had, and resumes the command.
     #[test]
     fn a_terminal_that_cannot_be_restored_is_not_handed_back_raw() {
         let mut m = Model {
@@ -202,15 +251,36 @@ mod tests {
         };
         command_stopped(&mut m).unwrap();
         assert!(!m.did.contains(&Did::StopSelf), "{:?}", m.did);
+        assert!(!m.did.contains(&Did::Refresh), "{:?}", m.did);
         assert_eq!(m.did.last(), Some(&Did::Resume));
-        // Raw mode that cannot be taken again still resumes the command,
-        // so it can end.
-        let mut m = Model {
-            raw_fails: true,
-            ..Model::default()
-        };
-        command_stopped(&mut m).unwrap();
-        assert_eq!(m.did.last(), Some(&Did::Resume));
+    }
+
+    /// Codex's review of M2-19 (high): raw mode that cannot be taken again
+    /// blocks both the resume and the input: the command stays stopped, no
+    /// key is passed on from then on, and the caller is told to end the
+    /// run. With the terminal never restored either, the same.
+    ///
+    /// Mutation checked: ignore the failure and resume (as before the
+    /// review): `Resume` is sent with the outer terminal cooked, and this
+    /// fails.
+    #[test]
+    fn raw_mode_that_cannot_be_taken_again_resumes_nothing_and_ends_input() {
+        for restore_fails in [false, true] {
+            let mut m = Model {
+                restore_fails,
+                raw_fails: true,
+                ..Model::default()
+            };
+            let halted = command_stopped(&mut m);
+            assert!(matches!(halted, Err(Halt::Raw(_))), "{halted:?}");
+            assert!(!m.did.contains(&Did::Resume), "{:?}", m.did);
+            assert!(
+                !m.did.contains(&Did::Barrier("exec.pty.resume")),
+                "{:?}",
+                m.did
+            );
+            assert_eq!(m.did.last_chunk(), Some(&[Did::Raw, Did::EndInput]));
+        }
     }
 
     /// An outside SIGTSTP only asks the monitor to stop the command; the

@@ -33,8 +33,13 @@
 //! - **Suspension** ([`crate::job_control`]): the suspend character is
 //!   relayed as a byte; when the monitor reports the command stopped, the
 //!   CLI flushes, restores the outer terminal, stops its own group, and on
-//!   SIGCONT takes raw mode and the size again before it resumes the
-//!   command. SIGTSTP from another process stops the command first.
+//!   SIGCONT reads the outer terminal's settings again (what the person's
+//!   shell left there is what later restores put back, and a control
+//!   character the person changed is copied to the PTY), takes raw mode
+//!   and the size again, and only then resumes the command. Raw mode that
+//!   cannot be taken again resumes nothing: input ends, and the run ends
+//!   with [`ExecError::TerminalLost`]. SIGTSTP from another process stops
+//!   the command first.
 //! - **The end.** The monitor reports the command's exit at once, and the
 //!   relay then closes its end of the monitor's channel, so the monitor,
 //!   once what the command wrote has been read, reaps the command and
@@ -73,10 +78,12 @@ use envcloak_core::SecretBytes;
 use envcloak_policy::EnvName;
 use envcloak_redact::{Redactor, StreamRedactor};
 use envcloak_sys::pty::{MonitorCommand, MonitorEvent, SessionMonitor, forward_signal};
-use envcloak_sys::{Relayed, SignalRelay, TerminalGuard, set_window_size, window_size};
+use envcloak_sys::{
+    Relayed, SignalRelay, TerminalGuard, TerminalSettings, set_window_size, window_size,
+};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::job_control::{self, Suspension};
+use crate::job_control::{self, Halt, Suspension};
 use crate::signals::{PTY_CAUGHT, PtyAct, pty_act};
 use crate::{ChildExit, DRAIN_LIMIT, ExecError};
 
@@ -201,6 +208,7 @@ pub(crate) fn run(
         lost: false,
         deadline: None,
         stopped_by: None,
+        broken: None,
         terms: 0,
         read_buf: Zeroizing::new(vec![0u8; CHUNK]),
     };
@@ -242,6 +250,9 @@ struct Relay<'a, 'r> {
     /// The cutoff: [`DRAIN_LIMIT`] after the exit or the monitor's loss.
     deadline: Option<Instant>,
     stopped_by: Option<i32>,
+    /// The outer terminal could not be put back in raw mode for the
+    /// command: the run ends ([`ExecError::TerminalLost`]).
+    broken: Option<io::ErrorKind>,
     terms: u32,
     read_buf: Zeroizing<Vec<u8>>,
 }
@@ -259,8 +270,13 @@ impl Relay<'_, '_> {
             if let Some(sig) = self.stopped_by {
                 return Ok(End::Stopped(sig));
             }
+            if let Some(kind) = self.broken {
+                return Err(ExecError::TerminalLost(kind));
+            }
             if self.ended() {
                 let now = Instant::now();
+                // Not at its end 2 seconds after the exit, though read on
+                // since: a descendant holds the slave.
                 if self.master_state == Master::Open && self.deadline.is_some_and(|d| d <= now) {
                     self.cut();
                 }
@@ -341,10 +357,16 @@ impl Relay<'_, '_> {
         while self.channel_open {
             match self.monitor.next_event(Some(Duration::ZERO)) {
                 Ok(None) => break,
-                Ok(Some(MonitorEvent::Stopped(_))) => {
+                Ok(Some(MonitorEvent::Stopped(_))) => match job_control::command_stopped(self) {
+                    Ok(()) => {}
                     // The monitor gone: its channel's end says so next.
-                    let _ = job_control::command_stopped(self);
-                }
+                    Err(Halt::Monitor) => {}
+                    // Not resumed, input ended: the run ends.
+                    Err(Halt::Raw(e)) => {
+                        self.broken.get_or_insert(e.kind());
+                        return;
+                    }
+                },
                 Ok(Some(MonitorEvent::Continued)) => {}
                 Ok(Some(MonitorEvent::Exited(status))) => {
                     self.exit = Some(status);
@@ -417,7 +439,19 @@ impl Relay<'_, '_> {
                 }
                 PtyAct::Continued => {
                     if self.raw_wanted {
-                        let _ = self.enter_raw();
+                        // Continued from a stop that was not the relay's
+                        // own (SIGSTOP), or once more after it: what the
+                        // person's shell left is kept unless still raw.
+                        self.refresh_settings();
+                        // Before the exit the command reads keys: it never
+                        // does so with the outer terminal cooked.
+                        if let Err(e) = self.raw_on_sigcont() {
+                            if !self.ended() {
+                                self.end_input();
+                                self.broken.get_or_insert(e.kind());
+                                return;
+                            }
+                        }
                         self.resend_size();
                     }
                 }
@@ -425,6 +459,22 @@ impl Relay<'_, '_> {
                 PtyAct::Nothing => {}
             }
         }
+    }
+
+    /// Raw mode again on a SIGCONT the suspension did not wait for.
+    fn raw_on_sigcont(&self) -> io::Result<()> {
+        // A test build fails here on request, as a terminal that refuses
+        // raw mode would (Codex's review of M2-19).
+        envcloak_sys::fail_point("exec.pty.raw-on-sigcont")?;
+        self.reenter_raw()
+    }
+
+    /// The outer terminal in raw mode again, from the saved settings.
+    fn reenter_raw(&self) -> io::Result<()> {
+        self.guard
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
+            .reenter_raw()
     }
 
     /// SIGWINCH: the outer terminal's size to the PTY.
@@ -637,11 +687,32 @@ impl Suspension for Relay<'_, '_> {
         envcloak_sys::stop_own_job()
     }
 
+    fn refresh_settings(&mut self) {
+        let Some(g) = self.guard.as_mut() else {
+            return;
+        };
+        // Unread or still raw: the settings saved before stay.
+        let Ok(before) = g.refresh() else {
+            return;
+        };
+        let after = *g.saved();
+        let Some(m) = self.master.as_ref() else {
+            return;
+        };
+        // The master side reads and sets the slave's settings.
+        if let Ok(now) = TerminalSettings::read(m.as_fd()) {
+            let wanted = now.with_changed_control_chars(&before, &after);
+            if !wanted.same_as(&now) {
+                let _ = wanted.apply(m.as_fd());
+            }
+        }
+    }
+
     fn enter_raw(&mut self) -> io::Result<()> {
-        self.guard
-            .as_ref()
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
-            .reenter_raw()
+        // A test build fails here on request, as a terminal that refuses
+        // raw mode would (Codex's review of M2-19).
+        envcloak_sys::fail_point("exec.pty.raw")?;
+        self.reenter_raw()
     }
 
     fn resend_size(&mut self) {
@@ -664,5 +735,11 @@ impl Suspension for Relay<'_, '_> {
 
     fn suspend(&mut self) -> io::Result<()> {
         self.monitor.send(MonitorCommand::Suspend)
+    }
+
+    fn end_input(&mut self) {
+        self.input_open = false;
+        self.raw_wanted = false;
+        self.drop_keys();
     }
 }

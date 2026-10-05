@@ -143,6 +143,22 @@ fn main() {
                 a_sigcont_while_the_output_drains_loses_nothing,
             ),
             (
+                "the_command_is_resumed_only_once_the_outer_terminal_is_raw_again",
+                the_command_is_resumed_only_once_the_outer_terminal_is_raw_again,
+            ),
+            (
+                "raw_mode_refused_after_fg_resumes_nothing_and_ends_the_run",
+                raw_mode_refused_after_fg_resumes_nothing_and_ends_the_run,
+            ),
+            (
+                "raw_mode_refused_on_sigcont_ends_the_run",
+                raw_mode_refused_on_sigcont_ends_the_run,
+            ),
+            (
+                "a_stty_change_made_while_stopped_reaches_the_command_and_stays",
+                a_stty_change_made_while_stopped_reaches_the_command_and_stays,
+            ),
+            (
                 "a_monitor_that_dies_hangs_the_command_up_and_the_run_fails_monitor_lost",
                 a_monitor_that_dies_hangs_the_command_up_and_the_run_fails_monitor_lost,
             ),
@@ -1528,6 +1544,20 @@ impl JobShell {
         std::fs::read(path).unwrap()
     }
 
+    /// The exit status of the last command, through `echo`.
+    fn status(&mut self) -> i32 {
+        let mark = self.outer.seen.len();
+        self.say("echo \"rc=$?\"");
+        let shown = String::from_utf8_lossy(&self.outer.seen[mark..]).into_owned();
+        // The last `rc=`: the first is the typed line's echo.
+        shown
+            .rsplit("rc=")
+            .next()
+            .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no status: {shown}"))
+    }
+
     fn exit(mut self) {
         self.outer.type_bytes(b"exit 0\r");
         let status = self.outer.wait_exit(&mut self.shell, DEADLINE);
@@ -1550,6 +1580,26 @@ impl Drop for JobShell {
             }
         }
     }
+}
+
+/// The process state `ps` shows for `pid` (read, never signalled).
+fn state_of(pid: u32) -> String {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// The pid `counter.py` printed in its `JOB-READY` line.
+fn job_pid(outer: &Outer) -> u32 {
+    let text = String::from_utf8_lossy(&outer.seen).into_owned();
+    text[text.find("JOB-READY ").unwrap() + 10..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
 }
 
 /// The runner's command line as typed into a shell, every word quoted.
@@ -1694,6 +1744,10 @@ fn two_suspend_characters_in_one_read_stop_the_command_once() {
 /// the exit (held at the exit's report): raw mode and the size are taken
 /// again, and nothing else changes: every line comes, redacted, the run
 /// ends with the command's status, and the outer terminal is as before.
+/// The runner's own line about its pause goes to the same terminal and
+/// can land inside a marker it had half written (the verifier's review of
+/// M2-19: `[envcloak:openai_api_ke<pause line>y/t]`), so it is taken out
+/// before anything is counted.
 fn a_sigcont_while_the_output_drains_loses_nothing() {
     let case = Case::new();
     let release = case.path("go");
@@ -1718,11 +1772,248 @@ fn a_sigcont_while_the_output_drains_loses_nothing() {
     std::fs::write(&release, b"").unwrap();
     let status = outer.wait_exit(&mut run.child, DEADLINE);
     assert_eq!(status.code(), Some(7), "{}", outer.text());
+    let shown = without_once(&outer.seen, b"envcloak test: paused at exec.pty.exited\n");
     let m = marker(labels::OPENAI_API_KEY);
-    assert_eq!(outer.count(&m), 300, "{}", outer.text());
-    assert_eq!(outer.count(" line 299\r\n"), 1, "{}", outer.text());
+    assert_eq!(count(&shown, m.as_bytes()), 300, "{}", outer.text());
+    for i in 0..300 {
+        let line = format!("{m} line {i}\r\n");
+        assert_eq!(
+            count(&shown, line.as_bytes()),
+            1,
+            "line {i}: {}",
+            outer.text()
+        );
+    }
     assert!(outer.settings().same_as(&before), "the outer terminal");
     case.assert_clean(&outer.seen);
+}
+
+/// `hay` with the first `needle` in it taken out (a harness line the
+/// runner wrote to the terminal under test), or as it is.
+fn without_once(hay: &[u8], needle: &[u8]) -> Vec<u8> {
+    match hay.windows(needle.len()).position(|w| w == needle) {
+        Some(at) => [&hay[..at], &hay[at + needle.len()..]].concat(),
+        None => hay.to_vec(),
+    }
+}
+
+/// D-35's order at its last barrier: when the runner is held just before
+/// it sends `Resume` (`exec.pty.resume`, after the person's `fg`), the
+/// outer terminal is raw again already and the command is still stopped,
+/// for as long as it is held; once let go, the command reads on.
+///
+/// Mutation checked: send `Resume` before re-entering raw mode (the
+/// verifier's review of M2-19 asked for this case, as the end-to-end round
+/// trip cannot tell): the command is running at the barrier, and this
+/// fails.
+fn the_command_is_resumed_only_once_the_outer_terminal_is_raw_again() {
+    let case = Case::new();
+    let release = case.path("go");
+    let mut js = JobShell::start(&case, &pause_env("exec.pty.resume", &release));
+    let counter = case.script("counter.py", COUNTER);
+    let python = python3();
+    let argv = case.runner_argv(
+        &[],
+        &[],
+        &[
+            python.as_os_str(),
+            counter.as_os_str(),
+            case.dir.path().as_os_str(),
+            OsStr::new("job"),
+        ],
+    );
+    js.start_job(&typed(&argv));
+    js.outer.expect("JOB-READY", 1, "the command");
+    let pid = job_pid(&js.outer);
+    js.outer.type_bytes(b"one\r");
+    js.outer.expect("GOT [one]", 1, "a line read");
+    js.outer.type_bytes(&[0x1a]);
+    js.prompt_again("the suspend character gave the outer shell its prompt back");
+    js.job_stopped();
+    js.outer.type_bytes(b"fg\r");
+    js.outer.expect(
+        "paused at exec.pty.resume",
+        1,
+        "the runner held before Resume",
+    );
+    // Held there: raw, and the command stopped, throughout.
+    let watch = Instant::now() + Duration::from_millis(300);
+    loop {
+        assert!(
+            js.outer.settings().is_raw(),
+            "the outer terminal is not raw before Resume"
+        );
+        let state = state_of(pid);
+        assert!(
+            state.starts_with('T'),
+            "the command runs before Resume: state {state:?}"
+        );
+        if Instant::now() >= watch {
+            break;
+        }
+        js.outer
+            .wait_for_within(Duration::from_millis(50), |_| false);
+    }
+    std::fs::write(&release, b"").unwrap();
+    js.outer.type_bytes(b"two\r");
+    js.outer
+        .expect("GOT [two]", 1, "the command read on after Resume");
+    js.outer.type_bytes(b"done\r");
+    js.prompt_again("the command and the runner ended");
+    js.exit();
+}
+
+/// Codex's review of M2-19 (high): raw mode that cannot be taken again
+/// after `fg` (a test build's injected failure in the suspension's own
+/// step, `exec.pty.raw`; the SIGCONT that follows takes raw mode as ever)
+/// resumes nothing. The command stays stopped and gets no key: the run
+/// ends at once, 125 with `run_failed`, and the outer shell's prompt comes
+/// back with the terminal as before.
+///
+/// Mutation checked: ignore the failure and resume the command (as before
+/// the review): the run goes on, no prompt comes, and this fails.
+fn raw_mode_refused_after_fg_resumes_nothing_and_ends_the_run() {
+    let case = Case::new();
+    let mut js = JobShell::start(&case, &[("ENVCLOAK_TEST_FAIL", OsStr::new("exec.pty.raw"))]);
+    let before = js.stty_g(&case.path("before"));
+    let counter = case.script("counter.py", COUNTER);
+    let python = python3();
+    let argv = case.runner_argv(
+        &[],
+        &[],
+        &[
+            python.as_os_str(),
+            counter.as_os_str(),
+            case.dir.path().as_os_str(),
+            OsStr::new("job"),
+        ],
+    );
+    js.start_job(&typed(&argv));
+    js.outer.expect("JOB-READY", 1, "the command");
+    js.outer.type_bytes(b"one\r");
+    js.outer.expect("GOT [one]", 1, "a line read");
+    js.outer.type_bytes(&[0x1a]);
+    js.prompt_again("the suspend character gave the outer shell its prompt back");
+    js.job_stopped();
+    js.outer.type_bytes(b"fg\r");
+    js.prompt_again("the run ended without resuming the command");
+    assert_eq!(
+        js.outer
+            .count("envcloak: run_failed: your terminal could not be put back in raw mode"),
+        1,
+        "{}",
+        js.outer.text()
+    );
+    assert_eq!(js.status(), 125);
+    assert_eq!(js.stty_g(&case.path("after")), before, "the outer terminal");
+    js.exit();
+}
+
+/// The same class on the other path to raw mode (Codex's review of M2-19,
+/// swept): a SIGCONT the suspension did not wait for (the runner stopped
+/// by another process, or continued twice) takes raw mode again before the
+/// command reads another key; refused there (`exec.pty.raw-on-sigcont`),
+/// the run ends at once, 125 with `run_failed`, no key typed after it
+/// reaches the command, and the outer terminal is as before.
+///
+/// Mutation checked: ignore the failure there (as before the review): the
+/// run goes on, the typed line reaches the command, the run exits 0, and
+/// this fails.
+fn raw_mode_refused_on_sigcont_ends_the_run() {
+    let case = Case::new();
+    let counter = case.script("counter.py", COUNTER);
+    let mut outer = Outer::new(24, 80);
+    let before = outer.settings();
+    let python = python3();
+    let argv = case.runner_argv(
+        &[],
+        &[],
+        &[
+            python.as_os_str(),
+            counter.as_os_str(),
+            case.dir.path().as_os_str(),
+            OsStr::new("job"),
+        ],
+    );
+    let mut run = Running {
+        child: detach(
+            &case,
+            &outer,
+            &argv,
+            &[("ENVCLOAK_TEST_FAIL", OsStr::new("exec.pty.raw-on-sigcont"))],
+        ),
+    };
+    outer.expect("JOB-READY", 1, "the command");
+    outer.type_bytes(b"one\r");
+    outer.expect("GOT [one]", 1, "a line read");
+    run.signal(libc::SIGCONT);
+    outer.expect("envcloak: run_failed: ", 1, "the run ended");
+    outer.type_bytes(b"two\r");
+    let status = outer.wait_exit(&mut run.child, DEADLINE);
+    assert_eq!(status.code(), Some(125), "{}", outer.text());
+    assert_eq!(outer.count("GOT [two]"), 0, "{}", outer.text());
+    assert!(outer.settings().same_as(&before), "the outer terminal");
+}
+
+/// The verifier's review of M2-19 (L-09): what the person changes on
+/// their terminal while the job is stopped is what the run takes from
+/// then on. `stty susp '^X'` made at the outer shell's prompt: after `fg`
+/// the remapped character reaches the command's terminal as its suspend
+/// character (^X stops the command), and the restores put the remapped
+/// settings back, at the next stop and at the end of the run (`stty -g`
+/// equal to what the person set, not to the settings from before the
+/// run).
+///
+/// Mutation checked: take raw mode and later restores from the settings
+/// saved at the start (no `refresh_settings` after the stop): ^X reaches
+/// cat as data, no prompt comes back, and this fails.
+fn a_stty_change_made_while_stopped_reaches_the_command_and_stays() {
+    let case = Case::new();
+    let mut js = JobShell::start(&case, &[]);
+    let before = js.stty_g(&case.path("before"));
+    let cat = case.script("cat.py", RETRY_CAT);
+    let python = python3();
+    let argv = case.runner_argv(&[], &[], &[python.as_os_str(), cat.as_os_str()]);
+    js.start_job(&typed(&argv));
+    js.outer.expect("CAT-READY", 1, "cat");
+    js.outer.type_bytes(b"line-one\r");
+    js.outer
+        .expect("line-one", 2, "a line round-trips through cat");
+    js.outer.type_bytes(&[0x1a]);
+    js.prompt_again("the suspend character gave the outer shell its prompt back");
+    js.job_stopped();
+    assert_eq!(js.stty_g(&case.path("after")), before, "the outer terminal");
+    js.say("stty susp '^X'");
+    let remapped = js.stty_g(&case.path("remapped"));
+    assert_ne!(remapped, before);
+    js.outer.type_bytes(b"fg\r");
+    js.outer.type_bytes(b"line-two\r");
+    js.outer
+        .expect("line-two", 2, "a fresh line round-trips after fg");
+    js.outer.type_bytes(&[0x18]);
+    js.prompt_again("the remapped suspend character stopped the command");
+    js.job_stopped();
+    assert_eq!(
+        js.stty_g(&case.path("after-x")),
+        remapped,
+        "the outer terminal at the second stop"
+    );
+    js.outer.type_bytes(b"fg\r");
+    js.outer.type_bytes(b"line-three\r");
+    js.outer.expect(
+        "line-three",
+        2,
+        "a fresh line round-trips after the second fg",
+    );
+    js.outer.type_bytes(b"\x04");
+    js.prompt_again("cat and the runner ended");
+    assert_eq!(
+        js.stty_g(&case.path("end")),
+        remapped,
+        "the outer terminal after the run"
+    );
+    js.say("stty susp '^Z'");
+    js.exit();
 }
 
 // ---------------------------------------------------------------------------
