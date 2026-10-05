@@ -36,9 +36,11 @@ its own after a bound. The script is never reaped before its group is
 empty, so no signal can reach a process that took a reaped pid (L-03).
 
 With --script PATH the cases run against another copy of build-app.sh. Run
-against the script before this test's round (an EXIT trap only, mktemp names
-in command substitutions), the signal, closed-stderr and staging-directory
-cases fail; with either sign-check call removed, the sign-check cases fail.
+against the script of round 2 (an EXIT trap only, mktemp names in command
+substitutions), the signal, closed-stderr and staging-directory cases fail;
+against round 3's (its cleanup removing every name with its pid), the
+earlier-run case fails; with either sign-check call removed, the sign-check
+cases fail.
 
 Usage: python3 scripts/macos/tests/test_build_swap.py [--script PATH]
 """
