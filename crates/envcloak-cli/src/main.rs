@@ -95,7 +95,7 @@ const HELP: &str = "usage:
   envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
   envcloak ls [--long] [--json]
   envcloak show <slug> [--json]
-  envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]
+  envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest PATH] [--json]
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]

@@ -30,14 +30,16 @@
 //! no grant (`live_not_ticked`). When the same provider has a
 //! test-classified item, the statement proposes it, before the bindings
 //! and their ticks, with how to bind it in the live one's place for the
-//! layer the live binding came from (the `envcloak ref` line for the
-//! manifest's `[env]` or a profile's table, the `--ref` or the env file's
-//! line otherwise: [`Proposal::advice`]); the daemon never substitutes an
-//! item. A proposal is not approved, so a name of one shaped like a key
-//! is not shown ([`HIDDEN`]). The daemon builds
-//! the classifications and the proposals from the vault when it shows the
-//! statement and again when it takes the approval (L-09), so a statement
-//! read before either changed is a `statement_mismatch`.
+//! layer the live binding came from (the `envcloak ref --manifest` line,
+//! naming the request's manifest, for its `[env]` or a profile's table,
+//! the `--ref` or the env file's line otherwise: [`Proposal::advice`]);
+//! the daemon never substitutes an item. A proposal is not approved, so a
+//! name of one shaped like a key is not shown ([`HIDDEN`]), and a proposed
+//! item is not vouched for: any caller can add a test item, or tighten
+//! one to live. The daemon builds the classifications and the proposals
+//! from the vault when it shows the statement and again when it takes the
+//! approval (L-09), so a statement read before either changed is a
+//! `statement_mismatch`, the change an agent's included.
 //!
 //! Every string the daemon sends (paths, slugs, an agent's name, argv) goes
 //! through the escaper before it reaches a terminal: a program running as
@@ -131,31 +133,64 @@ impl Proposal {
     /// item (resolution: a later layer replaces an earlier one, so the
     /// change goes where the live binding is):
     ///
-    /// - the manifest's `[env]`: run `envcloak ref NAME=<test>`;
-    /// - a profile's `[env.<profile>]`: run `envcloak ref --profile
-    ///   <profile> NAME=<test>`;
+    /// - the manifest's `[env]`: run `envcloak ref --manifest <manifest>
+    ///   NAME=<test>`;
+    /// - a profile's `[env.<profile>]`: run `envcloak ref --manifest
+    ///   <manifest> --profile <profile> NAME=<test>`;
     /// - the `--env-file`: set its line `<n>` to `NAME=envcloak://<test>`;
     /// - a `--ref`: give `--ref NAME=<test>` in place of the `--ref` for
     ///   `NAME`.
     ///
+    /// `manifest` is the path of the request's manifest, which the edit
+    /// names: `envcloak ref` alone edits the manifest nearest the directory
+    /// it runs in, and the terminal that follows the advice can be anywhere
+    /// (`run --manifest`, a person's own terminal). It is one shell word
+    /// ([`shell_word`]), so a path with spaces or a quote, or one a program
+    /// answering in the daemon's place chose, is that one argument. A path
+    /// holding a character the display escapes cannot be shown as the word
+    /// it is: the advice names its directory instead.
+    ///
     /// Every name is escaped, and one that `looks_like_value` takes for a
     /// key or token is [`HIDDEN`] (a proposal is not approved, so nothing
     /// the person approves is hidden by this).
-    pub fn advice(&self, looks_like_value: &dyn Fn(&str) -> bool) -> String {
+    pub fn advice(&self, manifest: &str, looks_like_value: &dyn Fn(&str) -> bool) -> String {
+        if let Some(line) = self.command_line_advice(looks_like_value) {
+            return line;
+        }
+        let name = shown_name(&self.env_name, looks_like_value);
+        let reference = self.shown_reference(looks_like_value);
+        let profile = match &self.source {
+            BindingSource::Profile { profile } => {
+                format!(" --profile {}", shown_name(profile, looks_like_value))
+            }
+            _ => String::new(),
+        };
+        match shell_word(manifest) {
+            Some(m) => format!("run `envcloak ref --manifest {m}{profile} {name}={reference}`"),
+            None => format!(
+                "run `envcloak ref{profile} {name}={reference}` in the directory of the manifest \
+                 {}",
+                escape_for_display(manifest)
+            ),
+        }
+    }
+
+    /// How to bind the test item when the live binding came from the
+    /// run's own command line, which names no manifest: the `--env-file`'s
+    /// line, or another `--ref` ([`Proposal::advice`]). `None` for a
+    /// binding of the manifest (`[env]` or a profile), which an edit of
+    /// the manifest replaces.
+    pub fn command_line_advice(&self, looks_like_value: &dyn Fn(&str) -> bool) -> Option<String> {
         let name = shown_name(&self.env_name, looks_like_value);
         let reference = self.shown_reference(looks_like_value);
         match &self.source {
-            BindingSource::Env => format!("run `envcloak ref {name}={reference}`"),
-            BindingSource::Profile { profile } => format!(
-                "run `envcloak ref --profile {} {name}={reference}`",
-                shown_name(profile, looks_like_value)
-            ),
-            BindingSource::EnvFile { line } => {
-                format!("set line {line} of the --env-file to `{name}=envcloak://{reference}`")
-            }
-            BindingSource::Ref => {
-                format!("give `--ref {name}={reference}` in place of the --ref for {name}")
-            }
+            BindingSource::Env | BindingSource::Profile { .. } => None,
+            BindingSource::EnvFile { line } => Some(format!(
+                "set line {line} of the --env-file to `{name}=envcloak://{reference}`"
+            )),
+            BindingSource::Ref => Some(format!(
+                "give `--ref {name}={reference}` in place of the --ref for {name}"
+            )),
         }
     }
 
@@ -194,6 +229,26 @@ pub fn shown_name(s: &str, looks_like_value: &dyn Fn(&str) -> bool) -> String {
     } else {
         escape_for_display(s)
     }
+}
+
+/// `s` as one word of a POSIX shell command line, when it can be shown as
+/// that word: as it is when every character is one a shell takes as
+/// itself (letters, digits and `/._-+=:,@%`), else in single quotes, a `'`
+/// in it written `'\''`. Quoted, nothing in it is expanded or run, so a
+/// path a program chose (one answering in the daemon's place, SPEC §1.1)
+/// is that one argument when the line is pasted. `None` when it is empty
+/// or holds a character [`escape_for_display`] escapes (a control or an
+/// invisible one): shown escaped, it would no longer be the same word.
+pub fn shell_word(s: &str) -> Option<String> {
+    if s.is_empty() || s.chars().any(display_escaped) {
+        return None;
+    }
+    if s.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/._-+=:,@%".contains(&b))
+    {
+        return Some(s.to_owned());
+    }
+    Some(format!("'{}'", s.replace('\'', "'\\''")))
 }
 
 /// Whether the live-key guard applies to a request from a subject of kind
@@ -695,7 +750,11 @@ pub fn render_statement_with(
                 x.shown_reference(looks_like_value),
                 hide(&x.live_slug)
             );
-            let _ = writeln!(t, "      to bind it: {}", x.advice(looks_like_value));
+            let _ = writeln!(
+                t,
+                "      to bind it: {}",
+                x.advice(&p.project.manifest, looks_like_value)
+            );
         }
     }
     let guarded = live_guarded(p.subject.kind);

@@ -2242,7 +2242,10 @@ fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
     let ticks = text.find("STRIPE_SECRET_KEY = stripe/acme-live").unwrap();
     assert!(test < ticks, "{text}");
     assert!(
-        text.contains("run `envcloak ref STRIPE_SECRET_KEY=stripe/zzz-test`"),
+        text.contains(
+            "run `envcloak ref --manifest /src/acme-web/envcloak.toml \
+             STRIPE_SECRET_KEY=stripe/zzz-test`"
+        ),
         "{text}"
     );
 }

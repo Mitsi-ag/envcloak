@@ -2617,10 +2617,13 @@ fn project_status_shows_only_the_grants_that_cover_this_agent() {
 /// `approval_required` message names, for the live Stripe binding, the
 /// same provider's test item and how to bind it for the layer the binding
 /// came from (`[env]`, or the profile the call names), from the run's
-/// status record; it still says nothing of `envcloak approve`. Following
-/// it with `add_reference`, as the message says, the next call's request
-/// binds the test item and names no test key. The control: a project whose
-/// live key's provider has no test item names none.
+/// status record: `add_reference` with this call's `project_dir` (Codex,
+/// round 3: the round-2 message named `envcloak ref`, which in a shell
+/// edits the manifest nearest the shell's directory); it still says
+/// nothing of `envcloak approve`. Following it with `add_reference`, as
+/// the message says, the next call's request binds the test item and
+/// names no test key. The control: a project whose live key's provider
+/// has no test item names none.
 ///
 /// Mutation: the message without the proposals (`test_keys` answering
 /// nothing): no test key is named and this fails; and the record without
@@ -2665,8 +2668,7 @@ fn run_with_secrets_names_the_test_key_for_a_live_one() {
     let named = |advice: &str| {
         format!(
             "STRIPE_SECRET_KEY is bound to the live key stripe/acme-live: to use the test key \
-             stripe/acme-test instead, {advice}, and call run_with_secrets again (add_reference \
-             binds a variable as `envcloak ref` does)."
+             stripe/acme-test instead, {advice}, and call run_with_secrets again."
         )
     };
     let message = call(&mut m, json!({}));
@@ -2676,14 +2678,16 @@ fn run_with_secrets_names_the_test_key_for_a_live_one() {
     );
     assert!(
         message.contains(&named(
-            "run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`"
+            "call add_reference with this call's project_dir, env_name STRIPE_SECRET_KEY and \
+             slug stripe/acme-test"
         )),
         "{message}"
     );
     let message = call(&mut m, json!({"profile": "dev"}));
     assert!(
         message.contains(&named(
-            "run `envcloak ref --profile dev STRIPE_SECRET_KEY=stripe/acme-test`"
+            "call add_reference with this call's project_dir, env_name STRIPE_SECRET_KEY and \
+             slug stripe/acme-test and profile dev"
         )),
         "{message}"
     );
@@ -2694,8 +2698,19 @@ fn run_with_secrets_names_the_test_key_for_a_live_one() {
             "slug": "stripe/acme-test", "profile": "dev"}),
     );
     assert_eq!(structured(&r)["change"], "replaced", "{r}");
-    let message = call(&mut m, json!({"profile": "dev"}));
-    assert!(!message.contains("test key"), "{message}");
+    let r = m.call(
+        "run_with_secrets",
+        json!({"project_dir": dir, "argv": ["/usr/bin/true"], "profile": "dev"}),
+    );
+    let s = structured(&r).clone();
+    assert_eq!(s["status"], "approval_required", "{s}");
+    assert!(!s["message"].as_str().unwrap().contains("test key"), "{s}");
+    // The `[env]` request and the profile's are each pending on their own
+    // (a request's layers are part of its identity, GRANTS.md), so this
+    // root has three waiting, the most it may: the person denies the last
+    // before the control asks.
+    let denied = common::run(&f.home, &["deny", s["request"].as_str().unwrap()], &[]);
+    assert!(denied.status.success(), "{}", stderr(&denied));
     // The control: the live OpenAI key's provider has no test item.
     let r = m.call(
         "run_with_secrets",
