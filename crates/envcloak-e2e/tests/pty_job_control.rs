@@ -16,11 +16,12 @@
 //!   what it was before, and `fg` resumes it; `/bin/cat` then does what its
 //!   baseline did (Linux's reads on; macOS's ends with "Interrupted system
 //!   call", as under any shell, M2-17);
-//! - a cat that reads again on `EINTR`: the same, then a fresh line
-//!   round-trips, and values typed into it (the PEM-shaped one, whose CR LF
-//!   form the terminal shows, and an API key) come back redacted (its echo
-//!   turned off first: on Linux the echo of a later line falls between the
-//!   copies of the lines before, measured in CI);
+//! - a cat that reads again on `EINTR`: the same, then (once it says it
+//!   was continued) a fresh line round-trips, and values typed into it
+//!   (the PEM-shaped one, whose CR LF form the terminal shows, and an API
+//!   key) come back redacted (its echo turned off first: on Linux the echo
+//!   of a later line falls between the copies of the lines before,
+//!   measured in CI);
 //! - a nested interactive shell as the command: the suspend character
 //!   stops its job and gives it its prompt back while `envcloak run` stays
 //!   running with the outer terminal raw, and `fg` in it resumes the job;
@@ -33,6 +34,10 @@
 //! - SIGTSTP sent to `envcloak run` from outside (by the program that
 //!   started it, its owner): the command is stopped before the outer
 //!   terminal is restored (it is stopped when the outer prompt comes);
+//! - the retrying cat again under `/bin/dash -i`, a job of the outer shell
+//!   in its session: dash, unlike bash, does not put its own terminal
+//!   settings back when a job stops, so `stty -g` at its prompt is what
+//!   `envcloak run` restored before it stopped;
 //! - a panic in the relay (a test build's injected one) leaves the outer
 //!   terminal as it was, echo on.
 //!
@@ -83,13 +88,15 @@ fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
 os.execv(sys.argv[1], sys.argv[1:])\n";
 
 /// A cat that reads again when a read is interrupted (`EINTR`, PEP 475),
-/// writes whole, and keeps SIGTSTP's default. Prints `CAT-READY` first. On
-/// the line `QUIET` it turns its terminal's echo off before it copies the
-/// line, so what is typed after shows only as its copy: the line
-/// discipline's echo of a later line cannot fall between the copies of
-/// the lines before (it does on Linux, measured), and a value typed over
-/// several lines comes back whole.
-const RETRY_CAT: &str = r"import os, termios
+/// writes whole, and keeps SIGTSTP's default. Prints `CAT-READY` first,
+/// and `CAT-CONT` each time it is continued (SIGCONT), so a line is typed
+/// after `fg` only once it reads again. On the line `QUIET` it turns its
+/// terminal's echo off before it copies the line, so what is typed after
+/// shows only as its copy: the line discipline's echo of a later line
+/// cannot fall between the copies of the lines before (it does on Linux,
+/// measured), and a value typed over several lines comes back whole.
+const RETRY_CAT: &str = r"import os, signal, termios
+signal.signal(signal.SIGCONT, lambda sig, frame: os.write(1, b'CAT-CONT\n'))
 os.write(1, b'CAT-READY\n')
 while True:
     b = os.read(0, 65536)
@@ -468,12 +475,15 @@ impl Shell {
             .unwrap_or_else(|| panic!("no status: {shown}"))
     }
 
-    /// `jobs` lists the job as stopped.
+    /// `jobs` lists the job as stopped (bash and Linux's dash say
+    /// "Stopped", macOS's dash "Suspended", `strsignal`'s name for
+    /// SIGTSTP there).
     fn job_stopped(&mut self) {
         let mark = self.mark();
         self.say("jobs");
         assert!(
-            self.outer.count_since(mark, b"Stopped") >= 1,
+            self.outer.count_since(mark, b"Stopped") + self.outer.count_since(mark, b"Suspended")
+                >= 1,
             "jobs did not list a stopped job:\n{}",
             self.outer.text()
         );
@@ -550,8 +560,17 @@ fn lines(path: &Path) -> usize {
 
 /// The suspend character's cycle for a job just started: it stops, the
 /// shell's prompt comes back with the job stopped and the terminal as
-/// `before`, and `fg` resumes it.
-fn suspend_and_resume(sh: &mut Shell, files: &Path, before: &[u8], suspend: u8, what: &str) {
+/// `before`, and `fg` resumes it; when the command says so once continued
+/// (`resumed`, the retrying cat's `CAT-CONT`), that is waited for, so the
+/// next line is typed once it reads again (the verifier's review of M2-19:
+/// a line typed at once after `fg` makes the round trip depend on timing).
+fn suspend_and_resume(
+    sh: &mut Shell,
+    files: &Path,
+    before: &[u8],
+    (suspend, resumed): (u8, Option<&[u8]>),
+    what: &str,
+) {
     sh.outer.type_bytes(&[suspend]);
     sh.prompt_again(&format!(
         "{what}: the suspend character gave the shell its prompt"
@@ -562,7 +581,12 @@ fn suspend_and_resume(sh: &mut Shell, files: &Path, before: &[u8], suspend: u8, 
         before,
         "{what}: the outer terminal was not restored when the job stopped"
     );
+    let mark = sh.mark();
     sh.outer.type_bytes(b"fg\r");
+    if let Some(resumed) = resumed {
+        sh.outer
+            .expect_since(mark, resumed, 1, &format!("{what}: continued by fg"));
+    }
 }
 
 /// What `/bin/cat`, continued by `fg` inside a read of its terminal, does
@@ -593,10 +617,12 @@ fn cat_after_fg(sh: &mut Shell, line: &str) -> bool {
 /// monitor (the suspend character stops nothing: no prompt comes back);
 /// every suspend character turned into a stop signal for the command (the
 /// raw-mode program never reads its byte, and the nested shell's job does
-/// not stop); the CLI stopped before the outer terminal is restored (`stty
-/// -g` differs); the outer terminal restored on an outside SIGTSTP without
-/// the command stopped first (the ticker runs while the prompt is back);
-/// the PTY redactor without the CR LF forms (the PEM-shaped value shows).
+/// not stop); the CLI stopped before the outer terminal is restored (under
+/// dash the terminal is left raw, so `stty -g` at its prompt never runs;
+/// bash puts its own settings back when a job stops and cannot show it);
+/// the outer terminal restored on an outside SIGTSTP without the command
+/// stopped first (the ticker runs while the prompt is back); the PTY
+/// redactor without the CR LF forms (the PEM-shaped value shows).
 #[test]
 fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pty() {
     let mut h = Harness::start();
@@ -651,7 +677,13 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer.type_bytes(b"base-one\r");
     sh.outer
         .expect_since(mark, b"base-one", 2, "a line round-trips through cat");
-    suspend_and_resume(&mut sh, &files, &before, 0x1a, "/bin/cat under the shell");
+    suspend_and_resume(
+        &mut sh,
+        &files,
+        &before,
+        (0x1a, None),
+        "/bin/cat under the shell",
+    );
     let reads_on = cat_after_fg(&mut sh, "base-two");
     if reads_on {
         sh.outer.type_bytes(b"\x04");
@@ -679,7 +711,7 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer.type_bytes(b"env-one\r");
     sh.outer
         .expect_since(mark, b"env-one", 2, "a line round-trips through cat");
-    suspend_and_resume(&mut sh, &files, &before, 0x1a, "/bin/cat");
+    suspend_and_resume(&mut sh, &files, &before, (0x1a, None), "/bin/cat");
     assert_eq!(
         cat_after_fg(&mut sh, "env-two"),
         reads_on,
@@ -699,7 +731,13 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer.type_bytes(b"r-one\r");
     sh.outer
         .expect_since(mark, b"r-one", 2, "a line round-trips through cat");
-    suspend_and_resume(&mut sh, &files, &before, 0x1a, "the retrying cat");
+    suspend_and_resume(
+        &mut sh,
+        &files,
+        &before,
+        (0x1a, Some(b"CAT-CONT")),
+        "the retrying cat",
+    );
     let mark = sh.mark();
     sh.outer.type_bytes(b"r-two\r");
     sh.outer
@@ -793,7 +831,13 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.start_job(&run_pty(&h, &[&py, &raw_suspend]));
     sh.outer
         .expect_since(mark, b"RAW-READY", 1, "the raw program");
-    suspend_and_resume(&mut sh, &files, &before, 0x1a, "the raw-mode program");
+    suspend_and_resume(
+        &mut sh,
+        &files,
+        &before,
+        (0x1a, None),
+        "the raw-mode program",
+    );
     assert_eq!(
         sh.outer.count_since(mark, b"GOT-SUSPEND-BYTE"),
         1,
@@ -817,7 +861,13 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer.type_bytes(b"z1\x1az2\r");
     sh.outer
         .expect_since(mark, b"z1\x1az2", 1, "^Z reached cat as data");
-    suspend_and_resume(&mut sh, &files, &remapped, 0x18, "^X remapped");
+    suspend_and_resume(
+        &mut sh,
+        &files,
+        &remapped,
+        (0x18, Some(b"CAT-CONT")),
+        "^X remapped",
+    );
     let mark = sh.mark();
     sh.outer.type_bytes(b"x-two\r");
     sh.outer
@@ -910,6 +960,47 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         .expect_since(mark, b"done", 1, "the ticker read done");
     sh.prompt_again("the ticker and the run ended");
     assert_eq!(sh.status(), 0);
+
+    // Under dash, which leaves the terminal as a stopped job had it (bash
+    // and ksh put back their own settings when a job stops, dash does not;
+    // measured on macOS 26.4, and Ubuntu's /bin/sh is dash): `stty -g` at
+    // its prompt shows what `envcloak run` itself put back before it
+    // stopped (the verifier's review of M2-19). A job of the outer shell,
+    // in its session, so the person's grant covers its runs; its prompt
+    // typed in two quoted halves, so the typed line never shows it whole.
+    if Path::new("/bin/dash").exists() {
+        sh.start_job("PS1='EC-OUT''ER> ' /bin/dash -i");
+        sh.prompt_again("dash's first prompt");
+        sh.say("set -m");
+        let before_dash = sh.stty_g(&files, "before-dash");
+        let mark = sh.mark();
+        sh.start_job(&run_pty(&h, &[&py, &retry_cat]));
+        sh.outer
+            .expect_since(mark, b"CAT-READY", 1, "cat under dash");
+        sh.outer.type_bytes(b"d-one\r");
+        sh.outer.expect_since(
+            mark,
+            b"d-one",
+            2,
+            "a line round-trips through cat under dash",
+        );
+        suspend_and_resume(
+            &mut sh,
+            &files,
+            &before_dash,
+            (0x1a, Some(b"CAT-CONT")),
+            "the retrying cat under dash",
+        );
+        let mark = sh.mark();
+        sh.outer.type_bytes(b"d-two\r");
+        sh.outer
+            .expect_since(mark, b"d-two", 2, "a fresh line after fg under dash");
+        sh.outer.type_bytes(b"\x04");
+        sh.prompt_again("the run under dash ended");
+        assert_eq!(sh.status(), 0);
+        sh.outer.type_bytes(b"exit 0\r");
+        sh.prompt_again("dash ended");
+    }
 
     // A panic in the relay (a test build's injected one) leaves the outer
     // terminal as it was.
