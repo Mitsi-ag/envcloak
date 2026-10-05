@@ -5,12 +5,18 @@ docs/APP.md "The app run by an agent"), run as scripts/macos/check-swift.sh.
 Swift is read with a lexer, not with patterns over raw text: comments are
 dropped, string literals keep their literal text apart from the code inside
 their interpolations (which is checked as code), so neither a comment nor a
-string can satisfy or trip a code rule. A file the lexer cannot read whole
-(an unterminated comment, string or interpolation, or a bare `/regex/`
-literal, which needs the compiler's context to tell from division) fails
-rather than being skipped. Every rule is a guess from the text: it sees
-names, not types, so each takes the conservative reading and the
-allowlists say, with a reason, where a reviewed file may do more.
+string can satisfy or trip a code rule. Every rule about what a literal
+says reads its value as the compiler does (escapes such as `\\u{65}`
+decoded, a raw string's escapes being a backslash and its `#`s, a
+multi-line literal's indentation and line continuations removed), and a
+path in it as the kernel does (repeated slashes, `.` and `..`, and `/dev`
+in any case, since the root volume finds `/DEV/stderr`: measured). A file
+the lexer cannot read whole (an unterminated comment, string or
+interpolation, or a bare `/regex/` literal, which needs the compiler's
+context to tell from division) fails rather than being skipped. Every
+rule is a guess from the text: it sees names, not types, so each takes the
+conservative reading and the allowlists say, with a reason, where a
+reviewed file may do more.
 
 Product code is the app target (apps/macos/EnvCloak/) and the local
 packages' sources (apps/macos/Packages/*/Sources/); it is what ships.
@@ -45,10 +51,15 @@ Rules (the id is what a finding and an allowlist entry name):
                  - the app's own standard input: `FileHandle.standardInput`
                    or any `.standardInput` that is not a child process's
                    being set, `stdin`, `__stdinp`, `STDIN_FILENO`,
-                   `readLine`, a descriptor-0 handle or read (the number
-                   also inside `Int32(...)` and the like), and a string
-                   literal naming `/dev/stdin` or `/dev/fd/N` (N other than
-                   1 and 2: a descriptor the starter may have passed in);
+                   `readLine`, a descriptor-0 handle or read (the number in
+                   any base, converted or cast, in System's
+                   `FileDescriptor(rawValue:)` or an implicit `.init(rawValue:)`
+                   in a file that imports System, as any call's
+                   `fileDescriptor:` argument, or handed to a child by
+                   `posix_spawn_file_actions_adddup2` or `addinherit_np`),
+                   and a string literal naming `/dev/stdin` or `/dev/fd/N`
+                   (N other than 1 and 2: a descriptor the starter may have
+                   passed in);
                  - the home directory as Foundation finds it, which follows
                    the environment's `CFFIXED_USER_HOME` (measured on macOS
                    26.4.1): `NSHomeDirectory`, `NSHomeDirectoryForUser`,
@@ -61,7 +72,7 @@ Rules (the id is what a finding and an allowlist entry name):
                    `expandingTildeInPath`, `abbreviatingWithTildeInPath`,
                    `standardizingPath`, `resolvingSymlinksInPath`,
                    `standardized`, `standardizedFileURL`, and a string
-                   literal that starts with `~` (`URL(fileURLWithPath:)` and
+                   literal whose value starts with `~` (`URL(fileURLWithPath:)` and
                    `URL(filePath:)` expand it from the same lookup). Home
                    comes from `getpwuid_r` only;
                  - the working directory: `getcwd`, `getwd`,
@@ -76,19 +87,42 @@ Rules (the id is what a finding and an allowlist entry name):
                  and the app delegate's open callbacks (rule 2). The keys
                  are read from every property list under apps/macos as
                  parsed (XML in any encoding, or binary, at any depth,
-                 whatever the file is called) and as text from the build
-                 settings (`INFOPLIST_KEY_...`).
+                 whatever the file is called; a key built from a build
+                 setting, `$(...)`, is refused) and from the other files as
+                 their grammar reads them: a project's and an old .strings
+                 file's quoted strings with their escapes decoded, a
+                 scheme's XML character references, JSON's escapes, and
+                 build settings (`INFOPLIST_KEY_...`). Settings that build
+                 an Info.plist other than the files read are refused:
+                 preprocessing it (`INFOPLIST_PREPROCESS`, its prefix
+                 header, definitions and flags), and an `INFOPLIST_FILE`
+                 outside apps/macos or named through another setting.
   a11y-action    accessibility actions, which another program can perform
                  (rule 2: none may approve, reveal or write): SwiftUI's
                  action, adjustable, scroll, zoom and quick actions, custom
                  actions, `accessibilityActionNames` and AppKit's
                  `accessibilityPerform...` overrides.
-  gated-key      (rule 2) a keyboard shortcut or key press on a button
-                 whose title starts with Approve, Reveal, Replace or
-                 Remove, or whose action names one (`approve()`,
-                 `revealValue`: a name that is the verb or starts with it
-                 and a capital); `onSubmit` or `onKeyPress` whose closure
-                 names one; Return as an AppKit `keyEquivalent`.
+  gated-key      (rule 2) SwiftUI sets `.keyboardShortcut` in the
+                 environment, where it reaches every button of the view it
+                 modifies (measured on macOS 26.4.1: on a VStack, or on a
+                 wrapper view, it fired the Approve button inside), so a
+                 shortcut is allowed only directly on a `Button(...)`,
+                 nothing between the button's call and it, with no string
+                 literal in the button whose first word is Approve, Reveal,
+                 Replace or Remove and no name that says one (`approve()`,
+                 `revealValue`: the verb, or the verb and a capital), and a
+                 label of text, images and stacks only. Also refused:
+                 `onKeyPress` on such a gated button; `onSubmit`,
+                 `onKeyPress` and the command handlers (`onDeleteCommand`,
+                 `onExitCommand`, `onMoveCommand`, `onCommand`,
+                 `onCutCommand`, `onCopyCommand`, `onPasteCommand`) and
+                 AppKit's key event monitors whose closure names one, on
+                 any view, since the closure is what they run; an override
+                 of an AppKit key method (`keyDown`, `keyUp`,
+                 `flagsChanged`, `performKeyEquivalent`, `insertNewline`,
+                 `cancelOperation`) whose body names one; and any AppKit
+                 key equivalent but the empty string, whose control's title
+                 and action are not in view.
   log            the app logs only through `Logger` with `LogToken` words
                  (rule 3: a launch environment can make the log store
                  "private" arguments in the clear, docs/APP.md "Logging"):
@@ -98,25 +132,40 @@ Rules (the id is what a finding and an allowlist entry name):
                    own `FileHandle.standardError` and `.standardOutput`
                    (any such member that is not a child's stream being
                    set), `stderr`, `stdout`, `STDOUT_FILENO`,
-                   `STDERR_FILENO`, a descriptor-1 or -2 handle or write,
-                   and a string literal naming `/dev/stdout`,
+                   `STDERR_FILENO`, a descriptor-1 or -2 handle or write
+                   (spelled as for descriptor 0 above, `fcntl` and `ioctl`
+                   included), a string literal naming `/dev/stdout`,
                    `/dev/stderr`, `/dev/fd/1`, `/dev/fd/2`, a terminal
-                   (`/dev/tty...`) or `/dev/console`;
+                   (`/dev/tty...`) or `/dev/console`, and any other path
+                   under /dev but /dev/null, /dev/random, /dev/urandom and
+                   /dev/zero (a part of one, `"/dev/"`, is completed at run
+                   time);
                  - no other log API: `os_log`, `os_signpost`, `os_trace`,
                    `os_activity` (any spelling), the system log facility
                    (`asl_...`), `OSLog`, `OSLogMessage`, `OSSignposter`,
                    `OSSignpostID`, `OSLogStore`;
                  - a `Logger` call (a level method on a receiver) takes its
                    message as a string literal at the call, and each
-                   interpolation in it is `\\(x.logToken)`;
+                   interpolation in it is `\\(x.logToken)` whole (a name and
+                   its members, calls and subscripts ending in `.logToken`:
+                   nothing joined to it, no `?:`, `??` or `?.`);
                    `privacy: .public` only on such a token; `%{public}`
-                   nowhere;
+                   nowhere, in any spelling;
+                 - a `Logger` is built only by ECLog in Log/LogToken.swift,
+                   and there its subsystem and category, which the log
+                   stores public whatever the message's privacy, are words
+                   fixed in that file: a literal, a constant bound once to
+                   one, or `c.rawValue` of a parameter whose type is an
+                   enum declared there with String raw values and literal
+                   cases only;
                  - `fatalError`, `precondition`, `preconditionFailure`,
                    `assert`, `assertionFailure` and an `NSException`'s
                    `reason:` (which reach standard error and the crash
                    report) take a literal message with the same
-                   interpolation rule; `raise(_:format:arguments:)` is
-                   refused;
+                   interpolation rule, and an `NSException`'s `name:`, which
+                   the crash report prints too, is fixed in the source
+                   (`.genericException`, `NSExceptionName("...")`);
+                   `raise(_:format:arguments:)` is refused;
                  - `LogToken`: only an `enum` whose raw type, written first,
                    is `String` and whose body holds only cases with literal
                    raw values conforms. Measured (Swift 6): a `rawValue`
@@ -163,14 +212,19 @@ Rules (the id is what a finding and an allowlist entry name):
                  linker or include search setting (`OTHER_LDFLAGS`, the
                  search paths, `OTHER_SWIFT_FLAGS`, `OTHER_CFLAGS`); any
                  Mach-O, archive, library or framework file in the tree;
-                 and any source that compiles into the app as something
-                 else, or generates code for it, or instantiates classes
-                 by name: C, C++, Objective-C, headers, module maps,
-                 assembly, Metal, lex and yacc, Rez, Swift interfaces and
-                 modules, intent definitions, Core ML models, Core Data
-                 models, storyboards, XIBs and NIBs, Reality files,
-                 playgrounds (scripts/check-sources.sh --swift also checks
-                 every object a build linked against the Swift it read).
+                 settings included from outside apps/macos
+                 (`#include` in an .xcconfig); and any source that compiles
+                 into the app as something else, or generates code for it,
+                 or instantiates classes by name: C (and preprocessed C),
+                 C++ (and its modules), Objective-C, headers, module maps,
+                 assembly, Metal, OpenCL, lex and yacc in each language,
+                 Rez, MIG, DriverKit interfaces, DTrace providers, LLVM IR
+                 and bitcode, precompiled headers and modules, AppleScript,
+                 Swift interfaces and modules, intent definitions, Core ML
+                 models, Core Data models, storyboards, XIBs and NIBs,
+                 Reality files, playgrounds (scripts/check-sources.sh
+                 --swift also checks every file a build's linker read
+                 against the Swift it compiled).
   entitlement    any key in an entitlements file, which must parse as a
                  property list (XML or binary): no tier signs one yet
                  (M3-10 adds the keychain group's, as
@@ -178,12 +232,13 @@ Rules (the id is what a finding and an allowlist entry name):
                  `com.apple.security.get-task-allow`, any
                  `com.apple.security.cs.` (hardened-runtime exception) and
                  any `com.apple.security.temporary-exception.` key are
-                 never signed (D3-05, D3-06).
+                 never signed (D3-05, D3-06); a `CODE_SIGN_ENTITLEMENTS`
+                 outside apps/macos or named through another setting.
   unreadable     a file a rule must read but cannot: a property list (by
                  name, `.plist` or `.entitlements`, or by its content) that
-                 does not parse, or a build setting, project, scheme, JSON
-                 or strings file that is not UTF-8 or UTF-16 text. Never
-                 skipped.
+                 does not parse, a JSON file that does not parse, or a
+                 build setting, project, scheme, JSON or strings file that
+                 is not UTF-8 or UTF-16 text. Never skipped.
   key-literal    a string matching a provider's key pattern
                  (providers/*.toml) in any file, a file that is not text
                  read byte for byte (rule 7).
@@ -195,12 +250,16 @@ Rules (the id is what a finding and an allowlist entry name):
 Limits (what a review still looks for): the rules read names and
 literals, not types or values computed at run time, so these are not
 seen: a `typealias` or a wrapper that renames a refused API (other than
-the ones above); a path built at run time (one that starts with `~` and
-reaches `URL(fileURLWithPath:)`, or `"/dev/" + "stderr"`); a relative path,
-which resolves against the working directory the starter chose (the app
-uses absolute paths from `getpwuid_r` and its bundle); a gated button whose
-title is not a literal and whose action has another name (M3-12's review
-looks for them, with `onSubmit` handlers named otherwise).
+the ones above); a path built at run time from parts none of which is a
+literal starting with `/dev` or `~` (`"/" + "dev/stderr"`, a variable that
+starts with `~` reaching `URL(fileURLWithPath:)`); a relative path, which
+resolves against the working directory the starter chose (the app uses
+absolute paths from `getpwuid_r` and its bundle); a descriptor held in a
+variable; a gated button whose title is not a literal and whose action has
+another name, and a key handler whose closure calls a function named
+otherwise (M3-12's review looks for them); which token a log message
+names is chosen at run time, so code written to spell a value out in
+tokens (one per bit or character) is a review matter too.
 
 The brand's own Swift (assets/brand/motion/swiftui/EnvCloakMotion.swift,
 reached through a symlink in EnvCloakDesign) is product code and held to
@@ -216,6 +275,7 @@ Usage: check-swift.sh [--root DIR]       check the tree (default: the repo)
                                          compiler read, target by target)
 """
 
+import json
 import os
 import plistlib
 import posixpath
@@ -297,6 +357,30 @@ A11Y_NAMES = {
 # the informal protocol's `accessibilityPerformAction(_:)`).
 A11Y_PREFIXES = ("accessibilityPerform",)
 GATED_VERBS = ("approve", "reveal", "replace", "remove")
+# Modifiers whose closure runs on a key press: Return in a field, a key
+# while focused, and the macOS command keys (Delete, Escape, the arrows, a
+# selector, Cut, Copy and Paste). None passes a key on to a button; the
+# closure is what runs, so the closure is checked on any receiver.
+KEY_HANDLERS = {
+    "onSubmit",
+    "onKeyPress",
+    "onDeleteCommand",
+    "onExitCommand",
+    "onMoveCommand",
+    "onCommand",
+    "onCutCommand",
+    "onCopyCommand",
+    "onPasteCommand",
+    "addLocalMonitorForEvents",
+    "addGlobalMonitorForEvents",
+}
+# AppKit's key methods, overridden in a view, window or responder: their
+# body runs on a key press.
+KEY_METHODS = {"keyDown", "keyUp", "flagsChanged", "performKeyEquivalent", "insertNewline", "cancelOperation"}
+# What a shortcut's Button may hold in its label: views that draw text and
+# images and lay them out. Any other view could hold a control the
+# shortcut reaches.
+LABEL_VIEWS = {"Text", "Image", "Label", "HStack", "VStack", "ZStack", "Group", "Spacer", "Divider"}
 PRINTERS = {
     "print",
     "debugPrint",
@@ -385,8 +469,13 @@ STREAM_MEMBERS = {"standardError": "log", "standardOutput": "log", "standardInpu
 C_STREAM_WRITERS = {"stderr", "stdout", "__stderrp", "__stdoutp", "STDOUT_FILENO", "STDERR_FILENO"}
 C_STREAM_READERS = {"stdin", "__stdinp", "STDIN_FILENO"}
 # Calls whose first argument is a descriptor: 0 is the app's standard
-# input, 1 and 2 its output and error.
-FD_CALLS = {"FileHandle", "write", "read", "pwrite", "pread", "writev", "readv", "fdopen", "dup", "dup2", "send", "recv"}
+# input, 1 and 2 its output and error. FileDescriptor is the System
+# module's (`FileDescriptor(rawValue: 2)`); fcntl duplicates one, ioctl can
+# push input into a terminal (TIOCSTI).
+FD_CALLS = {"FileHandle", "FileDescriptor", "write", "read", "pwrite", "pread", "writev", "readv", "fdopen", "dup", "dup2", "send", "recv", "fcntl", "ioctl"}
+# Calls that hand a child one of the app's descriptors, with the index of
+# that descriptor among the positional arguments.
+SPAWN_FD_CALLS = {"posix_spawn_file_actions_adddup2": 1, "posix_spawn_file_actions_addinherit_np": 1}
 LOG_LEVELS = {"debug", "info", "notice", "error", "warning", "fault", "critical", "trace", "log"}
 LOG_APIS = {"OSLog", "OSLogMessage", "OSSignposter", "OSSignpostID", "OSLogStore", "OSLogInterpolation"}
 LOG_API_PREFIXES = ("os_log", "_os_log", "os_signpost", "_os_signpost", "os_trace", "_os_trace", "os_activity", "_os_activity", "asl_")
@@ -560,17 +649,66 @@ MACHO_MAGIC = {
 }
 
 # The app's own streams and descriptors reached by path: (pattern, rule,
-# what). `/dev/fd/N` for N other than 1 and 2 is a descriptor the starter
-# may have passed in.
+# what), each matched against a path as the kernel reads it (normal_path).
+# `/dev/fd/N` for N other than 1 and 2 is a descriptor the starter may have
+# passed in.
 DEVICE_PATHS = (
-    (re.compile(r"/dev/(?:std(?:out|err)|fd/0*[12](?![0-9])|tty[A-Za-z0-9]*|console)"), "log", "the app's own output, error or terminal"),
-    (re.compile(r"/dev/(?:stdin|fd(?:$|/(?!0*[12](?![0-9]))))"), "launch-input", "the app's own standard input or a descriptor its starter passed in"),
-    (re.compile(r"^kern\.proc(?:args2?|\.args)"), "launch-input", "the launch arguments and environment, through sysctlbyname"),
+    (re.compile(r"^/dev/(?:std(?:out|err)|fd/0*[12]|tty[^/]*|console)(?:/|$)"), "log", "the app's own output, error or terminal"),
+    (re.compile(r"^/dev/(?:stdin|fd)(?:/|$)"), "launch-input", "the app's own standard input or a descriptor its starter passed in"),
 )
+# The devices any path under /dev may be: no one's stream.
+SAFE_DEVICES = ("/dev/null", "/dev/random", "/dev/urandom", "/dev/zero")
+# An absolute path inside a literal: at its start, or after a blank, a
+# quote, `=`, `:` (a `file:` URL), `(` or `,`.
+PATH_IN_TEXT = re.compile(r"(?:^|(?<=[\s\"'=:(,]))/[^\s\"'<>]*")
+# sysctl names that return the launch arguments and environment.
+SYSCTL_ARGS = re.compile(r"(?<![A-Za-z0-9_.])kern\.proc(?:args2?|\.args)")
+# `%{public}` and its spellings in a format string.
+PUBLIC_FORMAT = re.compile(r"%\{[^}]*public", re.I)
 # Source kinds that compile into the app (or generate code for it) as
 # something other than the Swift this check reads, and interface archives
-# that instantiate classes by name: refused anywhere under apps/macos.
+# that instantiate classes by name: refused anywhere under apps/macos. Each
+# kind Xcode's build rules compile: C and its preprocessed forms, C++ and
+# its modules, Objective-C, headers, module maps, assembly, Metal and
+# OpenCL, lex and yacc in each language, Rez, MIG, DriverKit interfaces,
+# DTrace providers, LLVM IR and bitcode, AppleScript, Swift interfaces and
+# modules, and the generated-code and archived-class formats.
 COMPILED_SUFFIXES = (
+    ".i",
+    ".ii",
+    ".mi",
+    ".mii",
+    ".cppm",
+    ".ccm",
+    ".cxxm",
+    ".c++m",
+    ".ixx",
+    ".mpp",
+    ".tcc",
+    ".tpp",
+    ".txx",
+    ".nasm",
+    ".lmm",
+    ".lp",
+    ".lpp",
+    ".lxx",
+    ".ymm",
+    ".yp",
+    ".ypp",
+    ".yxx",
+    ".defs",
+    ".mig",
+    ".iig",
+    ".d",
+    ".ll",
+    ".bc",
+    ".air",
+    ".metallib",
+    ".pcm",
+    ".gch",
+    ".applescript",
+    ".scpt",
+    ".scptd",
     ".c",
     ".cc",
     ".cp",
@@ -630,7 +768,8 @@ aliases = {}
 
 
 def find(rule, path, line, msg):
-    findings.append((rule, path, line, msg))
+    if (rule, path, line, msg) not in findings:
+        findings.append((rule, path, line, msg))
 
 
 # ---------------------------------------------------------------- the lexer
@@ -643,14 +782,19 @@ class LexError(Exception):
 
 
 class Tok:
-    __slots__ = ("kind", "text", "line", "parts", "level")
+    __slots__ = ("kind", "text", "line", "parts", "level", "value")
 
-    def __init__(self, kind, text, line, parts=None):
+    def __init__(self, kind, text, line, parts=None, value=None):
         self.kind = kind  # id, num, str, op, punct, attr, pound, regex
         self.text = text
         self.line = line
-        self.parts = parts  # for str: [("lit", text) | ("interp", [Tok])]
+        self.parts = parts  # for str: [("lit", source text) | ("interp", [Tok])]
         self.level = 0  # how many interpolations deep (set by flatten)
+        # For str: the literal's value as the compiler reads it (escapes
+        # decoded, a multi-line literal's indentation and line
+        # continuations removed), its interpolations left out. Every rule
+        # about what a literal says reads this, never the source text.
+        self.value = value
 
     def __repr__(self):  # pragma: no cover
         return "Tok(%s,%r,%d)" % (self.kind, self.text, self.line)
@@ -883,7 +1027,7 @@ class Lexer:
         if multiline:
             # A multi-line literal's text starts after its opening line.
             text = text[1:] if text.startswith("\n") else text
-        return Tok("str", text, start_line, parts), j
+        return Tok("str", text, start_line, parts, literal_parts_value(parts, hashes, multiline)), j
 
 
 def flatten(toks, level=0):
@@ -1037,6 +1181,7 @@ def read_text(path):
 def check_product_swift(rel, toks, brand):
     flat = flatten(toks)
     modules = set(SYSTEM_MODULES)
+    imported = set()
     for k, t in enumerate(flat):
         if t.kind == "id" and t.text == "import":
             j = k + 1
@@ -1044,6 +1189,7 @@ def check_product_swift(rel, toks, brand):
                 j += 1
             if j < len(flat) and flat[j].kind == "id":
                 modules.add(flat[j].text)
+                imported.add(flat[j].text)
 
     def at(j):
         return flat[j] if 0 <= j < len(flat) else None
@@ -1126,15 +1272,32 @@ def check_product_swift(rel, toks, brand):
                 find("a11y-action", rel, t.line, "`%s`: another program can perform it" % name)
             if name == "Button" and after is not None and after.kind == "punct" and after.text in ("(", "{"):
                 check_gated_button(rel, flat, k)
-            if name in ("onSubmit", "onKeyPress") and is_member(k):
+            if name == "keyboardShortcut" and is_member(k):
+                check_shortcut(rel, flat, k)
+            if name in KEY_HANDLERS and is_member(k):
                 span = flat[k + 1 : closure_end(flat, k) + 1]
                 verb = gated_call(span)
                 if verb:
                     find("gated-key", rel, t.line, "`%s` runs `%s` on a key press: these go through Touch ID, never a key alone" % (name, verb))
-            if name == "keyEquivalent":
-                nxt, val = at(k + 1), at(k + 2)
-                if nxt is not None and nxt.text in ("=", ":") and val is not None and val.kind == "str" and literal_value(val) in RETURN_KEYS:
-                    find("gated-key", rel, t.line, "Return as a key equivalent (Return never approves; design §1)")
+            if name == "func" and after is not None and after.kind == "id" and after.text in KEY_METHODS:
+                lb = k + 2
+                while lb < len(flat) and not (flat[lb].kind == "punct" and flat[lb].text == "{" and flat[lb].level == t.level):
+                    if flat[lb].kind == "punct" and flat[lb].text == "(":
+                        lb = matching(flat, lb)
+                    lb += 1
+                if lb < len(flat):
+                    verb = gated_call(flat[lb : matching(flat, lb) + 1])
+                    if verb:
+                        find("gated-key", rel, t.line, "`%s` runs `%s` on a key press: these go through Touch ID, never a key alone" % (after.text, verb))
+            if name == "keyEquivalent" and after is not None and after.text in ("=", ":"):
+                value = argument_after(flat, k + 2) if after.text == ":" else statement_after(flat, k + 2)
+                if not (len(value) == 1 and value[0].kind == "str" and literal_value(value[0]) == "" and not interpolations(value[0])):
+                    find(
+                        "gated-key",
+                        rel,
+                        t.line,
+                        "an AppKit key equivalent other than the empty string: a key alone triggers that control, whose title and action are not in view here (Return never approves; design §1)",
+                    )
             # rule 3: other writers
             if name in PRINTERS and calls and bare(k):
                 find("log", rel, t.line, "`%s` writes outside the unified log (use Logger with LogToken)" % name)
@@ -1145,15 +1308,45 @@ def check_product_swift(rel, toks, brand):
                 find(STREAM_MEMBERS[name], rel, t.line, "`.%s` %s the app's own standard stream (only a child's may be set)" % (name, what))
             if name in C_STREAM_WRITERS and bare(k):
                 find("log", rel, t.line, "`%s` writes to the app's own standard stream" % name)
-            if name in FD_CALLS and calls and (bare(k) or name == "FileHandle"):
+            if name in FD_CALLS and calls and (bare(k) or name in ("FileHandle", "FileDescriptor")):
                 check_descriptor_call(rel, flat, k)
-            if name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "FileHandle":
-                check_descriptor_call(rel, flat, k)
+            if name == "init" and calls and is_member(k):
+                owner = at(k - 2)
+                if owner is not None and owner.text in ("FileHandle", "FileDescriptor"):
+                    check_descriptor_call(rel, flat, k)
+                elif receiver(k) == "implicit" and "System" in imported:
+                    # `let fd: FileDescriptor = .init(rawValue: 2)`: the type
+                    # is not in view, so in a file that imports System any
+                    # implicit init of descriptor 0, 1 or 2 is refused.
+                    args = call_args(flat, k + 1)
+                    if args and args[0][0] == "rawValue":
+                        check_descriptor_call(rel, flat, k)
+            if name == "fileDescriptor" and after is not None and after.text == ":" and at(k - 1) is not None and at(k - 1).text in ("(", ","):
+                # A `fileDescriptor:` argument to any call (FileHandle,
+                # DispatchIO, DispatchSource and the rest).
+                check_descriptor(rel, t.line, argument_after(flat, k + 2))
+            if name in SPAWN_FD_CALLS and calls and bare(k):
+                positional = [expr for label, expr in call_args(flat, k + 1) if label is None]
+                if len(positional) > SPAWN_FD_CALLS[name]:
+                    check_descriptor(rel, t.line, positional[SPAWN_FD_CALLS[name]], "hands a child")
             # rule 3: other log APIs
             if (name in LOG_APIS and not (at(k - 1) is not None and at(k - 1).text == "import")) or name.startswith(LOG_API_PREFIXES):
                 find("log", rel, t.line, "`%s`: the app logs only through Logger with LogToken words" % name)
             if name in LOG_LEVELS and calls and is_member(k) and receiver(k) == "explicit":
                 check_log_call(rel, flat, k + 1)
+            # The log's metadata: a Logger's subsystem and category are
+            # stored public whatever the message's privacy, so only ECLog
+            # (in the token file) builds one, from fixed words.
+            logger_init = (
+                (name == "Logger" and calls and bare(k))
+                or (name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "Logger")
+                or (name == "init" and calls and is_member(k) and receiver(k) == "implicit" and {"subsystem", "category"} & {label for label, _ in call_args(flat, k + 1)})
+            )
+            if logger_init:
+                if rel != LOG_TOKEN_FILE:
+                    find("log", rel, t.line, "a Logger built outside %s (ECLog.logger gives the app's loggers, with fixed subsystem and category)" % LOG_TOKEN_FILE)
+                else:
+                    check_logger_metadata(rel, flat, k + 1)
             if name in FAIL_CALLS and calls and bare(k):
                 check_fail_call(rel, flat, k + 1, FAIL_CALLS[name], name)
             exception_init = name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "NSException"
@@ -1161,6 +1354,8 @@ def check_product_swift(rel, toks, brand):
                 for label, expr in call_args(flat, k + 1):
                     if label == "reason" and [x.text for x in unwrap(expr)] != ["nil"]:
                         check_message(rel, expr, t.line, "an NSException reason, which reaches standard error and the crash report,")
+                    if label == "name" and not fixed_exception_name(expr):
+                        find("log", rel, t.line, "an NSException name that is not fixed in the source (`.genericException`, `NSExceptionName(\"...\")`): it reaches standard error and the crash report")
             if name == "raise" and calls and is_member(k):
                 if "format" in [label for label, _ in call_args(flat, k + 1)]:
                     find("log", rel, t.line, "`raise(_:format:arguments:)` formats values into standard error and the crash report")
@@ -1201,17 +1396,52 @@ def check_product_swift(rel, toks, brand):
             if t.text == "#colorLiteral" and not brand:
                 find("color", rel, t.line, "`#colorLiteral` (use an EnvCloakDesign token)")
         elif t.kind == "str":
-            if "%{public" in t.text:
+            value = literal_value(t)
+            if PUBLIC_FORMAT.search(value):
                 find("log", rel, t.line, "`%{public}` in a format string")
-            if t.text.startswith("~"):
+            if value.startswith("~"):
                 find("launch-input", rel, t.line, "a path that starts with `~`, which Foundation expands from CFFIXED_USER_HOME")
-            for pattern, rule, what in DEVICE_PATHS:
-                if pattern.search(t.text):
-                    find(rule, rel, t.line, "`%s` reaches %s by path" % (t.text, what))
+            check_paths(rel, t.line, value)
+            if SYSCTL_ARGS.search(value):
+                find("launch-input", rel, t.line, "`%s`: the launch arguments and environment, through sysctlbyname" % value)
             for inner in interpolations(t):
                 args = split_top(inner)
                 if len(args) > 1 and any(is_public_privacy(a) for a in args[1:]) and not is_log_token_expr(args[0]):
                     find("log", rel, t.line, "`privacy: .public` on something other than `x.logToken`")
+
+
+def normal_path(path):
+    """A path as the kernel reads it: repeated slashes as one, `.` and `..`
+    taken lexically, and `/dev` in any case, since the root volume finds
+    `/DEV/stderr` and `/Dev/fd/2` (measured on macOS 26.4.1; names inside
+    devfs are case-sensitive)."""
+    path = posixpath.normpath(re.sub(r"/+", "/", path))
+    parts = path.split("/")
+    if len(parts) > 1 and parts[1].lower() == "dev":
+        parts[1] = "dev"
+    return "/".join(parts)
+
+
+def check_paths(rel, line, value):
+    """Each absolute path in a literal, read as the kernel reads it: the
+    app's own streams, terminal and inherited descriptors are refused, and
+    so is any other path under /dev but the four safe devices, since a part
+    of one (`"/dev/"`, `"/dev/fd"`) is completed at run time."""
+    for m in PATH_IN_TEXT.finditer(value):
+        path = normal_path(m.group(0))
+        for pattern, rule, what in DEVICE_PATHS:
+            if pattern.match(path):
+                find(rule, rel, line, "`%s` reaches %s by path" % (m.group(0), what))
+                break
+        else:
+            if (path == "/dev" or path.startswith("/dev/")) and path not in SAFE_DEVICES:
+                find(
+                    "log",
+                    rel,
+                    line,
+                    "`%s`: a path under /dev other than %s (the app's own streams and terminal are there, and a part of one is completed at run time)"
+                    % (m.group(0), ", ".join(SAFE_DEVICES)),
+                )
 
 
 def is_public_privacy(arg):
@@ -1223,9 +1453,94 @@ def is_public_privacy(arg):
 
 
 def is_log_token_expr(expr):
-    if len(expr) < 2:
+    """Whether an expression is `x.logToken` whole: a name, then member
+    names, calls and subscripts, ending in `.logToken`, with nothing around
+    it (no operator, no `?:`, no optional chaining), so its value is one
+    token's fixed text and never that joined to anything else."""
+    expr = unwrap(expr)
+    if len(expr) < 3 or not (expr[-1].kind == "id" and expr[-1].text == "logToken" and expr[-2].kind == "op" and expr[-2].text == "."):
         return False
-    return expr[-1].kind == "id" and expr[-1].text == "logToken" and expr[-2].kind == "op" and expr[-2].text.endswith(".")
+    if expr[0].kind != "id" or expr[0].text in KEYWORDS:
+        return False
+    i, end = 1, len(expr) - 2
+    while i < end:
+        x = expr[i]
+        if x.kind == "op" and x.text == "." and i + 1 < end and expr[i + 1].kind == "id":
+            i += 2
+        elif x.kind == "punct" and x.text in ("(", "[") and x.level == expr[0].level:
+            i = matching(expr, i) + 1
+        else:
+            return False
+    return i == end
+
+
+def fixed_exception_name(expr):
+    """`.someName`, `NSExceptionName.someName`, or `NSExceptionName("...")`
+    / `NSExceptionName(rawValue: "...")` with a literal without
+    interpolations."""
+    expr = unwrap(expr)
+    texts = [x.text for x in expr]
+    if len(expr) == 2 and texts[0] == "." and expr[1].kind == "id":
+        return True
+    if len(expr) == 3 and texts[:2] == ["NSExceptionName", "."] and expr[2].kind == "id":
+        return True
+    if len(expr) >= 4 and texts[:2] == ["NSExceptionName", "("] and matching(expr, 1) == len(expr) - 1:
+        inner = expr[2:-1]
+        if len(inner) >= 2 and inner[0].kind == "id" and inner[1].text == ":":
+            if inner[0].text != "rawValue":
+                return False
+            inner = inner[2:]
+        return is_literal(inner) and not interpolations(unwrap(inner)[0])
+    return False
+
+
+def check_logger_metadata(rel, flat, lp):
+    """In the token file, a Logger's subsystem is a literal or a name bound
+    there to one (`let subsystem = "..."`), and its category a literal or
+    `c.rawValue` of a parameter whose type is an enum declared there with
+    String raw values and nothing but literal cases: so the log's metadata
+    is always one of the words written in that file."""
+    toks = [x for x in flat if x.level == 0]
+    constants = set()
+    enums = set()
+    params = {}
+    bound = {}
+    for j, x in enumerate(toks):
+        if x.kind == "id" and x.text in ("let", "var") and j + 1 < len(toks) and toks[j + 1].kind == "id":
+            bound[toks[j + 1].text] = bound.get(toks[j + 1].text, 0) + 1
+        if x.kind == "id" and x.text == "let" and j + 3 < len(toks) and toks[j + 1].kind == "id" and toks[j + 2].text == "=":
+            rest = toks[j + 3]
+            if rest.kind == "str" and not interpolations(rest) and (j + 4 >= len(toks) or toks[j + 4].line != rest.line or toks[j + 4].text in (";", "}")):
+                constants.add(toks[j + 1].text)
+        if x.kind == "id" and x.text == "enum" and j + 3 < len(toks) and toks[j + 2].text == ":" and toks[j + 3].text == "String":
+            _, _, lbrace, generic = declaration(toks, j)
+            if lbrace is not None and not generic and cases_only(toks[lbrace + 1 : matching(toks, lbrace)]):
+                enums.add(toks[j + 1].text)
+        if x.kind == "id" and x.text in ("func", "init") and j + 1 < len(toks):
+            lp_decl = j + 1 if toks[j + 1].text == "(" else j + 2
+            if lp_decl < len(toks) and toks[lp_decl].text == "(":
+                for param in split_top(toks[lp_decl + 1 : matching(toks, lp_decl)]):
+                    colon = [i for i, y in enumerate(param) if y.text == ":"]
+                    if colon and colon[0] > 0 and colon[0] + 1 < len(param) and param[colon[0] + 1].kind == "id":
+                        # A name bound twice in the file is not trusted.
+                        pname = param[colon[0] - 1].text
+                        params[pname] = None if pname in params else param[colon[0] + 1].text
+    # A name bound more than once in the file is not trusted.
+    constants = {c for c in constants if bound.get(c) == 1}
+    for label, expr in call_args(flat, lp):
+        e = unwrap(expr)
+        if label == "subsystem":
+            ok = (is_literal(e) and not interpolations(e[0])) or (len(e) == 1 and e[0].kind == "id" and e[0].text in constants)
+        elif label == "category":
+            ok = (is_literal(e) and not interpolations(e[0])) or (
+                len(e) == 3 and e[0].kind == "id" and e[1].text == "." and e[2].text == "rawValue" and params.get(e[0].text) in enums
+            )
+        else:
+            ok = False
+        if not ok:
+            find("log", rel, flat[lp].line, "a Logger's `%s` that is not a word fixed in %s (the subsystem and category are stored public)" % (label or "argument", LOG_TOKEN_FILE))
+    if not call_args(flat, lp):
+        find("log", rel, flat[lp].line, "a Logger without the app's subsystem and category")
 
 
 def check_message(rel, message, line, what):
@@ -1267,23 +1582,106 @@ def check_fail_call(rel, flat, lp, index, name):
         check_message(rel, positional[index], flat[lp].line, "`%s`, whose message reaches standard error and the crash report," % name)
 
 
-# Conversions a descriptor number may be written in: `Int32(2)`.
-INT_CONVERSIONS = {"Int32", "CInt", "Int", "UInt32", "Int16", "numericCast"}
+# Conversions a descriptor number may be written in: `Int32(2)`,
+# `CInt(truncatingIfNeeded: 2)`.
+INT_CONVERSIONS = {
+    "Int",
+    "Int8",
+    "Int16",
+    "Int32",
+    "Int64",
+    "UInt",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "CInt",
+    "CUnsignedInt",
+    "CShort",
+    "CLong",
+    "CLongLong",
+    "numericCast",
+}
+
+
+def int_literal(text):
+    """An integer literal's value in any of Swift's spellings (`2`, `0x2`,
+    `0o2`, `0b10`, `0_2`), or None."""
+    t = text.replace("_", "")
+    try:
+        if t[:2] in ("0x", "0X"):
+            return int(t[2:], 16)
+        if t[:2] in ("0o", "0O"):
+            return int(t[2:], 8)
+        if t[:2] in ("0b", "0B"):
+            return int(t[2:], 2)
+        return int(t, 10)
+    except ValueError:
+        return None
+
+
+def descriptor_number(expr):
+    """The descriptor an argument names when it is an integer literal,
+    perhaps in parentheses, with a `+`, converted (`Int32(2)`,
+    `CInt(truncatingIfNeeded: 2)`, `Int32.init(2)`), cast (`2 as Int32`) or
+    in a System `FileDescriptor(rawValue: 2)`; None for anything else."""
+    expr = unwrap(expr)
+    while True:
+        top = [i for i, x in enumerate(expr) if x.kind == "id" and x.text == "as" and x.level == expr[0].level] if expr else []
+        if top:
+            expr = unwrap(expr[: top[0]])
+            continue
+        n = 1
+        if len(expr) >= 3 and expr[0].kind == "id" and expr[1].text == "." and expr[2].kind == "id" and expr[2].text == "init":
+            n = 3
+        if len(expr) > n + 1 and expr[0].kind == "id" and expr[0].text in INT_CONVERSIONS | {"FileDescriptor"} and expr[n].text == "(" and matching(expr, n) == len(expr) - 1:
+            inner = expr[n + 1 : -1]
+            if len(inner) >= 2 and inner[0].kind == "id" and inner[1].text == ":":
+                inner = inner[2:]
+            expr = unwrap(inner)
+            continue
+        if len(expr) == 2 and expr[0].kind == "op" and expr[0].text == "+":
+            expr = expr[1:]
+            continue
+        break
+    if len(expr) == 1 and expr[0].kind == "num":
+        return int_literal(expr[0].text)
+    return None
+
+
+def argument_after(flat, j):
+    """The tokens of a call argument starting at flat[j], up to the comma or
+    bracket that ends it."""
+    out, depth = [], 0
+    level = flat[j].level if j < len(flat) else 0
+    while j < len(flat):
+        x = flat[j]
+        if x.level == level and x.kind == "punct":
+            if x.text in "([{":
+                depth += 1
+            elif x.text in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif x.text == "," and depth == 0:
+                break
+        out.append(x)
+        j += 1
+    return out
+
+
+def check_descriptor(rel, line, expr, how="is"):
+    fd = descriptor_number(expr)
+    if fd == 0:
+        find("launch-input", rel, line, "descriptor 0 %s the app's own standard input" % how)
+    elif fd in (1, 2):
+        find("log", rel, line, "descriptor %d %s the app's own standard %s" % (fd, how, "output" if fd == 1 else "error"))
 
 
 def check_descriptor_call(rel, flat, k):
     args = call_args(flat, k + 1)
-    if not args:
-        return
-    expr = unwrap(args[0][1])
-    while len(expr) >= 4 and expr[0].kind == "id" and expr[0].text in INT_CONVERSIONS and expr[1].text == "(" and matching(expr, 1) == len(expr) - 1:
-        expr = unwrap(expr[2:-1])
-    if len(expr) == 1 and expr[0].kind == "num" and expr[0].text in ("0", "1", "2"):
-        fd = expr[0].text
-        if fd == "0":
-            find("launch-input", rel, flat[k].line, "descriptor 0 is the app's own standard input")
-        else:
-            find("log", rel, flat[k].line, "descriptor %s is the app's own standard %s" % (fd, "output" if fd == "1" else "error"))
+    if args:
+        check_descriptor(rel, flat[k].line, args[0][1])
 
 
 def declaration(flat, k):
@@ -1483,28 +1881,80 @@ def check_log_token_extensions():
 
 
 def literal_value(tok):
-    """A string literal's value, its escapes decoded (\\r, \\n, \\u{...})."""
+    """A string literal's value (Tok.value)."""
+    return tok.value if tok.value is not None else tok.text
+
+
+ESCAPES = {"n": "\n", "r": "\r", "t": "\t", "0": "\0"}
+
+
+def literal_parts_value(parts, hashes, multiline):
+    """The value of a string literal from its source parts, as the compiler
+    reads it: `\\n`, `\\r`, `\\t`, `\\0`, `\\u{...}` and the escaped
+    quote and backslash decoded, with a raw literal's escapes being a
+    backslash followed by its `#`s (so `#"\\n"#` is a backslash and an n);
+    in a multi-line literal, the line breaks after the opening and before
+    the closing delimiter dropped, the closing delimiter's indentation
+    taken off each line, and a backslash at the end of a line joining it to
+    the next. Interpolations are left out."""
+    esc = "\\" + "#" * hashes
+    indent = ""
+    if multiline and parts and parts[-1][0] == "lit":
+        last = parts[-1][1]
+        nl = last.rfind("\n")
+        if nl >= 0 and last[nl + 1 :].strip(" \t") == "":
+            indent = last[nl + 1 :]
     out = []
-    text = tok.text
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if c == "\\" and i + 1 < len(text):
-            e = text[i + 1]
-            if e == "u" and text[i + 2 : i + 3] == "{":
-                close = text.find("}", i + 3)
-                if close > 0:
-                    try:
-                        out.append(chr(int(text[i + 3 : close], 16)))
-                    except ValueError:
-                        out.append(text[i : close + 1])
-                    i = close + 1
-                    continue
-            out.append({"r": "\r", "n": "\n", "t": "\t", "0": "\0"}.get(e, e))
-            i += 2
+    for idx, (kind, raw) in enumerate(parts):
+        if kind != "lit":
             continue
-        out.append(c)
-        i += 1
+        s = raw
+        at_start = False
+        if multiline and idx == 0:
+            if s.startswith("\n"):
+                s = s[1:]
+            at_start = True
+        if multiline and idx == len(parts) - 1:
+            nl = s.rfind("\n")
+            if nl >= 0 and s[nl + 1 :].strip(" \t") == "":
+                s = s[:nl]
+        res = []
+        k = 0
+        while k < len(s):
+            if at_start:
+                at_start = False
+                if indent and s.startswith(indent, k):
+                    k += len(indent)
+                continue
+            if s.startswith(esc, k) and k + len(esc) < len(s):
+                m = k + len(esc)
+                e = s[m]
+                if multiline and e in " \t\n":
+                    q = m
+                    while q < len(s) and s[q] in " \t":
+                        q += 1
+                    if q < len(s) and s[q] == "\n":
+                        k = q + 1
+                        at_start = True
+                        continue
+                if e == "u" and s[m + 1 : m + 2] == "{":
+                    close = s.find("}", m + 2)
+                    if close > 0:
+                        try:
+                            res.append(chr(int(s[m + 2 : close], 16)))
+                        except (ValueError, OverflowError):
+                            res.append(s[k : close + 1])
+                        k = close + 1
+                        continue
+                res.append(ESCAPES.get(e, e))
+                k = m + 1
+                continue
+            c = s[k]
+            res.append(c)
+            k += 1
+            if c == "\n" and multiline:
+                at_start = True
+        out.append("".join(res))
     return "".join(out)
 
 
@@ -1550,40 +2000,179 @@ def closure_end(flat, k):
     return end
 
 
+def gated_span(span):
+    """What in a span says it approves, reveals, replaces or removes: a
+    string literal whose first word is one of the verbs, or a name that
+    says one; None if nothing does."""
+    for t in span:
+        if t.kind == "str":
+            first = re.match(r"\s*([A-Za-z]+)", literal_value(t))
+            if first and first.group(1).lower() in GATED_VERBS:
+                return '"%s"' % literal_value(t).strip()
+    verb = gated_call(span)
+    return "`%s`" % verb if verb else None
+
+
 def check_gated_button(rel, flat, k):
     """A button is gated when its title (the first string literal in it)
     starts with Approve, Reveal, Replace or Remove, or when its action names
-    one of them (`approve()`, `removeKey`)."""
+    one of them (`approve()`, `removeKey`): no `onKeyPress` in its modifier
+    chain. (A keyboard shortcut is check_shortcut's.)"""
     end = closure_end(flat, k)
-    span = flat[k + 1 : end + 1]
-    title = None
-    for t in span:
-        if t.kind == "str":
-            title = t.text
-            break
-    what = None
-    if title is not None:
-        first = re.match(r"\s*([A-Za-z]+)", title)
-        if first and first.group(1).lower() in GATED_VERBS:
-            what = '"%s" button' % title.strip()
-    if what is None:
-        verb = gated_call(span)
-        if verb:
-            what = "button that runs `%s`" % verb
+    what = gated_span(flat[k + 1 : end + 1])
     if what is None:
         return
     # The modifier chain after the button.
     j = end + 1
     while j + 1 < len(flat) and flat[j].kind == "op" and flat[j].text == "." and flat[j + 1].kind == "id":
         name = flat[j + 1].text
-        if name in ("keyboardShortcut", "onKeyPress"):
-            find("gated-key", rel, flat[j + 1].line, "`%s` on a %s: these go through Touch ID, never a key alone" % (name, what))
+        if name == "onKeyPress":
+            find("gated-key", rel, flat[j + 1].line, "`onKeyPress` on a button that holds %s: these go through Touch ID, never a key alone" % what)
             return
         j += 2
         if j < len(flat) and flat[j].kind == "punct" and flat[j].text == "(":
             j = matching(flat, j) + 1
         while j < len(flat) and flat[j].kind == "punct" and flat[j].text == "{":
             j = matching(flat, j) + 1
+
+
+def opener_before(flat, j):
+    """For a closing bracket at flat[j], the index of the bracket it closes."""
+    closers = {")": "(", "]": "[", "}": "{"}
+    want, closer = closers[flat[j].text], flat[j].text
+    depth = 0
+    for i in range(j, -1, -1):
+        x = flat[i]
+        if x.kind == "punct" and x.level == flat[j].level:
+            if x.text == closer:
+                depth += 1
+            elif x.text == want:
+                depth -= 1
+                if depth == 0:
+                    return i
+    return None
+
+
+def receiver_root(flat, dot):
+    """The first token of the expression a `.member` at flat[dot + 1] is
+    applied to: walking back over member names, calls, subscripts and
+    trailing closures. None when there is no receiver in view."""
+    j = dot - 1
+    root = None
+    while j >= 0:
+        x = flat[j]
+        if x.kind == "punct" and x.text in (")", "]", "}"):
+            o = opener_before(flat, j)
+            if o is None:
+                return None
+            j = o - 1
+            # `label: {` of a labelled trailing closure.
+            if j >= 1 and flat[j].text == ":" and flat[j - 1].kind == "id" and x.text == "}":
+                j -= 2
+            continue
+        if x.kind == "id" and x.text not in KEYWORDS:
+            root = j
+            p = flat[j - 1] if j >= 1 else None
+            if p is not None and p.kind == "op" and p.text == ".":
+                j -= 2
+                continue
+            return root
+        return root
+    return root
+
+
+def button_label_spans(flat, k):
+    """The label closures of the Button named at flat[k]: a `label:`
+    argument or labelled trailing closure, or the first trailing closure
+    when the parentheses hold `action:`."""
+    spans = []
+    j = k + 1
+    has_action = False
+    if j < len(flat) and flat[j].text == "(":
+        for label, expr in call_args(flat, j):
+            if label == "label":
+                spans.append(expr)
+            if label == "action":
+                has_action = True
+        j = matching(flat, j) + 1
+    first = True
+    while j < len(flat):
+        x = flat[j]
+        if x.kind == "punct" and x.text == "{":
+            end = matching(flat, j)
+            if first and has_action:
+                spans.append(flat[j : end + 1])
+            first = False
+            j = end + 1
+            continue
+        if x.kind == "id" and j + 2 < len(flat) and flat[j + 1].text == ":" and flat[j + 2].text == "{":
+            end = matching(flat, j + 2)
+            if x.text == "label":
+                spans.append(flat[j + 2 : end + 1])
+            j = end + 1
+            continue
+        break
+    return spans
+
+
+def check_shortcut(rel, flat, k):
+    """`.keyboardShortcut` (flat[k]) is set in SwiftUI's environment and
+    reaches every button in the view it modifies (measured: on a VStack or
+    a wrapper view it fires the Approve button inside). So it is allowed
+    only directly on a `Button(...)`: nothing between the button's own
+    call and the shortcut, no string or name in the button that says
+    approve, reveal, replace or remove, and a label of text, images and
+    stacks only."""
+    line = flat[k].line
+    root = receiver_root(flat, k - 1)
+    if root is None or flat[root].text != "Button" or root + 1 >= len(flat) or flat[root + 1].text not in ("(", "{"):
+        find(
+            "gated-key",
+            rel,
+            line,
+            "`.keyboardShortcut` on something other than a Button directly: on a container or another view it reaches every button inside",
+        )
+        return
+    end = closure_end(flat, root)
+    if end != k - 2:
+        find("gated-key", rel, line, "`.keyboardShortcut` after other modifiers of a Button: put it directly on the Button, before any view another modifier adds")
+        return
+    span = flat[root + 1 : end + 1]
+    what = gated_span(span)
+    if what is not None:
+        find("gated-key", rel, line, "`.keyboardShortcut` on a button that holds %s: these go through Touch ID, never a key alone" % what)
+        return
+    for label in button_label_spans(flat, root):
+        for i, x in enumerate(label):
+            nxt = label[i + 1] if i + 1 < len(label) else None
+            if x.kind == "id" and x.text[:1].isupper() and x.text not in LABEL_VIEWS and nxt is not None and nxt.text in ("(", "{"):
+                find("gated-key", rel, line, "`.keyboardShortcut` on a button whose label holds `%s`, a view this check cannot see inside" % x.text)
+                return
+
+
+def statement_after(flat, j):
+    """The tokens of an expression starting at flat[j] that runs to the end
+    of its statement: a `;`, a closing bracket of an enclosing level, or a
+    new line at the top level."""
+    out, depth = [], 0
+    level = flat[j].level if j < len(flat) else 0
+    line = flat[j].line if j < len(flat) else 0
+    while j < len(flat):
+        x = flat[j]
+        if x.level == level:
+            if depth == 0 and (x.line != line and not (x.kind == "op" and x.text not in ("?", "!"))) and out and not (out[-1].kind == "op"):
+                break
+            if x.kind == "punct" and x.text in "([{":
+                depth += 1
+            elif x.kind == "punct" and x.text in ")]}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif x.kind == "punct" and x.text in (";", ",") and depth == 0:
+                break
+        out.append(x)
+        j += 1
+    return out
 
 
 def check_color(rel, flat, k):
@@ -1698,6 +2287,109 @@ def plist_keys(value):
             yield from plist_keys(inner)
 
 
+NEXTSTEP_ESCAPES = {"a": "\a", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v"}
+XML_REFERENCE = re.compile(r"&(#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z]+);")
+JSON_STRING = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+QUOTED = re.compile(r'"((?:[^"\\]|\\.)*)"')
+
+
+def nextstep_unquote(body):
+    """A quoted string's value in the NeXTSTEP property list grammar that
+    project files and old .strings files use: `\\Uxxxx`, three octal
+    digits, and the C escapes."""
+    out = []
+    i = 0
+    while i < len(body):
+        c = body[i]
+        if c == "\\" and i + 1 < len(body):
+            e = body[i + 1]
+            if e in "Uu" and re.match(r"[0-9A-Fa-f]{4}", body[i + 2 : i + 6]):
+                out.append(chr(int(body[i + 2 : i + 6], 16)))
+                i += 6
+                continue
+            if re.match(r"[0-7]{3}", body[i + 1 : i + 4]):
+                out.append(chr(int(body[i + 1 : i + 4], 8)))
+                i += 4
+                continue
+            out.append(NEXTSTEP_ESCAPES.get(e, e))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def one_line(value):
+    # A decoded line break would move every later line number.
+    return value.replace("\r", " ").replace("\n", " ")
+
+
+def searchable(rel, text):
+    """A text file as its own grammar reads it, for the key and settings
+    rules: in a project file or a .strings file each quoted string decoded
+    (NeXTSTEP escapes), in a scheme each XML character reference, and in
+    JSON each string's escapes, so `\\U0043FBundleURLTypes`,
+    `&#67;FBundleURLTypes` and `\\u0043FBundleURLTypes` read as the key
+    they spell. Line numbers stay where they were."""
+    if rel.endswith((".pbxproj", ".strings")):
+        return QUOTED.sub(lambda m: '"%s"' % one_line(nextstep_unquote(m.group(1))), text)
+    if rel.endswith(".xcscheme"):
+
+        def ref(m):
+            body = m.group(1)
+            try:
+                if body[:2] in ("#x", "#X"):
+                    return one_line(chr(int(body[2:], 16)))
+                if body[:1] == "#":
+                    return one_line(chr(int(body[1:])))
+            except (ValueError, OverflowError):
+                return m.group(0)
+            return {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}.get(body, m.group(0))
+
+        return XML_REFERENCE.sub(ref, text)
+    if rel.endswith((".json", ".xcstrings")):
+
+        def unescape(m):
+            try:
+                return '"%s"' % one_line(json.loads(m.group(0)))
+            except ValueError:
+                return m.group(0)
+
+        return JSON_STRING.sub(unescape, text)
+    return text
+
+
+# Settings that preprocess the Info.plist, so the keys built are not the
+# keys this check reads.
+INFOPLIST_PREPROCESSING = re.compile(
+    r"(?<![A-Za-z0-9_])(INFOPLIST_PREPROCESS|INFOPLIST_PREFIX_HEADER|INFOPLIST_PREPROCESSOR_DEFINITIONS|INFOPLIST_OTHER_PREPROCESSOR_FLAGS)(?:\[[^\]\n]*\])*\s*="
+)
+# Settings that name a file the build reads: it must be one this check
+# reads, inside apps/macos.
+FILE_SETTINGS = re.compile(r"(?<![A-Za-z0-9_])(INFOPLIST_FILE|CODE_SIGN_ENTITLEMENTS)(?:\[[^\]\n]*\])*\s*=\s*(\"?)([^\";\n]*)\2")
+XCCONFIG_INCLUDE = re.compile(r"^\s*#include\??\s*\"([^\"]*)\"", re.M)
+
+
+def check_settings(rel, text):
+    """Build settings in a project or configuration file that change what
+    is built from what this check reads."""
+    for m in INFOPLIST_PREPROCESSING.finditer(text):
+        find("side-door", rel, line_of(text, m.start()), "`%s` preprocesses the Info.plist, so the keys built are not the keys this check reads" % m.group(1))
+    for m in FILE_SETTINGS.finditer(text):
+        value = m.group(3).strip()
+        for prefix in ("$(SRCROOT)/", "$(PROJECT_DIR)/", "${SRCROOT}/", "${PROJECT_DIR}/"):
+            if value.startswith(prefix):
+                value = value[len(prefix) :]
+        rule = "side-door" if m.group(1) == "INFOPLIST_FILE" else "entitlement"
+        if not value or value.startswith("/") or "$" in value or not inside(posixpath.join(APP, value), [APP + "/"]):
+            find(rule, rel, line_of(text, m.start()), "`%s = %s`: a file outside %s/ or named through a setting, which this check does not read" % (m.group(1), m.group(3), APP))
+    if rel.endswith(".xcconfig"):
+        for m in XCCONFIG_INCLUDE.finditer(text):
+            target = m.group(1)
+            if target.startswith("/") or "$" in target or not inside(posixpath.join(posixpath.dirname(rel), target), [APP + "/"]):
+                find("linked-code", rel, line_of(text, m.start()), "`#include \"%s\"`: settings from outside %s/, which this check does not read" % (target, APP))
+
+
 def check_text_file(rel, data, text):
     """The key and settings rules for one file under apps/macos. A property
     list is read parsed (XML in any encoding, or binary), whatever its name,
@@ -1721,22 +2413,33 @@ def check_text_file(rel, data, text):
         for key in LAUNCH_KEYS:
             if key in keys:
                 find("launch-input", rel, 0, "`%s` sets the app's environment" % key)
+        for key in sorted(keys):
+            if "$(" in key or "${" in key:
+                find("side-door", rel, 0, "`%s`: a key built from a build setting, so the key built is not the key this check reads" % key)
     elif rel.endswith(PLIST_INPUTS):
         if text is None:
             find("unreadable", rel, 0, "not UTF-8 or UTF-16 text, so this check cannot read it")
         else:
+            if rel.endswith((".json", ".xcstrings")):
+                try:
+                    json.loads(text)
+                except ValueError:
+                    find("unreadable", rel, 0, "JSON this check cannot parse, so its keys would go unchecked")
+            search = searchable(rel, text)
             for key in SIDE_DOOR_KEYS:
                 # `_` may come before a key: INFOPLIST_KEY_<Key> sets it from a build setting.
-                for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
-                    find("side-door", rel, line_of(text, m.start()), "`%s` (SPEC §12 \"No side doors\")" % key)
+                for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), search):
+                    find("side-door", rel, line_of(search, m.start()), "`%s` (SPEC §12 \"No side doors\")" % key)
             for key in LAUNCH_KEYS:
-                for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), text):
-                    find("launch-input", rel, line_of(text, m.start()), "`%s` sets the app's environment" % key)
+                for m in re.finditer(r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9_])" % re.escape(key), search):
+                    find("launch-input", rel, line_of(search, m.start()), "`%s` sets the app's environment" % key)
     if text is not None and rel.endswith((".pbxproj", ".xcconfig")):
-        for m in LINK_SETTINGS.finditer(text):
-            find("linked-code", rel, line_of(text, m.start()), "`%s` links or includes code from outside the reviewed sources" % m.group(1))
+        search = searchable(rel, text)
+        for m in LINK_SETTINGS.finditer(search):
+            find("linked-code", rel, line_of(search, m.start()), "`%s` links or includes code from outside the reviewed sources" % m.group(1))
+        check_settings(rel, search)
     if text is not None and rel.endswith(".pbxproj"):
-        check_pbxproj(rel, text)
+        check_pbxproj(rel, searchable(rel, text))
     if rel.endswith(".entitlements"):
         if not isinstance(parsed, dict):
             find("entitlement", rel, 0, "not a property list dictionary this check can read")

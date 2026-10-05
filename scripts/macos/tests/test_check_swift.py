@@ -4,13 +4,18 @@ refusal fixture (one change to that tree) fails with the rule it breaks,
 pinned to the changed file. Negative controls (code that looks close but
 is allowed: a child process's streams, working directory, arguments and
 environment being set, an implicit `.error(...)` case, a descriptor in a
-variable, `/dev/null`, the temporary directory, an NSException with a
-literal reason, a token enum's case forms, a struct with its own
-`rawValue`, a nested one inside an extension, a local named `rawValue`,
-SwiftUI's `extension ShapeStyle where Self == Color`, a button with an
-ordinary action on the default key, `onSubmit` that searches, the brand's
-icon group, an SDK framework) sit in the clean tree, so a rule that
-refuses too much fails here too.
+variable, `/dev/null` and `/dev/urandom`, the temporary directory, an
+NSException with a literal reason and a fixed name, a token enum's case
+forms, a struct with its own `rawValue`, a nested one inside an extension,
+a local named `rawValue`, an option set's implicit `.init(rawValue: 1)` in
+a file without System, SwiftUI's `extension ShapeStyle where Self ==
+Color`, buttons with ordinary actions and a text-and-image label given
+shortcuts directly, `onSubmit` and `onExitCommand` that search, an empty
+AppKit key equivalent, ECLog's Logger from a constant subsystem and a
+category enum, the brand's icon group, an SDK framework, settings that
+name files inside apps/macos, a scheme and a JSON file with escapes that
+spell nothing refused) sit in the clean tree, so a rule that refuses too
+much fails here too.
 
 The fixture trees are written at run time under a short temporary
 directory: the key-literal case needs a key-shaped string, which is never
@@ -44,11 +49,16 @@ KIT = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Client.swift"
 TOKEN_FILE = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Log/LogToken.swift"
 DESIGN = "apps/macos/Packages/EnvCloakDesign/Sources/EnvCloakDesign/Tokens.swift"
 TEST = "apps/macos/EnvCloakTests/AppTests.swift"
+# A product file of its own, for fixtures whose import changes what the
+# clean tree's files mean.
+STREAM = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Stream.swift"
 INFO = "apps/macos/Support/EnvCloak-Info.plist"
 ENTITLEMENTS = "apps/macos/Support/EnvCloak.entitlements"
 MANIFEST = "apps/macos/Packages/EnvCloakKit/Package.swift"
 PBXPROJ = "apps/macos/EnvCloak.xcodeproj/project.pbxproj"
 XCCONFIG = "apps/macos/Config/Base.xcconfig"
+SCHEME = "apps/macos/EnvCloak.xcodeproj/xcshareddata/xcschemes/EnvCloak.xcscheme"
+ASSET_JSON = "apps/macos/Packages/EnvCloakDesign/Sources/EnvCloakDesign/Resources/Colors.xcassets/Contents.json"
 EXPOSE = "apps/macos/security/expose-allowlist.txt"
 RULES = "apps/macos/security/check-swift-allowlist.txt"
 BRAND_SWIFT = "assets/brand/motion/swiftui/Motion.swift"
@@ -102,15 +112,19 @@ struct View: SwiftUI.View {
                 .keyboardShortcut(.defaultAction)
             Button("Search") { search() }
                 .keyboardShortcut("f")
+            Button(action: search) { Label("Find", systemImage: "magnifyingglass") }
+                .keyboardShortcut("g")
             TextField("Find", text: .constant("")).onSubmit { search() }
             Divider().background(Color.clear)
         }
+        .onExitCommand { search() }
         .environment(\\.locale, Locale(identifier: "en_GB"))
         .padding(total > 2 ? 8 : 4)
     }
 }
 """,
     KIT: """import Foundation
+import AppKit
 
 public struct Client {
     public init() {}
@@ -137,6 +151,22 @@ public struct Client {
     public func scratch() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent(NSTemporaryDirectory()) }
     public func outcome() -> Outcome { return .error(1) }
     public func checked(_ n: Int) { precondition(n >= 0, "negative count") }
+    // A name fixed in the source.
+    public func named() -> NSException { NSException(name: NSExceptionName("ai.envcloak.stop"), reason: "stopped", userInfo: nil) }
+    // Devices that are no one's stream.
+    public func random() -> FileHandle? { FileHandle(forReadingAtPath: "/dev/urandom") }
+    // An empty AppKit key equivalent binds no key.
+    public func item() -> NSMenuItem { NSMenuItem(title: "Go", action: nil, keyEquivalent: "") }
+}
+
+// A key method that does nothing gated.
+final class KeyView: NSView { override func keyDown(with event: NSEvent) { super.keyDown(with: event) } }
+
+// An option set's implicit init, in a file that does not import System.
+public struct Flags: OptionSet {
+    public let rawValue: Int
+    public init(rawValue: Int) { self.rawValue = rawValue }
+    public static let first: Flags = .init(rawValue: 1)
 }
 
 public enum Outcome { case ok, error(Int) }
@@ -161,8 +191,14 @@ extension LogToken {
 }
 
 public enum ECLog {
+    public static let subsystem = "ai.envcloak.app"
+
     public static func logger(_ category: ECLogCategory) -> Logger {
-        Logger(subsystem: "ai.envcloak.app", category: category.rawValue)
+        Logger(subsystem: subsystem, category: category.rawValue)
+    }
+
+    public static func other() -> Logger {
+        Logger(subsystem: "ai.envcloak.app", category: "fixed")
     }
 }
 
@@ -218,7 +254,13 @@ let package = Package(
         "\t\tEC05 = {isa = XCBuildConfiguration; buildSettings = {LD_RUNPATH_SEARCH_PATHS = \"@executable_path/../Frameworks\"; }; };\n"
         "\t};\n}\n"
     ),
-    XCCONFIG: "SWIFT_VERSION = 6.0\nLD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks\n",
+    XCCONFIG: (
+        "SWIFT_VERSION = 6.0\nLD_RUNPATH_SEARCH_PATHS = @executable_path/../Frameworks\n"
+        "INFOPLIST_FILE = Support/EnvCloak-Info.plist\nCODE_SIGN_ENTITLEMENTS = $(SRCROOT)/Support/EnvCloak.entitlements\n"
+        '#include "Signing-Adhoc.xcconfig"\n'
+    ),
+    SCHEME: '<?xml version="1.0" encoding="UTF-8"?>\n<Scheme version = "1.7">\n   <LaunchAction buildConfiguration = "Debug" &amp; "x"/>\n</Scheme>\n',
+    ASSET_JSON: '{"info": {"author": "x\\u0063ode", "version": 1}}\n',
     EXPOSE: "# path  # reason\n",
     RULES: "# rule path  # reason\n",
 }
@@ -323,6 +365,11 @@ SWIFT_REFUSALS = [
     ("resolving links", "launch-input", KIT, append(KIT, "func t(u: URL) -> URL { u.resolvingSymlinksInPath() }\n")),
     ("a standardized URL", "launch-input", KIT, append(KIT, "func t(u: URL) -> URL { u.standardized }\n")),
     ("a tilde path", "launch-input", KIT, append(KIT, "let r = URL(fileURLWithPath: \"~/Library/Application Support/EnvCloak/run\")\n")),
+    ("an escaped tilde path", "launch-input", KIT, append(KIT, "let r = URL(fileURLWithPath: \"\\u{7E}/Library\")\n")),
+    ("a tilde path in a raw string", "launch-input", KIT, append(KIT, "let r = URL(fileURLWithPath: #\"\\#u{7E}/Library\"#)\n")),
+    ("an indented tilde path in a multi-line literal", "launch-input", KIT, append(KIT, "let r = \"\"\"\n    ~/Library\n    \"\"\"\n")),
+    ("a tilde path after a line continuation", "launch-input", KIT, append(KIT, "let r = \"\"\"\n    \\\n    ~/Library\n    \"\"\"\n")),
+    ("an escaped sysctl name", "launch-input", KIT, append(KIT, "let n = \"kern.proc\\u{61}rgs2\"\n")),
     # launch inputs: working directory
     ("the working directory", "launch-input", KIT, append(KIT, "let d = FileManager.default.currentDirectoryPath\n")),
     ("getcwd", "launch-input", KIT, append(KIT, "let d = getcwd(nil, 0)\n")),
@@ -342,6 +389,19 @@ SWIFT_REFUSALS = [
     ("approve on submit", "gated-key", VIEW, replace(VIEW, ".onSubmit { search() }", ".onSubmit { approveRequest() }")),
     ("Return as an AppKit key equivalent", "gated-key", KIT, append(KIT, "import AppKit\nfunc b(x: NSButton) { x.keyEquivalent = \"\\r\" }\n")),
     ("Return as a menu item's key equivalent", "gated-key", KIT, append(KIT, "import AppKit\nlet i = NSMenuItem(title: \"Go\", action: nil, keyEquivalent: \"\\u{0D}\")\n")),
+    # A shortcut is in SwiftUI's environment: it reaches every button in
+    # the view it is set on (measured: Return fired the inner Approve).
+    ("a shortcut on a stack holding an Approve button", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            VStack { Button(\"Approve\") { approve() } }\n                .keyboardShortcut(.defaultAction)")),
+    ("a shortcut on a wrapper view", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            Wrapper()\n                .keyboardShortcut(\"k\", modifiers: [])")),
+    ("a shortcut on a group holding a Reveal button", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            Group { Button(\"Reveal\") {} }\n                .keyboardShortcut(\"r\")")),
+    ("a shortcut after a modifier that adds a button", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            Button(\"Open\") {}\n                .background(Button(\"Approve\") {})\n                .keyboardShortcut(.defaultAction)")),
+    ("a shortcut on a button whose label is a view of its own", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            Button(action: open) { Panel() }\n                .keyboardShortcut(.defaultAction)")),
+    ("remove on the Delete command", "gated-key", VIEW, in_view(".onDeleteCommand { removeSelected() }")),
+    ("approve through a command selector", "gated-key", VIEW, in_view(".onCommand(#selector(approveRequest)) {}")),
+    ("approve in a key monitor", "gated-key", KIT, append(KIT, "let m = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in approveRequest(); return e }\n")),
+    ("reveal in a keyDown override", "gated-key", KIT, append(KIT, "final class V: NSView { override func keyDown(with event: NSEvent) { revealValue() } }\n")),
+    ("a menu item bound to a key", "gated-key", KIT, append(KIT, "let i = NSMenuItem(title: \"Approve\", action: nil, keyEquivalent: \"a\")\n")),
+    ("Return as a key equivalent in parentheses", "gated-key", KIT, append(KIT, "func b(x: NSButton) { x.keyEquivalent = (\"\\r\") }\n")),
     ("zoom action", "a11y-action", VIEW, in_view(".accessibilityZoomAction { _ in }")),
     ("an AppKit accessibility override", "a11y-action", KIT, append(KIT, "import AppKit\nfinal class B: NSButton { override func accessibilityPerformPress() -> Bool { true } }\n")),
     # log: other writers
@@ -370,6 +430,23 @@ SWIFT_REFUSALS = [
     ("descriptor 2 by path", "log", KIT, append(KIT, "let f = fopen(\"/dev/fd/2\", \"w\")\n")),
     ("the terminal by path", "log", KIT, append(KIT, "let f = fopen(\"/dev/tty\", \"w\")\n")),
     ("CFShow", "log", KIT, append(KIT, "func p(x: CFTypeRef) { CFShow(x) }\n")),
+    # The same streams in other spellings: the number in any base, through
+    # conversions, casts and System's FileDescriptor; the path as the
+    # kernel reads it and the literal as the compiler reads it.
+    ("standard error through System's FileDescriptor", "log", STREAM, write(STREAM, "import System\nlet d = FileDescriptor(rawValue: 2)\n")),
+    ("standard error through an implicit FileDescriptor init", "log", STREAM, write(STREAM, "import System\nlet d: FileDescriptor = .init(rawValue: 2)\n")),
+    ("standard error by a hexadecimal descriptor", "log", KIT, append(KIT, "let h = FileHandle(fileDescriptor: 0x2)\n")),
+    ("standard output by a converted, labelled descriptor", "log", KIT, append(KIT, "let h = FileHandle(fileDescriptor: CInt(truncatingIfNeeded: 0b1))\n")),
+    ("standard error by a cast descriptor", "log", KIT, append(KIT, "let h = FileHandle(fileDescriptor: 2 as Int32)\n")),
+    ("standard input through a dispatch source", "launch-input", KIT, append(KIT, "let s = DispatchSource.makeReadSource(fileDescriptor: 0, queue: .main)\n")),
+    ("a child handed the app's standard error", "log", KIT, append(KIT, "func a(f: inout posix_spawn_file_actions_t) { posix_spawn_file_actions_adddup2(&f, 2, 2) }\n")),
+    ("standard error by a path with a doubled slash", "log", KIT, append(KIT, "let h = FileHandle(forWritingAtPath: \"/dev//stderr\")\n")),
+    ("descriptor 2 by a path with a dot segment", "log", KIT, append(KIT, "let h = FileHandle(forWritingAtPath: \"/dev/./fd/2\")\n")),
+    ("standard error by a capitalised path", "log", KIT, append(KIT, "let h = FileHandle(forWritingAtPath: \"/DEV/stderr\")\n")),
+    ("standard error by an escaped path", "log", KIT, append(KIT, "let h = FileHandle(forWritingAtPath: \"/dev/std\\u{65}rr\")\n")),
+    ("standard error through a file URL", "log", KIT, append(KIT, "let u = URL(string: \"file:///dev/stderr\")\n")),
+    ("standard error in a multi-line literal", "log", KIT, append(KIT, "let p = \"\"\"\n    /dev/std\\\n    err\n    \"\"\"\n")),
+    ("a device path completed at run time", "log", KIT, append(KIT, "func p(s: String) -> String { \"/dev/\" + s }\n")),
     ("the system log facility", "log", KIT, append(KIT, "func p() { withVaList([]) { asl_vlog(nil, nil, 3, \"x\", $0) } }\n")),
     ("an NSException reason", "log", KIT, append(KIT, "func x(s: String) -> NSException { NSException(name: .genericException, reason: s, userInfo: nil) }\n")),
     ("raise with a format", "log", KIT, append(KIT, "func x(s: String) { withVaList([s]) { NSException.raise(.genericException, format: \"%@\", arguments: $0) } }\n")),
@@ -390,6 +467,19 @@ SWIFT_REFUSALS = [
     ("a private value", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.rawValue)")),
     ("public privacy outside a log call", "log", KIT, append(KIT, "func m(name: String) -> String { \"x \\(name, privacy: .public)\" }\n")),
     ("public format", "log", KIT, append(KIT, "let f = \"%{public}s\"\n")),
+    ("an escaped public format", "log", KIT, append(KIT, "let f = \"%{p\\u{75}blic}s\"\n")),
+    # The token whole: nothing joined to it, chosen against it, or around it.
+    ("a token joined to a value", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(AppEvent.launched.logToken + Secret.value, privacy: .public)")),
+    ("a token or a value", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(flag ? Secret.value : AppEvent.launched.logToken, privacy: .public)")),
+    ("a value or a token", "log", APP, replace(APP, "\\(AppEvent.launched.logToken, privacy: .public)", "\\(Secret.value ?? AppEvent.launched.logToken)")),
+    # The log's metadata: only ECLog builds a Logger, from fixed words.
+    ("a Logger built in the app", "log", APP, append(APP, "import os\nlet extra = Logger(subsystem: \"ai.envcloak.app\", category: \"x\")\n")),
+    ("a Logger built by an implicit init", "log", KIT, append(KIT, "import os\nlet l: Logger = .init(subsystem: \"a\", category: \"b\")\n")),
+    ("a run-time subsystem", "log", TOKEN_FILE, replace(TOKEN_FILE, "Logger(subsystem: subsystem,", "Logger(subsystem: NSUserName(),")),
+    ("a run-time category", "log", TOKEN_FILE, replace(TOKEN_FILE, "category: category.rawValue)", "category: ProcessInfo.processInfo.hostName)")),
+    ("a category of a type not declared there", "log", TOKEN_FILE, replace(TOKEN_FILE, "_ category: ECLogCategory", "_ category: Wordy")),
+    ("a subsystem bound twice", "log", TOKEN_FILE, replace(TOKEN_FILE, "        Logger(subsystem: subsystem, category: category.rawValue)", "        let subsystem = NSUserName()\n        return Logger(subsystem: subsystem, category: category.rawValue)")),
+    ("an NSException name from a value", "log", KIT, append(KIT, "func x(s: String) -> NSException { NSException(name: NSExceptionName(s), reason: \"r\", userInfo: nil) }\n")),
     ("a value in fatalError", "log", APP, replace(APP, "fatalError(\"stopped \\(AppEvent.third.logToken)\")", "fatalError(\"stopped \\(total)\")")),
     ("a message variable in fatalError", "log", APP, replace(APP, "fatalError(\"stopped \\(AppEvent.third.logToken)\")", "fatalError(reason)")),
     ("a value in precondition", "log", KIT, replace(KIT, "precondition(n >= 0, \"negative count\")", "precondition(n >= 0, \"negative count \\(n)\")")),
@@ -477,6 +567,21 @@ OTHER_REFUSALS = [
     ("scripting definition", "side-door", INFO, replace(INFO, "</dict>", "\t<key>OSAScriptingDefinition</key>\n\t<string>x.sdef</string>\n</dict>")),
     ("services", "side-door", INFO, replace(INFO, "</dict>", "\t<key>NSServices</key>\n\t<array/>\n</dict>")),
     ("a key set by a build setting", "side-door", PBXPROJ, in_pbxproj("INFOPLIST_KEY_NSServices = x;")),
+    # Keys as each format's own grammar reads them.
+    ("an escaped key in the project", "side-door", PBXPROJ, in_pbxproj("EC09 = {isa = XCBuildConfiguration; buildSettings = {\"INFOPLIST_KEY_\\U004eSServices\" = x; }; };")),
+    ("an escaped key in a strings file", "side-door", "apps/macos/Support/InfoPlist.strings", write("apps/macos/Support/InfoPlist.strings", "\"\\U004eSServices\" = \"x\";\n")),
+    ("a key in a scheme through a character reference", "side-door", SCHEME, replace(SCHEME, "<LaunchAction", "<EnvironmentVariable key = \"&#67;FBundleURLTypes\"/>\n   <LaunchAction")),
+    ("an escaped key in JSON", "side-door", ASSET_JSON, write(ASSET_JSON, "{\"\\u0043FBundleURLTypes\": []}\n")),
+    ("JSON that does not parse", "unreadable", ASSET_JSON, write(ASSET_JSON, "{\"info\": \n")),
+    ("a key built from a build setting", "side-door", INFO, replace(INFO, "</dict>", "\t<key>$(EXTRA_KEY)</key>\n\t<array/>\n</dict>")),
+    # Settings that build an Info.plist, entitlements or settings other
+    # than the files this check reads.
+    ("a preprocessed Info.plist", "side-door", XCCONFIG, append(XCCONFIG, "INFOPLIST_PREPROCESS = YES\n")),
+    ("Info.plist macros", "side-door", PBXPROJ, in_pbxproj("EC09 = {isa = XCBuildConfiguration; buildSettings = {INFOPLIST_PREPROCESSOR_DEFINITIONS = \"KEY=X\"; }; };")),
+    ("an Info.plist from outside the tree", "side-door", XCCONFIG, append(XCCONFIG, "INFOPLIST_FILE = ../../Other/Info.plist\n")),
+    ("an Info.plist named through a setting", "side-door", PBXPROJ, in_pbxproj("EC09 = {isa = XCBuildConfiguration; buildSettings = {INFOPLIST_FILE = \"$(OTHER)/Info.plist\"; }; };")),
+    ("entitlements from outside the tree", "entitlement", XCCONFIG, append(XCCONFIG, "CODE_SIGN_ENTITLEMENTS = /tmp/x.entitlements\n")),
+    ("settings included from outside the tree", "linked-code", XCCONFIG, append(XCCONFIG, "#include \"../../../shared.xcconfig\"\n")),
     ("an environment in Info.plist", "launch-input", INFO, replace(INFO, "</dict>", "\t<key>LSEnvironment</key>\n\t<dict/>\n</dict>")),
     ("get-task-allow", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.get-task-allow</key>\n\t<true/>\n")),
     ("a runtime exception", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.cs.allow-jit</key>\n\t<true/>\n")),
@@ -515,6 +620,11 @@ OTHER_REFUSALS = [
     ("a module map", "linked-code", "apps/macos/Packages/EnvCloakKit/Sources/CShim/include/module.modulemap", write("apps/macos/Packages/EnvCloakKit/Sources/CShim/include/module.modulemap", "module CShim {}\n")),
     ("assembly", "linked-code", "apps/macos/EnvCloak/App/start.S", write("apps/macos/EnvCloak/App/start.S", ".text\n")),
     ("a storyboard", "linked-code", "apps/macos/EnvCloak/App/Main.storyboard", write("apps/macos/EnvCloak/App/Main.storyboard", "<document/>\n")),
+    ("a MIG definition", "linked-code", "apps/macos/EnvCloak/App/rpc.defs", write("apps/macos/EnvCloak/App/rpc.defs", "subsystem rpc 100;\n")),
+    ("a DriverKit interface", "linked-code", "apps/macos/EnvCloak/App/Driver.iig", write("apps/macos/EnvCloak/App/Driver.iig", "class Driver;\n")),
+    ("preprocessed C", "linked-code", "apps/macos/EnvCloak/App/shim.i", write("apps/macos/EnvCloak/App/shim.i", "int shim(void);\n")),
+    ("preprocessed Objective-C++", "linked-code", "apps/macos/EnvCloak/App/shim.mii", write("apps/macos/EnvCloak/App/shim.mii", "int shim(void);\n")),
+    ("AppleScript", "linked-code", "apps/macos/EnvCloak/App/Bridge.applescript", write("apps/macos/EnvCloak/App/Bridge.applescript", "script Bridge\nend script\n")),
     ("a data model", "linked-code", "apps/macos/EnvCloak/Model.xcdatamodeld/Model.xcdatamodel/contents", write("apps/macos/EnvCloak/Model.xcdatamodeld/Model.xcdatamodel/contents", "<model/>\n")),
     ("a script phase", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXShellScriptBuildPhase; shellScript = \"true\"; };")),
     ("a build rule", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXBuildRule; script = \"true\"; };")),
