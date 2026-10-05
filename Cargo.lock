@@ -459,11 +459,16 @@ version = "0.1.0"
 dependencies = [
  "envcloak-core",
  "envcloak-policy",
+ "envcloak-testkit",
+ "hmac",
  "proptest",
+ "secrecy",
  "serde_json",
+ "sha1",
  "sha2",
  "static_assertions",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -963,6 +968,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

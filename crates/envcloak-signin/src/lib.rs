@@ -27,7 +27,8 @@
 //!   revocation, root exit, epochs, the world's changes and the clock
 //!   (R-M2b-13, R-M2b-17).
 //!
-//! The TOTP function joins with plan task M2b-03. The contract's
+//! [`totp`] provides RFC 6238 and injected-clock arithmetic (M2b-03a).
+//! The contract's
 //! invariants are checked by exhaustive enumeration of event orderings in
 //! `tests/enumeration.rs`.
 
@@ -37,6 +38,7 @@ pub mod scope;
 pub mod statement;
 pub mod status;
 pub mod store;
+pub mod totp;
 
 pub use authorization::{
     Authorization, AuthorizationId, AuthorizationKind, BudgetError, CreditLease, Deadline,

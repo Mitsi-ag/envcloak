@@ -207,6 +207,8 @@ jobs:
         run: scripts/check-sources.sh
       - name: expose_secret lint canary
         run: scripts/check-expose-lint.sh
+      - name: SHA-1 TOTP confinement canary
+        run: scripts/check-totp-lint.sh
       - name: unsafe_code forbid canary
         run: scripts/check-unsafe-lint.sh
       # Gate 12: the whole suite at RUST_LOG=trace with full backtraces;
