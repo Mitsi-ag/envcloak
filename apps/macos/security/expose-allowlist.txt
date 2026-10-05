@@ -1,0 +1,9 @@
+# Swift files that may open a SecretBuffer's bytes (M3 plan §5 rule 1):
+# `withUnsafeBytes` and `withUnsafeMutableBytes` appear in no other product
+# file, which scripts/macos/check-swift.sh enforces. One file per line,
+# with the reason after `#`:
+#
+#   apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/SecretBuffer.swift  # the buffer itself
+#
+# Adding a file needs review, as security/expose-allowlist.txt does for
+# expose_secret in Rust. Task M3-03 adds the first entries.

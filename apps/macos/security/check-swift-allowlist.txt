@@ -1,0 +1,5 @@
+# Product Swift files allowed one of scripts/macos/check-swift.sh's
+# allowlistable rules (launch-input, storage, a11y-action, daemon-text),
+# one per line as `<rule> <path>  # <reason>`. Every entry needs a reason,
+# must name a product Swift file and must still allow something there, or
+# the check fails. Adding an entry needs review.
