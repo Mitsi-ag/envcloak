@@ -20,6 +20,8 @@ pub struct Found {
     pub name: SecretBytes,
     pub value: Option<SecretBytes>,
     pub disposition: Disposition,
+    /// True only for a schema-level include directive, never a binding name.
+    pub env_file: bool,
     pub range: Range<u64>,
     pub single_complete_line: bool,
     pub source: Source,

@@ -82,10 +82,11 @@ fn catalog_settings_and_project_servers_produce_values() {
 
 #[test]
 fn absent_catalog_stores_are_complete_and_present_omissions_are_notes() {
-    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let d = fixture_home();
     let locations = catalog(d.path());
     let configs = locations.config_sources();
     let transcripts = locations.transcript_sources();
+    std::fs::create_dir_all(d.path().join(".codex")).unwrap();
     let config = envcloak_scan::scan_config_sources(&configs).unwrap();
     let transcript = envcloak_scan::transcript::scan_transcript_sources(
         &transcripts,
@@ -105,6 +106,9 @@ fn absent_catalog_stores_are_complete_and_present_omissions_are_notes() {
         if let Some(name) = &s.names {
             std::fs::create_dir_all(&s.path).unwrap();
             std::fs::write(s.path.join(format!("{name}fixture.sqlite")), b"not read").unwrap();
+        } else if s.path.file_name().is_some_and(|n| n == "mcp-secrets") {
+            std::fs::create_dir_all(&s.path).unwrap();
+            std::fs::write(s.path.join("nested"), b"not read").unwrap();
         } else {
             std::fs::write(&s.path, b"not read").unwrap();
         }
@@ -117,6 +121,13 @@ fn absent_catalog_stores_are_complete_and_present_omissions_are_notes() {
     )
     .unwrap();
     assert!(config.complete() && transcript.complete());
+    for s in configs
+        .iter()
+        .filter(|s| s.source_kind == SourceKind::Credentials)
+    {
+        let path = std::fs::canonicalize(&s.path).unwrap();
+        assert!(config.notes.iter().any(|n| n.source.path == path));
+    }
     assert_eq!(
         config
             .notes

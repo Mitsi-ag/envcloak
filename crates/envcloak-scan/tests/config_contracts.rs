@@ -167,3 +167,42 @@ fn findings_obey_shared_candidate_and_occurrence_limits() {
         }
     }
 }
+
+#[test]
+fn binding_named_env_file_is_not_an_include_directive() {
+    let d = dir();
+    for (text, format) in [
+        (
+            r#"{"servers":{"s":{"env":{"envFile":"fixtureZliteralEnvFile"},"headers":{"envFile":"${NAME}"},"envFile":"actual.env"}}}"#,
+            ConfigFormat::Json,
+        ),
+        (
+            "[mcp_servers.s]\nenvFile='actual.env'\n[mcp_servers.s.env]\nenvFile='fixtureZliteralEnvFile'\n[mcp_servers.s.headers]\nenvFile='${NAME}'\n",
+            ConfigFormat::Toml,
+        ),
+    ] {
+        let path = d.path().join("config");
+        std::fs::write(&path, text).unwrap();
+        std::fs::write(d.path().join("actual.env"), b"A=fixtureZincludedValue\n").unwrap();
+        let mut descriptor = source(path);
+        descriptor.format = format;
+        let report = scan_config_sources_with_budget(&[descriptor], Budget::default()).unwrap();
+        assert!(report.complete(), "{:?}", report.issues);
+        assert_eq!(report.findings.len(), 3);
+        assert!(report.findings.iter().any(|f| {
+            f.name.ct_eq(b"envFile")
+                && f.value
+                    .as_ref()
+                    .is_some_and(|v| v.ct_eq(b"fixtureZliteralEnvFile"))
+        }));
+        assert!(report.findings.iter().any(|f| f.name.ct_eq(b"envFile")
+            && f.value.is_none()
+            && f.disposition == Disposition::Template));
+        assert!(report.findings.iter().any(|f| {
+            f.name.ct_eq(b"A")
+                && f.value
+                    .as_ref()
+                    .is_some_and(|v| v.ct_eq(b"fixtureZincludedValue"))
+        }));
+    }
+}
