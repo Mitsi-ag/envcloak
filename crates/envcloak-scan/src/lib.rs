@@ -31,6 +31,8 @@
 //!
 //! Nothing here logs, and no error carries text from a file.
 
+pub mod candidates;
+pub mod profile;
 pub mod atomic;
 pub mod delete;
 pub mod dotenv;
