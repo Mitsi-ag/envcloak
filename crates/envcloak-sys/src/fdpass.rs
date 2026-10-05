@@ -6,9 +6,9 @@
 //!   of them, and the rest of the bytes as plain writes.
 //! - [`recv_with_fds`] reads bytes and takes every descriptor that came
 //!   with them, each close-on-exec, at most [`MAX_FDS`] in one read. A
-//!   read whose descriptors did not all fit (`MSG_CTRUNC`) is an error,
-//!   and the ones that did fit are closed with it: the kernel discards
-//!   the others, so the reader can never tell what was sent.
+//!   read that brought more, or whose descriptors did not all fit
+//!   (`MSG_CTRUNC`), is an error, and every one that came is closed with
+//!   it (the kernel discards the ones that did not fit).
 //!
 //! A descriptor taken here is a capability the sender chose: the caller
 //! decides what it may be ([`descriptor_kind`]) before it uses one, and
@@ -130,11 +130,11 @@ fn send_first(sock: BorrowedFd<'_>, data: &[u8], fds: &[BorrowedFd<'_>]) -> io::
 /// Returns how many bytes were read: 0 at the end of the stream.
 ///
 /// # Errors
-/// [`io::ErrorKind::InvalidData`] when the descriptors sent did not all
-/// fit (`MSG_CTRUNC`, more than [`MAX_FDS`] in one read): the ones that
-/// fit are closed, the others the kernel discarded. `recvmsg`'s errors
-/// otherwise: a read with a timeout set on the socket times out as a
-/// `read` does.
+/// [`io::ErrorKind::InvalidData`] when more than [`MAX_FDS`] descriptors
+/// came with the read, or they did not all fit (`MSG_CTRUNC`): every one
+/// that came is closed (the kernel discarded the ones that did not fit),
+/// and none is appended. `recvmsg`'s errors otherwise: a read with a
+/// timeout set on the socket times out as a `read` does.
 pub fn recv_with_fds(
     sock: BorrowedFd<'_>,
     buf: &mut [u8],
@@ -206,8 +206,9 @@ pub fn recv_with_fds(
             return Err(io::Error::last_os_error());
         }
     }
-    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
-        // The ones that fit are closed here, with `got`.
+    if msg.msg_flags & libc::MSG_CTRUNC != 0 || got.len() > MAX_FDS {
+        // More than one read takes (the control buffer has room for
+        // more): every one that came is closed here, with `got`.
         return Err(io::ErrorKind::InvalidData.into());
     }
     fds.extend(got);

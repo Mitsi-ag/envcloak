@@ -343,3 +343,89 @@ fn the_idle_bound_is_per_frame_and_closes_only_a_quiet_connection() {
         VaultState::Absent
     );
 }
+
+/// Whether `w`'s pipe has no read end left: a write fails (`EPIPE`),
+/// tried for up to 5 seconds (the daemon drops what it closes as it
+/// answers).
+fn reader_gone(w: &std::os::fd::OwnedFd) -> bool {
+    let mut f = std::fs::File::from(w.try_clone().unwrap());
+    let end = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < end {
+        if f.write_all(b"x").is_err() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
+
+/// Descriptor passing (`SCM_RIGHTS`, M2 task M2-27): only a `run.request`
+/// hands descriptors over. A descriptor sent with `status` is refused
+/// `invalid_params` and closed by the daemon, and more descriptors than a
+/// request hands over (five) close the connection unanswered, each of
+/// them closed. "Closed" is seen from each pipe's write end once the
+/// daemon held its only read end: a write fails. The positive control: a
+/// pipe whose read end the test still holds takes the writes.
+///
+/// Mutations checked: descriptors sent with another method let through
+/// (`status` is answered as usual, and holds them until the connection
+/// ends); the count bound removed (five descriptors are taken with the
+/// request, and it is answered).
+#[test]
+fn descriptors_with_another_method_or_too_many_are_refused_and_closed() {
+    use std::os::fd::AsFd;
+    let home = TestHome::new();
+    let _d = start(&home);
+    let (r, w) = envcloak_sys::pipe_cloexec().unwrap();
+    let mut s = raw(&home);
+    let status =
+        envcloak_ipc::Frame::encode(&json!({"jsonrpc": "2.0", "id": 1, "method": "status"}))
+            .unwrap();
+    status.write_with_fds(&s, &[r.as_fd()]).unwrap();
+    drop(r);
+    assert_eq!(error_kind(&read_json(&mut s).unwrap()), "invalid_params");
+    assert!(
+        reader_gone(&w),
+        "the descriptor sent with status stayed open"
+    );
+    // The connection still serves: a request without descriptors.
+    send_json(
+        &mut s,
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "status"}),
+    );
+    assert_eq!(read_json(&mut s).unwrap()["id"], 2);
+    let (kept_r, kept_w) = envcloak_sys::pipe_cloexec().unwrap();
+    assert!(!reader_gone_quick(&kept_w), "the positive control");
+    drop(kept_r);
+
+    let pipes: Vec<_> = (0..5)
+        .map(|_| envcloak_sys::pipe_cloexec().unwrap())
+        .collect();
+    let mut s = raw(&home);
+    let request = envcloak_ipc::Frame::encode(&json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "run.request",
+        "params": {"manifest": "/nonexistent/envcloak.toml", "argv": ["x"], "launch": "0".repeat(26),
+                   "fds": ["stdin", "stdout", "lifeline"]},
+    }))
+    .unwrap();
+    let ends: Vec<_> = pipes.iter().map(|(r, _)| r.as_fd()).collect();
+    request.write_with_fds(&s, &ends).unwrap();
+    let writers: Vec<_> = pipes.into_iter().map(|(_, w)| w).collect();
+    assert!(
+        read_json(&mut s).is_none(),
+        "five descriptors were answered"
+    );
+    assert!(closed(&mut s));
+    for (i, w) in writers.iter().enumerate() {
+        assert!(reader_gone(w), "descriptor {i} of five stayed open");
+    }
+}
+
+/// [`reader_gone`] without waiting: one write.
+fn reader_gone_quick(w: &std::os::fd::OwnedFd) -> bool {
+    std::fs::File::from(w.try_clone().unwrap())
+        .write_all(b"x")
+        .is_err()
+}
