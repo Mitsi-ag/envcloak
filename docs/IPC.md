@@ -448,6 +448,20 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `failed` | outcome | M2-09 | landed | the probe or its control failed; listed first |
 | `skipped` | outcome | M2-09 | landed | the probe did not run, with the reason |
 | `not_qualified` | outcome | M2-28 | landed | the probe is not qualified for this host version, which is not a failure |
+| `prompt_to_model` | surface | M2-09 | landed | what the person types reaching the model (`--json`'s `surface`) |
+| `transcript` | surface | M2-09 | landed | a blocked prompt kept out of the host's local stores |
+| `file_read` | surface | M2-09 | landed | reading an env file through the host's tools |
+| `shell` | surface | M2-09 | landed | the host's shell tool printing the environment |
+| `mcp` | surface | M2-09 | landed | the host's MCP tool calls |
+| `output` | surface | M2-09 | landed | what `envcloak run` prints reaching the host, redacted |
+| `appeared` | sentinel | M2-09 | landed | the sentinel a command `run_with_secrets` started wrote appeared where the host's sandbox denies its own shell: the evidence for `outside_host_sandbox` |
+| `absent` | sentinel | M2-09 | landed | the sentinel did not appear |
+| `not_run` | sentinel | M2-09 | landed | no sentinel probe ran |
+| `at_mention` | case | M2-09 | landed | Claude Code's `@` mentions, a case of the file-read probe not run where the host does not expand them under `-p` (M2-26's interactive variant) |
+| `interactive_history` | case | M2-09 | landed | the prompt history only the hosts' interactive sessions write, a case of the transcript probe not run under `-p` or `exec` (M2-26's interactive variant) |
+| `current` | probed | M2-09 | landed | `agents status --json`'s `probed`: the states rest on a probe of this binary, version and configuration (else `changed_since_probe` or `not_probed`, the reasons) |
+| `version` | identity | M2-09 | landed | `agents status --json`'s `identified_by`: the host was told by the version line its binary gives |
+| `executable_name` | identity | M2-09 | landed | `identified_by`: only an executable of the host's name on `PATH` was found, which may be another program |
 <!-- /reservations -->
 
 **Control-pipe messages** of the processes EnvCloak starts (never socket methods):

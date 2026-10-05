@@ -53,7 +53,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::SystemTime;
 
-use envcloak_agents::coverage::{self, Cache, ConfigSet, Coverage, Probed, Surface};
+use envcloak_agents::coverage::{
+    self, Cache, ConfigSet, Coverage, Identity, ProbeStatus, Probed, Surface,
+};
 use envcloak_agents::detect::{self, DetectError};
 use envcloak_agents::hook::Host;
 use envcloak_agents::install::{
@@ -188,12 +190,12 @@ struct Row {
     exe: Option<PathBuf>,
     /// `current`, `changed_since_probe` or `not_probed`: what the states
     /// rest on.
-    probed: &'static str,
+    probed: ProbeStatus,
     /// How the host was told: `version` (its version line, read the way
     /// the catalog reads the host's), or `executable_name` (an executable
     /// of that name on `PATH`, which another program can have: the
     /// verifier's finding, `goose` is also a database migration tool).
-    identified_by: &'static str,
+    identified_by: Identity,
     coverage: Coverage,
 }
 
@@ -242,8 +244,8 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
                     name: host_name(host),
                     tier: 1,
                     exe: detect::find_on_path(detect::exe_name(host), &path),
-                    probed: "not_probed",
-                    identified_by: "executable_name",
+                    probed: ProbeStatus::NotProbed,
+                    identified_by: Identity::ExecutableName,
                     coverage: c,
                 });
                 continue;
@@ -268,17 +270,12 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
             .and_then(|me| cs.fingerprint(&me))
             .unwrap_or_default();
         let probed = cache.probed(host.id(), &sha, &d.version, &fingerprint);
-        let word = match probed {
-            Probed::Current(_) => "current",
-            Probed::Stale => "changed_since_probe",
-            Probed::None => "not_probed",
-        };
         rows.push(Row {
             name: host_name(host),
             tier: 1,
             exe: Some(d.exe.clone()),
-            probed: word,
-            identified_by: "version",
+            probed: probed.status(),
+            identified_by: Identity::Version,
             coverage: coverage::assemble(host, &d.version, &cs, probed),
         });
     }
@@ -293,8 +290,8 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
             name: static_name(id),
             tier: 2,
             exe: Some(found),
-            probed: "not_probed",
-            identified_by: "executable_name",
+            probed: ProbeStatus::NotProbed,
+            identified_by: Identity::ExecutableName,
             coverage: Coverage {
                 agent: id.to_owned(),
                 version: None,
@@ -328,8 +325,8 @@ fn print_coverage(rows: &[Row], json: bool) {
                 v["name"] = json!(r.name);
                 v["tier"] = json!(r.tier);
                 v["exe"] = json!(r.exe.as_ref().map(|p| shown(&home, p)));
-                v["probed"] = json!(r.probed);
-                v["identified_by"] = json!(r.identified_by);
+                v["probed"] = json!(r.probed.name());
+                v["identified_by"] = json!(r.identified_by.name());
                 v
             })
             .collect();
@@ -373,13 +370,13 @@ fn print_coverage(rows: &[Row], json: bool) {
             );
         }
         match r.probed {
-            "current" => {}
-            "changed_since_probe" => println!(
+            ProbeStatus::Current => {}
+            ProbeStatus::ChangedSinceProbe => println!(
                 "  The probe results kept are for another binary, version or configuration of \
                  {}: they are not used.",
                 r.name
             ),
-            _ => println!(
+            ProbeStatus::NotProbed => println!(
                 "  No probe has run on this machine for this binary, version and configuration \
                  of {}.",
                 r.name
@@ -449,7 +446,6 @@ fn double_install() -> Option<String> {
     ))
 }
 
-/// The project's directory: where the nearest manifest is, or here.
 /// The working directory, resolved.
 fn working_dir() -> Result<PathBuf, Failure> {
     std::env::current_dir()
@@ -457,6 +453,7 @@ fn working_dir() -> Result<PathBuf, Failure> {
         .map_err(|_| Failure::new("io", "the working directory could not be read"))
 }
 
+/// The project's directory: where the nearest manifest is, or here.
 fn project_dir() -> Result<PathBuf, Failure> {
     let cwd = || Failure::new("io", "the working directory could not be read");
     match find_manifest(Path::new(".")).map_err(|_| cwd())? {
