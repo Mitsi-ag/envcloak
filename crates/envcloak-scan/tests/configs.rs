@@ -104,3 +104,28 @@ fn config_links_and_unsupported_stores_are_visible() {
     assert!(report.issues.iter().any(|i| i.reason == "database"));
     assert!(!report.complete());
 }
+
+#[test]
+fn leftover_discovery_obeys_the_shared_file_budget() {
+    let d = dir();
+    for suffix in ["01", "02", "03"] {
+        std::fs::write(
+            d.path()
+                .join(format!(".missing.json.envcloak-new-{suffix}.tmp")),
+            b"foreign",
+        )
+        .unwrap();
+    }
+    let report = envcloak_scan::agent_config::scan_config_sources_with_budget(
+        &[source(d.path().join("missing.json"), ConfigFormat::Json)],
+        envcloak_scan::candidates::Budget {
+            files: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.leftovers.len(), 1);
+    assert!(report.issues.iter().any(|i| i.reason == "file_budget"));
+    assert!(!report.complete());
+    assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 3);
+}

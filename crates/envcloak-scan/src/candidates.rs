@@ -57,6 +57,7 @@ pub struct ScanReport {
     pub issues: Vec<Issue>,
     pub leftovers: Vec<Leftover>,
     pub files: u64,
+    /// Budget charged: successful bytes, or the allowance of a failed config read.
     pub bytes: u64,
 }
 impl ScanReport {
