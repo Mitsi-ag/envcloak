@@ -51,11 +51,18 @@ Rules (the id is what a finding and an allowlist entry name):
                  - the app's own standard input: `FileHandle.standardInput`
                    or any `.standardInput` that is not a child process's
                    being set, `stdin`, `__stdinp`, `STDIN_FILENO`,
-                   `readLine`, a descriptor-0 handle or read (the number in
-                   any base, converted or cast, in System's
-                   `FileDescriptor(rawValue:)` or an implicit `.init(rawValue:)`
-                   in a file that imports System, as any call's
-                   `fileDescriptor:` argument, or handed to a child by
+                   `readLine`, a descriptor-0 handle, read or query (the
+                   number in any base, or computed from literals alone:
+                   `1 - 1`, `-(-0)`, `Int32(exactly: 0)!`; converted or
+                   cast, in System's `FileDescriptor(rawValue:)` or an
+                   implicit `.init(rawValue:)` in a file that imports
+                   System, as any call's `fileDescriptor:` argument and
+                   DispatchIO's `fromFileDescriptor:`, given to the calls
+                   that take a descriptor (FD_CALLS: the read and write
+                   family, `dup` and `dup2` on either side, `fcntl`,
+                   `ioctl`, the terminal queries `isatty`, `ttyname`,
+                   `tcgetattr`, `fstat`, `fchdir`, `sendfile`, `fcopyfile`,
+                   `mmap`), or handed to a child by
                    `posix_spawn_file_actions_adddup2` or `addinherit_np`),
                    and a string literal naming `/dev/stdin` or `/dev/fd/N`
                    (N other than 1 and 2: a descriptor the starter may have
@@ -111,7 +118,26 @@ Rules (the id is what a finding and an allowlist entry name):
                  literal in the button whose first word is Approve, Reveal,
                  Replace or Remove and no name that says one (`approve()`,
                  `revealValue`: the verb, or the verb and a capital), and a
-                 label of text, images and stacks only. Also refused:
+                 label of text, images and stacks only. The keys the
+                 system binds by default (measured on macOS 26.4.1, a
+                 Return key event sent to a presented alert: with no
+                 destructive button, the first button without a role
+                 answered Return, `Button("Approve")` and
+                 `Button { } label: { Text("Approve") }` in an alert and a
+                 plain `Button("Remove")` in a confirmation dialog; the
+                 cancel role has Escape; with a destructive button present
+                 no button answered Return and the destructive one has no
+                 key; an NSAlert's first button has Return): in the
+                 actions of `.alert` and `.confirmationDialog`, anything
+                 that says one of the verbs but a Button with
+                 `role: .destructive`; a deprecated `Alert` or
+                 `ActionSheet` button that says one and is not
+                 `.destructive(...)`; an NSAlert's `addButton(withTitle:)`
+                 or an alert button retitled (`buttons[0].title = ...`) to
+                 one; any window `defaultButtonCell` but nil; and a file
+                 dialog's or panel's confirming label
+                 (`fileDialogConfirmationLabel`, `prompt`) that says one.
+                 Also refused:
                  `onKeyPress` on such a gated button; `onSubmit`,
                  `onKeyPress` and the command handlers (`onDeleteCommand`,
                  `onExitCommand`, `onMoveCommand`, `onCommand`,
@@ -133,8 +159,10 @@ Rules (the id is what a finding and an allowlist entry name):
                    (any such member that is not a child's stream being
                    set), `stderr`, `stdout`, `STDOUT_FILENO`,
                    `STDERR_FILENO`, a descriptor-1 or -2 handle or write
-                   (spelled as for descriptor 0 above, `fcntl` and `ioctl`
-                   included), a string literal naming `/dev/stdout`,
+                   (spelled and computed as for descriptor 0 above, every
+                   call that takes one and DispatchIO's
+                   `toFileDescriptor:` included), a string literal naming
+                   `/dev/stdout`,
                    `/dev/stderr`, `/dev/fd/1`, `/dev/fd/2`, a terminal
                    (`/dev/tty...`) or `/dev/console`, and any other path
                    under /dev but /dev/null, /dev/random, /dev/urandom and
@@ -157,7 +185,15 @@ Rules (the id is what a finding and an allowlist entry name):
                    fixed in that file: a literal, a constant bound once to
                    one, or `c.rawValue` of a parameter whose type is an
                    enum declared there with String raw values and literal
-                   cases only;
+                   cases only. Outside that file the type is only ever
+                   written as a type: `Logger.self`, `Logger.init` (called
+                   or as a value), a `typealias` for it, and any `.init`
+                   given a `subsystem:` or `category:` whatever its
+                   receiver (a metatype, `type(of:)`) are refused;
+                 - `try!`, which prints the error it traps on with
+                   everything it holds, and
+                   `Dictionary(uniqueKeysWithValues:)`, which prints a
+                   duplicate key (both measured on macOS 26.4.1);
                  - `fatalError`, `precondition`, `preconditionFailure`,
                    `assert`, `assertionFailure` and an `NSException`'s
                    `reason:` (which reach standard error and the crash
@@ -255,9 +291,13 @@ literal starting with `/dev` or `~` (`"/" + "dev/stderr"`, a variable that
 starts with `~` reaching `URL(fileURLWithPath:)`); a relative path, which
 resolves against the working directory the starter chose (the app uses
 absolute paths from `getpwuid_r` and its bundle); a descriptor held in a
-variable; a gated button whose title is not a literal and whose action has
-another name, and a key handler whose closure calls a function named
-otherwise (M3-12's review looks for them); which token a log message
+variable, or a C call outside FD_CALLS given 0, 1 or 2; a gated button
+whose title is not a literal and whose action has another name, and a key
+handler whose closure calls a function named otherwise (M3-12's review
+looks for them); Space on a focused button when the person has turned on
+keyboard navigation, which is the platform's accessibility path and not a
+binding the code makes (approval itself is behind Touch ID, M3-12); a type
+other than Logger renamed by a metatype; which token a log message
 names is chosen at run time, so code written to spell a value out in
 tokens (one per bit or character) is a review matter too.
 
@@ -377,6 +417,18 @@ KEY_HANDLERS = {
 # AppKit's key methods, overridden in a view, window or responder: their
 # body runs on a key press.
 KEY_METHODS = {"keyDown", "keyUp", "flagsChanged", "performKeyEquivalent", "insertNewline", "cancelOperation"}
+# SwiftUI modifiers whose actions the system binds to keys (measured on
+# macOS 26.4.1, a Return key event sent to the presented alert: with no
+# destructive button, the first button without a role answers Return, as
+# `Button("Approve")`, `Button { } label: { Text("Approve") }` and a plain
+# `Button("Remove")` in a confirmation dialog did; the cancel role answers
+# Escape; with a destructive button present, no button answered Return and
+# the destructive one has no key).
+ALERT_MODIFIERS = {"alert", "confirmationDialog"}
+# The deprecated alert types, whose `.default` button answers Return and
+# `.cancel` Escape.
+LEGACY_ALERTS = {"Alert", "ActionSheet"}
+LEGACY_ALERT_BUTTON_LABELS = {"primaryButton", "secondaryButton", "dismissButton", "buttons"}
 # What a shortcut's Button may hold in its label: views that draw text and
 # images and lay them out. Any other view could hold a control the
 # shortcut reaches.
@@ -468,11 +520,52 @@ KEYWORDS = {
 STREAM_MEMBERS = {"standardError": "log", "standardOutput": "log", "standardInput": "launch-input"}
 C_STREAM_WRITERS = {"stderr", "stdout", "__stderrp", "__stdoutp", "STDOUT_FILENO", "STDERR_FILENO"}
 C_STREAM_READERS = {"stdin", "__stdinp", "STDIN_FILENO"}
-# Calls whose first argument is a descriptor: 0 is the app's standard
-# input, 1 and 2 its output and error. FileDescriptor is the System
-# module's (`FileDescriptor(rawValue: 2)`); fcntl duplicates one, ioctl can
-# push input into a terminal (TIOCSTI).
-FD_CALLS = {"FileHandle", "FileDescriptor", "write", "read", "pwrite", "pread", "writev", "readv", "fdopen", "dup", "dup2", "send", "recv", "fcntl", "ioctl"}
+# Calls that take a descriptor, with the indexes of the arguments that are
+# one: 0 is the app's standard input, 1 and 2 its output and error.
+# FileDescriptor is the System module's (`FileDescriptor(rawValue: 2)`);
+# fcntl and dup duplicate one, ioctl can push input into a terminal
+# (TIOCSTI), the terminal queries read what the starter attached, fchdir
+# makes a descriptor the working directory, and sendfile, fcopyfile and
+# mmap read or write through one. A labelled `...fileDescriptor:` argument
+# to any call is checked as well.
+FD_CALLS = {
+    "FileHandle": (0,),
+    "FileDescriptor": (0,),
+    "write": (0,),
+    "read": (0,),
+    "pwrite": (0,),
+    "pread": (0,),
+    "writev": (0,),
+    "readv": (0,),
+    "pwritev": (0,),
+    "preadv": (0,),
+    "fdopen": (0,),
+    "dup": (0,),
+    "dup2": (0, 1),
+    "send": (0,),
+    "recv": (0,),
+    "sendto": (0,),
+    "recvfrom": (0,),
+    "sendmsg": (0,),
+    "recvmsg": (0,),
+    "fcntl": (0,),
+    "ioctl": (0,),
+    "isatty": (0,),
+    "ttyname": (0,),
+    "ttyname_r": (0,),
+    "tcgetattr": (0,),
+    "tcsetattr": (0,),
+    "tcflush": (0,),
+    "tcdrain": (0,),
+    "fstat": (0,),
+    "lseek": (0,),
+    "fsync": (0,),
+    "ftruncate": (0,),
+    "fchdir": (0,),
+    "sendfile": (0, 1),
+    "fcopyfile": (0, 1),
+    "mmap": (4,),
+}
 # Calls that hand a child one of the app's descriptors, with the index of
 # that descriptor among the positional arguments.
 SPAWN_FD_CALLS = {"posix_spawn_file_actions_adddup2": 1, "posix_spawn_file_actions_addinherit_np": 1}
@@ -1274,6 +1367,36 @@ def check_product_swift(rel, toks, brand):
                 check_gated_button(rel, flat, k)
             if name == "keyboardShortcut" and is_member(k):
                 check_shortcut(rel, flat, k)
+            # Keys the system binds by default: an alert's or dialog's first
+            # button and its cancel button, an NSAlert's first button, a
+            # window's default button and a file panel's confirming button.
+            if name in ALERT_MODIFIERS and is_member(k):
+                check_alert_actions(rel, flat, k)
+            if name in LEGACY_ALERTS and calls and bare(k):
+                check_legacy_alert(rel, flat, k)
+            if name == "addButton" and calls and is_member(k):
+                args = call_args(flat, k + 1)
+                what = gated_span(args[0][1]) if args else None
+                if what is not None:
+                    find("gated-key", rel, t.line, "an NSAlert button that holds %s: an NSAlert's first button answers Return (measured), and which one this is is not in view" % what)
+            if name == "title" and is_member(k) and after is not None and after.kind == "op" and after.text == "=":
+                root = receiver_root(flat, k - 1)
+                if root is not None and any(x.kind == "id" and x.text == "buttons" for x in flat[root:k]):
+                    what = gated_span(statement_after(flat, k + 2))
+                    if what is not None:
+                        find("gated-key", rel, t.line, "an alert button retitled to %s: it keeps the key the alert gave it (Return for the first)" % what)
+            if name == "defaultButtonCell" and is_member(k) and after is not None and after.kind == "op" and after.text == "=":
+                value = statement_after(flat, k + 2)
+                if [x.text for x in value] != ["nil"]:
+                    find("gated-key", rel, t.line, "a window's default button answers Return, and its title and action are not in view (Return never approves; design §1)")
+            if name == "fileDialogConfirmationLabel" and calls and is_member(k):
+                what = gated_span(flat[k + 1 : closure_end(flat, k) + 1])
+                if what is not None:
+                    find("gated-key", rel, t.line, "a file dialog's confirming button that holds %s answers Return" % what)
+            if name == "prompt" and is_member(k) and after is not None and after.kind == "op" and after.text == "=":
+                what = gated_span(statement_after(flat, k + 2))
+                if what is not None:
+                    find("gated-key", rel, t.line, "a panel's confirming button that holds %s answers Return" % what)
             if name in KEY_HANDLERS and is_member(k):
                 span = flat[k + 1 : closure_end(flat, k) + 1]
                 verb = gated_call(span)
@@ -1321,9 +1444,11 @@ def check_product_swift(rel, toks, brand):
                     args = call_args(flat, k + 1)
                     if args and args[0][0] == "rawValue":
                         check_descriptor_call(rel, flat, k)
-            if name == "fileDescriptor" and after is not None and after.text == ":" and at(k - 1) is not None and at(k - 1).text in ("(", ","):
+            if (name == "fileDescriptor" or name.endswith("FileDescriptor")) and after is not None and after.text == ":" and at(k - 1) is not None and at(k - 1).text in ("(", ","):
                 # A `fileDescriptor:` argument to any call (FileHandle,
-                # DispatchIO, DispatchSource and the rest).
+                # DispatchIO, DispatchSource and the rest), and the
+                # `toFileDescriptor:` and `fromFileDescriptor:` of
+                # DispatchIO.write and .read.
                 check_descriptor(rel, t.line, argument_after(flat, k + 2))
             if name in SPAWN_FD_CALLS and calls and bare(k):
                 positional = [expr for label, expr in call_args(flat, k + 1) if label is None]
@@ -1337,18 +1462,33 @@ def check_product_swift(rel, toks, brand):
             # The log's metadata: a Logger's subsystem and category are
             # stored public whatever the message's privacy, so only ECLog
             # (in the token file) builds one, from fixed words.
+            # An init given a subsystem or category is a Logger's whatever
+            # names it: `Logger.self`, a metatype, `type(of: l)`.
             logger_init = (
                 (name == "Logger" and calls and bare(k))
                 or (name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "Logger")
-                or (name == "init" and calls and is_member(k) and receiver(k) == "implicit" and {"subsystem", "category"} & {label for label, _ in call_args(flat, k + 1)})
+                or (name == "init" and calls and is_member(k) and {"subsystem", "category"} & {label for label, _ in call_args(flat, k + 1)})
             )
             if logger_init:
                 if rel != LOG_TOKEN_FILE:
                     find("log", rel, t.line, "a Logger built outside %s (ECLog.logger gives the app's loggers, with fixed subsystem and category)" % LOG_TOKEN_FILE)
                 else:
                     check_logger_metadata(rel, flat, k + 1)
+            # The type by another name: `Logger.self`, `Logger.init` as a
+            # function value (outside the token file the type is only ever
+            # written as a type; typealiases are check_declaration's).
+            if name == "Logger" and rel != LOG_TOKEN_FILE and after is not None and after.kind == "op" and after.text == ".":
+                find("log", rel, t.line, "`Logger.%s` outside %s: a Logger reached by another name is built where its subsystem and category are not in view" % (at(k + 2).text if at(k + 2) is not None else "", LOG_TOKEN_FILE))
             if name in FAIL_CALLS and calls and bare(k):
                 check_fail_call(rel, flat, k + 1, FAIL_CALLS[name], name)
+            # Traps that print a value (measured on macOS 26.4.1, Swift 6):
+            # `try!` prints the error it caught with everything it holds
+            # (`Leak(value: "...")`, an NSError's user info), and
+            # `Dictionary(uniqueKeysWithValues:)` prints a duplicate key.
+            if name == "try" and after is not None and after.kind == "op" and after.text == "!":
+                find("log", rel, t.line, "`try!` prints the error it traps on, with what it holds, to standard error and the crash report (measured): handle the error")
+            if name == "uniqueKeysWithValues" and after is not None and after.kind == "punct" and after.text == ":":
+                find("log", rel, t.line, "`Dictionary(uniqueKeysWithValues:)` prints a duplicate key to standard error and the crash report (measured): use `init(_:uniquingKeysWith:)`")
             exception_init = name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "NSException"
             if (name == "NSException" and calls and bare(k)) or exception_init:
                 for label, expr in call_args(flat, k + 1):
@@ -1620,33 +1760,131 @@ def int_literal(text):
         return None
 
 
+# Binary operators a descriptor computed from literals may use, by Swift's
+# precedence (shifts above multiplication above addition); the overflow
+# forms (`&+`) compute the same small values.
+INT_BINARY = {
+    "<<": 3, ">>": 3, "&<<": 3, "&>>": 3,
+    "*": 2, "/": 2, "%": 2, "&": 2, "&*": 2,
+    "+": 1, "-": 1, "|": 1, "^": 1, "&+": 1, "&-": 1,
+}
+
+
+def int_apply(op, a, b):
+    op = op.lstrip("&") if op.startswith("&") and len(op) > 1 else op
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op in ("/", "%"):
+        if b == 0:
+            raise ValueError("division by zero")
+        q = abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1)
+        return q if op == "/" else a - q * b
+    if op == "<<":
+        return a << b if b >= 0 else a >> -b
+    if op == ">>":
+        return a >> b if b >= 0 else a << -b
+    if op == "&":
+        return a & b
+    if op == "|":
+        return a | b
+    if op == "^":
+        return a ^ b
+    raise ValueError(op)
+
+
 def descriptor_number(expr):
-    """The descriptor an argument names when it is an integer literal,
-    perhaps in parentheses, with a `+`, converted (`Int32(2)`,
-    `CInt(truncatingIfNeeded: 2)`, `Int32.init(2)`), cast (`2 as Int32`) or
-    in a System `FileDescriptor(rawValue: 2)`; None for anything else."""
-    expr = unwrap(expr)
-    while True:
-        top = [i for i, x in enumerate(expr) if x.kind == "id" and x.text == "as" and x.level == expr[0].level] if expr else []
-        if top:
-            expr = unwrap(expr[: top[0]])
-            continue
-        n = 1
-        if len(expr) >= 3 and expr[0].kind == "id" and expr[1].text == "." and expr[2].kind == "id" and expr[2].text == "init":
-            n = 3
-        if len(expr) > n + 1 and expr[0].kind == "id" and expr[0].text in INT_CONVERSIONS | {"FileDescriptor"} and expr[n].text == "(" and matching(expr, n) == len(expr) - 1:
-            inner = expr[n + 1 : -1]
-            if len(inner) >= 2 and inner[0].kind == "id" and inner[1].text == ":":
-                inner = inner[2:]
-            expr = unwrap(inner)
-            continue
-        if len(expr) == 2 and expr[0].kind == "op" and expr[0].text == "+":
-            expr = expr[1:]
-            continue
-        break
-    if len(expr) == 1 and expr[0].kind == "num":
-        return int_literal(expr[0].text)
-    return None
+    """The descriptor an argument names when it is computed from integer
+    literals alone, in any base: `2`, `0x2`, `(2)`, `+2`, `-(-2)`, `1 + 1`,
+    `0b100 >> 1`, converted (`Int32(2)`, `CInt(truncatingIfNeeded: 2)`,
+    `Int32.init(2)`, `Int32(exactly: 2)!`), cast (`2 as Int32`) or in a
+    System `FileDescriptor(rawValue: 2)`; None for anything else (a name, a
+    call, a member: a descriptor held in a variable is a limit)."""
+    toks = [x for x in expr]
+    pos = [0]
+
+    def peek(n=0):
+        i = pos[0] + n
+        return toks[i] if i < len(toks) else None
+
+    def take():
+        t = peek()
+        pos[0] += 1
+        return t
+
+    def primary():
+        t = take()
+        if t is None:
+            raise ValueError("end")
+        if t.kind == "num":
+            v = int_literal(t.text)
+            if v is None:
+                try:
+                    v = float(t.text.replace("_", ""))
+                except ValueError:
+                    raise ValueError(t.text)
+        elif t.kind == "op" and t.text in ("+", "-", "~"):
+            v = primary()
+            if t.text == "-":
+                v = -v
+            elif t.text == "~":
+                v = ~int(v)
+            return v
+        elif t.kind == "punct" and t.text == "(":
+            v = binary(0)
+            close = take()
+            if close is None or close.text != ")":
+                raise ValueError("(")
+        elif t.kind == "id" and t.text in INT_CONVERSIONS | {"FileDescriptor"}:
+            if peek() is not None and peek().text == "." and peek(1) is not None and peek(1).text == "init":
+                take()
+                take()
+            if take_text() != "(":
+                raise ValueError(t.text)
+            if peek() is not None and peek().kind == "id" and peek(1) is not None and peek(1).text == ":":
+                take()
+                take()
+            v = int(binary(0))
+            if take_text() != ")":
+                raise ValueError(t.text)
+        else:
+            raise ValueError(t.text)
+        # postfix: a force unwrap, a cast to an integer type
+        while True:
+            if peek() is not None and peek().kind == "op" and peek().text == "!":
+                take()
+                continue
+            if peek() is not None and peek().kind == "id" and peek().text == "as" and peek(1) is not None and peek(1).kind == "id":
+                take()
+                take()
+                continue
+            break
+        return v
+
+    def take_text():
+        t = take()
+        return t.text if t is not None else None
+
+    def binary(min_prec):
+        left = primary()
+        while peek() is not None and peek().kind == "op" and INT_BINARY.get(peek().text, 0) > min_prec:
+            op = take().text
+            right = binary(INT_BINARY[op])
+            left = int_apply(op, int(left), int(right))
+        return left
+
+    try:
+        v = binary(0)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    if pos[0] != len(toks):
+        return None
+    if isinstance(v, float):
+        return int(v) if v.is_integer() else None
+    return v
 
 
 def argument_after(flat, j):
@@ -1679,9 +1917,12 @@ def check_descriptor(rel, line, expr, how="is"):
 
 
 def check_descriptor_call(rel, flat, k):
+    """A call in FD_CALLS (or `FileHandle.init`) at flat[k]: each argument
+    that is a descriptor."""
     args = call_args(flat, k + 1)
-    if args:
-        check_descriptor(rel, flat[k].line, args[0][1])
+    for i in FD_CALLS.get(flat[k].text, (0,)):
+        if i < len(args):
+            check_descriptor(rel, flat[k].line, args[i][1])
 
 
 def declaration(flat, k):
@@ -1784,6 +2025,8 @@ def check_declaration(rel, flat, k):
                 if rel != LOG_TOKEN_FILE:
                     find("log", rel, line, "a typealias for LogToken")
                 return
+            if seen_eq and flat[j].kind == "id" and flat[j].text == "Logger" and rel != LOG_TOKEN_FILE:
+                find("log", rel, line, "a typealias for Logger outside %s: a Logger built under another name" % LOG_TOKEN_FILE)
             if seen_eq and flat[j].kind == "id":
                 target.append(flat[j].text)
             if flat[j].kind == "op" and flat[j].text == "=":
@@ -2148,6 +2391,115 @@ def check_shortcut(rel, flat, k):
             if x.kind == "id" and x.text[:1].isupper() and x.text not in LABEL_VIEWS and nxt is not None and nxt.text in ("(", "{"):
                 find("gated-key", rel, line, "`.keyboardShortcut` on a button whose label holds `%s`, a view this check cannot see inside" % x.text)
                 return
+
+
+def alert_action_ranges(flat, k):
+    """For an alert or dialog modifier named at flat[k]: the (start, end)
+    indexes of its actions, an `actions:` argument or labelled closure, else
+    its first unlabelled trailing closure (never its title or `message:`)."""
+    ranges = []
+    j = k + 1
+    if j < len(flat) and flat[j].kind == "punct" and flat[j].text == "(":
+        rp = matching(flat, j)
+        level = flat[j].level
+        i = j + 1
+        while i < rp:
+            x = flat[i]
+            if x.level == level and x.kind == "punct" and x.text in "([{":
+                i = matching(flat, i) + 1
+                continue
+            if x.level == level and x.kind == "id" and x.text == "actions" and i + 2 < rp and flat[i + 1].text == ":":
+                arg = argument_after(flat, i + 2)
+                if arg:
+                    ranges.append((i + 2, i + 1 + len(arg)))
+                    i += 2 + len(arg)
+                    continue
+            i += 1
+        j = rp + 1
+    first = not ranges
+    while j < len(flat):
+        x = flat[j]
+        if x.kind == "punct" and x.text == "{":
+            end = matching(flat, j)
+            if first:
+                ranges.append((j, end))
+            first = False
+            j = end + 1
+            continue
+        if x.kind == "id" and j + 2 < len(flat) and flat[j + 1].text == ":" and flat[j + 2].text == "{":
+            end = matching(flat, j + 2)
+            if x.text == "actions":
+                ranges.append((j + 2, end))
+            j = end + 1
+            continue
+        break
+    return ranges
+
+
+def button_role(flat, k):
+    """The last name of the `role:` argument of the Button named at
+    flat[k] (`destructive`, `cancel`), or None."""
+    if k + 1 < len(flat) and flat[k + 1].kind == "punct" and flat[k + 1].text == "(":
+        for label, expr in call_args(flat, k + 1):
+            if label == "role":
+                names = [x.text for x in expr if x.kind == "id"]
+                return names[-1] if names else None
+    return None
+
+
+def check_alert_actions(rel, flat, k):
+    """`.alert` and `.confirmationDialog` (flat[k]): the system binds Return
+    to the first button without a role when no button is destructive, and
+    Escape to the cancel button (measured). So in their actions, anything
+    that says approve, reveal, replace or remove is refused unless it is a
+    Button with `role: .destructive`, which answers no key (measured). The
+    deprecated Alert and ActionSheet inside are check_legacy_alert's."""
+    for start, end in alert_action_ranges(flat, k):
+        i = start
+        while i <= end:
+            x = flat[i]
+            nxt = flat[i + 1] if i + 1 < len(flat) else None
+            if x.kind == "id" and nxt is not None and nxt.kind == "punct" and nxt.text in ("(", "{") and x.text == "Button":
+                stop = closure_end(flat, i)
+                if button_role(flat, i) != "destructive":
+                    what = gated_span(flat[i + 1 : stop + 1])
+                    if what is not None:
+                        find(
+                            "gated-key",
+                            rel,
+                            x.line,
+                            "an alert or dialog button that holds %s without `role: .destructive`: the system gives it Return (the first such button) or Escape (the cancel role), measured" % what,
+                        )
+                i = stop + 1
+                continue
+            if x.kind == "id" and x.text in LEGACY_ALERTS and nxt is not None and nxt.text == "(":
+                i = matching(flat, i + 1) + 1
+                continue
+            what = gated_span([x])
+            if what is not None:
+                find("gated-key", rel, x.line, "%s in an alert's or dialog's actions outside a destructive Button: the system binds its buttons to Return and Escape" % what)
+            i += 1
+
+
+def check_legacy_alert(rel, flat, k):
+    """The deprecated `Alert(...)` and `ActionSheet(...)` (flat[k]): their
+    `.default` button answers Return and `.cancel` Escape, so a button
+    argument that says approve, reveal, replace or remove is refused unless
+    it is `.destructive(...)`."""
+    for label, expr in call_args(flat, k + 1):
+        if label not in LEGACY_ALERT_BUTTON_LABELS:
+            continue
+        i = 0
+        while i < len(expr):
+            x = expr[i]
+            if x.kind == "id" and x.text == "destructive" and i + 1 < len(expr) and expr[i + 1].text == "(":
+                i = matching(expr, i + 1) + 1
+                continue
+            what = gated_span([x])
+            if what is not None:
+                find("gated-key", rel, x.line, "an %s button that holds %s and is not `.destructive`: `.default` answers Return and `.cancel` Escape" % (flat[k].text, what))
+                break
+            i += 1
 
 
 def statement_after(flat, j):
