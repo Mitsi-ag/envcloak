@@ -1,0 +1,61 @@
+# EnvCloak: managed MCP servers
+
+Status: M2. Task M2-27 lands the records, the registered launches, the daemon's launch check and the daemon-started runner; `envcloak migrate-mcp` itself, which writes them from a host's MCP config, is task M2-20, and `envcloak mcp-bridge`, which the host runs in the server's place, task M2-18. This file fixes what a managed server's record holds, what its launch receipt says, what the daemon checks before it releases a key and to whom it releases it, and what that costs. The code is in `crates/envcloak-policy/src/managed.rs` (declarations, classes, the launch environment, the update statement), `crates/envcloak-daemon/src/{managed,launch_check,spawn_envcloak}.rs`, `crates/envcloak-exec/src/launch.rs` (the runner), `crates/envcloak-sys/src/{launch,codesign,owned}.rs` and `crates/envcloak-ipc/src/control.rs`. The wire form is in docs/IPC.md, the grant rules in docs/GRANTS.md "Managed servers".
+
+## The record
+
+A managed server's record (docs/VAULT.md "Policy records", kind 3) names its managed project by identity (canonical directory, device, inode) and how the server is reached:
+
+- a **stdio server**: its registered launch: the absolute executable, resolved once, in the daemon, against the declared `PATH` (never at launch), with its identity read through a descriptor (Linux: SHA-256; macOS: the code directory hash, with the Team ID and signing identifier when signed) and device and inode; the whole argv; the working directory (the declared one, or the managed directory) by device and inode; the launch environment (the declared `PATH` and variables, and the names of the bindings); the class and the binding strength; a script's entry file by identity; and the declaration exactly as given, which an update starts from (CR-2);
+- a **bridged HTTP server**: its exact origin and the header names its relay inserts. Every binding of its managed manifest carries the origin's digest in its name (`_O` and 16 hex digits of the origin's SHA-256), so an edited origin is a new binding, which asks for approval.
+
+It also holds who registered it and the mark "written by migrate-mcp on this device". Only `managed.register`, with the passphrase, from a terminal subject, writes a record (the same rule as `approve`: no agent by any evidence, a terminal of its own); a record of the same name or the same project is replaced, a stdio launch keeping its launch id with the next revision. `managed.unregister` removes one, with a proof.
+
+## Declarations EnvCloak refuses
+
+A declaration whose environment sets a variable that selects code (SPEC §6.6: `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `NODE_PATH`, `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`, `RUBYOPT`, `RUBYLIB`, `PERL5OPT`, `PERL5LIB`, `BASH_ENV`, `ENV` and the others of `envcloak_policy::managed::CODE_SELECTING`), or whose argv gives its interpreter an option that loads other code (`-e`, `-c`, `-m`, `-r`, `--require`, `--import`, `--loader` and their kin), is refused `code_selecting_env` at registration (reasons `code_selecting_variable` and `interpreter_option`): what such a launch runs cannot be checked. `migrate-mcp` reports the server as manual. A key-shaped argument or variable value is refused by the client before any daemon contact (gate 13): a secret a host config held there becomes a binding of the managed manifest, never part of the launch.
+
+## Launch classes and strength
+
+| Class | What it is | Strength |
+|---|---|---|
+| `native` | an ELF or Mach-O executable | `bound` on Linux unless its run path names `$ORIGIN`; `bound` on macOS when it has a code directory; `checked_at_rest` otherwise |
+| `script` | an interpreter with an absolute entry file (`node /abs/server.js`), or a `#!` file | `checked_at_rest` |
+| `package_runner` | `npx`, `pnpm dlx`, `yarn dlx`, `bunx`, `uvx`, `pipx run`, `npm exec`, `bun x`, `uv tool run` | `checked_at_rest` |
+
+**`bound`**: the program that runs is the checked image. On Linux the daemon copies the executable, through the descriptor it checked, into a memory file sealed against writing, growing and shrinking (`memfd_create`, `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL`, the seals checked), hashes the sealed copy and compares that digest with the record, and the runner executes that same copy (`execveat(fd, "", AT_EMPTY_PATH)`): a file rewritten in place or replaced after the check never runs. A run path naming `$ORIGIN` would resolve against the memory file, so such a file is `checked_at_rest`. On macOS the runner starts the registered path suspended (`POSIX_SPAWN_START_SUSPENDED`) and reports its pid; the daemon reads the code directory hash the kernel validated the suspended process against and lets it run only when it is the record's, otherwise the runner kills it through its handle before it runs and exits `managed_launch_changed`.
+
+**`checked_at_rest`**: checked before launch, not bound through the start. On Linux the runner executes the descriptor the daemon checked once its stamp (device, inode, size, change times) is read again and found the same; a `#!` file (a package runner is one) runs by its path. The receipt says what is not bound. Standing approvals (task M2-15) are for `bound` launches only, so such a launch gets once and session approvals.
+
+**Every receipt says** that the guarantee covers the server's main executable only: not its dynamic loader, the shared libraries it loads or anything they load. A `script` receipt says EnvCloak checks the interpreter and the entry script, not the modules it loads; a `package_runner` receipt says the code that runs is chosen by the runner at launch, and how to pin it (install the package and register its entry file). Every receipt carries D-05's sentence: only this server's exact command can receive its key, but any program the agent runs can start that command and read the key from its environment.
+
+## The check before release
+
+For every request against a managed project, the daemon checks, before any pending request exists: the request names the record's launch (or bridge) and carries its descriptors (`managed_command_mismatch` otherwise); the executable's device, inode and identity; a script's entry file; the working directory's device and inode (`managed_launch_changed`, audited `managed_launch` with the part that changed and the old and new device, inode and digest prefix, never a value); on Linux, the sealed copy (`runner_unavailable` when the system refuses an executable memory file, `vm.memfd_noexec=2`; nothing falls back to the file). A launch that changed needs `migrate-mcp --update` and a proof; its refusal says so.
+
+## Updates
+
+`managed.update_plan` builds the next revision from the declaration stored in the record (never a host config, which after migration holds only `envcloak mcp-bridge --stdio --launch <id>`) with explicit changes (`argv`, `cwd`, `set_env`, `unset_env`, `path_env`), resolved in the daemon as a registration is, and answers the old and new receipts and the statement's digest (`envcloak-update-statement/1`) to a caller whose proof the daemon would accept; anyone else gets nothing. `managed.update` makes the plan again, refuses `statement_mismatch` when its digest changed, and commits the same launch id at the next revision. Grants made for the old revision cover nothing of the new one.
+
+## The daemon-started runner
+
+The value recipient is a process the daemon starts itself (M2 plan D-36), never the client that asked: a hardened client's executable cannot be read reliably (on Linux a non-dumpable process's `/proc/<pid>/exe` refuses the daemon, `EACCES`), and a client's identity would prove nothing about where a value goes once it has it.
+
+- A covered managed request is answered `started`. The daemon starts EnvCloak's runner, `envcloak run --launch <id>` (a bridged server's relay, `envcloak mcp-bridge --relay`, the same way), as a child that leads a session of its own, with the client's pipe ends as its standard input, output and error, the lifeline, the checked image and working directory as descriptors, and a control channel on which it sends the values and the launch, once, after the delivery's audit entry is on disk.
+- **Its image** is the `envcloak` beside `envcloakd`, taken when the daemon starts: on Linux a sealed copy, hashed once sealed and kept for every start, so an `envcloak` rewritten or replaced later leaves the daemon starting the image it took, until it restarts; on macOS the file's code directory hash, which the started process (suspended) must have, with `envcloakd`'s own Team ID on a Developer ID build, before it runs. An image that cannot be taken or started is `runner_unavailable`.
+- **A runner the daemon did not start** receives nothing: before it reads anything it checks that its control channel's peer is its parent and that its parent serves the daemon's socket, and otherwise exits 125 `not_started_by_daemon`.
+- **The server** is the runner's child, in a process group of its own, with the launch's environment only: `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ` and `TMPDIR` from the runner's own (which the daemon set from its own fixed list), the recorded `PATH` and variables, and the bindings; a code-selecting variable is dropped wherever it comes from. Its output goes through the runner's redactor to the client. When the client is gone (the lifeline's end of file), its input ends, or the runner is signalled, the runner stops the server's group through its owned handle: SIGTERM, then SIGKILL after 5 seconds.
+
+**Consequences.** Managed servers run as descendants of the daemon, outside the host's process tree:
+
+- they outlive a daemon restart: the systemd unit has `KillMode=process` (`envcloak daemon install` rewrites an older unit), and launchd's cleanup of the daemon's job does not reach a process that leads its own session (measured on macOS 26.4: `launchctl kickstart -k` and `bootout` kill the job's process group, not a child that called `setsid`), so the plist needs no `AbandonProcessGroup`. Neither the runner nor the relay gets `PR_SET_PDEATHSIG`. A new daemon holds no handle to them and signals nothing;
+- a command a server starts is classed `unknown` (no terminal, no agent in its chain): no terminal grant covers it, and its proofs are refused;
+- the unit's `NoNewPrivileges` applies to them;
+- macOS privacy prompts (a protected folder, the local network) for a daemon-started server may name `envcloakd` rather than the host; this was not measured for this task (no CI runner shows the prompts), and is stated here as a risk.
+
+## Measurements behind this
+
+Measured for task M2-27 (and kept as permanent tests in `crates/envcloak-sys/tests/launch.rs` and `crates/envcloak-e2e/tests/managed_{launch,runner}.rs`):
+
+- macOS 26.4 (the pinned runner's major version): `posix_spawn` with `POSIX_SPAWN_START_SUSPENDED | POSIX_SPAWN_SETSID` starts a child that runs nothing until `SIGCONT`; `csops(CS_OPS_CDHASH)` on it, without extra entitlements, gives the code directory hash `codesign -dvvv` prints; a suspended child killed with `SIGKILL` runs nothing; `posix_spawn_file_actions_addfchdir_np` sets its directory.
+- Linux 6.12 (a Debian container on Docker Desktop's Linux VM; CI's `ubuntu-latest` runs the same tests), as a non-root user: a `MFD_EXEC` memory file, sealed, executes with `execveat(AT_EMPTY_PATH)` (no `ETXTBSY`); writing, growing, shrinking and a shared writable mapping are refused (`EPERM`); a non-dumpable process's `/proc/<pid>/exe` refuses another process of the same user (`EACCES`) while an ordinary one's is readable.
