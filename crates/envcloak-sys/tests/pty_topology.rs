@@ -343,6 +343,7 @@ fn monitor_cycle(cat: &str, reads_on: bool) {
         Some(MonitorEvent::Continued),
         "{cat}"
     );
+    let mut early = None;
     if reads_on {
         screen.expect("line-two\r\n", 1, "Resume gave cat its input back");
         screen.type_bytes(b"line-three\n");
@@ -353,23 +354,28 @@ fn monitor_cycle(cat: &str, reads_on: bool) {
         // terminal): nothing is read for 1.2 s after cat was continued, by
         // which time cat has written its message and exited and the
         // monitor has seen the exit (within its 1 s tick). The monitor
-        // holds the slave open until the message is read (up to 2 s); let
-        // it close at once and macOS discards the message: measured, the
-        // exit then comes at about 0.6 s and nothing is left to read.
-        let early = monitor
+        // reports the exit at once (so the CLI's 2-second cutoff counts
+        // from it: one deadline, M2-19) and then holds the slave open
+        // until the message is read (up to 2 s); let it close at once and
+        // macOS discards the message, and nothing is left to read here.
+        let late = std::time::Instant::now() + Duration::from_millis(1200);
+        early = monitor
             .next_event(Some(Duration::from_millis(1200)))
             .unwrap();
+        // The rest of the 1.2 s, the terminal still unread: no report but
+        // the exit's can come.
+        let left = late.saturating_duration_since(std::time::Instant::now());
+        assert_eq!(monitor.next_event(Some(left)).unwrap(), None, "{cat}");
         screen.expect(
             "Interrupted system call",
             1,
             "macOS's /bin/cat after a stop, as under a shell, read late",
         );
-        assert_eq!(
-            early, None,
-            "{cat}: the exit was reported before its output was read"
-        );
     }
-    let event = screen.next_event(&mut monitor);
+    let event = match early {
+        Some(event) => Some(event),
+        None => screen.next_event(&mut monitor),
+    };
     let Some(MonitorEvent::Exited(status)) = event else {
         panic!("{cat} did not exit: {event:?} (a stop on SIGTTIN would show here)");
     };
