@@ -19,8 +19,12 @@ final class LaunchUITests: XCTestCase {
         XCTAssertTrue(window.waitForExistence(timeout: 30), "the main window did not open")
         XCTAssertTrue(window.staticTexts["envcloak status"].exists)
 
-        app.menuBars.menuBarItems["EnvCloak"].click()
-        app.menuBars.menuItems["About EnvCloak"].click()
+        let appMenu = app.menuBars.menuBarItems["EnvCloak"]
+        appMenu.click()
+        // One "About EnvCloak" in the whole menu bar: the About scene adds
+        // no Window-menu item of its own.
+        XCTAssertEqual(app.menuBars.menuItems.matching(NSPredicate(format: "title == %@", "About EnvCloak")).count, 1)
+        appMenu.menus.menuItems["About EnvCloak"].click()
         let about = app.windows["About EnvCloak"]
         XCTAssertTrue(about.waitForExistence(timeout: 10), "About did not open")
         XCTAssertTrue(about.staticTexts["about.licence.font"].exists)

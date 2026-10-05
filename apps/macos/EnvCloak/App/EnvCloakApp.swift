@@ -29,11 +29,14 @@ struct EnvCloakApp: App {
             CommandGroup(replacing: .newItem) {}
         }
 
+        // Opened from the app menu only: no second "About EnvCloak" item in
+        // the Window menu, which SwiftUI adds for a Window scene otherwise.
         Window("About EnvCloak", id: WindowID.about) {
             AboutView()
         }
         .windowResizability(.contentSize)
         .restorationBehavior(.disabled)
+        .commandsRemoved()
     }
 }
 
