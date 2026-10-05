@@ -30,3 +30,6 @@ crates/envcloak-exec/src/spawn.rs            # puts a run's values in the child'
 crates/envcloak-agents/src/hook/payload.rs   # the hook handler reads a host's payload in place to decide; only the decision and fixed text leave it
 crates/envcloak-signin/src/totp.rs           # RFC 6238 reads a seed into HMAC; generated digits stay in SecretBytes, never formatting or I/O
 crates/envcloak-signin/src/otpauth.rs        # enrollment parsed in place and decoded into wiping buffers; only typed parameters and SecretBytes leave
+
+crates/envcloak-scan/src/profile.rs          # parses bounded profile literals in place; never executes a profile
+crates/envcloak-scan/src/candidates.rs       # per-run keyed candidate hashes, never persisted or reported
