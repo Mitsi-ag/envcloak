@@ -815,6 +815,8 @@ jobs:
         run: python3 scripts/macos/tests/test_build_swap.py
       - name: check-sources.sh --swift's fixtures
         run: python3 scripts/macos/tests/test_check_sources_swift.py
+      - name: Independent models of the tests' process cleanup and of the compiled-record check
+        run: python3 scripts/macos/tests/test_owned_cleanup_and_records.py
       - name: EnvCloakKit and EnvCloakDesign tests
         run: |
           for p in EnvCloakKit EnvCloakDesign; do
