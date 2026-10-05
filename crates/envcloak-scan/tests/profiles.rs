@@ -33,7 +33,6 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
     assert!(output.status.success(), "oracle failed");
     assert!(output.stderr.is_empty());
     let cases: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let mut literals = 0;
     for case in cases.as_array().unwrap() {
         let bytes = SecretBytes::from_vec(
             std::fs::read(dir.path().join(case["source_file"].as_str().unwrap())).unwrap(),
@@ -50,7 +49,18 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
                 "template {}",
                 case["name"]
             );
-        } else if let Some(f) = a.filter(|f| f.value.is_some()) {
+        } else if case["proposed_policy"]
+            .as_str()
+            .unwrap()
+            .starts_with("manual_")
+        {
+            assert!(!result.complete(), "manual {}", case["name"]);
+            assert!(a.is_some_and(|f| f.disposition == Disposition::Manual
+                && f.value.is_none()
+                && !f.single_complete_line));
+        } else {
+            let f = a.expect("supported assignment must be found");
+            assert_eq!(f.disposition, Disposition::Literal, "{}", case["name"]);
             let v = f.value.as_ref().unwrap();
             #[allow(clippy::disallowed_methods)]
             let digest = Sha256::digest(v.expose_secret())
@@ -66,19 +76,16 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
                 v.len(),
                 case["expected_a"]["bytes"].as_u64().unwrap() as usize
             );
-            if f.single_complete_line {
-                assert_eq!(
-                    case["proposed_whole_line_delete_eligible"], true,
-                    "removal {}",
-                    case["name"]
-                );
-            }
-            literals += 1;
-        } else {
-            assert!(!result.complete(), "silently omitted {}", case["name"]);
+            assert_eq!(
+                f.single_complete_line,
+                case["proposed_whole_line_delete_eligible"]
+                    .as_bool()
+                    .unwrap(),
+                "removal {}",
+                case["name"]
+            );
         }
     }
-    assert!(literals >= 50, "ordinary literal syntax must work");
 }
 
 #[test]
@@ -157,4 +164,22 @@ fn profile_count_fish_literals_and_ambiguous_context_are_conservative() {
     );
     assert!(!parsed.complete());
     assert!(parsed.findings.iter().all(|f| !f.single_complete_line));
+}
+
+#[test]
+fn fish_export_scopes_and_comments_preserve_literals() {
+    for flag in ["-x", "-gx", "-Ux", "-xg", "-xU"] {
+        let r = parse_profile(
+            &SecretBytes::from_vec(
+                format!("set {flag} NAME 'fixture value' # $OTHER `ignored`\n").into_bytes(),
+            ),
+            Shell::Fish,
+        );
+        assert!(r.complete());
+        assert_eq!(r.findings.len(), 1);
+        let f = &r.findings[0];
+        assert_eq!(f.disposition, Disposition::Literal);
+        assert!(f.value.as_ref().unwrap().ct_eq(b"fixture value"));
+        assert!(f.single_complete_line);
+    }
 }
