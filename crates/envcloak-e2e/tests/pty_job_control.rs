@@ -18,8 +18,9 @@
 //!   call", as under any shell, M2-17);
 //! - a cat that reads again on `EINTR`: the same, then a fresh line
 //!   round-trips, and values typed into it (the PEM-shaped one, whose CR LF
-//!   form the terminal shows, and an API key) come back redacted, the echo
-//!   and the copy;
+//!   form the terminal shows, and an API key) come back redacted (its echo
+//!   turned off first: on Linux the echo of a later line falls between the
+//!   copies of the lines before, measured in CI);
 //! - a nested interactive shell as the command: the suspend character
 //!   stops its job and gives it its prompt back while `envcloak run` stays
 //!   running with the outer terminal raw, and `fg` in it resumes the job;
@@ -82,13 +83,22 @@ fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
 os.execv(sys.argv[1], sys.argv[1:])\n";
 
 /// A cat that reads again when a read is interrupted (`EINTR`, PEP 475),
-/// writes whole, and keeps SIGTSTP's default. Prints `CAT-READY` first.
-const RETRY_CAT: &str = r"import os
+/// writes whole, and keeps SIGTSTP's default. Prints `CAT-READY` first. On
+/// the line `QUIET` it turns its terminal's echo off before it copies the
+/// line, so what is typed after shows only as its copy: the line
+/// discipline's echo of a later line cannot fall between the copies of
+/// the lines before (it does on Linux, measured), and a value typed over
+/// several lines comes back whole.
+const RETRY_CAT: &str = r"import os, termios
 os.write(1, b'CAT-READY\n')
 while True:
     b = os.read(0, 65536)
     if not b:
         break
+    if b == b'QUIET\n':
+        t = termios.tcgetattr(0)
+        t[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, t)
     while b:
         b = b[os.write(1, b):]
 ";
@@ -555,6 +565,27 @@ fn suspend_and_resume(sh: &mut Shell, files: &Path, before: &[u8], suspend: u8, 
     sh.outer.type_bytes(b"fg\r");
 }
 
+/// What `/bin/cat`, continued by `fg` inside a read of its terminal, does
+/// next: nothing is typed for a second, its chance to fail (macOS's ends
+/// with "Interrupted system call", as M2-17 measured; a line typed before
+/// it is continued would be read instead, so the baseline and the run
+/// under EnvCloak are given the same chance); then, if it is still there,
+/// `line` must round-trip (the echo and the copy). Returns whether it read
+/// on.
+fn cat_after_fg(sh: &mut Shell, line: &str) -> bool {
+    let mark = sh.mark();
+    let failed = sh.outer.wait_for_within(Duration::from_secs(1), |o| {
+        o.count_since(mark, b"Interrupted system call") > 0
+    });
+    if failed {
+        return false;
+    }
+    sh.outer.type_bytes(format!("{line}\r").as_bytes());
+    sh.outer
+        .expect_since(mark, line.as_bytes(), 2, "a fresh line after fg");
+    true
+}
+
 /// The isolated outer-shell gate (see the file's documentation), through
 /// `envcloak run --pty` against the fixture project.
 ///
@@ -621,11 +652,7 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer
         .expect_since(mark, b"base-one", 2, "a line round-trips through cat");
     suspend_and_resume(&mut sh, &files, &before, 0x1a, "/bin/cat under the shell");
-    let mark = sh.mark();
-    sh.outer.type_bytes(b"base-two\r");
-    let reads_on = sh.outer.wait_for_within(DEADLINE, |o| {
-        o.count_since(mark, b"base-two") >= 2 || o.count_since(mark, b"Interrupted system call") > 0
-    }) && sh.outer.count_since(mark, b"Interrupted system call") == 0;
+    let reads_on = cat_after_fg(&mut sh, "base-two");
     if reads_on {
         sh.outer.type_bytes(b"\x04");
     }
@@ -653,24 +680,16 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer
         .expect_since(mark, b"env-one", 2, "a line round-trips through cat");
     suspend_and_resume(&mut sh, &files, &before, 0x1a, "/bin/cat");
-    let mark = sh.mark();
+    assert_eq!(
+        cat_after_fg(&mut sh, "env-two"),
+        reads_on,
+        "/bin/cat did not do what it did under the plain shell"
+    );
     if reads_on {
-        sh.outer.type_bytes(b"env-two\r");
-        sh.outer
-            .expect_since(mark, b"env-two", 2, "a fresh line after fg");
         sh.outer.type_bytes(b"\x04");
-        sh.prompt_again("cat and the run ended");
-        assert_eq!(sh.status(), 0);
-    } else {
-        sh.outer.expect_since(
-            mark,
-            b"Interrupted system call",
-            1,
-            "/bin/cat as under the plain shell",
-        );
-        sh.prompt_again("cat and the run ended");
-        assert_eq!(sh.status(), 1);
     }
+    sh.prompt_again("cat and the run ended");
+    assert_eq!(sh.status(), if reads_on { 0 } else { 1 });
 
     // The retrying cat: the round trip after fg, and values typed into it
     // come back redacted, the CR LF form included.
@@ -685,14 +704,17 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer.type_bytes(b"r-two\r");
     sh.outer
         .expect_since(mark, b"r-two", 2, "a fresh line after fg");
+    sh.outer.type_bytes(b"QUIET\r");
+    sh.outer
+        .expect_since(mark, b"QUIET", 2, "cat turned its echo off");
     let pem_value = h.canary(PEM).as_str().to_owned();
     sh.outer.type_bytes(format!("{pem_value}\r").as_bytes());
     let pem_marker = format!("[envcloak:{PEM_SLUG}]");
     sh.outer.expect_since(
         mark,
         pem_marker.as_bytes(),
-        2,
-        "the PEM-shaped value typed, echoed and copied, redacted",
+        1,
+        "the PEM-shaped value typed and copied back in its CR LF form, redacted",
     );
     let key = h.canary(labels::OPENAI_API_KEY).as_str().to_owned();
     sh.outer.type_bytes(format!("{key}\r").as_bytes());
@@ -700,8 +722,8 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer.expect_since(
         mark,
         key_marker.as_bytes(),
-        2,
-        "the key typed, echoed and copied, redacted",
+        1,
+        "the key typed and copied back, redacted",
     );
     sh.outer.type_bytes(b"\x04");
     sh.prompt_again("the run ended");
