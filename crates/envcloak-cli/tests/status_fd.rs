@@ -70,10 +70,7 @@ fn the_status_descriptors_own_failures_start_nothing() {
     );
     assert_eq!(
         RunStatus::decode(&std::fs::read(&status).unwrap()),
-        Some(RunStatus::NotStarted {
-            token: "run_failed".into(),
-            request: None,
-        })
+        Some(RunStatus::not_started("run_failed"))
     );
     assert!(!mark.exists(), "the command ran");
 
@@ -82,10 +79,7 @@ fn the_status_descriptors_own_failures_start_nothing() {
     assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
     assert_eq!(
         RunStatus::decode(&std::fs::read(&status).unwrap()),
-        Some(RunStatus::NotStarted {
-            token: "daemon_unavailable".into(),
-            request: None,
-        })
+        Some(RunStatus::not_started("daemon_unavailable"))
     );
     assert!(!mark.exists(), "the command ran");
 }

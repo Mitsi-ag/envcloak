@@ -30,8 +30,12 @@
 //!    command started, the result is that outcome, and its message the
 //!    child's own failure line (nothing else wrote to its output then):
 //!    `approval_required` names the request the record names and says how
-//!    the person approves it, from a terminal of their own (T-15); the
-//!    child's own line, which names `envcloak approve`, is not passed on.
+//!    the person approves it, from a terminal of their own (T-15), and
+//!    names the test items the daemon proposed in place of live ones, with
+//!    how to bind each (SPEC §10b "Live-key guard"; from the record, at
+//!    most [`envcloak_client::run_status::MAX_PROPOSALS`] with a count of
+//!    the rest; a name shaped like a key or token hidden); the child's own
+//!    line, which names `envcloak approve`, is not passed on.
 //!    No record, or one that is not well formed, is `execution_unknown`:
 //!    the command may have run, and the result says so with the output.
 //!    Otherwise the command ran: the result is its exit code and its
@@ -51,8 +55,9 @@ use std::process::Command;
 use envcloak_agents::hook::{self, Decision};
 use envcloak_agents::tool_timeouts;
 use envcloak_client::fail::Failure;
+use envcloak_client::render::proposal_text;
 use envcloak_client::run_status::{Exit, RunStatus};
-use envcloak_policy::{PendingId, ProfileName};
+use envcloak_policy::{PendingId, ProfileName, Proposal};
 use serde_json::{Map, Value, json};
 
 use super::{Ctx, check_keys, invalid, object, opt_str, project_dir, refuse_value_like, req_str};
@@ -304,19 +309,32 @@ fn own_message(done: &Captured, token: &str) -> Option<String> {
 /// What the call answers for `done`, whose status record is in `report`.
 fn outcome(done: &Captured, report: &Report, ctx: &Ctx, wait_secs: u64) -> Value {
     match status_of(report) {
-        RunStatus::NotStarted { token, request } => {
-            not_started(done, &token, request, ctx, wait_secs)
-        }
+        RunStatus::NotStarted {
+            token,
+            request,
+            proposals,
+            proposals_left_out,
+        } => not_started(
+            done,
+            &token,
+            request,
+            (&proposals, proposals_left_out),
+            ctx,
+            wait_secs,
+        ),
         RunStatus::Ran(exit) => completed(done, exit),
         RunStatus::Unknown => unknown(done),
     }
 }
 
-/// `envcloak run` refused with `token` before it started the command.
+/// `envcloak run` refused with `token` before it started the command;
+/// with `approval_required`, the record named `proposed`: the test items
+/// the daemon proposed, and how many more.
 fn not_started(
     done: &Captured,
     token: &str,
     request: Option<PendingId>,
+    proposed: (&[Proposal], u32),
     ctx: &Ctx,
     wait_secs: u64,
 ) -> Value {
@@ -341,7 +359,8 @@ fn not_started(
                  from this session are refused. This call waited {wait_secs} s for it. Once \
                  it is approved, call run_with_secrets again with the same arguments. The \
                  command then runs outside this host's sandbox and holds the injected keys \
-                 while it runs."
+                 while it runs.{}",
+                test_keys(proposed)
             ));
         }
         ("approval_denied", _) => {
@@ -351,6 +370,34 @@ fn not_started(
         _ => v["message"] = json!(passed_on(&message)),
     }
     v
+}
+
+/// What the `approval_required` message adds for the test items the
+/// daemon proposed in place of live ones (SPEC §10b "Live-key guard"): each
+/// with how to bind it ([`proposal_text`]: every name escaped, one shaped
+/// like a key or token hidden), and how many more it proposed than the
+/// record names. Empty when there are none.
+fn test_keys((proposals, left_out): (&[Proposal], u32)) -> String {
+    if proposals.is_empty() && left_out == 0 {
+        return String::new();
+    }
+    let mut out = " EnvCloak proposes test keys of the same provider in place of live ones, \
+         and never swaps them in: a live key needs the person's tick on the approval, and a \
+         test key does not."
+        .to_owned();
+    for x in proposals {
+        out.push(' ');
+        out.push_str(&proposal_text(
+            x,
+            "call run_with_secrets again (add_reference binds a variable as `envcloak ref` does).",
+        ));
+    }
+    if left_out > 0 {
+        out.push_str(&format!(
+            " It proposed {left_out} more; `envcloak run` in a shell names them all."
+        ));
+    }
+    out
 }
 
 /// The command ran, and ended as `exit` says.
@@ -545,9 +592,9 @@ mod tests {
              terminal you control; waiting up to 8s for it\n"
         );
         let refused = |token: &str, request| {
-            report(&RunStatus::NotStarted {
-                token: token.to_owned(),
-                request,
+            report(&match request {
+                Some(id) => RunStatus::approval_required(id, &[]),
+                None => RunStatus::not_started(token),
             })
         };
         let c = ctx();
@@ -687,6 +734,83 @@ mod tests {
     /// Output past the caps keeps its ends, names what was left out, and
     /// never shows part of a key-shaped word at a cut: the cut moves to a
     /// byte that cannot be in one, and the masking sees whole words.
+    /// The test keys a record names (SPEC §10b "Live-key guard"): the
+    /// `approval_required` message names each with how to bind it, and how
+    /// many more the record counts; a name shaped like a key or token
+    /// (generated canaries, each a valid slug, field or variable name) is
+    /// never in the answer, the words every metadata command prints in its
+    /// place are (Codex, round 2). The control: an ordinary name is shown.
+    ///
+    /// Mutation: the names passed through unmasked (`proposal_text`
+    /// escaping only): the canaries are in the answer and this fails.
+    #[test]
+    fn the_test_keys_a_record_names_are_in_the_message_masked() {
+        use envcloak_client::run_status::MAX_PROPOSALS;
+        use envcloak_policy::BindingSource;
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        let token: String = cs
+            .iter()
+            .flat_map(|c| c.value().to_vec())
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|b| char::from(b).to_ascii_lowercase())
+            .take(42)
+            .chain("x1y2z3".chars())
+            .collect();
+        let x = |env: &str, test: &str, source| Proposal {
+            env_name: env.to_owned(),
+            live_slug: "stripe/acme-live".to_owned(),
+            test_slug: test.to_owned(),
+            test_field: None,
+            source,
+        };
+        let mut proposals = vec![
+            x("STRIPE_SECRET_KEY", "stripe/acme-test", BindingSource::Env),
+            x(
+                "OTHER_KEY",
+                &format!("stripe/{token}"),
+                BindingSource::Profile {
+                    profile: "dev".to_owned(),
+                },
+            ),
+            x(
+                &format!("K{}", token.to_ascii_uppercase()),
+                "stripe/acme-test",
+                BindingSource::Env,
+            ),
+        ];
+        proposals.extend(
+            (0..MAX_PROPOSALS)
+                .map(|i| x(&format!("MORE_{i}"), "stripe/acme-test", BindingSource::Env)),
+        );
+        let id = PendingId::generate();
+        let record = RunStatus::approval_required(id, &proposals);
+        let c = ctx();
+        let v = outcome(&captured(Some(125), b"", b""), &report(&record), &c, 8);
+        assert_eq!(v["status"], "approval_required", "{v}");
+        let m = v["message"].as_str().unwrap();
+        assert!(!v.to_string().to_ascii_lowercase().contains(&token), "{v}");
+        assert!(m.contains(envcloak_client::render::HIDDEN), "{m}");
+        assert!(
+            m.contains(
+                "STRIPE_SECRET_KEY is bound to the live key stripe/acme-live: to use the test key \
+                 stripe/acme-test instead, run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`, \
+                 and call run_with_secrets again"
+            ),
+            "{m}"
+        );
+        // Of the 11 proposed, the record names 8 and counts 3.
+        assert!(m.contains("It proposed 3 more"), "{m}");
+        assert!(!v.to_string().contains("envcloak approve"), "{v}");
+        // None proposed: the message names no test key.
+        let v = outcome(
+            &captured(Some(125), b"", b""),
+            &report(&RunStatus::approval_required(id, &[])),
+            &c,
+            8,
+        );
+        assert!(!v["message"].as_str().unwrap().contains("test key"), "{v}");
+    }
+
     #[test]
     fn long_output_keeps_its_ends_and_masks_whole_words() {
         let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
