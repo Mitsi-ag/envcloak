@@ -67,13 +67,15 @@ def bashes():
     return found
 
 
+# The loop counter is local: the mv stand-in's own `n` (the move's number)
+# must survive a hold.
 HOLD = """hold() {
+  local tries=0
   : >"$FAKE/held.$1"
-  n=0
   while [ ! -e "$FAKE/release.$1" ]; do
     /bin/sleep 0.02
-    n=$((n + 1))
-    [ "$n" -lt 2000 ] || exit 99
+    tries=$((tries + 1))
+    [ "$tries" -lt 2000 ] || exit 99
   done
 }
 """
@@ -173,6 +175,20 @@ def mark_app(path):
     with open(os.path.join(path, "mark"), "wb") as f:
         f.write(data)
     return hashlib.sha256(data).digest()
+
+
+def live_in_group(pgid):
+    """Processes still running in a process group: read from ps, since
+    macOS answers kill(-pgid, 0) with EPERM while a member is a zombie
+    waiting to be reaped (seen in this test), which is no step left
+    running."""
+    out = subprocess.run(["/bin/ps", "-A", "-o", "pid=,pgid=,stat="], stdout=subprocess.PIPE, check=True).stdout.decode()
+    live = []
+    for line in out.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and fields[1] == str(pgid) and not fields[2].startswith("Z"):
+            live.append(int(fields[0]))
+    return live
 
 
 def child_setup():
@@ -288,20 +304,28 @@ class Build:
         """Waits for the script; returns (status, processes left)."""
         try:
             status = self.proc.wait(timeout=WAIT)
-        except Exception:
-            os.killpg(self.proc.pid, signal.SIGKILL)
+        except subprocess.TimeoutExpired:
+            ps = subprocess.run(["/bin/ps", "-o", "pid,pgid,stat,command", "-g", str(self.proc.pid)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode()
+            files = sorted(n for n in os.listdir(self.fake) if n.startswith(("held.", "release.")))
+            for pid in live_in_group(self.proc.pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
             self.proc.wait()
-            raise AssertionError("the script did not end\n%s" % self.stderr())
+            raise AssertionError("the script did not end\n%s\n%s\n%s" % (self.stderr(), ps, files))
         left = True
         for _ in range(20):
-            try:
-                os.killpg(self.proc.pid, 0)
-            except ProcessLookupError:
+            if not live_in_group(self.proc.pid):
                 left = False
                 break
             time.sleep(0.05)
         if left:
-            os.killpg(self.proc.pid, signal.SIGKILL)
+            for pid in live_in_group(self.proc.pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
         if self.err_read is not None:
             try:
                 os.close(self.err_read)
@@ -545,9 +569,9 @@ class BuildApp(unittest.TestCase):
             time.sleep(0.1)
             b.release("mv%d" % restore)
             status, left = b.finish()
-            self.assertEqual(status, -signal.SIGTERM, b.stderr())
-            self.assertEqual(self.at(b, self.old(b)), [rel_dest(b)])
+            self.assertEqual(self.at(b, self.old(b)), [rel_dest(b)], b.stderr())
             self.assertClean(b, left)
+            self.assertEqual(status, -signal.SIGTERM, b.stderr())
 
         self.each(case)
 

@@ -243,7 +243,9 @@ class Stopped(unittest.TestCase):
                     finally:
                         try:
                             os.killpg(p.pid, signal.SIGKILL)
-                        except ProcessLookupError:
+                        except OSError:
+                            # Gone (ESRCH), or only a zombie waiting to be
+                            # reaped, which macOS answers with EPERM.
                             pass
                     self.assertNotEqual(status, 0)
                     self.assertEqual([n for n in os.listdir(tmp) if n.startswith("check-sources-swift.")], [], "the listing was left behind")
