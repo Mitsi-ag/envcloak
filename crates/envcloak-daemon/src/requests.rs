@@ -461,7 +461,15 @@ pub fn run_request(
             ),
         )?),
         Some(_) => None,
-        None if fds.is_empty() && p.fds.is_empty() => None,
+        // No record: a request that names a launch or a bridge is refused
+        // `managed_command_mismatch` below, descriptors or not; any other
+        // takes none.
+        None if (fds.is_empty() && p.fds.is_empty())
+            || p.launch.is_some()
+            || p.bridge.is_some() =>
+        {
+            None
+        }
         None => {
             return Err(RpcError::new(ErrorKind::InvalidParams));
         }

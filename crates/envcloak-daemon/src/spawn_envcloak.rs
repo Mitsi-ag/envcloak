@@ -458,6 +458,9 @@ fn confirm_spawn(
     let Ok(FromRunner::ConfirmSpawn(pid)) = control::receive::<FromRunner>(control) else {
         return Err(RpcError::new(ErrorKind::RunnerUnavailable));
     };
+    // A test stops here, with the server started and not yet answered: it
+    // must have run nothing.
+    envcloak_sys::pause_point("launch.confirm");
     let ok = i32::try_from(pid)
         .ok()
         .and_then(|pid| envcloak_sys::proc_info(pid).ok())

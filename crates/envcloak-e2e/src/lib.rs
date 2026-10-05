@@ -437,6 +437,16 @@ impl Harness {
     /// # Panics
     /// When the daemon does not start.
     pub fn start_with(env: &[(&str, &str)]) -> Harness {
+        Harness::start_from(bin_dir(), env)
+    }
+
+    /// As [`Harness::start_with`], with `envcloak` and `envcloakd` from
+    /// `bins`: a test's own copies, which it may replace while the daemon
+    /// runs (the daemon's anchor, M2 task M2-27).
+    ///
+    /// # Panics
+    /// When the daemon does not start.
+    pub fn start_from(bins: PathBuf, env: &[(&str, &str)]) -> Harness {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let mut cs = canaries(fresh_seed());
         // Passphrases of six random words, as `vault create` suggests.
@@ -456,7 +466,6 @@ impl Harness {
             .prefix("ecf")
             .tempdir_in("/tmp")
             .unwrap_or_else(|e| panic!("cannot create the files directory: {e}"));
-        let bins = bin_dir();
         let env: Vec<(String, OsString)> = env
             .iter()
             .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
@@ -843,6 +852,26 @@ impl Harness {
         self.keep(format!("the agent's command {n} (stdout)"), &o.stdout);
         self.keep(format!("the agent's command {n} (stderr)"), &o.stderr);
         o
+    }
+
+    /// Starts `line` in the background as a job of the agent's shell
+    /// itself, in `cwd`, and returns at once: the agent stays its
+    /// ancestor while it runs (a job of a subshell that exits would be
+    /// reparented, and leave the agent's tree). Its output goes nowhere.
+    ///
+    /// # Panics
+    /// When the agent's shell is gone.
+    pub fn agent_spawn(&mut self, cwd: &Path, line: &str) {
+        let agent = self.agent_session(cwd);
+        let written = writeln!(
+            agent.stdin,
+            "cd {}; {line} </dev/null >/dev/null 2>&1 &",
+            quoted(cwd.to_str().unwrap_or(""))
+        )
+        .and_then(|()| agent.stdin.flush());
+        if let Err(e) = written {
+            panic!("the agent's shell is gone: {e}");
+        }
     }
 
     /// `envcloak <args>` run by the agent in `cwd`.

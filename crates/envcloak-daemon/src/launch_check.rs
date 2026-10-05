@@ -475,7 +475,10 @@ fn recheck(rec: &FileIdentity, part: Part) -> Result<File, CheckError> {
         digest_prefix: digest,
     };
     if (m.dev(), m.ino()) != (rec.dev, rec.ino) {
-        return Err(changed(Some(here(None))));
+        // Another file: its identity too, for the audit entry, when it
+        // can be read.
+        let now = identity(&f).ok().map(|d| digest_prefix(&d));
+        return Err(changed(Some(here(now))));
     }
     let now = identity(&f).map_err(|_| changed(Some(here(None))))?;
     if now != rec.digest {
