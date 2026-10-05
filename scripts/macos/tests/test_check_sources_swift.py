@@ -402,12 +402,26 @@ exec "%(python)s" "$@"
 """
 
 
+# The stand-in cargo the Rust check runs ($CARGO), which holds the same way.
+HOLDING_CARGO = """#!/bin/bash
+: >"%(held)s"
+n=0
+while [ "$n" -lt 4000 ]; do
+  [ -z "${HEARTBEAT:-}" ] || printf . >>"$HEARTBEAT"
+  /bin/sleep 0.05
+  n=$((n + 1))
+done
+exit 99
+"""
+
+
 class Stopped(unittest.TestCase):
-    """check-sources.sh --swift leaves no listing behind however it stops:
-    the comparison is held by a stand-in python3 (the real one runs
-    check-swift.sh's listing) while a signal goes to its process group. A
-    listing an earlier run of the same pid kept is not this run's to
-    remove. However a case ends, every process of its group is ended and
+    """check-sources.sh leaves no listing behind however it stops, in both
+    of its modes: with --swift the comparison is held by a stand-in python3
+    (the real one runs check-swift.sh's listing), and the Rust check is
+    held by a stand-in cargo, while a signal goes to the script's process
+    group. A listing an earlier run of the same pid kept is not this run's
+    to remove. However a case ends, every process of its group is ended and
     confirmed gone (procgroup.py)."""
 
     def setUp(self):
@@ -422,6 +436,10 @@ class Stopped(unittest.TestCase):
         with open(os.path.join(stubs, "python3"), "w") as f:
             f.write(HOLDING_PYTHON % {"held": self.held, "python": sys.executable})
         os.chmod(os.path.join(stubs, "python3"), 0o755)
+        self.cargo = os.path.join(stubs, "cargo")
+        with open(self.cargo, "w") as f:
+            f.write(HOLDING_CARGO % {"held": self.held})
+        os.chmod(self.cargo, 0o755)
         self.env = {"PATH": stubs + ":/usr/bin:/bin", "TMPDIR": self.tmp, "HOME": self.base, "LC_ALL": "C"}
         self.groups = []
 
@@ -434,19 +452,22 @@ class Stopped(unittest.TestCase):
         finally:
             shutil.rmtree(self.base, ignore_errors=True)
 
-    def listings(self):
-        return sorted(n for n in os.listdir(self.tmp) if n.startswith("check-sources-swift."))
+    def listings(self, rust=False):
+        prefix = "check-sources." if rust else "check-sources-swift."
+        return sorted(n for n in os.listdir(self.tmp) if n.startswith(prefix))
 
-    def stop_once(self, name, early=None, **env):
-        """Runs the check until the comparison holds, signals its group, and
-        returns its status. With `early`, raises that once the comparison
-        holds instead, as a failed assertion would."""
+    def stop_once(self, name, early=None, rust=False, **env):
+        """Runs the check until the comparison (or, with rust, cargo) holds,
+        signals its group, and returns its status. With `early`, raises
+        that once it holds instead, as a failed assertion would."""
         if os.path.exists(self.held):
             os.unlink(self.held)
-        g = Group(
-            ["/bin/bash", CHECK_SOURCES, "--swift", self.fx.derived, ROOT],
-            env=dict(self.env, **env), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        if rust:
+            args = ["/bin/bash", CHECK_SOURCES, ROOT]
+            env = dict(env, CARGO=self.cargo)
+        else:
+            args = ["/bin/bash", CHECK_SOURCES, "--swift", self.fx.derived, ROOT]
+        g = Group(args, env=dict(self.env, **env), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.groups.append(g)
         kept = None
         try:
@@ -457,17 +478,17 @@ class Stopped(unittest.TestCase):
             self.assertTrue(g.live(), "nothing was running in the check's group")
             if early is not None:
                 raise early()
-            self.assertEqual(len(self.listings()), 1, "no listing while it ran")
+            self.assertEqual(len(self.listings(rust)), 1, "no listing while it ran")
             # A listing an earlier run of this pid left: the stop must not
             # remove it.
-            kept = os.path.join(self.tmp, "check-sources-swift.%d.earlier" % g.pgid)
+            kept = os.path.join(self.tmp, "%s%d.earlier" % ("check-sources." if rust else "check-sources-swift.", g.pgid))
             with open(kept, "w") as f:
                 f.write("kept\n")
             g.signal(getattr(signal, "SIG" + name))
             self.assertTrue(g.wait_ended(180), "the check did not end\n" + g.ps())
         finally:
             status = g.close()
-        self.assertEqual(self.listings(), [os.path.basename(kept)], "this run's listing was left behind, or an earlier one removed")
+        self.assertEqual(self.listings(rust), [os.path.basename(kept)], "this run's listing was left behind, or an earlier one removed")
         os.unlink(kept)
         return status
 
@@ -475,6 +496,13 @@ class Stopped(unittest.TestCase):
         for name in ("HUP", "INT", "QUIT", "TERM"):
             with self.subTest(signal=name):
                 self.assertNotEqual(self.stop_once(name), 0)
+
+    def test_a_stopped_rust_check_leaves_no_listing(self):
+        # The same listing in the Rust check, which before this round was a
+        # mktemp name removed only by the exit trap (so SIGQUIT left it).
+        for name in ("HUP", "INT", "QUIT", "TERM"):
+            with self.subTest(signal=name):
+                self.assertNotEqual(self.stop_once(name, rust=True), 0)
 
     def test_a_case_that_fails_early_leaves_no_process_running(self):
         # A case that fails while the stand-in holds still ends it: nothing
