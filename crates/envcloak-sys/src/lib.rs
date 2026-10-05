@@ -114,8 +114,8 @@ pub use dir::{
     volume_of,
 };
 pub use fd::{
-    claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn, inherited_fd,
-    pipe_cloexec,
+    chdir_on_spawn, claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn,
+    inherited_fd, pipe_cloexec,
 };
 pub use fs::open_beneath;
 pub use fsclock::wait_for_clock_past;

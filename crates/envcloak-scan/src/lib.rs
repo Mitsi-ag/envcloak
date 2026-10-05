@@ -32,6 +32,7 @@
 //! Nothing here logs, and no error carries text from a file.
 
 pub mod agent_config;
+pub mod git;
 pub mod sources;
 pub use agent_config::scan_config_sources;
 pub mod atomic;
