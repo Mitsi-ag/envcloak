@@ -433,14 +433,15 @@ jobs:
       # too.
       - run: cargo check -p envcloak-agents -p envcloak-scan -p envcloak-mcp -p envcloak --all-targets --no-default-features --locked
 
-  # Which of the M2 agent jobs a pull request needs, from the paths it
-  # changes (scripts/ci-paths.py, which checks its own table of paths
-  # first). Every other event runs them all.
+  # Which of the M2 agent jobs and the macOS app job a pull request needs,
+  # from the paths it changes (scripts/ci-paths.py, which checks its own
+  # table of paths first). Every other event runs them all.
   changes:
     runs-on: ubuntu-latest
     outputs:
       gates: ${{ steps.paths.outputs.gates }}
       agents: ${{ steps.paths.outputs.agents }}
+      app: ${{ steps.paths.outputs.app }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -454,6 +455,7 @@ jobs:
           if [ "$EVENT" != "pull_request" ]; then
             echo "gates=true" >> "$GITHUB_OUTPUT"
             echo "agents=true" >> "$GITHUB_OUTPUT"
+            echo "app=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed="$(git diff --name-only "$BASE"...HEAD)"
@@ -751,3 +753,80 @@ jobs:
           echo "::error title=release-check-models::$msg"
           echo "release-check-models failed: $msg" >> "$GITHUB_STEP_SUMMARY"
           exit 1
+
+  # The macOS app (M3 plan §5 rule 8, task M3-02; docs/APP.md "CI: the
+  # macos-app job"). On pull requests only when ci-paths.py's `app` answer
+  # says the change reaches the app; on main, nightly and manual runs
+  # always. Xcode 26.6 is selected by path and the job fails when the runner
+  # lacks it (plan K3-07). The Swift rules and both script test suites run
+  # before anything is built; then the packages' tests, the app built and
+  # signed ad hoc (sign-check inside), the built app read by two signature
+  # readers and the kernel, an install into a temporary directory, the
+  # hosted tests, and the compiled-sources check over every build. The UI
+  # tests run on main, nightly and manual runs only, until they are shown
+  # stable on pull requests.
+  macos-app:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.app == 'true'
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Xcode 26.6, selected by path
+        run: |
+          if [ ! -d "$DEVELOPER_DIR" ]; then
+            echo "::error title=macos-app::/Applications/Xcode_26.6.app is not on this runner"
+            ls -d /Applications/Xcode*.app || true
+            exit 1
+          fi
+          xcodebuild -version
+          xcodebuild -version | grep -qx "Build version 17F113" || {
+            echo "::error title=macos-app::the selected Xcode is not 26.6 (17F113)"
+            exit 1
+          }
+          sw_vers
+          python3 --version
+          automationmodetool || true
+      - name: Swift rules and their fixtures
+        run: |
+          scripts/macos/check-swift.sh
+          python3 scripts/macos/tests/test_check_swift.py
+      - name: The project's resolved settings
+        run: python3 scripts/macos/tests/test_project_settings.py
+      - name: sign-check's fixtures (gate 19 for the bundle)
+        run: python3 scripts/macos/tests/test_sign_check.py SignCheck
+      - name: EnvCloakKit and EnvCloakDesign tests
+        run: |
+          for p in EnvCloakKit EnvCloakDesign; do
+            (cd "apps/macos/Packages/$p" && xcodebuild -scheme "$p" -destination 'platform=macOS' \
+              -derivedDataPath "$RUNNER_TEMP/dd-$p" SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test)
+          done
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
+      - name: Build, sign, check and install the app (ad hoc)
+        run: |
+          scripts/macos/build-app.sh --sign adhoc --out "$RUNNER_TEMP/app" --derived-data "$RUNNER_TEMP/dd-release" \
+            --install --install-dir "$RUNNER_TEMP/Applications" | tee "$RUNNER_TEMP/build-app.out"
+          test "$(tail -1 "$RUNNER_TEMP/build-app.out")" = "$RUNNER_TEMP/Applications/EnvCloak.app"
+      - name: The built app, through two signature readers and the kernel
+        run: |
+          python3 scripts/macos/tests/test_sign_check.py --app "$RUNNER_TEMP/app/EnvCloak.app" BuiltApp
+          python3 scripts/macos/tests/test_sign_check.py --app "$RUNNER_TEMP/Applications/EnvCloak.app" BuiltApp
+      - name: The app's hosted tests
+        run: |
+          xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloak -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-debug" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+      - name: The app's UI tests (main, nightly and manual)
+        if: github.event_name != 'pull_request'
+        run: |
+          xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloakUITests -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-debug" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+      - name: Compiled Swift sources are the scanned sources
+        run: |
+          for dd in "$RUNNER_TEMP"/dd-*; do
+            scripts/check-sources.sh --swift "$dd"
+          done
