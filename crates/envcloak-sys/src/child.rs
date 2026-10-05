@@ -28,7 +28,7 @@
 //!   for every process in a group.
 
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
@@ -655,6 +655,60 @@ impl SignalRelay {
                 _ => return Err(err),
             }
         }
+    }
+
+    /// The next relayed signal or mark if one is there now, without
+    /// waiting: `Ok(None)` when there is none, for a reader that waits on
+    /// [`SignalRelay::ready`] with its own descriptors (`envcloak run
+    /// --pty`'s relay, which never calls [`SignalRelay::stop`]: a stop
+    /// mark read here is taken as nothing). A signal kept aside for a full
+    /// pipe is handed out as [`SignalRelay::next`] hands it out.
+    ///
+    /// # Errors
+    /// When `read` fails for another reason than an empty pipe or a
+    /// signal.
+    pub fn try_next(&self) -> io::Result<Option<Relayed>> {
+        let fd = self.pipe.read.as_raw_fd();
+        loop {
+            if let Some(kept) = self.take_kept() {
+                return Ok(Some(kept));
+            }
+            let mut byte = 0u8;
+            // SAFETY: `byte` is one writable byte; the descriptor is open for
+            // the life of the process and non-blocking.
+            let n = unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+            if n == 1 {
+                match byte {
+                    STOP => return Ok(None),
+                    MARK => {
+                        self.marks_read.fetch_add(1, Ordering::SeqCst);
+                        KEPT_SINCE.store(true, Ordering::SeqCst);
+                        return Ok(Some(Relayed::Mark));
+                    }
+                    WAKE => continue,
+                    b => {
+                        return Ok(Some(Relayed::Signal {
+                            number: i32::from(b & !BY_PROCESS),
+                            by_process: b & BY_PROCESS != 0,
+                        }));
+                    }
+                }
+            }
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => {}
+                // A signal kept since the look above wrote its wake-up
+                // byte, which a later call reads.
+                io::ErrorKind::WouldBlock => return Ok(self.take_kept()),
+                _ => return Err(err),
+            }
+        }
+    }
+
+    /// The descriptor that is readable whenever [`SignalRelay::try_next`]
+    /// may have something: to wait on with `poll` beside others.
+    pub fn ready(&self) -> BorrowedFd<'_> {
+        self.pipe.read.as_fd()
     }
 
     /// Takes one signal kept aside that is due: caught before the marks
