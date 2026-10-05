@@ -53,7 +53,10 @@ sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = {"path": os.path.join(os.path.dirname(HERE), "build-app.sh")}
-WAIT = 30.0
+# How long a step may take to reach its hold or to end: generous, since a
+# loaded Mac (load averages of 500 were seen beside other builds) slows
+# every process start.
+WAIT = 180.0
 STATUS = {"HUP": -signal.SIGHUP, "INT": -signal.SIGINT, "TERM": -signal.SIGTERM, "QUIT": 131}
 
 
@@ -75,7 +78,7 @@ HOLD = """hold() {
   while [ ! -e "$FAKE/release.$1" ]; do
     /bin/sleep 0.02
     tries=$((tries + 1))
-    [ "$tries" -lt 2000 ] || exit 99
+    [ "$tries" -lt 20000 ] || exit 99
   done
 }
 """
