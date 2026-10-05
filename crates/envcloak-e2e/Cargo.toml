@@ -27,6 +27,7 @@ tempfile.workspace = true
 # The agent-host tests (M2 plan task M2-04) check the scripted model's
 # qualified-version table against agents/versions.toml.
 [dev-dependencies]
+envcloak-scan.workspace = true
 envcloak-agents.workspace = true
 # The catalog's tests (M2 plan task M2-10) gather a caller's evidence as
 # the daemon does, against the pinned hosts.
