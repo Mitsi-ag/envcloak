@@ -43,6 +43,7 @@ pub mod profile;
 pub mod restore;
 pub mod root;
 pub mod source;
+pub mod transcript;
 pub mod walk;
 
 #[cfg(feature = "testing")]
