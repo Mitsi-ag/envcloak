@@ -1404,8 +1404,8 @@ fn a_dead_base_url_fails_every_probe_through_its_control() {
 /// session's next turn without the control's (`reached(&rc.requests,
 /// &ctl)` dropped): a fresh session after the block passes and this
 /// fails; the transcript without its sweep's completeness (`swept.complete`
-/// replaced by `true`, the verifier's round-2 finding): the locked store
-/// and the linked one pass and this fails.
+/// replaced by `true`, the verifier's round-2 finding): the store holding
+/// a file past the sweep's cap and the linked one pass and this fails.
 #[test]
 fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
     struct Case {
@@ -1455,10 +1455,13 @@ fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
             failed: &[Surface::PromptToModel, Surface::Transcript],
             check: "the session goes on after the block, the control's turn in it",
         },
-        // A store that cannot be read whole, or one behind a link out of
-        // the stores that holds the blocked prompt: no clean sweep.
+        // A store that cannot be read whole (a file past the sweep's cap;
+        // the unit test `a_sweep_finds_and_says_when_it_could_not_read` has
+        // a file of mode 0000, which a run as root reads), or one behind a
+        // link out of the stores that holds the blocked prompt: no clean
+        // sweep.
         Case {
-            mode: json!({"locked": true}),
+            mode: json!({"unread": true}),
             failed: &[Surface::Transcript],
             check: "the host's stores were read whole",
         },
@@ -1918,6 +1921,20 @@ fn fake_output_probe(emitter: &str, runs: bool, value: &str, marker: &str) -> Pr
         &[Surface::Output],
         false,
     )
+}
+
+/// The stand-in's copy of the sweep's cap per file is the sweep's.
+#[test]
+fn the_stand_in_knows_the_sweeps_cap() {
+    let source = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/ec-fake-host.rs"),
+    )
+    .unwrap();
+    assert_eq!(
+        envcloak_agents::probe::controls::SWEEP_FILE_CAP,
+        64 * 1024 * 1024
+    );
+    assert!(source.contains("const SWEEP_FILE_CAP: u64 = 64 * 1024 * 1024;"));
 }
 
 /// A host version outside the scripted model's qualified table is not

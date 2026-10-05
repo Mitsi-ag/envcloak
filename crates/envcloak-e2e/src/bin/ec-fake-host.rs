@@ -29,7 +29,10 @@
 //!   the session's file; `"all"` keeps a blocked one too; `"none"` keeps
 //!   nothing; `"linked"` keeps a blocked one in a file outside the stores
 //!   that a link in them leads to;
-//! - `locked`: `true` leaves a file in its store that cannot be read;
+//! - `unread`: `true` leaves a file in its store that a sweep cannot read
+//!   whole: one past the sweep's cap per file (a sparse file, so nothing is
+//!   written; a file of mode 0000 would not do, since a test run as root, as
+//!   in CI's user namespace, reads it);
 //! - `stray`: `true` also sends the model a request for a route it does
 //!   not serve;
 //! - `mention`: `"guarded"` (the default) expands `@<file>` mentions but
@@ -57,19 +60,23 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+/// The most bytes of one file a sweep reads
+/// (`envcloak_agents::probe::controls::SWEEP_FILE_CAP`, whose test keeps
+/// the two equal).
+const SWEEP_FILE_CAP: u64 = 64 * 1024 * 1024;
+
 struct Mode {
     dead: bool,
     prompt: String,
     session_lost: bool,
     resume_fresh: bool,
-    locked: bool,
+    unread: bool,
     stray: bool,
     persist: String,
     mention: String,
@@ -92,7 +99,7 @@ fn mode(home: &Path) -> Mode {
         prompt: s("prompt", "block"),
         session_lost: s("session", "kept") == "lost",
         resume_fresh: s("resume", "history") == "fresh",
-        locked: v.get("locked").and_then(Value::as_bool) == Some(true),
+        unread: v.get("unread").and_then(Value::as_bool) == Some(true),
         stray: v.get("stray").and_then(Value::as_bool) == Some(true),
         persist: s("persist", "allowed"),
         mention: s("mention", "guarded"),
@@ -160,10 +167,10 @@ fn main() {
         None => store.join("session.jsonl"),
     };
     let _ = std::fs::create_dir_all(&store);
-    if m.locked {
-        let locked = store.join("locked.jsonl");
-        let _ = std::fs::write(&locked, b"{}");
-        let _ = std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000));
+    if m.unread {
+        if let Ok(f) = std::fs::File::create(store.join("large.jsonl")) {
+            let _ = f.set_len(SWEEP_FILE_CAP + 1);
+        }
     }
     let keep = |file: &Path, text: &str, blocked: bool| {
         if let Ok(mut f) = std::fs::OpenOptions::new()
