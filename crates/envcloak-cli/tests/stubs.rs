@@ -30,7 +30,6 @@ const STUBS: &[(&[&str], &str)] = &[
     (&["standing"], "`envcloak standing`"),
     (&["login"], "`envcloak login`"),
     (&["signin"], "`envcloak signin`"),
-    (&["run", "--pty"], "`envcloak run --pty`"),
 ];
 
 /// Exit code of a stub, as of `run`'s own failures.
@@ -294,6 +293,8 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
         .find(|l| l.trim_start().starts_with("envcloak run "))
         .unwrap();
     assert!(run.contains("[--manifest PATH] [--wait DURATION]"), "{run}");
+    // M2-19 landed `run --pty`: listed with the command, not as a stub.
+    assert!(run.contains("[--pty]"), "{run}");
     assert!(lists(available, &["grants", "list"]));
     assert!(lists(available, &["daemon", "uninstall"]));
 }

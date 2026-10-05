@@ -86,7 +86,7 @@ const HELP: &str = "usage:
   envcloak status [--json]
   envcloak daemon install [--daemon /absolute/path/to/envcloakd] [--no-start]
   envcloak daemon uninstall
-  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] -- <cmd...>
+  envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
   envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
@@ -115,7 +115,6 @@ const HELP: &str = "usage:
   envcloak hook --host ID --event NAME
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak run --pty
   envcloak reveal
   envcloak scrub
   envcloak agents migrate-mcp
@@ -203,10 +202,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// The refusal of an M2 or M2b command this build does not have, or of
-/// `run --pty`, chosen by the words that select it (the first, and for
-/// `agents` the second; for `run`, `--pty` anywhere before `--`); `None`
-/// for any other command line. No other argument is read.
+/// The refusal of an M2 or M2b command this build does not have, chosen
+/// by the words that select it (the first, and for `agents` the second);
+/// `None` for any other command line. No other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
@@ -217,14 +215,6 @@ fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Opti
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
         "agents" if word(1)? == "migrate-mcp" => cmd::agents::run(&["migrate-mcp"]),
-        "run"
-            if args[1..]
-                .iter()
-                .take_while(|a| a.as_os_str() != "--")
-                .any(|a| a.as_os_str() == "--pty") =>
-        {
-            cmd::not_in_this_build("`envcloak run --pty`")
-        }
         _ => return None,
     })
 }
