@@ -1,15 +1,18 @@
 //! The approval statement (SPEC §10a "Bounds and display", §10b
-//! "Approval proofs"; gate 31): argv renders as a list with control
-//! characters, bidirectional overrides and zero-width characters shown as
-//! escapes, text beyond 2 KB is truncated with a marker, and the canonical
-//! statement, which the passphrase approves, always covers the full argv
-//! and the options.
+//! "Approval proofs", "Live-key guard"; gates 31 and 40): argv renders as
+//! a list with control characters, bidirectional overrides and zero-width
+//! characters shown as escapes, text beyond 2 KB is truncated with a
+//! marker, and the canonical statement (`envcloak-statement/2`), which the
+//! passphrase approves, always covers the full argv, the options, the
+//! classifications, the live ticks and the test items proposed in place
+//! of live ones, which the rendering lists before the live bindings.
 #![allow(clippy::unwrap_used)]
 
 use envcloak_policy::{
     ApprovalOptions, BindingSummary, EnvName, Mode, PendingDescriptor, ProcessSummary,
-    ProjectSummary, RENDER_LIMIT, SubjectKind, SubjectSummary, Uses, canonical_statement,
-    escape_for_display, render_statement, statement_digest,
+    ProjectSummary, Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, SubjectKind, SubjectSummary, Uses,
+    canonical_statement, escape_for_display, live_guarded, render_statement, statement_digest,
+    unticked_live,
 };
 
 fn descriptor(argv: Vec<String>) -> PendingDescriptor {
@@ -56,9 +59,34 @@ fn descriptor(argv: Vec<String>) -> PendingDescriptor {
                 granted: false,
             },
         ],
+        proposals: Vec::new(),
         mode: Mode::Inject,
         argv,
     }
+}
+
+/// The test item `test` proposed for the variable `env`, bound to the live
+/// item `live`.
+fn proposal(env: &str, live: &str, test: &str, field: Option<&str>) -> Proposal {
+    Proposal {
+        env_name: env.to_owned(),
+        live_slug: live.to_owned(),
+        test_slug: test.to_owned(),
+        test_field: field.map(str::to_owned),
+    }
+}
+
+/// [`descriptor`] with the Stripe test item proposed for its live
+/// binding.
+fn proposing(argv: Vec<String>) -> PendingDescriptor {
+    let mut d = descriptor(argv);
+    d.proposals = vec![proposal(
+        "STRIPE_SECRET_KEY",
+        "stripe/acme-web",
+        "stripe/acme-test",
+        None,
+    )];
+    d
 }
 
 fn opts() -> ApprovalOptions {
@@ -179,7 +207,8 @@ fn the_canonical_statement_is_unambiguous_and_covers_the_options() {
     let d = descriptor(strings(&["./emit", "a b"]));
     let o = opts();
     let bytes = canonical_statement(&d, &o);
-    assert!(bytes.starts_with(b"envcloak-statement/1\n"));
+    assert!(bytes.starts_with(STATEMENT_DOMAIN));
+    assert_eq!(STATEMENT_DOMAIN, b"envcloak-statement/2\n");
     assert_eq!(statement_digest(&d, &o).len(), 32);
     // Deterministic.
     assert_eq!(canonical_statement(&d, &o), bytes);
@@ -218,17 +247,64 @@ fn the_canonical_statement_is_unambiguous_and_covers_the_options() {
     let mut mode = d.clone();
     mode.mode = Mode::Proxy;
     assert_ne!(canonical_statement(&mode, &o), bytes);
-    let mut root = d;
+    let mut root = d.clone();
     root.subject.root.start_time += 1;
     assert_ne!(canonical_statement(&root, &o), bytes);
+    // A classification, a tick and every field of a proposal.
+    let mut class = d.clone();
+    class.bindings[1].classification = "test".to_owned();
+    assert_ne!(canonical_statement(&class, &o), bytes);
+    let mut tick = o.clone();
+    tick.live.push(EnvName::new("OPENAI_API_KEY").unwrap());
+    assert_ne!(canonical_statement(&d, &tick), bytes);
+    let proposed = proposing(strings(&["./emit", "a b"]));
+    let with = canonical_statement(&proposed, &o);
+    assert_ne!(with, bytes);
+    let changes: [fn(&mut Proposal); 5] = [
+        |x| x.env_name.push('X'),
+        |x| x.live_slug.push('x'),
+        |x| x.test_slug.push('x'),
+        |x| x.test_field = Some("value".to_owned()),
+        |x| x.test_field = Some(String::new()),
+    ];
+    for change in changes {
+        let mut other = proposed.clone();
+        change(&mut other.proposals[0]);
+        assert_ne!(canonical_statement(&other, &o), with, "{other:?}");
+    }
+    // An absent field and an empty one differ.
+    let mut empty = proposed.clone();
+    empty.proposals[0].test_field = Some(String::new());
+    let mut absent = proposed.clone();
+    absent.proposals[0].test_field = None;
+    assert_ne!(
+        canonical_statement(&empty, &o),
+        canonical_statement(&absent, &o)
+    );
+    // A proposal does not run into the bindings or the mode: a binding
+    // moved into a proposal's place encodes differently.
+    let mut two = proposed.clone();
+    two.proposals.push(proposal("A", "a/b", "c/d", None));
+    assert_ne!(canonical_statement(&two, &o), with);
 }
 
 #[test]
 fn descriptors_and_options_cross_the_wire_as_json() {
-    let d = descriptor(strings(&["./emit"]));
-    let json = serde_json::to_string(&d).unwrap();
-    let back: PendingDescriptor = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, d);
+    for d in [
+        descriptor(strings(&["./emit"])),
+        proposing(strings(&["./emit"])),
+    ] {
+        let json = serde_json::to_string(&d).unwrap();
+        let back: PendingDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+    // A descriptor without its proposals, or with a field a proposal does
+    // not have, is refused: both sides are one build.
+    let mut v = serde_json::to_value(proposing(strings(&["./emit"]))).unwrap();
+    v["proposals"][0]["extra"] = serde_json::json!(1);
+    assert!(serde_json::from_value::<PendingDescriptor>(v.clone()).is_err());
+    v.as_object_mut().unwrap().remove("proposals");
+    assert!(serde_json::from_value::<PendingDescriptor>(v).is_err());
     let o = opts();
     let json = serde_json::to_string(&o).unwrap();
     assert_eq!(
@@ -299,9 +375,7 @@ fn with_pid(mut d: PendingDescriptor, caller: bool, pid: i32) -> PendingDescript
 /// F-81 (gate 23): each pid is bound with its sign. Set to each of
 /// [`SIGNED`], the caller's pid and the root's each give a statement of
 /// their own; a pid and its negative render differently and so must
-/// differ in the digest. A positive pid encodes as it always did: the
-/// digest of this file's descriptor is the one the encoding before the
-/// change gave, so a statement already shown approves as before.
+/// differ in the digest.
 #[test]
 fn each_pid_is_bound_with_its_sign() {
     let o = opts();
@@ -324,24 +398,48 @@ fn each_pid_is_bound_with_its_sign() {
         assert_ne!(render_statement(&d, &o), render_statement(&negative, &o));
         assert_ne!(statement_digest(&d, &o), statement_digest(&negative, &o));
     }
+}
+
+/// Golden vectors of `envcloak-statement/2` (M2-13): the digests of this
+/// file's descriptor without and with a proposal, as the independent
+/// encoder (`tests/oracles/statement.py`) gives them, fixed here so a
+/// change to the format is a change to this test. The version 1 digest of
+/// the same descriptor (M1's golden vector, which the encoder's version 1
+/// reproduces) is not what the crate gives: a statement shown before the
+/// upgrade approves nothing after it (SPEC §10b; docs/IPC.md "Statement
+/// domains"), and version 1 gives the same digest with or without the
+/// proposal, which version 2 tells apart.
+#[test]
+fn statement_v2_golden_vectors() {
+    let o = opts();
+    let plain = statement_digest(&descriptor(strings(&["./emit", "a b"])), &o);
+    let proposed = statement_digest(&proposing(strings(&["./emit", "a b"])), &o);
     assert_eq!(
-        hex(&statement_digest(
-            &descriptor(strings(&["./emit", "a b"])),
-            &o
-        )),
-        "825ff7c19353506ba2da685f5081d90f44238198147ad60708dd84276201053f"
+        hex(&plain),
+        "2baf6aace098d0cc3a679fea6b125744ed8470253537437432f67c0db2028118"
     );
+    assert_eq!(
+        hex(&proposed),
+        "76a96288a2d66e0bcb1168fd6c7684d478a78c381063241df613b132b7844a89"
+    );
+    const V1: &str = "825ff7c19353506ba2da685f5081d90f44238198147ad60708dd84276201053f";
+    assert_ne!(hex(&plain), V1);
+    assert_ne!(hex(&proposed), V1);
 }
 
 /// The canonical statement against an independent encoder of
 /// docs/GRANTS.md's format (`tests/oracles/statement.py`, Python): byte
 /// for byte, for each pid of [`SIGNED`] in each field, and for
 /// descriptors with no label or executable, no bindings, empty, multibyte
-/// and control-character arguments, and `once` options without live
-/// names. The oracle's encoding before F-81 (absolute pids) is its
-/// positive control: it gives a pid and its negative the same bytes, and
-/// differs from the crate for every negative pid; for the rest it is the
-/// same as now.
+/// and control-character arguments, `once` options without live names,
+/// and proposals with and without a field, empty and multibyte. Two
+/// positive controls: the oracle's encoding before F-81 (absolute pids)
+/// gives a pid and its negative the same bytes, and differs from the crate
+/// for every negative pid, for the rest it is the same as now; and its
+/// version 1 encoding, which has no proposals, differs from the crate for
+/// every case (a version 1 digest approves nothing) and gives two
+/// descriptors that differ in their proposals alone the same bytes, which
+/// the crate tells apart.
 #[test]
 fn the_canonical_statement_matches_an_independent_encoder() {
     let o = opts();
@@ -366,7 +464,24 @@ fn the_canonical_statement_matches_an_independent_encoder() {
         live: Vec::new(),
     };
     cases.push((bare, once.clone()));
-    cases.push((descriptor(Vec::new()), once));
+    cases.push((descriptor(Vec::new()), once.clone()));
+    // Proposals: none and one (a pair differing in proposals alone), with
+    // a field, several, empty and multibyte strings.
+    let first_proposal = cases.len();
+    cases.push((descriptor(strings(&["./emit"])), o.clone()));
+    cases.push((proposing(strings(&["./emit"])), o.clone()));
+    let mut several = proposing(strings(&["./emit"]));
+    several.proposals.push(proposal(
+        "OPENAI_API_KEY",
+        "openai/live",
+        "openai/test",
+        Some("api_key"),
+    ));
+    several.proposals.push(proposal("", "", "", Some("")));
+    several
+        .proposals
+        .push(proposal("中文", "a\u{202e}b", "c\u{0}d", Some("é")));
+    cases.push((several, once));
     let input = serde_json::to_vec(
         &cases
             .iter()
@@ -397,6 +512,7 @@ fn the_canonical_statement_matches_an_independent_encoder() {
     for ((d, o), g) in cases.iter().zip(&got) {
         let ours = hex(&canonical_statement(d, o));
         assert_eq!(ours, g["signed"], "{d:?}");
+        assert_ne!(ours, g["v1"], "{d:?}");
         if d.subject.caller_pid < 0 || d.subject.root.pid < 0 {
             assert_ne!(ours, g["legacy"], "{d:?}");
             negatives += 1;
@@ -419,4 +535,155 @@ fn the_canonical_statement_matches_an_independent_encoder() {
             assert_ne!(got[field + i]["signed"], got[field + j]["signed"]);
         }
     }
+    // The second control: version 1 cannot tell the pair apart.
+    let (a, b) = (&got[first_proposal], &got[first_proposal + 1]);
+    assert_eq!(a["v1"], b["v1"]);
+    assert_ne!(a["signed"], b["signed"]);
+}
+
+/// A descriptor of `kind` whose bindings are `(variable, slug,
+/// classification)`.
+fn of_kind(kind: SubjectKind, bindings: &[(&str, &str, &str)]) -> PendingDescriptor {
+    let mut d = descriptor(strings(&["./emit"]));
+    d.subject.kind = kind;
+    if kind != SubjectKind::Agent {
+        d.subject.label = None;
+    }
+    d.bindings = bindings
+        .iter()
+        .map(|(env, slug, class)| BindingSummary {
+            env_name: (*env).to_owned(),
+            slug: (*slug).to_owned(),
+            item: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            field: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            field_name: "value".to_owned(),
+            classification: (*class).to_owned(),
+            first_use: false,
+            granted: false,
+        })
+        .collect();
+    d
+}
+
+fn ticking(names: &[&str]) -> ApprovalOptions {
+    ApprovalOptions {
+        uses: Uses::Once,
+        ttl_secs: 600,
+        live: names.iter().map(|n| EnvName::new(n).unwrap()).collect(),
+    }
+}
+
+/// Gate 40, sentence 1 (SPEC §10b "Live-key guard"): for an agent or an
+/// unknown subject every live binding must be ticked, each by its own
+/// variable; test and unknown classifications need none; a terminal
+/// subject needs none. The statement says which ticks are missing.
+#[test]
+fn the_live_key_guard_names_every_unticked_live_binding() {
+    assert!(live_guarded(SubjectKind::Agent));
+    assert!(live_guarded(SubjectKind::Unknown));
+    assert!(!live_guarded(SubjectKind::Terminal));
+    let bindings = [
+        ("STRIPE_SECRET_KEY", "stripe/acme-live", "live"),
+        ("OPENAI_API_KEY", "openai/acme-web", "live"),
+        ("STRIPE_TEST_KEY", "stripe/acme-test", "test"),
+        ("DATABASE_URL", "postgres/acme-web", "unknown"),
+    ];
+    for kind in [SubjectKind::Agent, SubjectKind::Unknown] {
+        let d = of_kind(kind, &bindings);
+        assert_eq!(
+            unticked_live(&d, &ticking(&[])),
+            ["STRIPE_SECRET_KEY", "OPENAI_API_KEY"],
+            "{kind:?}"
+        );
+        assert_eq!(
+            unticked_live(&d, &ticking(&["OPENAI_API_KEY"])),
+            ["STRIPE_SECRET_KEY"],
+            "{kind:?}"
+        );
+        // A tick of a test binding stands for no live one.
+        assert_eq!(
+            unticked_live(&d, &ticking(&["STRIPE_TEST_KEY", "OPENAI_API_KEY"])),
+            ["STRIPE_SECRET_KEY"],
+            "{kind:?}"
+        );
+        assert!(
+            unticked_live(&d, &ticking(&["STRIPE_SECRET_KEY", "OPENAI_API_KEY"])).is_empty(),
+            "{kind:?}"
+        );
+        let text = render_statement(&d, &ticking(&["OPENAI_API_KEY"]));
+        assert!(
+            text.contains(
+                "STRIPE_SECRET_KEY = stripe/acme-live#value  (live key, live: not allowed by \
+                 you, so this approval is refused unless you add --live STRIPE_SECRET_KEY)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "OPENAI_API_KEY = openai/acme-web#value  (live key, live: allowed by you)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("(live_not_ticked). Approve again with --live STRIPE_SECRET_KEY."),
+            "{text}"
+        );
+        let all = render_statement(&d, &ticking(&["STRIPE_SECRET_KEY", "OPENAI_API_KEY"]));
+        assert!(!all.contains("not allowed"), "{all}");
+        assert!(!all.contains("live_not_ticked"), "{all}");
+    }
+    // A terminal subject: M1's rules, no tick needed and none asked for.
+    let d = of_kind(SubjectKind::Terminal, &bindings);
+    assert!(unticked_live(&d, &ticking(&[])).is_empty());
+    let text = render_statement(&d, &ticking(&[]));
+    assert!(!text.contains("not allowed"), "{text}");
+    assert!(!text.contains("live_not_ticked"), "{text}");
+}
+
+/// The whole statement of [`the_statement_lists_the_test_item_before_the_live_one`],
+/// as a snapshot.
+const PROPOSED_SNAPSHOT: &str = "\
+Approval request ABCDEFGH
+  requested by: agent EnvCloak test fixture agent (caller pid 92), rooted at pid 80 started at 800, /opt/fixture-agent
+  project: /src/acme-web (new project: the vault has no record of it)
+  manifest: /src/acme-web/envcloak.toml sha256 abababababababababababababababababababababababababababababababab
+  test keys of the same provider, proposed instead of live ones (EnvCloak never swaps them in: bind one, then run the command again):
+    STRIPE_SECRET_KEY: the test key stripe/acme-test, not the live key stripe/acme-web
+      envcloak ref STRIPE_SECRET_KEY=stripe/acme-test
+    OPENAI_API_KEY: the test key openai/acme-\\u{1b}[31mtest#api\\u{200b}key, not the live key openai/acme\\u{202e}-live
+      envcloak ref OPENAI_API_KEY=openai/acme-\\u{1b}[31mtest#api\\u{200b}key
+  bindings (inject mode):
+    OPENAI_API_KEY = openai/acme-web#value  (test key, first use: no project uses this item yet)
+    STRIPE_SECRET_KEY = stripe/acme-web#value  (live key, live: not allowed by you, so this approval is refused unless you add --live STRIPE_SECRET_KEY)
+  command (1 arguments):
+    [0] ./emit
+  grant: once, for the next matching request within 10m
+  live keys: agent EnvCloak test fixture agent gets a live key only where you tick it, and this approval leaves 1 unticked, so it creates no grant (live_not_ticked). Approve again with --live STRIPE_SECRET_KEY, or bind a test key proposed above.
+The passphrase you enter approves exactly this, and nothing else.
+";
+
+/// Gate 40, sentence 2 (SPEC §10b): the test item is proposed first.
+/// The rendering lists each proposal, with the `envcloak ref` line that
+/// binds it, before the bindings and their ticks, every string escaped:
+/// a program answering in the daemon's place could send anything. The
+/// whole statement is compared ([`PROPOSED_SNAPSHOT`]).
+#[test]
+fn the_statement_lists_the_test_item_before_the_live_one() {
+    let mut d = proposing(strings(&["./emit"]));
+    d.proposals.push(proposal(
+        "OPENAI_API_KEY",
+        "openai/acme\u{202e}-live",
+        "openai/acme-\u{1b}[31mtest",
+        Some("api\u{200b}key"),
+    ));
+    let text = render_statement(&d, &ticking(&[]));
+    assert_eq!(text, PROPOSED_SNAPSHOT);
+    // The test item comes before the live one.
+    let test = text.find("stripe/acme-test").unwrap();
+    let live = text.find("STRIPE_SECRET_KEY = stripe/acme-web").unwrap();
+    assert!(test < live, "{text}");
+    // With no proposal, no such section.
+    let none = render_statement(&descriptor(strings(&["./emit"])), &ticking(&[]));
+    assert!(!none.contains("test keys of the same provider"), "{none}");
+    assert!(!none.contains("or bind a test key"), "{none}");
 }

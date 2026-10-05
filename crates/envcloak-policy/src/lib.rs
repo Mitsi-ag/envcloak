@@ -28,7 +28,9 @@
 //!   holds no value and is never written to disk.
 //! - [`PendingDescriptor`], [`canonical_statement`] and
 //!   [`render_statement`]: what an approval surface shows for a pending
-//!   request, and the bytes the proof approves.
+//!   request, and the bytes the proof approves; the live-key guard
+//!   ([`unticked_live`]) and the test items proposed for live bindings
+//!   ([`proposals`]).
 //!
 //! The formats are in docs/MANIFEST.md and docs/GRANTS.md.
 
@@ -86,7 +88,7 @@ pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
 };
 pub use statement::{
-    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, RENDER_LIMIT,
-    SubjectSummary, canonical_statement, display_escaped, escape_for_display, render_statement,
-    statement_digest,
+    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, Proposal, RENDER_LIMIT,
+    STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped, escape_for_display,
+    live_guarded, proposals, render_statement, statement_digest, unticked_live,
 };

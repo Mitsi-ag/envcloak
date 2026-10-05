@@ -7,7 +7,10 @@
 //! renderer escapes. From it and the approver's [`ApprovalOptions`]:
 //!
 //! - [`canonical_statement`] is an unambiguous byte encoding of every
-//!   field, the full command line included. [`statement_digest`], its
+//!   field, the full command line included, under the domain
+//!   [`STATEMENT_DOMAIN`] (`envcloak-statement/2`: the bindings'
+//!   classifications, the live ticks and the proposed test items; a
+//!   version 1 digest never equals one). [`statement_digest`], its
 //!   SHA-256, is what the approver sends with the passphrase, and the
 //!   daemon compares it against the digest of its own pending request
 //!   with the same options: a statement that differs from the pending
@@ -20,6 +23,18 @@
 //!   the passphrase approves is the canonical statement, which always
 //!   covers the full argv, and the rendering says so where it cuts.
 //!
+//! **The live-key guard** (SPEC §10b, M2 plan D-11). An agent or unknown
+//! subject ([`live_guarded`]) receives a live-classified binding only when
+//! the approval ticks it (`--live NAME`): [`unticked_live`] names the live
+//! bindings an approval leaves unticked, and an approval with any creates
+//! no grant (`live_not_ticked`). When the same provider has a
+//! test-classified item, the statement proposes it, before the bindings
+//! and their ticks, with the `envcloak ref` line that binds it
+//! ([`Proposal`]); the daemon never substitutes an item. The daemon builds
+//! the classifications and the proposals from the vault when it shows the
+//! statement and again when it takes the approval (L-09), so a statement
+//! read before either changed is a `statement_mismatch`.
+//!
 //! Every string the daemon sends (paths, slugs, an agent's name, argv) goes
 //! through the escaper before it reaches a terminal: a program running as
 //! the user could answer in the daemon's place (SPEC §1.1), and a command
@@ -27,19 +42,27 @@
 
 use core::fmt::Write as _;
 
+use envcloak_core::crypto::ItemClass;
+use envcloak_core::vault::{Classification, FieldName, ItemMeta, Slug};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::effective::SubjectKind;
-use crate::grants::{ApprovalOptions, Uses};
+use crate::grants::{ApprovalOptions, BoundRef, Uses};
 use crate::manifest::Mode;
 
 /// Rendered argv beyond this many bytes is cut, with a marker.
 pub const RENDER_LIMIT: usize = 2048;
 
+/// The first line of every canonical statement (docs/IPC.md "Statement
+/// domains"). Version 1 had no proposals; its digests are refused since
+/// (none equals a version 2 digest).
+pub const STATEMENT_DOMAIN: &[u8] = b"envcloak-statement/2\n";
+
 /// A pending request as an approval surface receives it (SPEC §10b
 /// `{request_id, daemon_nonce, subject evidence, project, bindings, mode,
-/// ttl, live flags, new project, first use, argv}`). Metadata only.
+/// ttl, live flags, new project, first use, argv}`, and the test items
+/// proposed in place of live ones). Metadata only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingDescriptor {
@@ -54,9 +77,163 @@ pub struct PendingDescriptor {
     pub subject: SubjectSummary,
     pub project: ProjectSummary,
     pub bindings: Vec<BindingSummary>,
+    /// The same provider's test items, proposed for live bindings
+    /// ([`proposals`]), in the order of the bindings.
+    pub proposals: Vec<Proposal>,
     pub mode: Mode,
     /// The command line, as display text.
     pub argv: Vec<String>,
+}
+
+/// A test item proposed in place of a live one (SPEC §10b "Live-key
+/// guard"): for the variable `env_name`, bound to the live item
+/// `live_slug`, the same provider's test item `test_slug` (with the same
+/// account label, when both have one). The daemon never substitutes it:
+/// the person, or the agent, binds it with [`Proposal::ref_line`] and asks
+/// again.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Proposal {
+    pub env_name: String,
+    pub live_slug: String,
+    pub test_slug: String,
+    /// The test item's field to bind, when it has several: the one named
+    /// as the live binding's field is. `None` when it has one.
+    pub test_field: Option<String>,
+}
+
+impl Proposal {
+    /// The reference that binds the test item: `<slug>`, or
+    /// `<slug>#<field>` for an item of several fields.
+    pub fn reference(&self) -> String {
+        match &self.test_field {
+            Some(f) => format!("{}#{f}", self.test_slug),
+            None => self.test_slug.clone(),
+        }
+    }
+
+    /// The command that binds the test item to the variable, escaped for
+    /// display: `envcloak ref NAME=<slug>[#field]`.
+    pub fn ref_line(&self) -> String {
+        format!(
+            "envcloak ref {}={}",
+            escape_for_display(&self.env_name),
+            escape_for_display(&self.reference())
+        )
+    }
+
+    /// Whether every name has the shape the daemon gives it: a variable
+    /// name, two slugs and a field name. A program answering in the
+    /// daemon's place could send anything (SPEC §1.1); a client shows no
+    /// proposal that fails this.
+    pub fn well_formed(&self) -> bool {
+        crate::names::EnvName::new(&self.env_name).is_ok()
+            && Slug::new(&self.live_slug).is_ok()
+            && Slug::new(&self.test_slug).is_ok()
+            && self
+                .test_field
+                .as_deref()
+                .is_none_or(|f| FieldName::new(f).is_ok())
+    }
+}
+
+/// Whether the live-key guard applies to a request from a subject of kind
+/// `k`: agent and unknown subjects (SPEC §10b; an unknown subject's
+/// evidence is missing, and missing evidence takes the tighter rule).
+pub fn live_guarded(k: SubjectKind) -> bool {
+    match k {
+        SubjectKind::Agent | SubjectKind::Unknown => true,
+        SubjectKind::Terminal => false,
+    }
+}
+
+/// The variables of `p`'s live-classified bindings that `o` does not tick,
+/// in the order of the bindings, when the guard applies to its subject
+/// ([`live_guarded`]); none otherwise. An approval that leaves any is
+/// refused `live_not_ticked` and creates no grant. Read from the
+/// statement, so the daemon and an approval surface decide from the same
+/// classifications: the ones the daemon built from the vault when it sent
+/// the statement, and again when it takes the approval.
+pub fn unticked_live<'a>(p: &'a PendingDescriptor, o: &ApprovalOptions) -> Vec<&'a str> {
+    if !live_guarded(p.subject.kind) {
+        return Vec::new();
+    }
+    p.bindings
+        .iter()
+        .filter(|b| b.classification == LIVE && !ticked(o, &b.env_name))
+        .map(|b| b.env_name.as_str())
+        .collect()
+}
+
+/// The word of a live classification in a statement.
+const LIVE: &str = "live";
+
+/// Whether `o` ticks the variable `env_name`.
+fn ticked(o: &ApprovalOptions, env_name: &str) -> bool {
+    o.live.iter().any(|l| l.as_str() == env_name)
+}
+
+/// The test items to propose for `bindings` (SPEC §10b "Live-key
+/// guard"), from `items`, the vault's metadata now: for each binding whose
+/// item is a live-classified secret of a known provider, the same
+/// provider's test-classified secret item (not the same item), with the
+/// same account label when both have one, that a reference can bind
+/// unambiguously (its one field, or the field named as the binding's).
+/// One per binding, the first by: an account label equal to the live
+/// item's, then slug. A binding whose item is gone, or of no provider, has
+/// none.
+pub fn proposals(bindings: &[BoundRef], items: &[ItemMeta]) -> Vec<Proposal> {
+    let mut out = Vec::new();
+    for b in bindings {
+        let Some(live) = items.iter().find(|m| m.id == b.binding.item) else {
+            continue;
+        };
+        if live.class != ItemClass::Secret || live.details.classification != Classification::Live {
+            continue;
+        }
+        let Some(provider) = live.details.provider.as_deref() else {
+            continue;
+        };
+        let live_label = live.details.account.label.as_deref();
+        let best = items
+            .iter()
+            .filter(|m| {
+                m.id != live.id
+                    && m.class == ItemClass::Secret
+                    && m.details.classification == Classification::Test
+                    && m.details.provider.as_deref() == Some(provider)
+                    && match (live_label, m.details.account.label.as_deref()) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            })
+            .filter_map(|m| {
+                let field = match m.fields.as_slice() {
+                    [_] => None,
+                    fields => Some(
+                        fields
+                            .iter()
+                            .find(|f| f.name == b.field_name)?
+                            .name
+                            .as_str()
+                            .to_owned(),
+                    ),
+                };
+                let same_label =
+                    live_label.is_some() && live_label == m.details.account.label.as_deref();
+                Some((!same_label, m.slug.as_str(), field))
+            })
+            .min_by(|x, y| (x.0, x.1).cmp(&(y.0, y.1)));
+        if let Some((_, test_slug, test_field)) = best {
+            out.push(Proposal {
+                env_name: b.binding.env_name.as_str().to_owned(),
+                live_slug: live.slug.as_str().to_owned(),
+                test_slug: test_slug.to_owned(),
+                test_field,
+            });
+        }
+    }
+    out
 }
 
 /// The caller, as the daemon classified it.
@@ -178,11 +355,13 @@ fn uses_word(u: Uses) -> &'static str {
     }
 }
 
-/// The canonical encoding of the statement: every field of `p` and `o`,
-/// length-prefixed, the full argv included. See the module documentation.
+/// The canonical encoding of the statement: [`STATEMENT_DOMAIN`], then
+/// every field of `p` and `o`, length-prefixed, the full argv included,
+/// the proposals after the bindings. See the module documentation and
+/// docs/GRANTS.md "Canonical encoding".
 pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8> {
     let mut e = Enc(Vec::with_capacity(512));
-    e.0.extend_from_slice(b"envcloak-statement/1\n");
+    e.0.extend_from_slice(STATEMENT_DOMAIN);
     e.str(&p.request)
         .str(&p.nonce)
         .num(p.created_secs)
@@ -209,6 +388,14 @@ pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8
             .str(&b.classification)
             .flag(b.first_use)
             .flag(b.granted);
+    }
+    e.count(p.proposals.len());
+    for x in &p.proposals {
+        e.str(&x.env_name)
+            .str(&x.live_slug)
+            .str(&x.test_slug)
+            .str(x.test_field.as_deref().unwrap_or(""))
+            .flag(x.test_field.is_some());
     }
     e.str(mode_word(p.mode)).count(p.argv.len());
     for a in &p.argv {
@@ -339,15 +526,21 @@ fn render_argv(argv: &[String]) -> String {
     full
 }
 
-/// One binding as the statement shows it, with its notes.
-fn binding_line(b: &BindingSummary, o: &ApprovalOptions) -> String {
+/// One binding as the statement shows it, with its notes. `guarded`: the
+/// live-key guard applies to the request ([`live_guarded`]).
+fn binding_line(b: &BindingSummary, o: &ApprovalOptions, guarded: bool) -> String {
     let e = escape_for_display;
     let mut notes = vec![format!("{} key", e(&b.classification))];
     if b.first_use {
         notes.push("first use: no project uses this item yet".to_owned());
     }
-    if o.live.iter().any(|l| l.as_str() == b.env_name) {
+    if ticked(o, &b.env_name) {
         notes.push("live: allowed by you".to_owned());
+    } else if guarded && b.classification == LIVE {
+        notes.push(format!(
+            "live: not allowed by you, so this approval is refused unless you add --live {}",
+            e(&b.env_name)
+        ));
     }
     format!(
         "    {} = {}#{}  ({})\n",
@@ -400,6 +593,27 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
         e(&p.project.manifest),
         e(&p.project.manifest_sha256)
     );
+    // The test items first, before the live bindings and their ticks
+    // (SPEC §10b "Live-key guard"): each with the line that binds it. The
+    // daemon never swaps one in.
+    if !p.proposals.is_empty() {
+        let _ = writeln!(
+            t,
+            "  test keys of the same provider, proposed instead of live ones (EnvCloak never \
+             swaps them in: bind one, then run the command again):"
+        );
+        for x in &p.proposals {
+            let _ = writeln!(
+                t,
+                "    {}: the test key {}, not the live key {}",
+                e(&x.env_name),
+                e(&x.reference()),
+                e(&x.live_slug)
+            );
+            let _ = writeln!(t, "      {}", x.ref_line());
+        }
+    }
+    let guarded = live_guarded(p.subject.kind);
     // The difference first: what no grant in force covers. The bindings
     // a grant already covered follow, under a heading that says this grant
     // holds them too, for its own uses and length: the statement shows
@@ -416,7 +630,7 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
         );
     }
     for b in &new {
-        t.push_str(&binding_line(b, o));
+        t.push_str(&binding_line(b, o, guarded));
     }
     if !granted.is_empty() {
         let _ = writeln!(
@@ -425,7 +639,7 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
              them when this was asked):"
         );
         for b in &granted {
-            t.push_str(&binding_line(b, o));
+            t.push_str(&binding_line(b, o, guarded));
         }
     }
     let _ = writeln!(t, "  command ({} arguments):", p.argv.len());
@@ -445,6 +659,26 @@ pub fn render_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> String {
                 duration_words(o.ttl_secs)
             );
         }
+    }
+    let unticked = unticked_live(p, o);
+    if !unticked.is_empty() {
+        let flags: Vec<String> = unticked
+            .iter()
+            .map(|n| format!("--live {}", e(n)))
+            .collect();
+        let _ = writeln!(
+            t,
+            "  live keys: {} gets a live key only where you tick it, and this approval leaves \
+             {} unticked, so it creates no grant (live_not_ticked). Approve again with {}{}.",
+            who.trim_end(),
+            unticked.len(),
+            flags.join(" "),
+            if p.proposals.is_empty() {
+                ""
+            } else {
+                ", or bind a test key proposed above"
+            }
+        );
     }
     t.push_str("The passphrase you enter approves exactly this, and nothing else.\n");
     t

@@ -11,14 +11,19 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
+use envcloak_core::crypto::ItemClass;
+use envcloak_core::vault::{
+    Account, Classification, FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId,
+    ItemMeta, Slug,
+};
 use envcloak_policy::{
     AUTO_DENY, AccessRequest, Ancestor, ApprovalOptions, ApprovalProof, ApproveError,
     AttemptLimiter, BoundBinding, BoundRef, CatalogSource, ChainEnd, Claims, DENIAL_WINDOW,
     Decision, DenyReason, EnvName, GrantId, MAX_AGENT_TTL, MAX_DENIALS, MAX_GRANTS, MAX_PENDING,
     MAX_PENDING_PER_ROOT, MAX_TERMINAL_TTL, MatchBasis, Mode, Now, OptionsError, PENDING_TTL,
-    PendingCap, PendingId, ProcessInstance, ProjectIdentity, ProofKind, ProofRefusal,
-    RevokeSelector, SubjectEvidence, SubjectKind, Uses, statement_digest,
+    PendingCap, PendingDescriptor, PendingId, ProcessInstance, ProjectIdentity, ProofKind,
+    ProofRefusal, Proposal, RevokeSelector, SubjectEvidence, SubjectKind, Uses, proposals,
+    render_statement, statement_digest,
 };
 use envcloak_policy::{AgentLabel, GrantStore};
 use envcloak_sys::StartTime;
@@ -191,6 +196,90 @@ fn store() -> GrantStore {
     s
 }
 
+/// The vault as these tests have it: each item a pending request binds,
+/// as the request recorded it (a secret of one field), so a statement
+/// reads now as it did when the request was made. The live-key guard's
+/// tests below give the store a vault of their own instead.
+fn held(s: &GrantStore, id: &PendingId, now: &Now) -> Vec<ItemMeta> {
+    s.pending(id, now)
+        .map(|p| metas(&p.request.bindings))
+        .unwrap_or_default()
+}
+
+/// The vault's metadata for `bindings`: a secret of one field each, of the
+/// classification the binding records.
+fn metas(bindings: &[BoundRef]) -> Vec<ItemMeta> {
+    bindings
+        .iter()
+        .map(|b| {
+            meta(
+                b.binding.item,
+                b.binding.field,
+                b.slug.as_str(),
+                b.binding.classification,
+            )
+        })
+        .collect()
+}
+
+/// One secret item of one field `value`.
+fn meta(item: ItemId, field: FieldId, slug: &str, class: Classification) -> ItemMeta {
+    ItemMeta {
+        id: item,
+        class: ItemClass::Secret,
+        slug: Slug::new(slug).unwrap(),
+        details: ItemDetails {
+            classification: class,
+            ..ItemDetails::default()
+        },
+        created_at: 0,
+        updated_at: 0,
+        fields: vec![FieldMeta {
+            id: field,
+            name: FieldName::new("value").unwrap(),
+            kind: FieldKind::Value,
+            prior_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        }],
+        classification_changed_at: None,
+        exposure: None,
+        rotate_recommended: false,
+        login: None,
+    }
+}
+
+/// The store's statement and approval with the vault of [`held`].
+trait Held {
+    fn shown(&self, id: &PendingId, now: &Now) -> Option<PendingDescriptor>;
+    fn approve_held(
+        &mut self,
+        id: &PendingId,
+        proof: ApprovalProof,
+        opts: ApprovalOptions,
+        digest: [u8; 32],
+        now: &Now,
+    ) -> Result<GrantId, ApproveError>;
+}
+
+impl Held for GrantStore {
+    fn shown(&self, id: &PendingId, now: &Now) -> Option<PendingDescriptor> {
+        self.pending_descriptor(id, now, &held(self, id, now))
+    }
+
+    fn approve_held(
+        &mut self,
+        id: &PendingId,
+        proof: ApprovalProof,
+        opts: ApprovalOptions,
+        digest: [u8; 32],
+        now: &Now,
+    ) -> Result<GrantId, ApproveError> {
+        let vault = held(self, id, now);
+        self.approve(id, proof, opts, digest, now, &vault)
+    }
+}
+
 fn proof(approver: SubjectEvidence) -> ApprovalProof {
     ApprovalProof {
         approver,
@@ -237,8 +326,8 @@ fn approve(
     now: &Now,
 ) -> Result<GrantId, ApproveError> {
     let id = pending_id(&s.decide(r, now));
-    let digest = statement_digest(s.pending_descriptor(&id, now).unwrap(), &opts);
-    s.approve(&id, proof(terminal()), opts, digest, now)
+    let digest = statement_digest(&s.shown(&id, now).unwrap(), &opts);
+    s.approve_held(&id, proof(terminal()), opts, digest, now)
 }
 
 // ------------------------------------------------ approve and its proofs
@@ -259,7 +348,7 @@ fn a_proof_from_an_agent_descended_caller_is_refused() {
         &now,
     ));
     let opts = session(3600);
-    let digest = statement_digest(s.pending_descriptor(&id, &now).unwrap(), &opts);
+    let digest = statement_digest(&s.shown(&id, &now).unwrap(), &opts);
 
     // The agent itself, a command under it, a shell claiming an agent
     // marker, an orphan and a cut chain: all refused, and the request
@@ -288,10 +377,10 @@ fn a_proof_from_an_agent_descended_caller_is_refused() {
         assert!(approver.agent_involved());
         assert!(approver.proof_refusal().is_some());
         let e = s
-            .approve(&id, proof(approver), opts.clone(), digest, &now)
+            .approve_held(&id, proof(approver), opts.clone(), digest, &now)
             .unwrap_err();
         assert_eq!(e, ApproveError::ProofRefused);
-        assert!(s.pending_descriptor(&id, &now).is_some());
+        assert!(s.shown(&id, &now).is_some());
     }
     // No agent is seen, but there is no terminal session: a job a service
     // manager started in a session of its own (`systemd-run --user`) or in
@@ -308,11 +397,11 @@ fn a_proof_from_an_agent_descended_caller_is_refused() {
         assert!(!approver.agent_involved(), "{approver:?}");
         assert_eq!(approver.proof_refusal(), Some(ProofRefusal::NoTerminal));
         let e = s
-            .approve(&id, proof(approver), opts.clone(), digest, &now)
+            .approve_held(&id, proof(approver), opts.clone(), digest, &now)
             .unwrap_err();
         assert_eq!(e, ApproveError::ProofRefused);
     }
-    assert!(s.pending_descriptor(&id, &now).is_some());
+    assert!(s.shown(&id, &now).is_some());
     assert_eq!(s.grants().count(), 0);
     assert_eq!(terminal().proof_refusal(), None);
 
@@ -321,25 +410,25 @@ fn a_proof_from_an_agent_descended_caller_is_refused() {
     let mut wrong = digest;
     wrong[0] ^= 1;
     let e = s
-        .approve(&id, proof(terminal()), opts.clone(), wrong, &now)
+        .approve_held(&id, proof(terminal()), opts.clone(), wrong, &now)
         .unwrap_err();
     assert_eq!(e, ApproveError::StatementMismatch);
     let e = s
-        .approve(&id, proof(terminal()), once(), digest, &now)
+        .approve_held(&id, proof(terminal()), once(), digest, &now)
         .unwrap_err();
     assert_eq!(e, ApproveError::StatementMismatch);
     let other = PendingId::parse("ABCDEFGH").unwrap();
     let e = s
-        .approve(&other, proof(terminal()), opts.clone(), digest, &now)
+        .approve_held(&other, proof(terminal()), opts.clone(), digest, &now)
         .unwrap_err();
     assert_eq!(e, ApproveError::NoSuchRequest);
     assert_eq!(s.grants().count(), 0);
 
     // The right statement from a terminal subject creates the grant.
     let g = s
-        .approve(&id, proof(terminal()), opts, digest, &now)
+        .approve_held(&id, proof(terminal()), opts, digest, &now)
         .unwrap();
-    assert!(s.pending_descriptor(&id, &now).is_none());
+    assert!(s.shown(&id, &now).is_none());
     let grant = s.grant(g).unwrap();
     assert_eq!(grant.root, inst(80, 800));
     assert_eq!(grant.kind, SubjectKind::Agent);
@@ -347,7 +436,7 @@ fn a_proof_from_an_agent_descended_caller_is_refused() {
     assert_eq!(grant.uses, Uses::Session);
     // Approved once: the request is gone.
     let e = s
-        .approve(&id, proof(terminal()), session(3600), digest, &now)
+        .approve_held(&id, proof(terminal()), session(3600), digest, &now)
         .unwrap_err();
     assert_eq!(e, ApproveError::NoSuchRequest);
 }
@@ -366,7 +455,7 @@ fn the_pending_request_carries_the_flags_and_expires() {
     );
     r.new_project = true;
     let id = pending_id(&s.decide(r, &now));
-    let d = s.pending_descriptor(&id, &now).unwrap();
+    let d = s.shown(&id, &now).unwrap();
     assert_eq!(d.request, id.to_string());
     assert_eq!(d.request.len(), 8);
     assert_eq!(d.nonce.len(), 64);
@@ -413,9 +502,9 @@ fn the_pending_request_carries_the_flags_and_expires() {
 
     // Pending requests expire after 10 minutes.
     let later = now_at(PENDING_TTL.as_secs());
-    assert!(s.pending_descriptor(&id, &later).is_none());
+    assert!(s.shown(&id, &later).is_none());
     let e = s
-        .approve(&id, proof(terminal()), session(3600), [0u8; 32], &later)
+        .approve_held(&id, proof(terminal()), session(3600), [0u8; 32], &later)
         .unwrap_err();
     assert_eq!(e, ApproveError::NoSuchRequest);
 }
@@ -473,8 +562,8 @@ fn approval_options_are_bounded() {
             &["x"],
         );
         let pid = pending_id(&s.decide(r, &now));
-        let digest = statement_digest(s.pending_descriptor(&pid, &now).unwrap(), &once());
-        s.approve(&pid, proof(terminal()), once(), digest, &now)
+        let digest = statement_digest(&s.shown(&pid, &now).unwrap(), &once());
+        s.approve_held(&pid, proof(terminal()), once(), digest, &now)
             .unwrap();
     }
     let e = approve(&mut s, agent_request(), once(), &now).unwrap_err();
@@ -670,7 +759,7 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
         .unwrap();
         let n = changed.len();
         let id = pending_id(&s.decide(request(under_agent(), changed, &["./emit"]), &now));
-        let d = s.pending_descriptor(&id, &now).unwrap();
+        let d = s.shown(&id, &now).unwrap();
         let asked: Vec<&str> = d
             .bindings
             .iter()
@@ -680,9 +769,9 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
         assert_eq!(asked, new);
         assert!(d.bindings.iter().any(|b| b.granted), "{d:?}");
         // Approved, the new grant holds the whole request.
-        let digest = statement_digest(d, &session(600));
+        let digest = statement_digest(&d, &session(600));
         let g2 = s
-            .approve(&id, proof(terminal()), session(600), digest, &now)
+            .approve_held(&id, proof(terminal()), session(600), digest, &now)
             .unwrap();
         assert_eq!(s.grant(g2).unwrap().bindings.len(), n);
     }
@@ -707,7 +796,7 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
         pending_id(&once_store.decide(request(under_agent(), three.clone(), &["./emit"]), &now));
     assert!(
         once_store
-            .pending_descriptor(&id, &now)
+            .shown(&id, &now)
             .unwrap()
             .bindings
             .iter()
@@ -727,9 +816,8 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
     )
     .unwrap();
     let id = pending_id(&once_store.decide(request(under_agent(), three, &["./emit", "2"]), &now));
-    let granted: Vec<&str> = once_store
-        .pending_descriptor(&id, &now)
-        .unwrap()
+    let shown = once_store.shown(&id, &now).unwrap();
+    let granted: Vec<&str> = shown
         .bindings
         .iter()
         .filter(|b| b.granted)
@@ -752,7 +840,7 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
     elsewhere.project = project("/src/other", 1, 200);
     let id = pending_id(&s3.decide(elsewhere, &now));
     assert!(
-        s3.pending_descriptor(&id, &now)
+        s3.shown(&id, &now)
             .unwrap()
             .bindings
             .iter()
@@ -1002,7 +1090,7 @@ fn revoke_lock_root_exit_and_epochs_end_grants() {
     let pending = pending_id(&s.decide(t(), &now));
     s.on_lock();
     assert_eq!(s.grants().count(), 0);
-    assert!(s.pending_descriptor(&pending, &now).is_none());
+    assert!(s.shown(&pending, &now).is_none());
     s.set_epochs(1, 1);
     assert!(matches!(s.decide(r(1), &now), Decision::Pending(_)));
 
@@ -1080,13 +1168,13 @@ fn removing_an_item_ends_the_grants_and_requests_that_bind_it() {
     assert_eq!(s.on_item_removed(it[1].item), 2);
     assert!(s.grant(g_both).is_none());
     assert!(s.grant(g_stripe).is_none());
-    assert!(s.pending_descriptor(&waiting_stripe, &now).is_none());
-    assert!(s.pending_descriptor(&waiting_github, &now).is_some());
+    assert!(s.shown(&waiting_stripe, &now).is_none());
+    assert!(s.shown(&waiting_github, &now).is_some());
     assert_eq!(s.binding_item(it[1].item), 0);
     // Nothing else binds it: removing it again ends nothing.
     assert_eq!(s.on_item_removed(it[1].item), 0);
     assert_eq!(s.on_item_removed(it[0].item), 0);
-    assert!(s.pending_descriptor(&waiting_github, &now).is_some());
+    assert!(s.shown(&waiting_github, &now).is_some());
 }
 
 // ---------------------------------------------------------- once grants
@@ -1139,13 +1227,13 @@ fn a_once_grant_is_consumed_exactly_once() {
         ),
         &now,
     ));
-    let digest = statement_digest(s.pending_descriptor(&a, &now).unwrap(), &once());
+    let digest = statement_digest(&s.shown(&a, &now).unwrap(), &once());
     let once_grant = s
-        .approve(&a, proof(terminal()), once(), digest, &now)
+        .approve_held(&a, proof(terminal()), once(), digest, &now)
         .unwrap();
-    let digest = statement_digest(s.pending_descriptor(&b, &now).unwrap(), &session(60));
+    let digest = statement_digest(&s.shown(&b, &now).unwrap(), &session(60));
     let session_grant = s
-        .approve(&b, proof(terminal()), session(60), digest, &now)
+        .approve_held(&b, proof(terminal()), session(60), digest, &now)
         .unwrap();
     assert_eq!(covered(&s.decide(r(), &now)), session_grant);
     assert!(s.grant(once_grant).is_some());
@@ -1507,4 +1595,624 @@ fn identifiers_are_crockford_and_parse_back() {
     assert_eq!(PendingId::parse("ABCDEFG!"), None);
     // Crockford aliases: I and L read as 1, O as 0.
     assert_eq!(PendingId::parse("0O1IL222"), PendingId::parse("00111222"));
+}
+
+// --------------------------------------------- the live-key guard (M2-13)
+
+/// `b` with the item recorded as `class` when the request was made.
+fn classified(mut b: BoundRef, class: Classification) -> BoundRef {
+    b.binding.classification = class;
+    b
+}
+
+/// A caller with no agent in its evidence and no terminal: a job in a
+/// session of its own (`systemd-run --user`). An unknown subject.
+fn unknown() -> SubjectEvidence {
+    ev(vec![p(96, 96, None), p(1, 1, None)], false, &[])
+}
+
+fn live(names: &[&str], uses: Uses) -> ApprovalOptions {
+    ApprovalOptions {
+        uses,
+        ttl_secs: 600,
+        live: names.iter().map(|n| EnvName::new(n).unwrap()).collect(),
+    }
+}
+
+/// Gate 40, sentence 1, the store's part (SPEC §10b "Live-key guard"): an
+/// agent's or an unknown subject's request with a live binding is not
+/// approved without that binding's tick. The refusal comes before the
+/// proof would be looked at (`check_approval`) and again at approval,
+/// makes no grant, and leaves the request pending; it names the item it
+/// left unticked. With the tick, the grant records it (`live = true`).
+#[test]
+fn an_agent_or_unknown_approval_without_its_live_tick_makes_no_grant() {
+    for requester in [under_agent(), unknown()] {
+        let kind = requester.kind();
+        assert_ne!(kind, SubjectKind::Terminal);
+        let it = items();
+        let mut s = store();
+        let now = now_at(0);
+        let r = request(
+            requester,
+            vec![
+                bound("OPENAI_API_KEY", &it[0]),
+                classified(bound("STRIPE_SECRET_KEY", &it[1]), Classification::Live),
+            ],
+            &["./emit"],
+        );
+        let vault = metas(&r.bindings);
+        let id = pending_id(&s.decide(r, &now));
+        let d = s.pending_descriptor(&id, &now, &vault).unwrap();
+        assert_eq!(d.bindings[1].classification, "live", "{kind:?}");
+        let opts = session(3600);
+        let digest = statement_digest(&d, &opts);
+        assert_eq!(
+            s.check_approval(&id, &opts, digest, &now, &vault),
+            Err(ApproveError::LiveNotTicked),
+            "{kind:?}"
+        );
+        let e = s
+            .approve(&id, proof(terminal()), opts.clone(), digest, &now, &vault)
+            .unwrap_err();
+        assert_eq!(e, ApproveError::LiveNotTicked, "{kind:?}");
+        assert_eq!(s.grants().count(), 0, "{kind:?}");
+        assert!(s.pending(&id, &now).is_some(), "{kind:?}");
+        let unticked = s.unticked_items(&id, &opts, &now, &vault);
+        assert_eq!(unticked.len(), 1, "{kind:?}");
+        assert_eq!(unticked[0].0, it[1].item, "{kind:?}");
+        assert_eq!(unticked[0].1.as_str(), "stripe/acme-web", "{kind:?}");
+        // A tick of the other binding is not this one's.
+        let wrong = live(&["OPENAI_API_KEY"], Uses::Session);
+        let e = s
+            .approve(
+                &id,
+                proof(terminal()),
+                wrong.clone(),
+                statement_digest(&d, &wrong),
+                &now,
+                &vault,
+            )
+            .unwrap_err();
+        assert_eq!(e, ApproveError::LiveNotTicked, "{kind:?}");
+        // Ticked: one grant, holding the tick.
+        let ticked = live(&["STRIPE_SECRET_KEY"], Uses::Once);
+        assert!(s.unticked_items(&id, &ticked, &now, &vault).is_empty());
+        let g = s
+            .approve(
+                &id,
+                proof(terminal()),
+                ticked.clone(),
+                statement_digest(&d, &ticked),
+                &now,
+                &vault,
+            )
+            .unwrap();
+        let grant = s.grant(g).unwrap();
+        assert_eq!(grant.kind, kind);
+        let held: Vec<(&str, bool)> = grant
+            .bindings
+            .iter()
+            .map(|b| (b.env_name.as_str(), b.live))
+            .collect();
+        assert_eq!(
+            held,
+            vec![("OPENAI_API_KEY", false), ("STRIPE_SECRET_KEY", true)]
+        );
+    }
+}
+
+/// Gate 40's other side: a terminal subject's live bindings need no tick
+/// (SPEC §10b: the guard is for agent and unknown subjects; M1's rules
+/// stand for the person's own terminal).
+#[test]
+fn a_terminal_subject_needs_no_live_tick() {
+    let it = items();
+    let mut s = store();
+    let now = now_at(0);
+    let r = request(
+        terminal(),
+        vec![classified(
+            bound("STRIPE_SECRET_KEY", &it[1]),
+            Classification::Live,
+        )],
+        &["./emit"],
+    );
+    let vault = metas(&r.bindings);
+    let id = pending_id(&s.decide(r.clone(), &now));
+    let d = s.pending_descriptor(&id, &now, &vault).unwrap();
+    let opts = session(3600);
+    let g = s
+        .approve(
+            &id,
+            proof(terminal()),
+            opts.clone(),
+            statement_digest(&d, &opts),
+            &now,
+            &vault,
+        )
+        .unwrap();
+    assert!(!s.grant(g).unwrap().bindings[0].live);
+    // And the grant holds the live binding at use.
+    assert_eq!(covered(&s.decide(r, &now)), g);
+}
+
+/// L-09 at approval ("Cache classification at approval" is the
+/// mutation): the classification is read from the vault when the
+/// statement is shown and again when it is approved, never taken from
+/// what the request recorded. A request made while its item was a test
+/// key, whose item the vault now holds as live (with nothing else told
+/// to the store), is shown as live: the statement read before is a
+/// `statement_mismatch`, the one shown now needs the tick, and with it
+/// the grant records it.
+#[test]
+fn the_classification_is_read_from_the_vault_when_shown_and_approved() {
+    let it = items();
+    let mut s = store();
+    let now = now_at(0);
+    let r = request(
+        under_agent(),
+        vec![bound("STRIPE_SECRET_KEY", &it[1])],
+        &["./emit"],
+    );
+    let before = metas(&r.bindings);
+    let id = pending_id(&s.decide(r, &now));
+    let opts = session(3600);
+    let then = s.pending_descriptor(&id, &now, &before).unwrap();
+    assert_eq!(then.bindings[0].classification, "test");
+    let read_then = statement_digest(&then, &opts);
+    // The vault now holds the item as live.
+    let after = vec![meta(
+        it[1].item,
+        it[1].field,
+        it[1].slug,
+        Classification::Live,
+    )];
+    let shown = s.pending_descriptor(&id, &now, &after).unwrap();
+    assert_eq!(shown.bindings[0].classification, "live");
+    let e = s
+        .approve(
+            &id,
+            proof(terminal()),
+            opts.clone(),
+            read_then,
+            &now,
+            &after,
+        )
+        .unwrap_err();
+    assert_eq!(e, ApproveError::StatementMismatch);
+    let e = s
+        .approve(
+            &id,
+            proof(terminal()),
+            opts.clone(),
+            statement_digest(&shown, &opts),
+            &now,
+            &after,
+        )
+        .unwrap_err();
+    assert_eq!(e, ApproveError::LiveNotTicked);
+    assert_eq!(s.grants().count(), 0);
+    let ticked = live(&["STRIPE_SECRET_KEY"], Uses::Session);
+    let g = s
+        .approve(
+            &id,
+            proof(terminal()),
+            ticked.clone(),
+            statement_digest(&shown, &ticked),
+            &now,
+            &after,
+        )
+        .unwrap();
+    assert!(s.grant(g).unwrap().bindings[0].live);
+    // A vault that lacks a bound item is not the one the request was made
+    // from: nothing is shown and nothing approved.
+    let r = request(
+        under_agent(),
+        vec![bound("OPENAI_API_KEY", &it[0])],
+        &["./emit"],
+    );
+    let id = pending_id(&s.decide(r, &now));
+    assert!(s.pending_descriptor(&id, &now, &[]).is_none());
+    assert_eq!(
+        s.check_approval(&id, &opts, read_then, &now, &[]),
+        Err(ApproveError::NoSuchRequest)
+    );
+}
+
+/// L-09 at use: a grant holds an agent's (or an unknown subject's)
+/// binding only with its tick while the item is live by the
+/// classification the request read from the vault, never by one recorded
+/// at approval. A grant approved while the item was a test key does not
+/// cover the request once it reads the item as live, even if nothing ended
+/// the grant; a grant with the tick does; a terminal grant is as in M1.
+#[test]
+fn a_grant_does_not_hold_an_item_that_became_live_without_its_tick() {
+    let it = items();
+    let now = now_at(0);
+    let test_binding = || bound("STRIPE_SECRET_KEY", &it[1]);
+    let live_binding = || classified(bound("STRIPE_SECRET_KEY", &it[1]), Classification::Live);
+    let requesters: [fn() -> SubjectEvidence; 2] = [under_agent, unknown];
+    for requester in requesters {
+        let mut s = store();
+        let g = approve_with_vault(
+            &mut s,
+            request(requester(), vec![test_binding()], &["./emit"]),
+            session(3600),
+            &now,
+        );
+        // As a test key, it is held.
+        assert_eq!(
+            covered(&s.decide(
+                request(requester(), vec![test_binding()], &["./emit"]),
+                &now
+            )),
+            g
+        );
+        // Read as live, it is not: the request asks again, and the
+        // statement asks for it (no grant holds it).
+        let id = pending_id(&s.decide(
+            request(requester(), vec![live_binding()], &["./emit"]),
+            &now,
+        ));
+        let vault = vec![meta(
+            it[1].item,
+            it[1].field,
+            it[1].slug,
+            Classification::Live,
+        )];
+        let d = s.pending_descriptor(&id, &now, &vault).unwrap();
+        assert!(!d.bindings[0].granted, "{d:?}");
+        // The ticked grant holds it.
+        let ticked = live(&["STRIPE_SECRET_KEY"], Uses::Session);
+        let t = s
+            .approve(
+                &id,
+                proof(terminal()),
+                ticked.clone(),
+                statement_digest(&d, &ticked),
+                &now,
+                &vault,
+            )
+            .unwrap();
+        assert_eq!(
+            covered(&s.decide(
+                request(requester(), vec![live_binding()], &["./emit"]),
+                &now
+            )),
+            t
+        );
+    }
+    // A terminal grant for a terminal subject holds it either way.
+    let mut s = store();
+    let g = approve_with_vault(
+        &mut s,
+        request(terminal(), vec![test_binding()], &["./emit"]),
+        session(3600),
+        &now,
+    );
+    assert_eq!(
+        covered(&s.decide(request(terminal(), vec![live_binding()], &["./emit"]), &now)),
+        g
+    );
+}
+
+/// Opens `r` and approves it as the person with `opts`, with the vault of
+/// `r`'s own bindings.
+fn approve_with_vault(
+    s: &mut GrantStore,
+    r: AccessRequest,
+    opts: ApprovalOptions,
+    now: &Now,
+) -> GrantId {
+    let vault = metas(&r.bindings);
+    let id = pending_id(&s.decide(r, now));
+    let d = s.pending_descriptor(&id, now, &vault).unwrap();
+    let digest = statement_digest(&d, &opts);
+    s.approve(&id, proof(terminal()), opts, digest, now, &vault)
+        .unwrap()
+}
+
+/// A secret item for the proposal tests: `slug` of `provider`, with
+/// `fields` (each a field id and name), classified `class`, with the
+/// account label `label`.
+fn provider_item(
+    slug: &str,
+    provider: &str,
+    class: Classification,
+    label: Option<&str>,
+    fields: &[&str],
+) -> ItemMeta {
+    let mut m = meta(ItemId::generate(), FieldId::generate(), slug, class);
+    m.details.provider = Some(provider.to_owned());
+    m.details.account = Account {
+        label: label.map(str::to_owned),
+        ..Account::default()
+    };
+    m.fields = fields
+        .iter()
+        .map(|f| FieldMeta {
+            id: FieldId::generate(),
+            name: FieldName::new(f).unwrap(),
+            kind: FieldKind::Value,
+            prior_count: 0,
+            created_at: 0,
+            updated_at: 0,
+        })
+        .collect();
+    m
+}
+
+/// A binding of `env` to field `field` of `m`, recorded as `m` is now.
+fn binding_of(env: &str, m: &ItemMeta, field: &str) -> BoundRef {
+    let f = m.fields.iter().find(|f| f.name.as_str() == field).unwrap();
+    BoundRef {
+        binding: BoundBinding {
+            env_name: EnvName::new(env).unwrap(),
+            item: m.id,
+            field: f.id,
+            classification: m.details.classification,
+        },
+        slug: m.slug.clone(),
+        field_name: f.name.clone(),
+        first_use: false,
+    }
+}
+
+/// Gate 40, sentence 2 (SPEC §10b): for each live binding, the same
+/// provider's test item is proposed, and nothing else: not another
+/// provider's, not a live or unknown one, not one whose account label
+/// differs from the live item's when both have one, not a card's or a
+/// login's, not one a reference cannot bind unambiguously. One per
+/// binding, the one with an equal account label first, then by slug; a
+/// test binding, an unknown one and an item of no provider get none.
+#[test]
+fn the_same_providers_test_item_is_proposed_for_each_live_binding() {
+    let live_one = provider_item(
+        "stripe/acme-live",
+        "stripe",
+        Classification::Live,
+        Some("acme"),
+        &["value"],
+    );
+    let live_two = provider_item(
+        "stripe/two-live",
+        "stripe",
+        Classification::Live,
+        None,
+        &["secret", "publishable"],
+    );
+    let test_unlabeled = provider_item(
+        "stripe/aaa-test",
+        "stripe",
+        Classification::Test,
+        None,
+        &["value"],
+    );
+    let test_same_label = provider_item(
+        "stripe/zzz-test",
+        "stripe",
+        Classification::Test,
+        Some("acme"),
+        &["value"],
+    );
+    let test_other_label = provider_item(
+        "stripe/aa-other",
+        "stripe",
+        Classification::Test,
+        Some("globex"),
+        &["value"],
+    );
+    let test_two_fields = provider_item(
+        "stripe/bbb-test",
+        "stripe",
+        Classification::Test,
+        Some("globex"),
+        &["publishable", "secret"],
+    );
+    let test_wrong_fields = provider_item(
+        "stripe/aab-test",
+        "stripe",
+        Classification::Test,
+        None,
+        &["a", "b"],
+    );
+    let other_provider = provider_item(
+        "github/aaa-test",
+        "github",
+        Classification::Test,
+        None,
+        &["value"],
+    );
+    let unknown_class = provider_item(
+        "stripe/aac-unknown",
+        "stripe",
+        Classification::Unknown,
+        None,
+        &["value"],
+    );
+    let mut login = provider_item(
+        "stripe/aad-login",
+        "stripe",
+        Classification::Test,
+        None,
+        &["value"],
+    );
+    login.class = ItemClass::Login;
+    let mut no_provider = provider_item(
+        "stripe/none",
+        "stripe",
+        Classification::Live,
+        None,
+        &["value"],
+    );
+    no_provider.details.provider = None;
+    let vault = vec![
+        live_one.clone(),
+        live_two.clone(),
+        test_unlabeled.clone(),
+        test_same_label.clone(),
+        test_other_label.clone(),
+        test_two_fields.clone(),
+        test_wrong_fields.clone(),
+        other_provider.clone(),
+        unknown_class.clone(),
+        login,
+        no_provider.clone(),
+    ];
+    let bindings = vec![
+        binding_of("STRIPE_SECRET_KEY", &live_one, "value"),
+        binding_of("STRIPE_TWO_KEY", &live_two, "secret"),
+        binding_of("STRIPE_TEST_KEY", &test_unlabeled, "value"),
+        binding_of("STRIPE_UNKNOWN_KEY", &unknown_class, "value"),
+        binding_of("NO_PROVIDER_KEY", &no_provider, "value"),
+    ];
+    let got = proposals(&bindings, &vault);
+    assert_eq!(
+        got,
+        vec![
+            // The equal account label first, though another sorts before.
+            Proposal {
+                env_name: "STRIPE_SECRET_KEY".to_owned(),
+                live_slug: "stripe/acme-live".to_owned(),
+                test_slug: "stripe/zzz-test".to_owned(),
+                test_field: None,
+            },
+            // No label on the live item: the first by slug that a
+            // reference binds (one field, or the binding's field).
+            Proposal {
+                env_name: "STRIPE_TWO_KEY".to_owned(),
+                live_slug: "stripe/two-live".to_owned(),
+                test_slug: "stripe/aa-other".to_owned(),
+                test_field: None,
+            },
+        ]
+    );
+    // Without the item of an equal label, an unlabeled one; never the
+    // other label's.
+    let fewer: Vec<ItemMeta> = vault
+        .iter()
+        .filter(|m| m.id != test_same_label.id)
+        .cloned()
+        .collect();
+    assert_eq!(
+        proposals(&bindings[..1], &fewer)[0].test_slug,
+        "stripe/aaa-test"
+    );
+    // A test item of several fields binds by the live binding's field.
+    let only_two: Vec<ItemMeta> = vec![live_two.clone(), test_two_fields.clone()];
+    assert_eq!(
+        proposals(&bindings[1..2], &only_two),
+        vec![Proposal {
+            env_name: "STRIPE_TWO_KEY".to_owned(),
+            live_slug: "stripe/two-live".to_owned(),
+            test_slug: "stripe/bbb-test".to_owned(),
+            test_field: Some("secret".to_owned()),
+        }]
+    );
+    // The proposal is read from the vault as it is: the live item as a
+    // test key now has none, and a binding whose item is gone has none.
+    let mut relabeled = vault.clone();
+    relabeled[0].details.classification = Classification::Test;
+    assert!(proposals(&bindings[..1], &relabeled).is_empty());
+    assert!(proposals(&bindings[..1], &vault[1..]).is_empty());
+    // The rendering lists it before the live binding.
+    let mut s = store();
+    let now = now_at(0);
+    let id = pending_id(&s.decide(
+        request(under_agent(), bindings[..1].to_vec(), &["./emit"]),
+        &now,
+    ));
+    let d = s.pending_descriptor(&id, &now, &vault).unwrap();
+    let text = render_statement(&d, &session(3600));
+    let test = text.find("stripe/zzz-test").unwrap();
+    let ticks = text.find("STRIPE_SECRET_KEY = stripe/acme-live").unwrap();
+    assert!(test < ticks, "{text}");
+    assert!(
+        text.contains("envcloak ref STRIPE_SECRET_KEY=stripe/zzz-test"),
+        "{text}"
+    );
+}
+
+/// A statement whose proposals changed is a `statement_mismatch` (gate
+/// 40; "Leave proposals out of the digest" is the mutation): the test item
+/// the person read as proposed was removed, or reclassified, or another
+/// became the one proposed, after they read it. The statement shown now
+/// approves.
+#[test]
+fn a_statement_whose_proposals_changed_is_a_mismatch() {
+    let live_item = provider_item(
+        "stripe/acme-live",
+        "stripe",
+        Classification::Live,
+        None,
+        &["value"],
+    );
+    let test_item = provider_item(
+        "stripe/acme-test",
+        "stripe",
+        Classification::Test,
+        None,
+        &["value"],
+    );
+    let earlier = provider_item(
+        "stripe/aaa-test",
+        "stripe",
+        Classification::Test,
+        None,
+        &["value"],
+    );
+    let vault = vec![live_item.clone(), test_item.clone()];
+    let mut s = store();
+    let now = now_at(0);
+    let id = pending_id(&s.decide(
+        request(
+            under_agent(),
+            vec![binding_of("STRIPE_SECRET_KEY", &live_item, "value")],
+            &["./emit"],
+        ),
+        &now,
+    ));
+    let opts = live(&["STRIPE_SECRET_KEY"], Uses::Once);
+    let read = s.pending_descriptor(&id, &now, &vault).unwrap();
+    assert_eq!(read.proposals.len(), 1);
+    let digest = statement_digest(&read, &opts);
+    let mut reclassified = vault.clone();
+    reclassified[1].details.classification = Classification::Live;
+    let changes = [
+        vec![live_item.clone()],
+        reclassified,
+        vec![live_item.clone(), test_item.clone(), earlier],
+    ];
+    for now_vault in &changes {
+        let shown = s.pending_descriptor(&id, &now, now_vault).unwrap();
+        assert_ne!(shown.proposals, read.proposals);
+        assert_eq!(
+            s.check_approval(&id, &opts, digest, &now, now_vault),
+            Err(ApproveError::StatementMismatch)
+        );
+        let e = s
+            .approve(
+                &id,
+                proof(terminal()),
+                opts.clone(),
+                digest,
+                &now,
+                now_vault,
+            )
+            .unwrap_err();
+        assert_eq!(e, ApproveError::StatementMismatch);
+    }
+    assert_eq!(s.grants().count(), 0);
+    let now_vault = &changes[2];
+    let shown = s.pending_descriptor(&id, &now, now_vault).unwrap();
+    s.approve(
+        &id,
+        proof(terminal()),
+        opts.clone(),
+        statement_digest(&shown, &opts),
+        &now,
+        now_vault,
+    )
+    .unwrap();
 }

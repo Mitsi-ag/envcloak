@@ -9,7 +9,10 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, Slug};
+use envcloak_core::crypto::ItemClass;
+use envcloak_core::vault::{
+    Classification, FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId, ItemMeta, Slug,
+};
 use envcloak_policy::{
     AccessRequest, AgentLabel, Ancestor, ApprovalOptions, ApprovalProof, BoundBinding, BoundRef,
     Busy, CatalogSource, ChainEnd, Claims, Decision, EnvName, GrantStore, MAX_OUTCOMES,
@@ -170,12 +173,45 @@ fn approve(s: &mut GrantStore, id: &PendingId, now: &Now) {
         ttl_secs: 600,
         live: Vec::new(),
     };
-    let digest = statement_digest(s.pending_descriptor(id, now).unwrap(), &opts);
+    // The vault as the request recorded its item: a test secret.
+    let vault = s
+        .pending(id, now)
+        .map(|p| {
+            p.request
+                .bindings
+                .iter()
+                .map(|b| ItemMeta {
+                    id: b.binding.item,
+                    class: ItemClass::Secret,
+                    slug: b.slug.clone(),
+                    details: ItemDetails {
+                        classification: b.binding.classification,
+                        ..ItemDetails::default()
+                    },
+                    created_at: 0,
+                    updated_at: 0,
+                    fields: vec![FieldMeta {
+                        id: b.binding.field,
+                        name: b.field_name.clone(),
+                        kind: FieldKind::Value,
+                        prior_count: 0,
+                        created_at: 0,
+                        updated_at: 0,
+                    }],
+                    classification_changed_at: None,
+                    exposure: None,
+                    rotate_recommended: false,
+                    login: None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    let digest = statement_digest(&s.pending_descriptor(id, now, &vault).unwrap(), &opts);
     let proof = ApprovalProof {
         approver: person(),
         kind: ProofKind::Passphrase,
     };
-    s.approve(id, proof, opts, digest, now).unwrap();
+    s.approve(id, proof, opts, digest, now, &vault).unwrap();
 }
 
 /// A poll that the limit admits: each from a root of its own, so none
