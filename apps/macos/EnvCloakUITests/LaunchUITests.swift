@@ -13,7 +13,11 @@ final class LaunchUITests: XCTestCase {
     func testLaunchShowsTheMainWindowAndAbout() {
         let app = XCUIApplication()
         app.launch()
-        defer { app.terminate() }
+        // A teardown block runs after a failed assertion too, which a
+        // `defer` does not when continueAfterFailure is false (the failure
+        // ends the test without unwinding it), so the app never outlives
+        // its test.
+        addTeardownBlock { @MainActor in app.terminate() }
 
         let window = app.windows["EnvCloak"]
         XCTAssertTrue(window.waitForExistence(timeout: 30), "the main window did not open")
