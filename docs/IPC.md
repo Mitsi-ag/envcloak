@@ -397,6 +397,9 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | Token | Task | Status | Use |
 |---|---|---|---|
 | `not_in_this_build` | M2-02 | landed | a command or option whose milestone has not shipped; exit 125, and no argument is echoed |
+| `invalid_text` | M2-12 | landed | a scanner encountered invalid UTF-8; bounded raw text runs on either side are still inspected and the report is incomplete |
+| `token_too_large` | M2-12 | landed | a transcript or Git text token exceeded the 4 KiB candidate cap; the token is skipped and the report is incomplete |
+| `reading_budget` | M2-12 | landed | a token exceeded the bounded alternative-reading allowance; accepted readings remain and the report is incomplete |
 | `incomplete` | M2-14 | reserved | doctor, import, scrub or `migrate-mcp` did not finish the whole job (a cap, a budget, an item reported as manual); a non-zero exit with the reason |
 | `value_on_argv` | M2-18 | reuse | a value given as a command-line argument; `mcp-bridge` takes slugs only |
 | `output_stalled` | M2-06 | landed | `envcloak mcp`: the host went on sending but stopped reading the answers, and the answers waiting for it reached their bound; the session ends and the calls in hand are stopped |

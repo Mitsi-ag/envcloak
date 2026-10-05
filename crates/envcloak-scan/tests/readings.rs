@@ -253,3 +253,64 @@ fn base64_padding_stays_in_each_wrapped_raw_range() {
         }
     }
 }
+
+#[test]
+fn long_binary_runs_do_not_hide_neighboring_text() {
+    let value = b"fixtureZbinaryNeighborValue";
+    for invalid in [0xff, 0x80, 0xc2, 0xe0, 0xf4] {
+        let mut input = vec![invalid; 8192];
+        let start = input.len();
+        input.extend_from_slice(value);
+        input.extend_from_slice(&[invalid; 8192]);
+        let mut found = false;
+        let report = scan_reader(
+            &mut std::io::Cursor::new(input),
+            ConfigFormat::Raw,
+            Default::default(),
+            Budget::default(),
+            &mut |c| {
+                if c.value.ct_eq(value) {
+                    found = true;
+                    assert_eq!(
+                        c.occurrence.range,
+                        start as u64..(start + value.len()) as u64
+                    );
+                }
+                true
+            },
+        )
+        .unwrap();
+        assert!(found);
+        assert!(!report.complete());
+        assert!(report.issues.iter().any(|i| i.reason == "invalid_text"));
+    }
+}
+
+#[test]
+fn binary_boundaries_keep_unicode_across_read_chunks() {
+    struct OneByte(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for OneByte {
+        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+            let n = output.len().min(1);
+            std::io::Read::read(&mut self.0, &mut output[..n])
+        }
+    }
+    let value = "fixtureZunicode🙂ValueAcrossChunks";
+    let mut found = 0;
+    let report = scan_reader(
+        &mut OneByte(std::io::Cursor::new(value.as_bytes().to_vec())),
+        ConfigFormat::Raw,
+        Default::default(),
+        Budget::default(),
+        &mut |c| {
+            if c.value.ct_eq(value.as_bytes()) {
+                found += 1;
+                assert_eq!(c.occurrence.range, 0..value.len() as u64);
+            }
+            true
+        },
+    )
+    .unwrap();
+    assert!(report.complete());
+    assert_eq!(found, 1);
+}
