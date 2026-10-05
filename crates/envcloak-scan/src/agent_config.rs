@@ -107,6 +107,7 @@ fn push(
         name: SecretBytes::copy_from(name),
         value: (disposition == Disposition::Literal).then(|| SecretBytes::copy_from(value)),
         disposition,
+        env_file: false,
         range,
         single_complete_line: false,
         source: Source::default(),
@@ -175,7 +176,11 @@ fn json(node: &Node, servers: bool, report: &mut ScanReport, budget: Budget) {
                 }
             } else if servers && k.value.ct_eq(b"envFile") {
                 if let Some(t) = v.text() {
-                    field(report, k, t, budget);
+                    if field(report, k, t, budget) {
+                        if let Some(f) = report.findings.last_mut() {
+                            f.env_file = true;
+                        }
+                    }
                 } else {
                     report.issue("", "invalid_env_file");
                 }
@@ -256,13 +261,17 @@ fn toml_table(
         } else if servers && key == "envFile" {
             if let Some(v) = item.as_str() {
                 let span = item.span().unwrap_or(0..0);
-                push(
+                if push(
                     report,
                     b"envFile",
                     v.as_bytes(),
                     span.start as u64..span.end as u64,
                     budget,
-                );
+                ) {
+                    if let Some(f) = report.findings.last_mut() {
+                        f.env_file = true;
+                    }
+                }
             } else {
                 report.issue("", "invalid_env_file");
             }
@@ -351,7 +360,7 @@ pub fn scan_config_sources_with_budget(
         }
         let mut includes = Vec::new();
         parsed.findings.retain(|f| {
-            if f.name.ct_eq(b"envFile") {
+            if f.env_file {
                 if let Some(v) = &f.value {
                     #[allow(clippy::disallowed_methods)]
                     includes.push(SecretBytes::copy_from(v.expose_secret()));
@@ -364,7 +373,7 @@ pub fn scan_config_sources_with_budget(
             }
         });
         for f in &parsed.findings {
-            if f.name.ct_eq(b"envFile") && f.value.is_none() {
+            if f.env_file && f.value.is_none() {
                 report.issue(root.path().join(rel), "unread_env_file");
             }
         }
@@ -421,6 +430,7 @@ pub fn scan_config_sources_with_budget(
                                     } else {
                                         Disposition::Literal
                                     },
+                                    env_file: false,
                                     range: e.span.start as u64..e.span.end as u64,
                                     single_complete_line: false,
                                     source: Source {

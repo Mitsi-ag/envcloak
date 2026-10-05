@@ -178,6 +178,7 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
                 None
             },
             disposition,
+            env_file: false,
             range: start as u64..offset as u64,
             single_complete_line: single,
             source: Source::default(),
