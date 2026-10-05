@@ -16,6 +16,9 @@ apps/macos/Packages/*/.swiftpm/
 *.xcuserstate
 xcuserdata/
 
+# Python's bytecode cache, written when a test imports a script
+__pycache__/
+
 # Local review notes (never published)
 .collab/
 
