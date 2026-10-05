@@ -1112,15 +1112,25 @@ fn gate8_real_serializers_through_a_pty_are_redacted_crlf_forms_included() {
 // Prompts, input, echo, Ctrl-C and the window size.
 
 /// A prompt without a newline shows while the command waits for its
-/// answer (the 40 ms idle flush; within 400 ms here, under any load the
-/// suite meets, of a marker written just before it), the answer typed on
-/// the terminal reaches the command, and the start of a value is held
-/// back until what follows shows it is not the value.
+/// answer: the 40 ms idle flush releases it within 100 ms of the read that
+/// brought it (the plan's bound), measured from the marker the same write
+/// carried, which the relay released at that read (the timing origin the
+/// relay itself sets). Five prompts, the fastest held to 100 ms: a load
+/// spike can delay one, never the flush itself. The answer typed on the
+/// terminal reaches the command, and the start of a value is held back
+/// until what follows shows it is not the value.
+///
+/// Mutation checked: an idle flush of 300 ms (`IDLE_FLUSH`): every prompt
+/// takes 300 ms or more, and this fails.
 fn a_prompt_without_a_newline_shows_and_the_start_of_a_value_waits() {
     let case = Case::new();
-    let script = r#"printf 'mark%8192sPassword: ' ''
-read answer
-printf 'got %s\n' "$answer"
+    let script = r#"i=0
+while [ $i -lt 5 ]; do
+  printf 'mark-%d%8192sPassword: ' $i ''
+  read answer
+  printf 'got %s\n' "$answer"
+  i=$((i+1))
+done
 printf '%.12s' "$OPENAI_API_KEY"
 read more
 printf '!\n'"#;
@@ -1133,14 +1143,18 @@ printf '!\n'"#;
     let mut run = Running {
         child: lead(&case, &outer, &argv, &[]),
     };
-    outer.expect("mark", 1, "the marker");
-    let t0 = Instant::now();
-    outer.expect("Password: ", 1, "the prompt while the command waits");
-    let took = t0.elapsed();
-    println!("pty prompt: shown {took:?} after the marker before it");
-    assert!(took < Duration::from_millis(400), "{took:?}");
-    outer.type_bytes(b"yes\r");
-    outer.expect("got yes", 1, "the answer reached the command");
+    let mut took = Vec::new();
+    for i in 0..5 {
+        outer.expect(&format!("mark-{i}"), 1, "the marker");
+        let t0 = Instant::now();
+        outer.expect("Password: ", i + 1, "the prompt while the command waits");
+        took.push(t0.elapsed());
+        outer.type_bytes(b"yes\r");
+        outer.expect("got yes", i + 1, "the answer reached the command");
+    }
+    let fastest = took.iter().min().copied().unwrap();
+    println!("pty prompt: shown {took:?} after the marker before it (fastest {fastest:?})");
+    assert!(fastest <= Duration::from_millis(100), "{took:?}");
     let prefix = &by_label(&case.cs, labels::OPENAI_API_KEY).value()[..12];
     let early = outer.wait_for_within(Duration::from_millis(300), |o| contains(&o.seen, prefix));
     assert!(!early, "the start of a value was released");
