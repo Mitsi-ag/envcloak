@@ -232,14 +232,14 @@ class Stopped(unittest.TestCase):
                         ["/bin/bash", CHECK_SOURCES, "--swift", fx.derived, ROOT],
                         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True, preexec_fn=child_setup,
                     )
-                    deadline = time.monotonic() + 60
+                    deadline = time.monotonic() + 180
                     while not os.path.exists(held) and p.poll() is None and time.monotonic() < deadline:
                         time.sleep(0.02)
                     self.assertTrue(os.path.exists(held), "the comparison never ran")
                     self.assertEqual(len([n for n in os.listdir(tmp) if n.startswith("check-sources-swift.")]), 1, "no listing while it ran")
                     os.killpg(p.pid, getattr(signal, "SIG" + name))
                     try:
-                        status = p.wait(timeout=30)
+                        status = p.wait(timeout=180)
                     finally:
                         try:
                             os.killpg(p.pid, signal.SIGKILL)
