@@ -2,7 +2,7 @@
 //! tests (M2 plan task M2-27). It reports what it is and what it got,
 //! never a value: digests and names only.
 //!
-//! Usage: `ec-launch-fixture [--marker <path>] [--var <NAME>]...`
+//! Usage: `ec-launch-fixture [--marker <path>] [--linger <secs>] [--var <NAME>]...`
 //!
 //! Its first act is to write `ran` to the marker file, so a test can tell
 //! whether any of it ran (a suspended start that was refused never does).
@@ -21,7 +21,9 @@
 //!   server starts is told;
 //! - anything else: ignored.
 //!
-//! At the end of its input it exits 0. Test support only.
+//! At the end of its input it exits 0, or with `--linger`, that many seconds
+//! later: a server that does not end with its input, so a test sees whether
+//! the runner stops it. Test support only.
 
 use std::io::{BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -64,10 +66,17 @@ fn cdhash() -> Option<String> {
 fn main() {
     let mut args = std::env::args_os().skip(1);
     let mut marker = None;
+    let mut linger = 0u64;
     let mut vars: Vec<String> = Vec::new();
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("--marker") => marker = args.next(),
+            Some("--linger") => {
+                linger = args
+                    .next()
+                    .and_then(|v| v.to_str().and_then(|v| v.parse().ok()))
+                    .unwrap_or(0);
+            }
             Some("--var") => {
                 if let Some(v) = args.next().and_then(|v| v.into_string().ok()) {
                     vars.push(v);
@@ -141,4 +150,5 @@ fn main() {
             break;
         }
     }
+    std::thread::sleep(std::time::Duration::from_secs(linger));
 }
