@@ -2661,6 +2661,7 @@ fn status_without_a_probe_claims_nothing() {
     for agent in ["claude-code", "codex"] {
         let a = row(&v, agent);
         assert_eq!(a["probed"], "not_probed", "{a}");
+        assert_eq!(a["identified_by"], "version", "{a}");
         assert_eq!(
             a["version"],
             if agent == "codex" {
@@ -2839,10 +2840,14 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
         .map(|(k, v)| (k.to_owned(), v))
         .collect();
     let env = |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    // The probe context's fingerprint, with the `envcloak` that runs
+    // `agents status`.
     let digest = || {
         let l = Locations::new(&env).unwrap();
         let home = std::fs::canonicalize(f.home.home()).unwrap();
-        ConfigSet::read(Host::ClaudeCode, &l, &claude_managed_dir(), &home, &env).digest()
+        ConfigSet::read(Host::ClaudeCode, &l, &claude_managed_dir(), &home, &env)
+            .fingerprint(common::cli())
+            .unwrap()
     };
     let sha = file_sha256(&std::fs::canonicalize(f.bin.join("claude")).unwrap()).unwrap();
     let observed: Vec<Observed> = Surface::ALL
@@ -2856,6 +2861,7 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
             },
             persisted: *s == Surface::Transcript,
             why: Vec::new(),
+            skipped: Vec::new(),
         })
         .collect();
     let mut cache = Cache::default();
@@ -2869,6 +2875,8 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
         server: ServerObserved {
             outcome: Outcome::Passed,
             sentinel: Sentinel::Appeared,
+            control_ran: true,
+            allowed_write: true,
             control_denied: true,
         },
         flags: Vec::new(),
@@ -2935,6 +2943,19 @@ fn status_uses_a_probe_result_only_for_what_it_was_for() {
     stale(&f.status_json());
     std::fs::write(&settings, &installed).unwrap();
     assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
+    // The same facts, another hook timeout (Codex F-132): stale.
+    let mut s: Value = serde_json::from_str(&installed).unwrap();
+    for groups in s["hooks"].as_object_mut().unwrap().values_mut() {
+        for g in groups.as_array_mut().unwrap() {
+            for h in g["hooks"].as_array_mut().unwrap() {
+                h["timeout"] = json!(1);
+            }
+        }
+    }
+    std::fs::write(&settings, serde_json::to_string_pretty(&s).unwrap()).unwrap();
+    stale(&f.status_json());
+    std::fs::write(&settings, &installed).unwrap();
+    assert_eq!(row(&f.status_json(), "claude-code")["probed"], "current");
     f.sweep();
 }
 
@@ -2970,6 +2991,23 @@ fn hosts_without_a_prompt_contract_read_unsupported_without_a_probe() {
             "{agent}"
         );
     }
+    // Told by an executable's name alone, which another program can have
+    // (`goose` is also a database migration tool): said so.
+    for agent in ["copilot", "opencode", "goose"] {
+        assert_eq!(
+            row(&v, agent)["identified_by"],
+            "executable_name",
+            "{agent}"
+        );
+    }
     let out = f.agents(&["status"]);
-    assert!(stdout(&out).contains("Copilot CLI"), "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("Copilot CLI"), "{text}");
+    assert!(
+        text.contains(
+            "Goose (not identified: an executable named goose is on PATH, which may be another \
+             program)"
+        ),
+        "{text}"
+    );
 }

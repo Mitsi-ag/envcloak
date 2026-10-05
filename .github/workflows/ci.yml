@@ -643,6 +643,23 @@ jobs:
              the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/k01-outside.log"
           grep -qx 'running 3 tests' "$RUNNER_TEMP/k01-outside.log"
           grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/k01-outside.log"
+      # The coverage probes' sentinels the same way (M2-09): Claude Code's
+      # sandboxed shell cannot start inside the user namespace above, where
+      # its sentinel probe fails through its shell's run witness; the Linux
+      # server lines of integrations/compat/matrix.toml are this step's.
+      - name: Probe sentinels outside a user namespace, loopback only (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          ENVCLOAK_TEST_NETWORK: loopback-only
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-e2e --test probes -- --nocapture --test-threads=1 \
+             --exact claude_code_sentinel_is_what_its_probe_observes codex_sentinel_is_what_its_probe_observes \
+             the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/sentinels-outside.log"
+          grep -qx 'running 3 tests' "$RUNNER_TEMP/sentinels-outside.log"
+          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/sentinels-outside.log"
       # S0's sandboxed cases the same way (the gates job runs them on pull
       # requests), on main, nightly and manual runs.
       - name: Story steps, sandboxed cases outside a user namespace, loopback only (Linux)

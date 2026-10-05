@@ -385,18 +385,22 @@ impl Site {
             );
         }
         println!(
-            "measurement: probe {} {} {}: EnvCloak server {} sentinel {} control denied {} {:?}",
+            "measurement: probe {} {} {} (user namespace {}): EnvCloak server {} sentinel {} \
+             shell ran {} allowed write {} control denied {} {:?}",
             self.host.id(),
             self.agent.installed.pin.version,
             os(),
+            envcloak_e2e::k01::user_namespace(),
             report.server.outcome.name(),
             report.server.sentinel.name(),
+            report.server.control_ran,
+            report.server.allowed_write,
             report.server.control_denied,
             report
                 .server
                 .checks
                 .iter()
-                .map(|c| (c.name, c.passed))
+                .map(|c| (c.name, c.passed, c.why))
                 .collect::<Vec<_>>()
         );
         report
@@ -427,11 +431,17 @@ impl Site {
         coverage::file_sha256(&std::fs::canonicalize(self.bin.join(name)).unwrap()).unwrap()
     }
 
+    /// The probe context's fingerprint `agents status` keys the cache by,
+    /// with the `envcloak` it runs.
+    fn fingerprint(&self) -> String {
+        self.config().fingerprint(&self.h.cli()).unwrap()
+    }
+
     /// Keeps `report` in the cache as `agents status --probe` will (M2-28).
     fn cache(&self, report: &ProbeReport) {
         let path = Cache::path(&self.h.data_dir());
         let mut c = Cache::load(&path);
-        c.put(report.record(&self.exe_sha256(), &self.config().digest()));
+        c.put(report.record(&self.exe_sha256(), &self.fingerprint()));
         c.store(&path).unwrap();
     }
 
@@ -497,25 +507,134 @@ fn shown(v: &Value) -> String {
     s
 }
 
-/// The whole probe of one pinned host: see the module documentation.
+/// The whole probe of one pinned host's six surfaces: see the module
+/// documentation (EnvCloak's server line is [`sentinel_probe`]'s).
 ///
 /// Mutations checked: `assemble` reporting `active` for Claude Code's
 /// prompt guard (`Outcome::Passed` read as `active` whatever degrades
 /// it): the status's prompt guard is not the matrix's `degraded (...)`
-/// and this fails; `outside_host_sandbox` reported without running the
-/// sentinel probe (`Prober::sentinel` answering passed and appeared at
-/// once): no sentinel is on disk and this fails; the transcript's outcome
-/// taken from the prompt probe without the stores' sweep: Claude Code's
-/// transcript reads passed, not the matrix's `unsupported
-/// (persists_blocked_prompt; probe=failed)`, and this fails.
+/// and this fails; the transcript's outcome taken from the prompt probe
+/// without the stores' sweep: Claude Code's transcript reads passed, not
+/// the matrix's `unsupported (persists_blocked_prompt; probe=failed)`,
+/// and this fails; Claude Code's file-read hook case reading the
+/// project's `.env` (`claude_code_file_read_with_and_without_the_deny_
+/// rule`'s mutation): its probe reads failed, not the matrix's passed,
+/// and this fails.
 fn whole_probe(host: Host, test: &str) {
     let Some(mut s) = site(host, test) else {
         return;
     };
-    let report = s.probe(&Surface::ALL, true, true);
-    // The sentinel's evidence, read on disk apart from the probe's report:
-    // the probe's directory in HOME, the shell's write absent and the one
-    // `run_with_secrets` started there.
+    // The probe context a result is kept for is the one it ran in: the
+    // host changes none of it while it is probed.
+    let before = s.fingerprint();
+    let report = s.probe(&Surface::ALL, false, true);
+    assert_eq!(
+        before,
+        s.fingerprint(),
+        "the probe changed the configuration its result is kept for"
+    );
+    let version = s.agent.installed.pin.version.clone();
+    let row: Vec<(String, String)> = matrix(host.id(), &version)
+        .into_iter()
+        .filter(|(name, _)| name != "envcloak_server")
+        .collect();
+    assert_eq!(row.len(), Surface::ALL.len());
+    // What the probes observed, against what the matrix publishes.
+    let observed = |surface: Surface| report.surface(surface).unwrap().outcome;
+    for (name, want) in &row {
+        let surface = Surface::from_name(name).unwrap();
+        assert!(
+            want.contains(&format!("probe={}", observed(surface).name())),
+            "{name}: the matrix says {want}, the probe {}",
+            observed(surface).name()
+        );
+    }
+    // What `agents status` reports from them, against both.
+    s.cache(&report);
+    let out = s.status(true);
+    assert_eq!(out.code, 0, "{}", out.all());
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let a = v["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["agent"] == host.id())
+        .unwrap_or_else(|| panic!("{v}"))
+        .clone();
+    assert_eq!(a["probed"], "current", "{a}");
+    assert_eq!(a["identified_by"], "version", "{a}");
+    let cs = s.config();
+    let record = report.record(&s.exe_sha256(), &s.fingerprint());
+    let expected = coverage::assemble(agent_of(host), &version, &cs, Probed::Current(&record));
+    for (name, want) in &row {
+        let entry = a["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["surface"] == name.as_str())
+            .unwrap();
+        let surface = Surface::from_name(name).unwrap();
+        // The claim is the observation: the reported probe outcome is the
+        // probe's own.
+        assert_eq!(
+            entry["probe"].as_str(),
+            Some(observed(surface).name()),
+            "{name}"
+        );
+        let got = shown(entry);
+        assert_eq!(
+            Some(got.clone()),
+            expected.surface(surface).map(ToString::to_string),
+            "{name}"
+        );
+        assert_eq!(&got, want, "{name}: reported {got}, the matrix says {want}");
+    }
+    assert_eq!(
+        a["envcloak_server"]["reasons"],
+        json!(["outside_host_sandbox"]),
+        "{a}"
+    );
+    // A failed probe is listed first.
+    let surfaces = a["surfaces"].as_array().unwrap();
+    let first_passed = surfaces.iter().position(|x| x["probe"] != "failed");
+    if let Some(i) = first_passed {
+        assert!(surfaces[i..].iter().all(|x| x["probe"] != "failed"), "{a}");
+    }
+    // The human report says the same.
+    let human = s.status(false);
+    assert_eq!(human.code, 0, "{}", human.all());
+    let text = human.out();
+    for (name, want) in &row {
+        assert!(
+            text.contains(want.as_str()),
+            "{name}: {want} not in\n{text}"
+        );
+    }
+    assert!(text.contains("outside_host_sandbox"), "{text}");
+    s.agent.check_pinned();
+    s.h.assert_swept(&format!("M2-09 probes ({})", host.id()));
+}
+
+/// EnvCloak's server line on one pinned host: the sentinel probe, its
+/// evidence read on disk apart from its report, and what `agents status`
+/// then says in the human and the `--json` report, held to the matrix.
+/// On Linux inside CI's user namespace Claude Code's sandboxed shell
+/// cannot start (K-01; docs/AGENTS.md): there the probe must fail through
+/// its shell's run witness, never pass, and the matrix's row is measured
+/// outside it, as a person's machine runs it (the CI step "Probe
+/// sentinels outside a user namespace").
+///
+/// Mutation checked: `outside_host_sandbox` reported without running the
+/// sentinel probe (`Prober::sentinel` answering passed and appeared at
+/// once): no sentinel is on disk and this fails.
+fn sentinel_probe(host: Host, test: &str) {
+    let Some(mut s) = site(host, test) else {
+        return;
+    };
+    let report = s.probe(&[], true, true);
+    // The sentinel's evidence, read on disk apart from the report: the
+    // probe's directory in HOME, the shell's denied write absent and the
+    // one `run_with_secrets` started there.
     let home = s.h.home.home();
     let dirs: Vec<PathBuf> = std::fs::read_dir(&home)
         .unwrap()
@@ -535,32 +654,12 @@ fn whole_probe(host: Host, test: &str) {
         report.server.sentinel == Sentinel::Appeared,
         "the report's sentinel is not what is on disk"
     );
-    assert_eq!(
-        !dirs[0].join("shell").exists(),
-        report.server.control_denied,
-        "the report's control is not what is on disk"
-    );
-    let version = s.agent.installed.pin.version.clone();
-    let row = matrix(host.id(), &version);
-    // What the probes observed, against what the matrix publishes.
-    let observed = |surface: Surface| report.surface(surface).unwrap().outcome;
-    for (name, want) in &row {
-        if name == "envcloak_server" {
-            assert!(
-                want.contains(&format!("probe={}", report.server.outcome.name())),
-                "server: {want} but the probe {}",
-                report.server.outcome.name()
-            );
-            continue;
-        }
-        let surface = Surface::from_name(name).unwrap();
+    if report.server.control_denied {
         assert!(
-            want.ends_with(&format!("probe={})", observed(surface).name())),
-            "{name}: the matrix says {want}, the probe {}",
-            observed(surface).name()
+            !dirs[0].join("shell").exists(),
+            "the report's control is not what is on disk"
         );
     }
-    // What `agents status` reports from them, against both.
     s.cache(&report);
     let out = s.status(true);
     assert_eq!(out.code, 0, "{}", out.all());
@@ -572,56 +671,47 @@ fn whole_probe(host: Host, test: &str) {
         .find(|a| a["agent"] == host.id())
         .unwrap_or_else(|| panic!("{v}"))
         .clone();
-    assert_eq!(a["probed"], "current", "{a}");
-    let cs = s.config();
-    let record = report.record(&s.exe_sha256(), &cs.digest());
-    let expected = coverage::assemble(agent_of(host), &version, &cs, Probed::Current(&record));
-    for (name, want) in &row {
-        let got = if name == "envcloak_server" {
-            shown(&a["envcloak_server"])
-        } else {
-            let entry = a["surfaces"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|x| x["surface"] == name.as_str())
-                .unwrap();
-            let surface = Surface::from_name(name).unwrap();
-            // The claim is the observation: the reported probe outcome is
-            // the probe's own.
-            assert_eq!(
-                entry["probe"].as_str(),
-                Some(observed(surface).name()),
-                "{name}"
-            );
-            assert_eq!(
-                Some(shown(entry)),
-                expected.surface(surface).map(ToString::to_string),
-                "{name}"
-            );
-            shown(entry)
-        };
-        assert_eq!(&got, want, "{name}: reported {got}, the matrix says {want}");
-    }
-    // A failed probe is listed first.
-    let surfaces = a["surfaces"].as_array().unwrap();
-    let first_passed = surfaces.iter().position(|x| x["probe"] != "failed");
-    if let Some(i) = first_passed {
-        assert!(surfaces[i..].iter().all(|x| x["probe"] != "failed"), "{a}");
-    }
-    // The human report says the same, the server line with its evidence.
+    let line = shown(&a["envcloak_server"]);
     let human = s.status(false);
     assert_eq!(human.code, 0, "{}", human.all());
     let text = human.out();
-    for (name, want) in &row {
-        assert!(
-            text.contains(want.as_str()),
-            "{name}: {want} not in\n{text}"
-        );
-    }
+    assert!(text.contains(&line), "{line} not in\n{text}");
     assert!(text.contains("outside_host_sandbox"), "{text}");
-    s.agent.check_pinned();
-    s.h.assert_swept(&format!("M2-09 probes ({})", host.id()));
+    if host == Host::ClaudeCode && envcloak_e2e::k01::user_namespace() {
+        // The shell never ran: failed, through its run witness.
+        assert_eq!(
+            report.server.outcome,
+            Outcome::Failed,
+            "{:?}",
+            report.server
+        );
+        assert!(!report.server.control_ran, "{:?}", report.server);
+        assert!(!report.server.control_denied, "{:?}", report.server);
+        assert!(line.contains("(probe=failed"), "{line}");
+    } else {
+        let want = matrix(host.id(), &s.agent.installed.pin.version)
+            .into_iter()
+            .find(|(name, _)| name == "envcloak_server")
+            .map(|(_, w)| w)
+            .unwrap();
+        assert!(
+            want.contains(&format!("probe={}", report.server.outcome.name())),
+            "the matrix says {want}, the probe {}",
+            report.server.outcome.name()
+        );
+        assert_eq!(line, want, "reported {line}, the matrix says {want}");
+    }
+    s.h.assert_swept(&format!("M2-09 sentinel ({})", host.id()));
+}
+
+#[test]
+fn claude_code_sentinel_is_what_its_probe_observes() {
+    sentinel_probe(Host::ClaudeCode, "M2-09 sentinel (Claude Code)");
+}
+
+#[test]
+fn codex_sentinel_is_what_its_probe_observes() {
+    sentinel_probe(Host::Codex, "M2-09 sentinel (Codex)");
 }
 
 #[test]
@@ -659,10 +749,9 @@ fn remove_hook(path: &Path, event: &str, matcher: Option<&str>) {
 
 /// One per surface: with EnvCloak's hook for it taken out of the installed
 /// configuration, its probe fails (and the others it does not rest on
-/// still pass, so the failure is the hook's). Claude Code's file read
-/// fails with its hook as well, its deny rule refusing the `Read` first:
-/// `claude_code_file_read_with_and_without_the_deny_rule` shows the hook
-/// behind the rule.
+/// still pass, so the failure is the hook's): each probe's hook case is a
+/// call EnvCloak's host rules leave to the hook, so no rule passes it in
+/// the hook's place.
 fn without_hooks(host: Host, test: &str) {
     let Some(mut s) = site(host, test) else {
         return;
@@ -709,6 +798,31 @@ fn without_hooks(host: Host, test: &str) {
         if hit.contains(&Surface::Transcript) {
             assert!(!report.surface(Surface::Transcript).unwrap().persisted);
         }
+        // The rule's cases stand without the hook: EnvCloak's host rules
+        // refuse them, in the host's own words.
+        if hit.contains(&Surface::FileRead) {
+            let by = match host {
+                Host::ClaudeCode => {
+                    "the host's own permission settings, under EnvCloak's deny rule"
+                }
+                Host::Codex => "Codex's exec policy, under EnvCloak's forbidden rule",
+            };
+            let mut with_rule = vec![Surface::FileRead];
+            if host == Host::Codex {
+                with_rule.push(Surface::Shell);
+            }
+            for surface in with_rule {
+                let rule = report
+                    .surface(surface)
+                    .unwrap()
+                    .checks
+                    .iter()
+                    .find(|c| c.name == "the call EnvCloak's host rule covers is refused")
+                    .copied()
+                    .unwrap();
+                assert!(rule.passed && rule.why == by, "{surface:?}: {rule:?}");
+            }
+        }
         assert_eq!(
             report.surface(kept).unwrap().outcome,
             Outcome::Passed,
@@ -731,29 +845,29 @@ fn codex_probes_fail_without_their_hooks() {
 }
 
 /// Claude Code's file read with the `Read(**/.env*)` deny rule and
-/// without it. As installed, Claude Code's own permission settings refuse
-/// `Read .env` (the project named by its resolved path) before EnvCloak's
-/// hook, without EnvCloak's marker: that check alone fails, so the probe
-/// does (the matrix says so on both systems), and the file reaches the
-/// model in no request. With the rule taken out, EnvCloak's hook refuses
-/// the `Read`, marker and all, and only the `@.env` case, which the rule
-/// alone covers, fails. With the hook for the file tools taken out as
-/// well, the file reaches the model: the hook is what stands behind the
-/// rule.
+/// without it. As installed, the rule refuses the `Read` of the project's
+/// `.env` (named by its resolved path, the one the host's working
+/// directory is) before EnvCloak's hook, in the host's own words: the
+/// rule's case, which passes; the `.env` outside the working directory,
+/// which the rule does not match, reaches the hook, whose marker the
+/// model gets: the hook's case, which passes; the probe passes. With the
+/// rule taken out, the hook refuses both `Read`s, marker and all, and only
+/// the `@.env` case, which the rule alone covers, fails. With the hook for
+/// the file tools taken out as well, the file reaches the model.
 ///
-/// Mutation checked: the probe's `Read` naming the project as given, not
-/// resolved (`file_read` without the `canonicalize`): on macOS the path
-/// runs through `/tmp` and passes the rule's check made before any hook,
-/// EnvCloak's hook refuses it with its marker, the probe passes with the
-/// rule and this fails (as does the matrix check of
-/// `claude_code_coverage_is_what_its_probes_observe`).
+/// Mutation checked: the hook's case reading the project's `.env` (the
+/// `ELSEWHERE` folder's replaced by the project in `file_read`): as
+/// installed the rule refuses it first, without the marker, the probe
+/// fails and this fails (as does `claude_code_coverage_is_what_its_probes_
+/// observe`'s matrix check).
 #[test]
 fn claude_code_file_read_with_and_without_the_deny_rule() {
     const AT_ENV: &str = "the @.env file's content never does";
     const MARKED: &str = "the probe call is denied with EnvCloak's marker";
+    const RULE: &str = "the call EnvCloak's host rule covers is refused";
     const NOTHING: &str = "nothing it would have read reaches the model";
-    const BY_SETTINGS: &str =
-        "the host's own permission settings refused it first, without EnvCloak's marker";
+    const BY_RULE: &str = "the host's own permission settings, under EnvCloak's deny rule";
+    const BY_HOOK: &str = "EnvCloak's hook, with its marker";
     let Some(mut s) = site(Host::ClaudeCode, "M2-09 @.env (Claude Code)") else {
         return;
     };
@@ -764,25 +878,25 @@ fn claude_code_file_read_with_and_without_the_deny_rule() {
             .map(|c| c.name)
             .collect()
     };
-    // What refused the `Read` call, named from the probe's fixed list.
-    let refused = |p: &probe::SurfaceProbe| -> &'static str {
+    // What refused the rule's case, named from the probe's fixed list.
+    let rule_by = |p: &probe::SurfaceProbe| -> &'static str {
+        p.checks
+            .iter()
+            .find(|c| c.name == RULE)
+            .map_or("not run", |c| c.why)
+    };
+    let hook_by = |p: &probe::SurfaceProbe| -> &'static str {
         p.checks
             .iter()
             .find(|c| c.name == MARKED)
-            .map_or("not run", |c| {
-                if c.passed {
-                    "EnvCloak's hook, its marker in the next request"
-                } else {
-                    c.why
-                }
-            })
+            .map_or("not run", |c| if c.passed { BY_HOOK } else { c.why })
     };
     let path = s.h.home.home().join(".claude/settings.json");
     let with = s.probe(&[Surface::FileRead], false, true);
     let with = with.surface(Surface::FileRead).unwrap().clone();
-    assert_eq!(with.outcome, Outcome::Failed, "{with:?}");
-    assert_eq!(failed(&with), [MARKED], "with the deny rule: {with:?}");
-    assert_eq!(refused(&with), BY_SETTINGS, "{with:?}");
+    assert_eq!(with.outcome, Outcome::Passed, "{with:?}");
+    assert_eq!(rule_by(&with), BY_RULE, "{with:?}");
+    assert_eq!(hook_by(&with), BY_HOOK, "{with:?}");
 
     let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     v["permissions"]["deny"]
@@ -798,6 +912,7 @@ fn claude_code_file_read_with_and_without_the_deny_rule() {
         [AT_ENV],
         "without the deny rule: {without:?}"
     );
+    assert_eq!(rule_by(&without), BY_HOOK, "{without:?}");
 
     remove_hook(
         &path,
@@ -808,18 +923,24 @@ fn claude_code_file_read_with_and_without_the_deny_rule() {
     let neither = neither.surface(Surface::FileRead).unwrap().clone();
     let failed_neither = failed(&neither);
     assert!(
-        failed_neither.contains(&MARKED) && failed_neither.contains(&NOTHING),
+        failed_neither.contains(&MARKED)
+            && failed_neither.contains(&RULE)
+            && failed_neither.contains(&NOTHING),
         "without the deny rule or the hook: {neither:?}"
     );
     println!(
-        "measurement: Claude Code {} {}: Read of .env as installed: {}; without the \
-         Read(**/.env*) deny rule: {}; without the rule or EnvCloak's file-tool hook: {} \
-         (the file reached the model: {})",
+        "measurement: Claude Code {} {}: as installed, Read of the project's .env refused by: \
+         {}; of a .env outside the working directory: {}; without the Read(**/.env*) deny \
+         rule: {} and {}; without the rule or EnvCloak's file-tool hook: {} and {} (the file \
+         reached the model: {})",
         s.agent.installed.pin.version,
         os(),
-        refused(&with),
-        refused(&without),
-        refused(&neither),
+        rule_by(&with),
+        hook_by(&with),
+        rule_by(&without),
+        hook_by(&without),
+        rule_by(&neither),
+        hook_by(&neither),
         failed_neither.contains(&NOTHING),
     );
     s.h.assert_swept("M2-09 @.env (Claude Code)");
@@ -982,7 +1103,24 @@ fn fake(mode: &Value) -> Fake {
 }
 
 fn fake_probe(mode: &Value) -> ProbeReport {
+    fake_probe_with(mode, false)
+}
+
+/// An approver for the stand-in, whose `run_with_secrets` asks no daemon.
+struct Yes;
+
+impl Approver for Yes {
+    fn approve(&self, _: Instant, _: &AtomicBool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// The stand-in probed on every surface and, with `server`, for EnvCloak's
+/// server (with an approver and a sentinel project, which the surface
+/// probes then do not have: the output probe needs a terminal).
+fn fake_probe_with(mode: &Value, server: bool) -> ProbeReport {
     let f = fake(mode);
+    let yes = Yes;
     let home = ProbeHome {
         root: f.root.clone(),
         home: f.home.clone(),
@@ -996,9 +1134,9 @@ fn fake_probe(mode: &Value) -> ProbeReport {
         model_exe: probe_model_exe(),
         envcloak: PathBuf::from("/nonexistent/envcloak"),
         mcp_fixture: Some(PathBuf::from("/nonexistent/fixture")),
-        sentinel_project: None,
+        sentinel_project: server.then(|| f.root.join("sentinel")),
         output: None,
-        approver: None,
+        approver: server.then_some(&yes as &dyn Approver),
         run_limit: Duration::from_secs(60),
     };
     let host = ProbeHost {
@@ -1006,7 +1144,11 @@ fn fake_probe(mode: &Value) -> ProbeReport {
         exe: PathBuf::from(env!("CARGO_BIN_EXE_ec-fake-host")),
         version: "2.1.280".to_owned(),
     };
-    probe::run(&host, &home, &HostFlags::default())
+    if server {
+        probe::run_surfaces(&host, &home, &HostFlags::default(), &[], true)
+    } else {
+        probe::run(&host, &home, &HostFlags::default())
+    }
 }
 
 /// The configuration of a host with EnvCloak installed and nothing
@@ -1209,6 +1351,152 @@ fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
             );
         }
     }
+}
+
+/// The sentinel probe on the stand-in: it passes only when the host's own
+/// shell ran its control (its marker came back), wrote where its sandbox
+/// lets it, was denied the write beside the sentinel's, and the command
+/// `run_with_secrets` started made that write. A shell that never ran (a
+/// sandbox that cannot start, as Claude Code's inside CI's user namespace;
+/// a hook refusing the command before it runs) fails it, never reads as a
+/// denied write, and the server line `agents status` gives from the
+/// record says `probe=failed` (Codex F-133).
+///
+/// Mutations checked: the shell's run witness dropped (`control_ran` taken
+/// from the run being usable alone): the dead sandbox passes and this
+/// fails; on the pinned Claude Code the same mutation passed the
+/// verifier's `printenv`-prefixed control, which EnvCloak's hook refused
+/// before it ran. The allowed write dropped (`allowed_write` set to
+/// `control_ran`): the closed sandbox passes and this fails.
+#[test]
+fn a_stand_in_sentinel_needs_its_shell_to_run_and_write() {
+    const RAN: &str = "the host's own shell ran the control";
+    const WROTE: &str = "the host's own shell wrote where its sandbox lets it";
+    const DENIED: &str = "the host's own shell is denied the write beside the sentinel's";
+    const MADE: &str = "a command run_with_secrets started made the write";
+    let r = fake_probe_with(&json!({}), true);
+    assert_eq!(r.server.outcome, Outcome::Passed, "{:#?}", r.server);
+    assert!(r.server.control_ran && r.server.allowed_write && r.server.control_denied);
+    assert_eq!(r.server.sentinel, Sentinel::Appeared);
+    let line = |r: &ProbeReport| {
+        coverage::assemble(
+            Agent::ClaudeCode,
+            "2.1.280",
+            &installed(),
+            Probed::Current(&r.record("x", "y")),
+        )
+        .envcloak_server
+        .map(|l| l.to_string())
+        .unwrap_or_default()
+    };
+    assert_eq!(
+        line(&r),
+        "needs_host_approval; outside_host_sandbox (probe=passed, sentinel appeared)"
+    );
+    for (mode, failed) in [
+        (json!({"sandbox": "dead"}), &[RAN, WROTE, DENIED][..]),
+        (json!({"sandbox": "closed"}), &[WROTE, DENIED][..]),
+        (json!({"sandbox": "open"}), &[DENIED][..]),
+        (json!({"server": "inside"}), &[MADE][..]),
+    ] {
+        let r = fake_probe_with(&mode, true);
+        assert_eq!(r.server.outcome, Outcome::Failed, "{mode}: {:#?}", r.server);
+        let got: Vec<&str> = r
+            .server
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(got, failed, "{mode}: {:#?}", r.server);
+        assert!(line(&r).contains("(probe=failed"), "{mode}: {}", line(&r));
+    }
+    // A shell that never ran is not a denied write.
+    let r = fake_probe_with(&json!({"sandbox": "dead"}), true);
+    assert!(
+        !r.server.control_ran && !r.server.control_denied,
+        "{:#?}",
+        r.server
+    );
+    // Pointed at a dead base URL, nothing ran: failed through its control.
+    let r = fake_probe_with(&json!({"url": "dead"}), true);
+    assert_eq!(r.server.outcome, Outcome::Failed);
+    assert!(r.server.checks.iter().any(|c| c.control && !c.passed));
+}
+
+/// The file read's hook case is a call EnvCloak's host rule leaves to the
+/// hook: with the stand-in's `Read(**/.env*)` rule refusing the project's
+/// `.env` first (as the pinned Claude Code does), the probe still passes
+/// on the hook's marker for the `.env` outside the working directory, and
+/// the rule's case passes on the rule's refusal; with the rule off, the
+/// hook refuses both; with the hook's marker gone, the probe fails
+/// through its hook case alone.
+///
+/// Mutation checked: the hook's case reading the project's `.env` (the
+/// `ELSEWHERE` folder's replaced by the project in `file_read`): the rule
+/// refuses it without the marker and this fails.
+#[test]
+fn a_stand_in_file_read_takes_the_hook_where_the_rule_leaves_it() {
+    const MARKED: &str = "the probe call is denied with EnvCloak's marker";
+    const RULE: &str = "the call EnvCloak's host rule covers is refused";
+    let failed = |r: &ProbeReport| -> Vec<&'static str> {
+        r.surface(Surface::FileRead)
+            .unwrap()
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| c.name)
+            .collect()
+    };
+    for mode in [json!({}), json!({"rule": "off"})] {
+        let r = fake_probe(&mode);
+        let file = r.surface(Surface::FileRead).unwrap();
+        assert_eq!(file.outcome, Outcome::Passed, "{mode}: {file:?}");
+        assert!(file.checks.iter().any(|c| c.name == RULE && c.passed));
+    }
+    let r = fake_probe(&json!({"tools": "plain"}));
+    assert_eq!(failed(&r), [MARKED], "{:?}", r.surface(Surface::FileRead));
+    // Both the rule and the hook gone: the file reaches the model.
+    let r = fake_probe(&json!({"rule": "off", "tools": "run"}));
+    let f = failed(&r);
+    assert!(f.contains(&MARKED) && f.contains(&RULE), "{f:?}");
+}
+
+/// A host that does not expand `@` mentions under `-p`: the file read's
+/// outcome is its other cases', and the `@` case is reported apart, `at_
+/// mention skipped`, in the report and in what `agents status` says, never
+/// as a check that passed.
+///
+/// Mutation checked: the case kept as a passed check (`mentions`
+/// returning a passing check and no skipped case): nothing says the case
+/// was not run and this fails.
+#[test]
+fn a_mention_the_host_does_not_expand_is_reported_skipped() {
+    let r = fake_probe(&json!({"mention": "none"}));
+    let file = r.surface(Surface::FileRead).unwrap();
+    assert_eq!(file.outcome, Outcome::Passed, "{file:?}");
+    assert_eq!(file.skipped, [coverage::Case::AtMention], "{file:?}");
+    assert!(
+        !file.checks.iter().any(|c| c.name.contains('@')),
+        "{file:?}"
+    );
+    let c = coverage::assemble(
+        Agent::ClaudeCode,
+        "2.1.280",
+        &installed(),
+        Probed::Current(&r.record("x", "y")),
+    );
+    assert_eq!(
+        c.surface(Surface::FileRead).map(ToString::to_string),
+        Some(
+            "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed, at_mention \
+             skipped)"
+                .to_owned()
+        )
+    );
+    // The control: a host that expands them runs the case.
+    let r = fake_probe(&json!({}));
+    assert!(r.surface(Surface::FileRead).unwrap().skipped.is_empty());
 }
 
 /// A host version outside the scripted model's qualified table is not

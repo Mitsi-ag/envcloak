@@ -22,15 +22,23 @@
 //!   `--allowedTools Bash,Read`; Codex `exec` with approval policy `never`
 //!   in a `read-only` sandbox, which lets both commands run), so a denial
 //!   must come from EnvCloak: a control (a README read, a printed marker)
-//!   must reach the model, then the read of `.env` and the printing of the
-//!   environment must be denied with EnvCloak's fixed marker
-//!   (`[envcloak:env_file]`, `[envcloak:env_dump]`) in the host's next
-//!   request, and nothing of the file or the environment reach it; a
-//!   denial without the marker is a failed probe. Claude Code's file read
-//!   also covers an `@.env` mention, which no hook sees and only the
+//!   must reach the model, then the hook's case, a read of a `.env` and
+//!   the printing of the environment, must be denied with EnvCloak's fixed
+//!   marker (`[envcloak:env_file]`, `[envcloak:env_dump]`) in the host's
+//!   next request, and nothing of the file or the environment reach it; a
+//!   denial without the marker is a failed probe. The hook's case is a
+//!   call EnvCloak's own host rules leave to the hook, on both hosts, so
+//!   the marker can only be the hook's: Claude Code's `Read` of a `.env`
+//!   outside the session's working directory (its `Read(**/.env*)` deny
+//!   rule matches within it), Codex's `cat -- .env` and `env` (its
+//!   `forbidden` rules match `cat .env` and `printenv`). The calls those
+//!   rules cover are the rule's case: refused, by the rule (the host's
+//!   refusal, named from a fixed list) or the hook. Claude Code's file
+//!   read also covers an `@.env` mention, which no hook sees and only the
 //!   `Read(**/.env*)` deny rule covers, best effort, against an
 //!   `@README.md` control whose content must arrive; where the host does
-//!   not expand `@` mentions under `-p`, that case is skipped, not failed.
+//!   not expand `@` mentions under `-p`, that case is not run and is
+//!   reported apart (`at_mention skipped`), never as passed.
 //! - **MCP**: a fixture MCP server in the probe home with a benign tool
 //!   (the control) and one that reads `.env` (the probe, denied with
 //!   EnvCloak's marker).
@@ -39,12 +47,14 @@
 //!   any form. This needs an approval from a terminal subject
 //!   ([`Approver`]); with none, the probe is skipped
 //!   (`probe_needs_terminal`).
-//! - **EnvCloak's server**: a `run_with_secrets` call with no bindings runs
-//!   `touch` on a path in the probe home that the host's own sandbox
-//!   denies (Claude Code with `sandbox.enabled`; Codex `workspace-write`
-//!   with its temporary directories excluded), after a control shell
-//!   command shows that denial: the sentinel appearing is the evidence for
-//!   `outside_host_sandbox` (D-03).
+//! - **EnvCloak's server**: the host's own shell, in its sandbox (Claude
+//!   Code with `sandbox.enabled`; Codex `workspace-write` with its
+//!   temporary directories excluded), writes in the project, is denied a
+//!   write in the probe home, and prints a marker that must come back in
+//!   its result (the witness that it ran: a missing file alone does not
+//!   say so); then a `run_with_secrets` call with no bindings runs `touch`
+//!   beside the denied write: the sentinel appearing is the evidence for
+//!   `outside_host_sandbox` (D-03). Each piece is kept with the result.
 //!
 //! A host version outside the scripted model's qualified table
 //! ([`model::QUALIFIED`]) is not probed: every outcome is `not_qualified`.
@@ -69,7 +79,9 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::coverage::{Observed, Outcome, ProbeRecord, Reason, Sentinel, ServerObserved, Surface};
+use crate::coverage::{
+    Case, Observed, Outcome, ProbeRecord, Reason, Sentinel, ServerObserved, Surface,
+};
 use crate::hook::Host;
 
 pub use run::{run, run_surfaces};
@@ -182,7 +194,8 @@ pub struct Check {
     /// than the probe.
     pub control: bool,
     pub passed: bool,
-    /// Why it failed (fixed text), or `""`.
+    /// Why it failed (fixed text), or `""`; for a passed check of what a
+    /// host refused, what refused it (fixed text).
     pub why: &'static str,
 }
 
@@ -196,6 +209,9 @@ pub struct SurfaceProbe {
     pub persisted: bool,
     /// Why it was skipped, when it was.
     pub why: Vec<Reason>,
+    /// The cases of it that were not run, while the rest was: its outcome
+    /// is the rest's, and these are reported apart, never as passed.
+    pub skipped: Vec<Case>,
 }
 
 /// The sentinel probe for EnvCloak's server.
@@ -203,7 +219,13 @@ pub struct SurfaceProbe {
 pub struct ServerProbe {
     pub outcome: Outcome,
     pub sentinel: Sentinel,
-    /// The host's own shell was denied the control write.
+    /// The host's own shell ran the control: the marker it prints after
+    /// its writes came back in its result (Codex F-133: a missing file
+    /// alone does not say the shell ran).
+    pub control_ran: bool,
+    /// That shell made its write where its sandbox lets it.
+    pub allowed_write: bool,
+    /// That shell was denied the write beside the sentinel's.
     pub control_denied: bool,
     pub checks: Vec<Check>,
 }
@@ -248,8 +270,8 @@ impl ProbeReport {
     }
 
     /// What the cache keeps of this report, for the host binary whose
-    /// SHA-256 is `exe_sha256` and the configuration whose digest is
-    /// `config_digest`.
+    /// SHA-256 is `exe_sha256` and the probe context whose fingerprint is
+    /// `config_digest` (`coverage::ConfigSet::fingerprint`).
     pub fn record(&self, exe_sha256: &str, config_digest: &str) -> ProbeRecord {
         ProbeRecord {
             host: self.host.id().to_owned(),
@@ -265,11 +287,14 @@ impl ProbeReport {
                     outcome: s.outcome,
                     persisted: s.persisted,
                     why: s.why.clone(),
+                    skipped: s.skipped.clone(),
                 })
                 .collect(),
             server: ServerObserved {
                 outcome: self.server.outcome,
                 sentinel: self.server.sentinel,
+                control_ran: self.server.control_ran,
+                allowed_write: self.server.allowed_write,
                 control_denied: self.server.control_denied,
             },
             flags: self.flags.clone(),
