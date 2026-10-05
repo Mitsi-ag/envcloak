@@ -1105,8 +1105,15 @@ fn codex_untrusted_hooks_read_degraded_with_failed_probes() {
 /// round-2 finding: a refusal taken as EnvCloak's without its provenance).
 /// Without that hook, the control, it passes.
 ///
-/// Mutation checked: the witness counted whatever hook gave it (`ours`
-/// answering true for Codex): the probe passes and this fails.
+/// The same with EnvCloak's prompt hook taken out and another program's
+/// key-blocking hook written inline in `config.toml` (the verifier's
+/// round-3 repro, where every check passed).
+///
+/// Mutations checked: the witness counted whatever hook gave it (`ours`
+/// answering true for Codex): the probe passes and this fails; the
+/// layers' own hooks not read (`layers().any(CodexLayer::prompt_hook)`
+/// dropped from `read_codex`): the inline hook's block counts as
+/// EnvCloak's and this fails.
 #[test]
 fn codex_block_beside_another_prompt_hook_is_not_counted() {
     const REPORTED: &str = "the host reports EnvCloak's hook blocked the prompt";
@@ -1142,6 +1149,45 @@ fn codex_block_beside_another_prompt_hook_is_not_counted() {
     let report = s.probe(&[Surface::PromptToModel], false, true);
     let p = report.surface(Surface::PromptToModel).unwrap();
     assert_eq!(p.outcome, Outcome::Passed, "the control: {p:?}");
+    // The verifier's round-3 repro: EnvCloak's prompt hook taken out of
+    // hooks.json, and another program's hook that blocks a key-shaped
+    // prompt written inline in config.toml, which Codex runs too: the block
+    // Codex reports is that hook's, and is not counted as EnvCloak's.
+    let blocker = s.h.home.root().join("other-blocker");
+    write_script(
+        &blocker,
+        "#!/bin/sh\nif grep -q ecpk; then echo 'not today' >&2; exit 2; fi\nexit 0\n",
+    );
+    remove_hook(&file, "UserPromptSubmit", None);
+    let config = s.agent.codex_home().join("config.toml");
+    let kept = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!(
+            "{kept}\n[[hooks.UserPromptSubmit]]\nhooks = [{{ type = \"command\", command = \"{}\" \
+             }}]\n",
+            blocker.display()
+        ),
+    )
+    .unwrap();
+    let report = s.probe(&[Surface::PromptToModel], false, true);
+    let p = report.surface(Surface::PromptToModel).unwrap().clone();
+    let failed: Vec<(&str, &str)> = p
+        .checks
+        .iter()
+        .filter(|c| !c.passed)
+        .map(|c| (c.name, c.why))
+        .collect();
+    assert_eq!(
+        failed,
+        [(
+            REPORTED,
+            "a prompt hook blocked it, not known to be EnvCloak's"
+        )],
+        "the inline hook's block: {p:?}"
+    );
+    std::fs::write(&config, &kept).unwrap();
+    std::fs::write(&file, &installed).unwrap();
     s.h.assert_swept("M2-09 another prompt hook (Codex)");
 }
 
@@ -1405,7 +1451,10 @@ fn a_dead_base_url_fails_every_probe_through_its_control() {
 /// &ctl)` dropped): a fresh session after the block passes and this
 /// fails; the transcript without its sweep's completeness (`swept.complete`
 /// replaced by `true`, the verifier's round-2 finding): the store holding
-/// a file past the sweep's cap and the linked one pass and this fails.
+/// a file past the sweep's cap and the linked one pass and this fails;
+/// the stores under Claude Code's own directory alone (`read_claude`'s
+/// stores filtered to `claude_dir`): the prompt kept where
+/// `CLAUDE_CODE_TMPDIR` moves a store is not swept and this fails.
 #[test]
 fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
     struct Case {
@@ -1469,6 +1518,14 @@ fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
             mode: json!({"persist": "linked"}),
             failed: &[Surface::Transcript],
             check: "the host's stores were read whole",
+        },
+        // A blocked prompt kept in a store the host's environment moved
+        // (`CLAUDE_CODE_TMPDIR`): swept where the probe context places
+        // it (Codex's round-3 review).
+        Case {
+            mode: json!({"persist": "moved"}),
+            failed: &[Surface::Transcript],
+            check: "the blocked prompt is in none of them",
         },
         Case {
             mode: json!({"tools": "plain"}),
@@ -1550,11 +1607,18 @@ fn a_stand_in_failing_each_control_or_probe_fails_that_probe() {
             assert_eq!(s.probe, Outcome::Failed, "{}: {s}", case.mode);
             assert_ne!(s.state, State::Active, "{}: {s}", case.mode);
         }
-        // A blocked prompt kept on disk is the documented gap, said so.
-        if case.mode == json!({"persist": "all"}) {
+        // A blocked prompt kept on disk is the documented gap, said so,
+        // the interactive history's case named apart.
+        if [json!({"persist": "all"}), json!({"persist": "moved"})].contains(&case.mode) {
             assert_eq!(
                 c.surface(Surface::Transcript).map(ToString::to_string),
-                Some("unsupported (persists_blocked_prompt; probe=failed)".to_owned())
+                Some(
+                    "unsupported (persists_blocked_prompt; probe=failed, interactive_history \
+                     skipped)"
+                        .to_owned()
+                ),
+                "{}",
+                case.mode
             );
         }
     }
@@ -1776,7 +1840,9 @@ fn a_stand_in_the_model_does_not_wholly_serve_fails_every_probe() {
 /// probe or its control fail).
 ///
 /// Mutations checked: the leak check dropped (`!leaked` replaced by
-/// `true`): the three leaks pass and this fails; the control dropped
+/// `true`): the three leaks pass and this fails; the leak check reading
+/// the wire bytes alone (`seen` without `holds`' decoded readings): the
+/// escaped value passes and this fails; the control dropped
 /// (`ran` replaced by `true`): the emitter with no marker and the refused
 /// run pass and this fails.
 #[test]
@@ -1815,7 +1881,7 @@ fn a_stand_in_output_probe_needs_its_marker_and_no_value() {
         ),
         (
             "a run envcloak refused",
-            marker,
+            marker.clone(),
             false,
             Some("the emitter ran under envcloak run and its marker reached the model"),
         ),
@@ -1844,6 +1910,32 @@ fn a_stand_in_output_probe_needs_its_marker_and_no_value() {
             Some(true),
             "{name}"
         );
+    }
+    // A value holding a quote, a backslash and a line break, which the
+    // host's JSON escapes in the tool result it sends (Codex's round-3
+    // review: no form of the value matched `\"` or `\n`): seen; and the
+    // same emitter redacted passes (the control).
+    const ESCAPED: &str = "ecp-value-6d2a\"91c4\\0e7b\n55f3-a8e1";
+    for (name, emitter, failing) in [
+        (
+            "an escaped value",
+            format!("{marker}printf '%s\\n' '{ESCAPED}'\n"),
+            Some("no value reached the model in any form"),
+        ),
+        ("an escaped value, redacted", marker.clone(), None),
+    ] {
+        let r = fake_output_probe(&format!("#!/bin/sh\n{emitter}"), true, ESCAPED, MARKER);
+        let out = r.surface(Surface::Output).unwrap();
+        let failed: Vec<&str> = out
+            .checks
+            .iter()
+            .filter(|c| !c.passed)
+            .map(|c| c.name)
+            .collect();
+        match failing {
+            None => assert_eq!(out.outcome, Outcome::Passed, "{name}: {out:?}"),
+            Some(check) => assert_eq!(failed, [check], "{name}: {out:?}"),
+        }
     }
 }
 

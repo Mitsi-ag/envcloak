@@ -28,7 +28,9 @@
 //! - `persist`: `"allowed"` (the default) keeps each prompt it sent in
 //!   the session's file; `"all"` keeps a blocked one too; `"none"` keeps
 //!   nothing; `"linked"` keeps a blocked one in a file outside the stores
-//!   that a link in them leads to;
+//!   that a link in them leads to; `"moved"` keeps a blocked one where
+//!   `CLAUDE_CODE_TMPDIR` places Claude Code's working-directory files (a
+//!   store its environment moves);
 //! - `unread`: `true` leaves a file in its store that a sweep cannot read
 //!   whole: one past the sweep's cap per file (a sparse file, so nothing is
 //!   written; a file of mode 0000 would not do, since a test run as root, as
@@ -196,6 +198,16 @@ fn main() {
     if key_shaped(&prompt) && m.prompt != "leak" {
         match m.persist.as_str() {
             "all" => keep(&transcript, &prompt, true),
+            "moved" => {
+                // Where the environment moves a store: a working-directory
+                // file in `CLAUDE_CODE_TMPDIR`, as Claude Code's Bash tool
+                // leaves them.
+                if let Some(tmp) = std::env::var_os("CLAUDE_CODE_TMPDIR") {
+                    let dir = PathBuf::from(tmp);
+                    let _ = std::fs::create_dir_all(&dir);
+                    keep(&dir.join("claude-fake-cwd"), &prompt, true);
+                }
+            }
             "linked" => {
                 // Kept outside the stores, behind a link in them.
                 let outside = home.join("elsewhere");
