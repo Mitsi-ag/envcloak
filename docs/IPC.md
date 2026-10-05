@@ -404,8 +404,8 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `value_on_argv` | M2-18 | reuse | a value given as a command-line argument; `mcp-bridge` takes slugs only |
 | `output_stalled` | M2-06 | landed | `envcloak mcp`: the host went on sending but stopped reading the answers, and the answers waiting for it reached their bound; the session ends and the calls in hand are stopped |
 | `not_started_by_daemon` | M2-27 | reserved | `envcloak run --launch`, `mcp-bridge --relay` or `mcp --browser-supervisor` started by anything but the daemon; exit 125, and nothing is received (SPEC §4); distinct from the error kind `runner_unavailable`, the daemon unable to start one |
-| `pty_unavailable` | M2-19 | reserved | `run --pty` without a terminal on stdin and stdout; exit 125, never a fallback |
-| `pty_monitor_lost` | M2-19 | reserved | the PTY monitor died without reporting the command's status; exit 125 |
+| `pty_unavailable` | M2-19 | landed | `run --pty` without a terminal on stdin and stdout; exit 125, never a fallback |
+| `pty_monitor_lost` | M2-19 | landed | the PTY monitor died without reporting the command's status; exit 125 |
 | `app_required` | M2-21 | reserved | `envcloak reveal` on macOS before the app; exit 125, no value requested |
 | `edited_since` | M2-05 | landed | a file a backup v2 restore would write back over is not what the change left (its SHA-256 is not the recorded `sha256_after`); it is kept as it is |
 | `backup_unread` | M2-05 | landed | a backup v2 restore could not have a file's backed-up contents whole (a chunk missing or of another length, or the whole not the backed-up SHA-256); nothing is written in its place |
