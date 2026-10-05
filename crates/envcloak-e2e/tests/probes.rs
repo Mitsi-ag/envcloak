@@ -659,7 +659,10 @@ fn remove_hook(path: &Path, event: &str, matcher: Option<&str>) {
 
 /// One per surface: with EnvCloak's hook for it taken out of the installed
 /// configuration, its probe fails (and the others it does not rest on
-/// still pass, so the failure is the hook's).
+/// still pass, so the failure is the hook's). Claude Code's file read
+/// fails with its hook as well, its deny rule refusing the `Read` first:
+/// `claude_code_file_read_with_and_without_the_deny_rule` shows the hook
+/// behind the rule.
 fn without_hooks(host: Host, test: &str) {
     let Some(mut s) = site(host, test) else {
         return;
@@ -727,23 +730,30 @@ fn codex_probes_fail_without_their_hooks() {
     without_hooks(Host::Codex, "M2-09 hooks removed (Codex)");
 }
 
-/// Claude Code's `@.env` case rests on the `Read(**/.env*)` deny rule
-/// alone: with the rule taken out of the installed settings, the file
-/// read probe's `@.env` check fails, and nothing that held with the rule
-/// breaks without it. The `Read` tool's own case: on macOS EnvCloak's
-/// hook denies it, marker and all, with the rule and without it (the
-/// hook runs before the rule there); on Linux CI measured Claude Code
-/// 2.1.280's own permission settings refusing it before the hook, without
-/// EnvCloak's marker, which fails the probe there (the matrix says so),
-/// so on Linux what refuses it, with the rule and without, is recorded,
-/// not asserted.
+/// Claude Code's file read with the `Read(**/.env*)` deny rule and
+/// without it. As installed, Claude Code's own permission settings refuse
+/// `Read .env` (the project named by its resolved path) before EnvCloak's
+/// hook, without EnvCloak's marker: that check alone fails, so the probe
+/// does (the matrix says so on both systems), and the file reaches the
+/// model in no request. With the rule taken out, EnvCloak's hook refuses
+/// the `Read`, marker and all, and only the `@.env` case, which the rule
+/// alone covers, fails. With the hook for the file tools taken out as
+/// well, the file reaches the model: the hook is what stands behind the
+/// rule.
+///
+/// Mutation checked: the probe's `Read` naming the project as given, not
+/// resolved (`file_read` without the `canonicalize`): on macOS the path
+/// runs through `/tmp` and passes the rule's check made before any hook,
+/// EnvCloak's hook refuses it with its marker, the probe passes with the
+/// rule and this fails (as does the matrix check of
+/// `claude_code_coverage_is_what_its_probes_observe`).
 #[test]
-fn claude_code_at_env_fails_without_the_deny_rule() {
-    const AT_ENV: [&str; 2] = [
-        "an @.env mention reaches the model as a prompt",
-        "the @.env file's content never does",
-    ];
+fn claude_code_file_read_with_and_without_the_deny_rule() {
+    const AT_ENV: &str = "the @.env file's content never does";
     const MARKED: &str = "the probe call is denied with EnvCloak's marker";
+    const NOTHING: &str = "nothing it would have read reaches the model";
+    const BY_SETTINGS: &str =
+        "the host's own permission settings refused it first, without EnvCloak's marker";
     let Some(mut s) = site(Host::ClaudeCode, "M2-09 @.env (Claude Code)") else {
         return;
     };
@@ -754,13 +764,14 @@ fn claude_code_at_env_fails_without_the_deny_rule() {
             .map(|c| c.name)
             .collect()
     };
-    let read_denial = |p: &probe::SurfaceProbe| -> &'static str {
+    // What refused the `Read` call, named from the probe's fixed list.
+    let refused = |p: &probe::SurfaceProbe| -> &'static str {
         p.checks
             .iter()
             .find(|c| c.name == MARKED)
             .map_or("not run", |c| {
                 if c.passed {
-                    "EnvCloak's hook denied it, its marker in the next request"
+                    "EnvCloak's hook, its marker in the next request"
                 } else {
                     c.why
                 }
@@ -769,14 +780,10 @@ fn claude_code_at_env_fails_without_the_deny_rule() {
     let path = s.h.home.home().join(".claude/settings.json");
     let with = s.probe(&[Surface::FileRead], false, true);
     let with = with.surface(Surface::FileRead).unwrap().clone();
-    // With the rule every check holds but, on Linux, the Read call's
-    // marker.
-    for c in with.checks.iter().filter(|c| c.name != MARKED) {
-        assert!(c.passed, "with the deny rule: {c:?} {with:?}");
-    }
-    if cfg!(target_os = "macos") {
-        assert_eq!(with.outcome, Outcome::Passed, "{with:?}");
-    }
+    assert_eq!(with.outcome, Outcome::Failed, "{with:?}");
+    assert_eq!(failed(&with), [MARKED], "with the deny rule: {with:?}");
+    assert_eq!(refused(&with), BY_SETTINGS, "{with:?}");
+
     let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     v["permissions"]["deny"]
         .as_array_mut()
@@ -786,27 +793,34 @@ fn claude_code_at_env_fails_without_the_deny_rule() {
     let without = s.probe(&[Surface::FileRead], false, true);
     let without = without.surface(Surface::FileRead).unwrap().clone();
     assert_eq!(without.outcome, Outcome::Failed, "{without:?}");
-    let failed_without = failed(&without);
-    assert!(
-        failed_without.contains(&AT_ENV[1]),
+    assert_eq!(
+        failed(&without),
+        [AT_ENV],
         "without the deny rule: {without:?}"
     );
-    for name in &failed_without {
-        assert!(
-            *name == AT_ENV[1] || failed(&with).contains(name),
-            "{name}: held with the deny rule, not without it: {without:?}"
-        );
-    }
-    if cfg!(target_os = "macos") {
-        assert_eq!(failed_without, [AT_ENV[1]], "{without:?}");
-    }
+
+    remove_hook(
+        &path,
+        "PreToolUse",
+        Some(envcloak_agents::hosts::claude::TOOL_MATCHER),
+    );
+    let neither = s.probe(&[Surface::FileRead], false, true);
+    let neither = neither.surface(Surface::FileRead).unwrap().clone();
+    let failed_neither = failed(&neither);
+    assert!(
+        failed_neither.contains(&MARKED) && failed_neither.contains(&NOTHING),
+        "without the deny rule or the hook: {neither:?}"
+    );
     println!(
-        "measurement: Claude Code {} {}: Read of .env with the Read(**/.env*) deny rule: {}; \
-         without it: {}",
+        "measurement: Claude Code {} {}: Read of .env as installed: {}; without the \
+         Read(**/.env*) deny rule: {}; without the rule or EnvCloak's file-tool hook: {} \
+         (the file reached the model: {})",
         s.agent.installed.pin.version,
         os(),
-        read_denial(&with),
-        read_denial(&without)
+        refused(&with),
+        refused(&without),
+        refused(&neither),
+        failed_neither.contains(&NOTHING),
     );
     s.h.assert_swept("M2-09 @.env (Claude Code)");
 }

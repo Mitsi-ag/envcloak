@@ -526,8 +526,23 @@ impl Prober<'_, '_> {
 
     /// File read: a control read, a read of `.env` that must be denied
     /// with EnvCloak's marker, and (Claude Code) the `@` mentions.
+    ///
+    /// Claude Code's `Read` names the files by the project's resolved
+    /// path, the one the host's working directory is. Claude Code checks
+    /// its deny rules against that before any hook runs, so the resolved
+    /// path is refused by the `Read(**/.env*)` rule first, without
+    /// EnvCloak's marker, while a path spelled through a link (on macOS
+    /// `/tmp` is one, to `/private/tmp`) passes that check, reaches
+    /// EnvCloak's hook first and meets the rule only after it (measured on
+    /// 2.1.280). The probe makes the call as a session shown the project
+    /// would.
     fn file_read(&mut self, fx: &Fixtures) -> SurfaceProbe {
-        let project = self.home.project.clone();
+        let Ok(project) = std::fs::canonicalize(&self.home.project) else {
+            return failed(
+                Surface::FileRead,
+                "the probe's project could not be resolved",
+            );
+        };
         let (control_step, probe_step) = if self.claude() {
             (
                 claude::read_step(&project.join("README.md")),

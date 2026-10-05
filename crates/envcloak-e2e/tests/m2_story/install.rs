@@ -553,10 +553,13 @@ fn the_installer_on_the_hosts_own_configs() {
     h.record("claude read stdout", &run.output.stdout);
     h.record("claude read stderr", &run.output.stderr);
     // Neither file is read. On macOS EnvCloak's hook is what refuses the
-    // env file (measured: the hook runs before Claude Code's own deny
-    // rule, which stops it when the hook does not); on Linux, CI measured
-    // Claude Code refusing a file in that directory before any hook runs,
-    // so there the refusal's source is recorded, not asserted.
+    // env file: its path runs through `/tmp`, a link to `/private/tmp`,
+    // which passes the deny-rule check Claude Code makes against its
+    // resolved working directory before any hook, and meets the rule only
+    // after the hook (M2-09 measured the resolved path refused by the
+    // rule first, without EnvCloak's marker); on Linux, with no link, the
+    // rule refuses it before any hook runs, so there the refusal's source
+    // is recorded, not asserted.
     // What refused, named from a fixed list: no tool output is printed
     // (it could hold fixture data; Codex's cycle 321 review).
     let shown = |out: &str| -> String {
