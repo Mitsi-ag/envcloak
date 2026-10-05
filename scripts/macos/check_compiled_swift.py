@@ -17,6 +17,18 @@ check-swift.sh lets test files print and read the environment. The
 generated files allowed are SwiftPM's resource_bundle_accessor.swift and
 Xcode's GeneratedAssetSymbols.swift, and only where the build writes them:
 a DerivedSources/ directory inside this derived data.
+
+What is linked is checked the same way, from the build's *.LinkFileList
+files (the object files xcodebuild hands to the linker, one list per
+target, beside that target's Swift file list): every object is one the
+target compiled from a Swift file in its list (`<name>.o` for
+`<name>.swift`; a basename two of its files share may carry a suffix), the
+prelinked object of another target in this build that has its own lists
+(`Build/Products/<config>/<target>.o`, how a local package's library
+reaches the app), or, in a test target only, the host app's Debug dylib. So
+an object compiled from C, Objective-C or assembly, which no Swift file
+list names, fails, and so does a target that links objects but compiles no
+Swift.
 """
 
 import os
@@ -24,6 +36,49 @@ import sys
 
 GENERATED = {"resource_bundle_accessor.swift", "GeneratedAssetSymbols.swift"}
 SUFFIX = ".SwiftFileList"
+LINK_SUFFIX = ".LinkFileList"
+
+
+def read_list(path):
+    with open(path, encoding="utf-8", errors="surrogateescape") as f:
+        return [line.rstrip("\n") for line in f if line.rstrip("\n")]
+
+
+def check_links(derived, link_lists, swift_lists, problems):
+    """Each object a target links was compiled from Swift this build read."""
+    targets = {os.path.basename(fl)[: -len(SUFFIX)] for fl in swift_lists}
+    objects = 0
+    for ll in sorted(link_lists):
+        target = os.path.basename(ll)[: -len(LINK_SUFFIX)]
+        where = os.path.relpath(ll, derived)
+        sibling = ll[: -len(LINK_SUFFIX)] + SUFFIX
+        if sibling not in swift_lists:
+            problems.append("%s links objects for %s, which compiles no Swift file this check reads" % (where, target))
+            continue
+        stems = [os.path.splitext(os.path.basename(p))[0] for p in read_list(sibling)]
+        shared = {s for s in stems if stems.count(s) > 1}
+        own = 0
+        for obj in read_list(ll):
+            objects += 1
+            real = os.path.realpath(obj)
+            inside = (real + os.sep).startswith(derived + os.sep)
+            name = os.path.basename(obj)
+            stem, ext = os.path.splitext(name)
+            if os.path.dirname(os.path.realpath(obj)) == os.path.dirname(os.path.realpath(ll)):
+                own += 1
+                if ext == ".o" and (stem in stems or any(stem.startswith(s + "-") for s in shared)):
+                    continue
+                problems.append("%s links %s, which no Swift file %s compiled made" % (where, name, target))
+                continue
+            rel = os.path.relpath(real, derived).split(os.sep) if inside else []
+            if inside and len(rel) == 4 and rel[:2] == ["Build", "Products"] and ext == ".o" and stem in targets:
+                continue
+            if inside and target.endswith("Tests") and name.endswith(".debug.dylib") and rel[:2] == ["Build", "Products"] and any(r.endswith(".app") for r in rel):
+                continue
+            problems.append("%s links %s, which is not an object this build compiled from Swift" % (where, obj))
+        if own != len(stems):
+            problems.append("%s links %d object(s) of its own for the %d Swift file(s) %s compiled" % (where, own, len(stems), target))
+    return objects
 
 
 def main(argv):
@@ -44,8 +99,10 @@ def main(argv):
                 continue
             scanned[os.path.realpath(path)] = cls
     lists = []
+    link_lists = []
     for dirpath, _, filenames in os.walk(os.path.join(derived, "Build", "Intermediates.noindex")):
         lists.extend(os.path.join(dirpath, n) for n in filenames if n.endswith(SUFFIX))
+        link_lists.extend(os.path.join(dirpath, n) for n in filenames if n.endswith(LINK_SUFFIX))
     compiled = generated = 0
     targets = set()
     for fl in sorted(lists):
@@ -73,6 +130,9 @@ def main(argv):
                 problems.append("%s compiles %s, which scripts/macos/check-swift.sh does not read" % (where, path))
     if not lists or compiled == 0:
         problems.append("no Swift file list under %s, so nothing was checked (build the app first)" % derived)
+    linked = check_links(derived, link_lists, set(lists), problems)
+    if lists and not link_lists:
+        problems.append("no link file list under %s, so what was linked was not checked" % derived)
     if not scanned:
         problems.append("check-swift.sh listed no Swift file")
     for p in problems:
@@ -80,8 +140,8 @@ def main(argv):
     if problems:
         return 1
     print(
-        "check-sources: ok (%d Swift file lists for %s; %d compiled files: %d that check-swift.sh reads, %d generated package accessors)"
-        % (len(lists), ", ".join(sorted(targets)), compiled, compiled - generated, generated)
+        "check-sources: ok (%d Swift file lists for %s; %d compiled files: %d that check-swift.sh reads, %d generated package accessors; %d linked objects, each from them)"
+        % (len(lists), ", ".join(sorted(targets)), compiled, compiled - generated, generated, linked)
     )
     return 0
 
