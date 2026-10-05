@@ -39,14 +39,14 @@ mod crowded;
 mod exe_hash;
 mod import;
 mod items;
+mod launch_check;
 mod lock;
-mod projects;
+mod managed;
 mod redact;
 mod requests;
-#[cfg(target_os = "linux")]
-mod reveal;
 mod scan_match;
 mod server;
+mod spawn_envcloak;
 mod state;
 
 use std::io::Write;

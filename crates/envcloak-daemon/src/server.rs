@@ -41,7 +41,7 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
@@ -57,9 +57,10 @@ use envcloak_ipc::proto::{
     BackupOpenRestore, BackupPut, BackupRead, BackupRecordResult, Deny, ErrorKind, FilesBackup,
     FilesRestore, FilesShow, GrantsList, GrantsRevoke, ImportCommit, ImportPlan, ImportVerify,
     IncomingRequest, ItemsAdd, ItemsCheck, ItemsList, ItemsMarkExposed, ItemsReclassify,
-    ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, Method, PendingGet, PendingList,
-    PendingPoll, RecoveryConfirm, Role, RunRequest, ScanMatch, Status, Unlock, UnlockParams,
-    VaultCreate, VaultCreateParams, VaultRecover, loggable_method, required_role,
+    ItemsRemove, ItemsRotate, ItemsShow, ItemsTarget, Lock, ManagedRegister, ManagedUnregister,
+    ManagedUpdate, ManagedUpdatePlan, Method, PendingGet, PendingList, PendingPoll,
+    RecoveryConfirm, Role, RunRequest, ScanMatch, Status, Unlock, UnlockParams, VaultCreate,
+    VaultCreateParams, VaultRecover, loggable_method, required_role,
 };
 use envcloak_ipc::view::{
     CreatedView, DaemonView, LockReason, LockedView, StatusView, UnlockedView,
@@ -76,7 +77,9 @@ use crate::clock::{SystemClocks, now_of};
 use crate::import;
 use crate::items;
 use crate::lock::Reading;
+use crate::managed;
 use crate::requests;
+use crate::spawn_envcloak::{Anchor, MAX_REQUEST_FDS};
 use crate::state::{BeginUnlock, State, passphrase_error};
 
 /// Connections served at once. Each holds at most one frame (1 MiB) and a
@@ -199,6 +202,9 @@ pub(crate) struct Shared {
     pub(crate) scan_checks: Mutex<crate::import::ValueChecks>,
     /// The restore chunks on their way out, which a lock waits for.
     pub(crate) deliveries: backups::Deliveries,
+    /// The image the daemon starts its runners and relays from (M2 task
+    /// M2-27), taken when it started.
+    pub(crate) anchor: Anchor,
 }
 
 impl Shared {
@@ -230,6 +236,7 @@ impl Shared {
                 crate::scan_match::MAX_SCAN_CHECKS,
             )),
             deliveries: backups::Deliveries::default(),
+            anchor: Anchor::unavailable(),
         }
     }
 }
@@ -355,6 +362,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
             crate::scan_match::MAX_SCAN_CHECKS,
         )),
         deliveries: backups::Deliveries::default(),
+        anchor: Anchor::at_start(),
     });
 
     {
@@ -571,10 +579,16 @@ fn idle_connection() -> Duration {
 
 /// Reads with a deadline: [`IDLE_CONNECTION`] until the first byte of a
 /// frame, then [`FRAME_DEADLINE`] for the rest of it.
+///
+/// Each read takes the descriptors a client attached (`SCM_RIGHTS`; a
+/// managed `run.request` hands over its pipe ends, M2 task M2-27), into
+/// [`FrameReader::fds`]: close-on-exec, and closed with the reader unless
+/// the request they came with takes them.
 struct FrameReader<'a> {
     stream: &'a UnixStream,
     deadline: Instant,
     started: bool,
+    fds: Vec<OwnedFd>,
 }
 
 impl<'a> FrameReader<'a> {
@@ -583,6 +597,7 @@ impl<'a> FrameReader<'a> {
             stream,
             deadline: Instant::now() + idle_connection(),
             started: false,
+            fds: Vec::new(),
         }
     }
 }
@@ -594,8 +609,13 @@ impl Read for FrameReader<'_> {
             return Err(io::ErrorKind::TimedOut.into());
         }
         self.stream.set_read_timeout(Some(self.deadline - now))?;
-        let mut stream: &UnixStream = self.stream;
-        let n = stream.read(buf)?;
+        let n = envcloak_sys::fdpass::recv_with_fds(self.stream.as_fd(), buf, &mut self.fds)?;
+        if self.fds.len() > MAX_REQUEST_FDS {
+            // More than any request hands over: the connection is closed,
+            // and the descriptors with it.
+            self.fds.clear();
+            return Err(io::ErrorKind::InvalidData.into());
+        }
         if n > 0 && !self.started {
             self.started = true;
             self.deadline = Instant::now() + FRAME_DEADLINE;
@@ -679,7 +699,8 @@ impl Write for FrameWriter<'_> {
 /// Serves one connection until it closes, stalls or breaks the framing.
 fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
     loop {
-        let frame = match Frame::read_from(&mut FrameReader::new(stream)) {
+        let mut reader = FrameReader::new(stream);
+        let frame = match Frame::read_from(&mut reader) {
             Ok(f) => f,
             Err(e @ (FrameError::TooLarge | FrameError::Empty)) => {
                 // The stream is out of step now: answer, then close.
@@ -716,7 +737,8 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
             );
             return;
         }
-        let (response, delivering) = dispatch(&frame, peer, shared);
+        let fds = std::mem::take(&mut reader.fds);
+        let (response, delivering) = dispatch(&frame, peer, shared, fds);
         drop(frame);
         let written = response.is_some_and(|r| r.write_to(&mut FrameWriter::new(stream)).is_ok());
         // A restore chunk's delivery ends once its answer is written, or
@@ -737,9 +759,10 @@ fn dispatch<'s>(
     frame: &Frame,
     peer: &PeerIdentity,
     shared: &'s Shared,
+    fds: Vec<OwnedFd>,
 ) -> (Option<Frame>, Option<backups::Delivering<'s>>) {
     let mut delivering = None;
-    let answer = respond(frame, peer, shared, &mut delivering);
+    let answer = respond(frame, peer, shared, &mut delivering, fds);
     (answer, delivering)
 }
 
@@ -750,12 +773,19 @@ fn respond<'s>(
     peer: &PeerIdentity,
     shared: &'s Shared,
     delivering: &mut Option<backups::Delivering<'s>>,
+    fds: Vec<OwnedFd>,
 ) -> Option<Frame> {
     let req = match IncomingRequest::parse(frame) {
         Ok(r) => r,
         Err(e) => return proto::error_frame(None, &e).ok(),
     };
     let id = req.id;
+    // Only a `run.request` hands descriptors over; any other request that
+    // carries one is refused, and they are closed.
+    if !fds.is_empty() && req.method != RunRequest::NAME {
+        drop(fds);
+        return proto::error_frame(Some(id), &RpcError::new(ErrorKind::InvalidParams)).ok();
+    }
     // The sleep and idle checks run before every request too.
     observe(shared);
     if required_role(req.method) == Role::App {
@@ -781,8 +811,20 @@ fn respond<'s>(
         }),
         Unlock::NAME => answer::<Unlock>(id, &req, |p| unlock(shared, peer, p)),
         VaultCreate::NAME => answer::<VaultCreate>(id, &req, |p| create(shared, peer, p)),
-        RunRequest::NAME => {
-            framed::<RunRequest>(id, &req, |p| requests::run_request(shared, peer, id, p))
+        RunRequest::NAME => framed::<RunRequest>(id, &req, |p| {
+            requests::run_request(shared, peer, id, p, fds)
+        }),
+        ManagedRegister::NAME => {
+            answer::<ManagedRegister>(id, &req, |p| managed::register(shared, peer, p))
+        }
+        ManagedUnregister::NAME => {
+            answer::<ManagedUnregister>(id, &req, |p| managed::unregister(shared, peer, p))
+        }
+        ManagedUpdatePlan::NAME => {
+            answer::<ManagedUpdatePlan>(id, &req, |p| managed::update_plan(shared, peer, p))
+        }
+        ManagedUpdate::NAME => {
+            answer::<ManagedUpdate>(id, &req, |p| managed::update(shared, peer, p))
         }
         PendingGet::NAME => {
             answer::<PendingGet>(id, &req, |p| requests::pending_get(shared, peer, p))
