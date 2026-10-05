@@ -120,7 +120,7 @@ Each light value also reaches at least 5.1:1 on white and on `#ECECEC`, and each
 
 ## 4. Typography
 
-**Martian Mono** (SIL OFL 1.1, by Evil Martians) is the brand face, used for the wordmark, code and site headings. Use the variable font, `MartianMono[wdth,wght].ttf` from [google/fonts](https://github.com/google/fonts/tree/main/ofl/martianmono), at width 87.5 (`font-stretch: 87.5%`), in weights 400 and 500 only. Keep its licence, `fonts/MartianMono-OFL.txt`, with every copy of the font. This repository holds the licence, not the font.
+**Martian Mono** (SIL OFL 1.1, by Evil Martians) is the brand face, used for the wordmark, code and site headings. Use the variable font, `MartianMono[wdth,wght].ttf` from [google/fonts](https://github.com/google/fonts/tree/main/ofl/martianmono), at width 87.5 (`font-stretch: 87.5%`), in weights 400 and 500 only. Keep its licence, `fonts/MartianMono-OFL.txt`, with every copy of the font. The brand kit holds the licence, not the font; the macOS app bundles the font with a copy of the licence (`apps/macos/Packages/EnvCloakDesign/Sources/EnvCloakDesign/Resources/Fonts/`, docs/APP.md "Design tokens").
 
 | Where | Face | Notes |
 |---|---|---|
