@@ -809,7 +809,9 @@ jobs:
         run: python3 scripts/macos/tests/test_project_settings.py
       - name: sign-check's fixtures (gate 19 for the bundle)
         run: python3 scripts/macos/tests/test_sign_check.py
-      - name: build-app.sh keeps the previous app when a replacement fails
+      - name: sign-check's policy on modeled codesign and lipo answers
+        run: python3 scripts/macos/tests/test_sign_check_policy.py
+      - name: build-app.sh keeps the previous app and leaves nothing behind, however it stops
         run: python3 scripts/macos/tests/test_build_swap.py
       - name: check-sources.sh --swift's fixtures
         run: python3 scripts/macos/tests/test_check_sources_swift.py
