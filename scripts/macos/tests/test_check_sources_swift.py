@@ -310,6 +310,18 @@ class CompiledSources(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("its output file map does not name the files its Swift file list does", out)
 
+    def test_a_map_that_gives_a_file_no_object_is_refused(self):
+        # Without its object, what the file compiled to could not be told
+        # from any other object in the link list.
+        fx = Fixture(self.base)
+        fx.check()
+        path = os.path.join(fx.objects_dir("EnvCloak"), "EnvCloak-OutputFileMap.json")
+        with open(path, "w") as f:
+            json.dump({fx.product: {"swift-dependencies": os.path.join(fx.objects_dir("EnvCloak"), "App.swiftdeps")}}, f)
+        code, out = run([sys.executable, COMPARE, fx.derived, os.path.join(fx.dir, "listing")], env=fx.env)
+        self.assertEqual(code, 1, out)
+        self.assertIn("its output file map gives %s no object" % fx.product, out)
+
     # ------------------------------------------- what the linker read
 
     def test_a_library_from_outside_the_sdk_is_refused(self):
@@ -370,6 +382,13 @@ class CompiledSources(unittest.TestCase):
         fx = Fixture(self.base)
         fx.lists = {}
         self.refused(fx, "no Swift file list")
+
+    def test_an_empty_listing_is_refused(self):
+        # A check-swift.sh that listed nothing is a broken listing, said as
+        # such, whatever else the build shows.
+        fx = Fixture(self.base)
+        fx.listing = {}
+        self.refused(fx, "check-swift.sh listed no Swift file")
 
     def test_a_listing_without_classes_is_refused(self):
         fx = Fixture(self.base)
