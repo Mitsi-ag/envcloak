@@ -14,7 +14,11 @@
 //!   the outer terminal; there is no other way out for the command's
 //!   bytes, and no fallback to passing them through. A slow reader slows
 //!   the command: at most [`OUTPUT_LIMIT`] released bytes wait for it
-//!   before the master side is not read.
+//!   before the master side is not read, while the command runs. Once it
+//!   has exited, the master side is read on whatever the reader does, up
+//!   to [`EXIT_READ_LIMIT`] more, far more than a PTY holds, so the PTY
+//!   reaches its end however slow the reader, and what was read is then
+//!   delivered at the reader's pace (the verifier's review of M2-19).
 //! - **Input.** The outer terminal is in raw mode for the run
 //!   (`TerminalGuard`), so every key reaches the command's terminal as a
 //!   byte: a typed Ctrl-C is a byte the slave's line discipline turns into
@@ -46,14 +50,22 @@
 //!   exits: the session ends (`SessionMonitor::end_channel`). The kernel
 //!   sends the terminal's foreground group, the command's with whatever it
 //!   left in it, SIGHUP; macOS also revokes the terminal for every process
-//!   still holding it. Output is read until the end of the stream, or for
-//!   [`crate::DRAIN_LIMIT`] (2 seconds) from the exit while a descendant
-//!   still holds the slave (on Linux, one that ignores SIGHUP): then the
+//!   still holding it. Output is read until the end of the stream, and
+//!   what was read is then delivered at the reader's pace, however slow;
+//!   only while a descendant still holds the slave (on Linux, one that
+//!   ignores SIGHUP) [`crate::DRAIN_LIMIT`] (2 seconds) from the exit, the
 //!   master side is closed, what the outer terminal does not take at once
 //!   is given up, and what the descendant writes later is lost, never
-//!   passed through. A SIGINT, SIGQUIT, SIGTERM or SIGHUP caught after the
-//!   exit stops the run at once (128 plus its number). The outer terminal
-//!   gets its settings back (`TCSAFLUSH`) and the monitor is reaped.
+//!   passed through. The master side not at its end by then is that case:
+//!   the relay has read on since the exit, and what a PTY no process
+//!   holds still has in it is far less than it reads. A SIGINT, SIGQUIT,
+//!   SIGTERM or SIGHUP caught after the exit stops the run at once (128
+//!   plus its number). The outer terminal gets its settings back
+//!   (`TCSAFLUSH`) and the monitor is reaped. Then the four get their
+//!   dispositions from before the run back, and one caught before that
+//!   and not read yet (during the last write, or while the monitor was
+//!   reaped) still decides the result (Codex's review of M2-19): no signal
+//!   is caught and then left unread.
 //! - **A lost monitor.** When the monitor's channel ends before it
 //!   reported an exit (the monitor died: the kernel hangs the session up,
 //!   SIGHUP to the command's group), the outer terminal is restored, the
@@ -93,8 +105,17 @@ const CHUNK: usize = 64 * 1024;
 /// the command to take them.
 pub const INPUT_CHUNK: usize = 4096;
 /// Released bytes that may wait for the outer terminal's reader before the
-/// master side is no longer read.
+/// master side is no longer read, while the command runs.
 pub const OUTPUT_LIMIT: usize = 64 * 1024;
+/// How many more released bytes may wait once the command has exited (or
+/// its monitor is gone): the master side is read on for them whatever the
+/// reader does, so a PTY that no process holds any more reaches its end
+/// and what it held is delivered at the reader's pace rather than given up
+/// at the cutoff. Far more than a PTY holds with nobody reading it
+/// (measured: 1 KiB on macOS 26.4, 12 KiB on Linux 6.12; `pty_relay.rs`
+/// checks the system it runs on), so only output a descendant keeps
+/// writing after the exit fills it.
+pub const EXIT_READ_LIMIT: usize = 1024 * 1024;
 /// How long the suspension waits for the outer terminal's reader to take
 /// what the command wrote before it stopped.
 const FLUSH_WAIT: Duration = Duration::from_secs(2);
@@ -216,7 +237,44 @@ pub(crate) fn run(
     // the command running; the panic hook restores the terminal.
     envcloak_sys::panic_point("exec.pty.relay");
     let ended = relay.relay();
-    relay.finish(ended)
+    if matches!(ended, Ok(End::Exited(_))) {
+        // A test build stops here on request: the output delivered, the
+        // result not chosen yet (M2-19's boundary gate).
+        envcloak_sys::pause_point("exec.pty.ended");
+    }
+    let result = relay.finish(ended);
+    let mut signals = signals;
+    after_the_boundary(&mut signals, result)
+}
+
+/// The line drawn before the run's result is chosen (Codex's review of
+/// M2-19): the four signals get their dispositions from before the run
+/// back, so one sent from now on acts as it would have without the run's
+/// relay, and one caught before and not read yet (while the last output
+/// was written, at the cutoff, or while the monitor was reaped: after the
+/// exit, every time) stops the run as one read in the loop does, 128 plus
+/// its number. The outer terminal is restored already. A failure, or a run
+/// a signal stopped already, stays as it is.
+fn after_the_boundary(
+    signals: &mut SignalRelay,
+    result: Result<ChildExit, ExecError>,
+) -> Result<ChildExit, ExecError> {
+    signals.restore_dispositions();
+    let mut late = None;
+    while let Ok(Some(caught)) = signals.try_next() {
+        if let Relayed::Signal { number, .. } = caught {
+            if let PtyAct::Stop(sig) = pty_act(number, true, 0) {
+                late.get_or_insert(sig);
+            }
+        }
+    }
+    match (result, late) {
+        (
+            Ok(ChildExit::Code(_) | ChildExit::Signal(_)) | Err(ExecError::MonitorLost),
+            Some(sig),
+        ) => Ok(ChildExit::Stopped(sig)),
+        (result, _) => result,
+    }
 }
 
 /// The relay's state: see the module documentation.
@@ -261,6 +319,23 @@ impl Relay<'_, '_> {
     /// Whether the command has exited or its monitor is gone.
     fn ended(&self) -> bool {
         self.exit.is_some() || self.lost
+    }
+
+    /// How many released bytes may wait for the outer terminal before the
+    /// master side is not read: [`OUTPUT_LIMIT`] while the command runs,
+    /// and [`EXIT_READ_LIMIT`] more once it has ended, so a PTY no process
+    /// holds is read to its end however slow the reader.
+    fn read_limit(&self) -> usize {
+        if self.ended() {
+            OUTPUT_LIMIT + EXIT_READ_LIMIT
+        } else {
+            OUTPUT_LIMIT
+        }
+    }
+
+    /// Whether the master side is to be read now.
+    fn reading_master(&self) -> bool {
+        self.master_state == Master::Open && self.out.len() < self.read_limit()
     }
 
     /// The loop: until the command has ended and its output is read and
@@ -317,7 +392,7 @@ impl Relay<'_, '_> {
         .flatten()
         .min()
         .map(|d| d.saturating_duration_since(now));
-        let reading_master = self.master_state == Master::Open && self.out.len() < OUTPUT_LIMIT;
+        let reading_master = self.reading_master();
         let keys_waiting = self.keys_at < self.keys_len;
         // Passed only when it is read or written: a hang-up is reported
         // whatever is asked, and would wake a loop with nothing to do.
@@ -489,9 +564,9 @@ impl Relay<'_, '_> {
     }
 
     /// Reads what the master side has, through the redactor, until it
-    /// would wait, its end, or [`OUTPUT_LIMIT`] released bytes wait.
+    /// would wait, its end, or the read limit ([`Relay::read_limit`]).
     fn read_master(&mut self) {
-        while self.master_state == Master::Open && self.out.len() < OUTPUT_LIMIT {
+        while self.reading_master() {
             let Some(mut m) = self.master.as_ref() else {
                 return;
             };
@@ -520,9 +595,11 @@ impl Relay<'_, '_> {
         self.flush_at = None;
     }
 
-    /// The cutoff: the master side is closed, so what a descendant writes
+    /// The cutoff, 2 seconds after the exit with a descendant still holding
+    /// the slave: the master side is closed, so what the descendant writes
     /// later is lost; what the redactor held back is released, redacted,
-    /// and the outer terminal is given what it takes at once.
+    /// and the outer terminal is given what it takes at once (SPEC §6.1
+    /// step 8: a write the reader has not taken by then is given up).
     fn cut(&mut self) {
         self.master_state = Master::Cut;
         self.master = None;

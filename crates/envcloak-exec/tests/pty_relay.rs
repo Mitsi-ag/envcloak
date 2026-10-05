@@ -48,7 +48,10 @@ use std::time::{Duration, Instant};
 
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::Slug;
-use envcloak_exec::{ExecError, Label, OuterTerminal, RunSpec, ShortPolicy, build_pty_redactor};
+use envcloak_exec::{
+    DRAIN_LIMIT, EXIT_READ_LIMIT, ExecError, Label, OUTPUT_LIMIT, OuterTerminal, RunSpec,
+    ShortPolicy, build_pty_redactor,
+};
 use envcloak_policy::EnvName;
 use envcloak_sys::pty::open_pty;
 use envcloak_sys::{TerminalSettings, WindowSize, set_window_size, wait_any};
@@ -177,6 +180,18 @@ fn main() {
             (
                 "a_grandchild_holding_the_terminal_is_cut_off_2_s_after_the_exit",
                 a_grandchild_holding_the_terminal_is_cut_off_2_s_after_the_exit,
+            ),
+            (
+                "a_slow_reader_gets_everything_a_command_wrote_before_it_exited",
+                a_slow_reader_gets_everything_a_command_wrote_before_it_exited,
+            ),
+            (
+                "a_pty_holds_far_less_than_the_relay_reads_after_the_exit",
+                a_pty_holds_far_less_than_the_relay_reads_after_the_exit,
+            ),
+            (
+                "a_sigterm_caught_after_the_last_output_still_ends_the_run_with_143",
+                a_sigterm_caught_after_the_last_output_still_ends_the_run_with_143,
             ),
             (
                 "a_panic_that_aborts_leaves_the_outer_terminal_as_it_was",
@@ -479,6 +494,30 @@ while time.monotonic() < end and not os.path.exists(stop):
     i += 1
     time.sleep(0.02)
 "#;
+
+/// `writer.py RECORD VAR`: numbered lines (every 97th holding the
+/// variable's value) written to a non-blocking standard output as fast as
+/// it takes them, until a write has waited a second for room (the runner
+/// holds all it may for a reader that reads nothing); then the bytes and
+/// whole lines written go to RECORD, and it exits 0.
+const SLOW_WRITER: &str = r"import fcntl, os, select, sys
+record, var = sys.argv[1], sys.argv[2]
+value = os.environb[var.encode()]
+fl = fcntl.fcntl(1, fcntl.F_GETFL)
+fcntl.fcntl(1, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+data = b''.join(b'line %06d %s\n' % (i, value if i % 97 == 0 else b'-' * 40) for i in range(20000))
+at = 0
+while at < len(data):
+    try:
+        at += os.write(1, data[at:at + 4096])
+    except BlockingIOError:
+        _, w, _ = select.select([], [1], [], 1.0)
+        if not w:
+            break
+with open(record + '.tmp', 'w') as f:
+    f.write('%d %d\n' % (at, data[:at].count(b'\n')))
+os.rename(record + '.tmp', record)
+";
 
 /// Writes the value of argv[1] three bytes at a time with a pause between
 /// pieces, then `ECHO-START`, then copies its input to its output until
@@ -2235,6 +2274,150 @@ exit 4
     // The descendant, given its stop, ends.
     let gone = outer.wait_for_within(DEADLINE, |_| ended.exists());
     assert!(gone, "the descendant did not end");
+}
+
+/// The verifier's review of M2-19: a command writes more than the runner
+/// may hold for its reader while it runs ([`OUTPUT_LIMIT`]), and exits,
+/// while the reader reads nothing until longer than the cutoff after the
+/// exit. No process holds the PTY any more, so nothing is given up: the
+/// runner reads on after the exit whatever the reader does, the PTY ends,
+/// and every line the command wrote arrives, redacted, at the reader's
+/// pace, with the command's status.
+///
+/// Mutation checked: read no further than `OUTPUT_LIMIT` after the exit
+/// (the read limit before the review): the PTY never reaches its end, the
+/// cutoff gives up what the reader had not taken (about 1 KiB arrived of
+/// 67 KiB in the verifier's run), and this fails.
+fn a_slow_reader_gets_everything_a_command_wrote_before_it_exited() {
+    let case = Case::new();
+    let writer = case.script("writer.py", SLOW_WRITER);
+    let record = case.path("wrote");
+    let mut outer = Outer::new(24, 80);
+    let python = python3();
+    let argv = case.runner_argv(
+        &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        &[],
+        &[
+            python.as_os_str(),
+            writer.as_os_str(),
+            record.as_os_str(),
+            OsStr::new("OPENAI_API_KEY"),
+        ],
+    );
+    let mut run = Running {
+        child: lead(&case, &outer, &argv, &[]),
+    };
+    // The reader reads nothing while the command writes, nor until the
+    // cutoff has long passed after its exit: the scenario itself, an idle
+    // reader, not a wait for something to happen.
+    let end = Instant::now() + DEADLINE;
+    while !record.exists() {
+        assert!(Instant::now() < end, "the command never finished writing");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(DRAIN_LIMIT + Duration::from_secs(1));
+    let status = outer.wait_exit(&mut run.child, DEADLINE);
+    let wrote = std::fs::read_to_string(&record).unwrap();
+    let mut words = wrote
+        .split_whitespace()
+        .map(|w| w.parse::<usize>().unwrap());
+    let (bytes, lines) = (words.next().unwrap(), words.next().unwrap());
+    println!(
+        "pty slow reader ({}): the command wrote {bytes} bytes ({lines} whole lines; the \
+         runner holds {OUTPUT_LIMIT} for a reader while it runs) and exited; {} bytes arrived",
+        std::env::consts::OS,
+        outer.seen.len()
+    );
+    assert_eq!(status.code(), Some(0), "{}", outer.text());
+    let mut missing = Vec::new();
+    for i in 0..lines {
+        if outer.count(&format!("line {i:06} ")) != 1 {
+            missing.push(i);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {lines} lines did not arrive once (first {:?})",
+        missing.len(),
+        missing.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outer.count(&marker(labels::OPENAI_API_KEY)),
+        lines.div_ceil(97),
+        "{}",
+        outer.text()
+    );
+    case.assert_clean(&outer.seen);
+}
+
+/// What a PTY holds with nobody reading its master side, on the system
+/// this runs on (a non-blocking writer fills its slave side until a write
+/// would wait): far less than what the relay reads on after the command's
+/// exit ([`EXIT_READ_LIMIT`]), so a PTY no process holds always reaches
+/// its end. docs/RUN.md's figures come from here.
+fn a_pty_holds_far_less_than_the_relay_reads_after_the_exit() {
+    let pty = open_pty(None, None).unwrap();
+    envcloak_sys::set_nonblocking(pty.slave.as_fd()).unwrap();
+    let slave = File::from(pty.slave);
+    let mut held = 0usize;
+    for size in [4096, 1] {
+        let chunk = vec![b'x'; size];
+        loop {
+            match (&slave).write(&chunk) {
+                Ok(n) => held += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+            assert!(held <= EXIT_READ_LIMIT, "the PTY took {held} bytes");
+        }
+    }
+    println!(
+        "pty capacity ({}): {held} bytes with nobody reading",
+        std::env::consts::OS
+    );
+    assert!(held > 0);
+    assert!(held * 16 <= EXIT_READ_LIMIT, "{held}");
+    drop(pty.master);
+}
+
+/// Codex's review of M2-19: a SIGTERM caught once the output has been
+/// delivered, before the run's result is chosen (the runner held there,
+/// `exec.pty.ended`), still ends the run with 128 plus its number (or, had
+/// it come after the line the runner draws, by SIGTERM itself), never with
+/// the command's status; the outer terminal is restored.
+///
+/// Mutation checked: choose the result without reading the signals caught
+/// since the loop's last look (`after_the_boundary` returning the result
+/// as it is): the run exits 3, and this fails.
+fn a_sigterm_caught_after_the_last_output_still_ends_the_run_with_143() {
+    let case = Case::new();
+    let release = case.path("go");
+    let mut outer = Outer::new(24, 80);
+    let before = outer.settings();
+    let argv = case.runner_argv(
+        &[],
+        &[],
+        &[
+            OsStr::new("/bin/sh"),
+            OsStr::new("-c"),
+            OsStr::new("echo LAST-LINE; exit 3"),
+        ],
+    );
+    let mut run = Running {
+        child: detach(&case, &outer, &argv, &pause_env("exec.pty.ended", &release)),
+    };
+    outer.expect("paused at exec.pty.ended", 1, "the runner held its result");
+    assert_eq!(outer.count("LAST-LINE"), 1, "{}", outer.text());
+    run.signal(libc::SIGTERM);
+    std::fs::write(&release, b"").unwrap();
+    let status = outer.wait_exit(&mut run.child, DEADLINE);
+    assert!(
+        status.code() == Some(143) || status.signal() == Some(libc::SIGTERM),
+        "{status:?}: {}",
+        outer.text()
+    );
+    assert!(outer.settings().same_as(&before), "the outer terminal");
 }
 
 /// A panic in the relay, with the outer terminal raw and the command
