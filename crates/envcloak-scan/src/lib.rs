@@ -31,11 +31,15 @@
 //!
 //! Nothing here logs, and no error carries text from a file.
 
-pub mod candidates;
-pub mod profile;
+pub mod agent_config;
+pub mod sources;
+pub use agent_config::scan_config_sources;
 pub mod atomic;
+pub mod candidates;
 pub mod delete;
 pub mod dotenv;
+mod json;
+pub mod profile;
 pub mod restore;
 pub mod root;
 pub mod source;

@@ -33,6 +33,8 @@ pub enum ConfigFormat {
 /// What kind of store a source is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SourceKind {
+    /// Provider keys in an approved config, inspected but never migrated as MCP.
+    ProviderConfig,
     /// An agent's MCP server configuration (or a settings file that can
     /// carry one).
     McpConfig,

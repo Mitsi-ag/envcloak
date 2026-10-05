@@ -197,6 +197,8 @@ The prompt check misses: a key made of words and separators that no provider pat
 | OpenCode | `<project>/opencode.json` | project MCP configuration |
 | OpenCode | `~/.local/share/opencode/auth.json` | its provider credentials (reported, not migrated) |
 | Goose | `~/.config/goose/config.yaml` | MCP configuration (YAML, reported) |
+| CodexBar | `~/.config/codexbar/config.json` | Provider configuration (inspected, never migrated as MCP) |
+| CodexBar | `~/.codexbar/config.json` | Legacy provider configuration (inspected, never migrated as MCP) |
 <!-- /catalog -->
 
 ## Claude Code plugin
@@ -301,3 +303,9 @@ Claude Code checks its deny rules before any hook, and `Read(**/.env*)` matches 
 | The project scope, each host's file, Codex's budget | `crates/envcloak-cli/tests/agents.rs` (`the_project_scope_writes_where_each_host_reads_instructions`: a lone `CLAUDE.md` gets an `AGENTS.md` for Codex unless Codex reads `CLAUDE.md` itself or only Claude Code is asked for, an override written nowhere and said so; `the_codex_block_ends_within_what_codex_reads`: past 32 KiB at the top, no room refused, a smaller `project_doc_max_bytes` read; `a_projects_shared_block_stays_for_the_host_still_installed`: uninstall for one host keeps a block another was installed to read, dry run and run), `crates/envcloak-agents/tests/project_hosts.rs` (each host its own file, one file both read, one host then the other, a record made before the hosts were kept) |
 | SPEC §5: nothing read under a tracer | `crates/envcloak-cli/tests/hook.rs` (`linux_a_traced_hook_reads_nothing`: the payload unread, the prompt and the tool call stopped as `traced`), `crates/envcloak-cli/tests/agents.rs` (`linux_traced_agents_commands_read_no_config`: install, uninstall and status) |
 | D-02, F-75: the scanner's descriptors and the one-way graph | `crates/envcloak-agents/tests/catalog_graph.rs` (and `every_store_the_hosts_write_has_a_source`: the catalog against the test kit's store list; `every_documented_store_has_a_source_and_every_source_a_row`: against the table above, both ways, credential stores by kind; `codex_settings_that_move_its_stores_are_read`), `crates/envcloak-agents/src/locations.rs` (`every_documented_variable_moves_its_stores`), `scripts/check-crate-graph.py` |
+
+CodexBar inspection includes both the XDG and legacy config paths, plus an absolute
+`CODEXBAR_CONFIG` override when supplied. The parser recognizes provider `apiKey`,
+`cookieHeader` and account `token` fields. These paths and fields follow
+[CodexBar configuration](https://github.com/steipete/CodexBar/blob/main/docs/configuration.md);
+this is a documentation-derived fixture, not a measured CodexBar runtime.
