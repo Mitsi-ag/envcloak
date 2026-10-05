@@ -15,6 +15,13 @@ object identifiers are not report fields. Input-holding types have value-free
 Debug implementations. A consumer must treat an error or an incomplete report
 as incomplete, even if another file produced findings.
 
+Below each approved root, reads use held directory descriptors and no-follow,
+nonblocking opens; traversal never crosses mount points. Only regular files
+owned by the current user are read. Symlinks, non-regular files and unreadable
+paths are reported. Hard links are reported even when their contents can be
+read, and do not grant modification permission. Profile and config files have
+a 1 MiB cap.
+
 Profiles cover the seven conventional shell files, literal `source`/`.` paths
 within the supplied home root, at most four source edges and 64 readable files.
 Only `$HOME` and `~` path prefixes expand. Assignments never execute. Dollar or
@@ -76,5 +83,4 @@ real git objects, and the pinned Claude Code and Codex CLIs and transcript
 stores. CodexBar is a documentation-derived fixture. Bounded proptest targets
 cover profile, config and transcript parsers; the milestone hardening task owns
 longer fuzz campaigns. Gate 11 uses the production wiping allocator, including
-library TOML parsing and its failure paths. Named mutations and local results
-are recorded in the M2-12 handoff.
+library TOML parsing and its failure paths.
