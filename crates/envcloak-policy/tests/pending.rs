@@ -137,6 +137,7 @@ fn request(subject: SubjectEvidence, argv: &str, item: &(ItemId, FieldId)) -> Ac
         mode: Mode::Inject,
         argv_display: vec![argv.to_owned()],
         new_project: false,
+        managed: None,
     }
 }
 

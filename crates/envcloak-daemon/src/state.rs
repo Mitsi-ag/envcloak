@@ -1186,6 +1186,7 @@ mod tests {
             mode: Mode::Inject,
             argv_display: vec!["./emit".to_owned()],
             new_project: false,
+            managed: None,
         }
     }
 
