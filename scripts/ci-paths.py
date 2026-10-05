@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Which of CI's M2 agent jobs a pull request needs (M2 plan §6, task M2-04).
+"""Which of CI's path-filtered jobs a pull request needs (M2 plan §6, task
+M2-04; M3 plan §5 rule 8, task M3-02).
 
 Reads the paths a pull request changes, one per line, on standard input,
-and prints `gates=true|false` and `agents=true|false` for $GITHUB_OUTPUT:
+and prints `gates=true|false`, `agents=true|false` and `app=true|false`
+for $GITHUB_OUTPUT:
 
 - `gates` (the story steps in crates/envcloak-e2e/tests/m2_story/ with the
   pinned hosts) runs when anything they build or drive changes: any crate,
@@ -15,6 +17,14 @@ and prints `gates=true|false` and `agents=true|false` for $GITHUB_OUTPUT:
   host tests, fixtures and pins, envcloak-testkit (the agent harness, the
   sweep and the scripted model's wrapper), the workspace manifests and
   lockfile, the installer and this workflow.
+- `app` (`macos-app`, the macOS app; M3 plan §5 rule 8, task M3-02) runs
+  when the app or its scripts change (apps/macos/, scripts/macos/), when
+  the daemon side the app talks to does (envcloak-ipc, envcloak-daemon,
+  envcloak-sys, envcloak-core, and the CLI's `ref`, `add`, `approve` and
+  `status` commands), when the brand files the app links do
+  (assets/brand/), when the documents its tests read do (docs/APP.md's
+  token table, docs/BRAND.md), and when check-sources.sh, this script or
+  the workflow do.
 
 `--self-test` checks representative paths against both answers and exits
 non-zero on any difference; CI runs it before using the answers.
@@ -38,6 +48,17 @@ AGENTS = HARNESS + [
     r"^crates/envcloak-mcp/",
     r"^integrations/",
 ]
+APP = [
+    r"^apps/macos/",
+    r"^scripts/macos/",
+    r"^crates/envcloak-(?:ipc|daemon|sys|core)/",
+    r"^crates/envcloak-cli/src/cmd/(?:ref_|add|approve[^/]*|status)\.rs$",
+    r"^assets/brand/",
+    r"^docs/(?:APP|BRAND)\.md$",
+    r"^scripts/check-sources\.sh$",
+    r"^scripts/ci-paths\.py$",
+    r"^\.github/workflows/ci\.yml$",
+]
 
 
 def needs(paths, patterns):
@@ -46,7 +67,7 @@ def needs(paths, patterns):
 
 
 def answers(paths):
-    return {"gates": needs(paths, GATES), "agents": needs(paths, AGENTS)}
+    return {"gates": needs(paths, GATES), "agents": needs(paths, AGENTS), "app": needs(paths, APP)}
 
 
 # (path, gates, agents)
@@ -84,18 +105,58 @@ CASES = [
 ]
 
 
+# (path, app)
+APP_CASES = [
+    ("apps/macos/EnvCloak/App/EnvCloakApp.swift", True),
+    ("apps/macos/EnvCloak.xcodeproj/project.pbxproj", True),
+    ("apps/macos/Packages/EnvCloakDesign/Sources/EnvCloakDesign/Tokens.swift", True),
+    ("scripts/macos/build-app.sh", True),
+    ("scripts/macos/tests/test_sign_check.py", True),
+    ("crates/envcloak-ipc/src/proto.rs", True),
+    ("crates/envcloak-daemon/src/server.rs", True),
+    ("crates/envcloak-sys/src/peer.rs", True),
+    ("crates/envcloak-core/src/vault/items.rs", True),
+    ("crates/envcloak-cli/src/cmd/ref_.rs", True),
+    ("crates/envcloak-cli/src/cmd/add.rs", True),
+    ("crates/envcloak-cli/src/cmd/approve.rs", True),
+    ("crates/envcloak-cli/src/cmd/approve_unlocker.rs", True),
+    ("crates/envcloak-cli/src/cmd/status.rs", True),
+    ("assets/brand/motion/swiftui/EnvCloakMotion.swift", True),
+    ("assets/brand/icon/EnvCloak.icon/icon.json", True),
+    ("docs/APP.md", True),
+    ("docs/BRAND.md", True),
+    ("scripts/check-sources.sh", True),
+    ("scripts/ci-paths.py", True),
+    (".github/workflows/ci.yml", True),
+    ("crates/envcloak-cli/src/cmd/run.rs", False),
+    ("crates/envcloak-cli/src/cmd/addendum/x.rs", False),
+    ("crates/envcloak-cli/tests/add.rs", False),
+    ("crates/envcloak-agents/src/lib.rs", False),
+    ("crates/envcloak-e2e/tests/agent_hosts.rs", False),
+    ("docs/SPEC.md", False),
+    ("scripts/check-unsafe.sh", False),
+    ("apps/linux/README.md", False),
+    ("Cargo.lock", False),
+]
+
+
 def self_test():
     bad = 0
     for path, gates, agents in CASES:
         got = answers([path])
-        if got != {"gates": gates, "agents": agents}:
+        if (got["gates"], got["agents"]) != (gates, agents):
             print("ci-paths: %s: gates=%s agents=%s, want gates=%s agents=%s"
                   % (path, got["gates"], got["agents"], gates, agents), file=sys.stderr)
             bad += 1
-    if answers([]) != {"gates": False, "agents": False}:
+    for path, app in APP_CASES:
+        got = answers([path])["app"]
+        if got != app:
+            print("ci-paths: %s: app=%s, want app=%s" % (path, got, app), file=sys.stderr)
+            bad += 1
+    if answers([]) != {"gates": False, "agents": False, "app": False}:
         print("ci-paths: no changed path must need nothing", file=sys.stderr)
         bad += 1
-    print("ci-paths: self-test %s (%d cases)" % ("failed" if bad else "ok", len(CASES)))
+    print("ci-paths: self-test %s (%d cases)" % ("failed" if bad else "ok", len(CASES) + len(APP_CASES)))
     return 1 if bad else 0
 
 
