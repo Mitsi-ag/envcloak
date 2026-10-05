@@ -76,6 +76,9 @@ STRIPE_SECRET_KEY = \"stripe/acme-test\"
 /// daemon with the vault unlocked, and the project.
 struct Fixture {
     cs: Vec<Canary>,
+    /// The seed `cs` was made from, which a [`live_child`] makes them
+    /// from again.
+    seed: u64,
     home: TestHome,
     d: Daemon,
     manifest: String,
@@ -84,7 +87,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         common::terminal_session();
-        let cs = canaries(fresh_seed());
+        let seed = fresh_seed();
+        let cs = canaries(seed);
         let home = TestHome::new();
         let kit = seed_vault(&home, &cs);
         let mut cs = cs;
@@ -94,6 +98,7 @@ impl Fixture {
         let manifest = project(&home, "acme-web", MANIFEST);
         let mut f = Fixture {
             cs,
+            seed,
             home,
             d,
             manifest: manifest.to_str().unwrap().to_owned(),
@@ -198,21 +203,32 @@ fn ticking(names: &[&str], uses: Uses) -> ApprovalOptions {
     }
 }
 
-/// Set in the environment of [`live_child`]: its mode (`agent` or
-/// `unknown`), the daemon's run directory and the manifest's path, a line
-/// each.
+/// Set in the environment of [`live_child`]: its mode (`agent`,
+/// `unknown`, `ancestry` or `plain`), the daemon's run directory, the
+/// manifest's path and the canaries' seed, a line each.
 const CHILD_ENV: &str = "ENVCLOAK_TEST_LIVE_CHILD";
+/// Set for an `ancestry` [`live_child`]: the path of `fixture-agent`.
+const CHILD_AGENT: &str = "ENVCLOAK_TEST_LIVE_AGENT";
 
 /// Runs only as a child of a test here: this test binary again, in
 /// another tree. `agent` leads a session on a pseudo-terminal of its own
 /// and claims Claude Code's marker, so the daemon takes it for an agent by
 /// its claims; `unknown` leads a session without a terminal, as a service
-/// manager's job or a command that forked out and called `setsid` does. It
-/// prints `ready`, then answers each line on its standard input, the
-/// `--ref` bindings separated by spaces (none on an empty line), with
-/// `answer=covered`, `answer=pending <id>`, `answer=denied <reason>` or
-/// `answer=error <kind>`, and `proposals=<json>`. A covered answer's
-/// values are dropped, and wiped, unprinted.
+/// manager's job or a command that forked out and called `setsid` does;
+/// `ancestry` leads a session on a pseudo-terminal of its own and runs
+/// `fixture-agent` (which the builtin catalog knows) with this binary
+/// again in `plain` mode, which claims nothing: an agent by its ancestry
+/// alone, with no marker. It prints `ready`, then answers each line on its
+/// standard input, the `--ref` bindings separated by spaces (none on an
+/// empty line), with `answer=covered`, `answer=pending <id>`,
+/// `answer=denied <reason>` or `answer=error <kind>`, and
+/// `proposals=<json>`. A line `reclassify <slug> <to>` instead asks
+/// `items.reclassify` over the socket, with the item's id from
+/// `items.show` and the vault passphrase as the proof, and answers
+/// `answer=<classification>` or `answer=error <kind>`, and `proposals=[]`;
+/// a line `check <id>` asks `approve` of that request without a
+/// passphrase (the CLI's check), with no tick, and answers the same way.
+/// A covered answer's values are dropped, and wiped, unprinted.
 #[test]
 fn live_child() {
     let Some(spec) = std::env::var_os(CHILD_ENV) else {
@@ -220,10 +236,11 @@ fn live_child() {
     };
     let spec = spec.into_string().unwrap();
     let mut lines = spec.lines();
-    let (mode, run_dir, manifest) = (
+    let (mode, run_dir, manifest, seed) = (
         lines.next().unwrap(),
         lines.next().unwrap(),
         lines.next().unwrap(),
+        lines.next().unwrap().parse::<u64>().unwrap(),
     );
     let claims = match mode {
         "agent" => {
@@ -234,12 +251,63 @@ fn live_child() {
             envcloak_sys::testing::setsid().unwrap();
             Vec::new()
         }
+        "ancestry" => {
+            common::terminal_session();
+            let status = Command::new(std::env::var_os(CHILD_AGENT).unwrap())
+                .arg("--")
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", "live_child", "--nocapture", "--test-threads=1"])
+                .env(CHILD_ENV, spec.replacen("ancestry", "plain", 1))
+                .status()
+                .unwrap();
+            std::process::exit(status.code().unwrap_or(1));
+        }
+        "plain" => Vec::new(),
         other => panic!("unknown mode {other}"),
     };
     let paths = RunPaths::under(std::path::PathBuf::from(run_dir)).unwrap();
     println!("\nready");
     for line in std::io::stdin().lock().lines() {
         let line = line.unwrap();
+        if let Some(id) = line.strip_prefix("check ") {
+            let opts = ApprovalOptions {
+                uses: Uses::Session,
+                ttl_secs: 3600,
+                live: Vec::new(),
+            };
+            let said = match Client::connect(&paths)
+                .unwrap()
+                .approve_check(id, opts, &[0u8; 32], &claims)
+            {
+                Ok(_) => "approved".to_owned(),
+                Err(e) => format!("error {}", e.token()),
+            };
+            println!("\nanswer={said}\nproposals=[]");
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("reclassify ") {
+            let (slug, to) = rest.split_once(' ').unwrap();
+            let to = match to {
+                "test" => ClassificationView::Test,
+                "unknown" => ClassificationView::Unknown,
+                other => panic!("not a loosening: {other}"),
+            };
+            let mut c = Client::connect(&paths).unwrap();
+            let item = c.items_show(slug).unwrap();
+            let target = TargetView {
+                item,
+                field: None,
+                grants: 0,
+            };
+            let pass =
+                SecretBytes::copy_from(by_label(&canaries(seed), labels::VAULT_PASSPHRASE).value());
+            let said = match c.items_reclassify(&target, to, pass, &claims) {
+                Ok(done) => done.classification.as_str().to_owned(),
+                Err(e) => format!("error {}", e.token()),
+            };
+            println!("\nanswer={said}\nproposals=[]");
+            continue;
+        }
         let answer = Client::connect(&paths)
             .unwrap()
             .run_request(&RunRequestParams {
@@ -281,8 +349,14 @@ impl Requester {
             .args(["--exact", "live_child", "--nocapture", "--test-threads=1"])
             .env(
                 CHILD_ENV,
-                format!("{mode}\n{}\n{}", run_dir.to_str().unwrap(), f.manifest),
+                format!(
+                    "{mode}\n{}\n{}\n{}",
+                    run_dir.to_str().unwrap(),
+                    f.manifest,
+                    f.seed
+                ),
             )
+            .env(CHILD_AGENT, envcloak_testkit::testkit_bin("fixture-agent"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -783,6 +857,78 @@ fn live_to_test_needs_a_proof() {
     assert_eq!(f.shown(&id).bindings[0].classification, "test");
     f.approve(&id, ticking(&[], Uses::Once)).unwrap();
     drop(r);
+    f.sweep();
+}
+
+/// A loosening is a proof (SPEC §10b "Writes that need a proof"), so it is
+/// refused, before the passphrase is looked at, to every caller that may
+/// not give one, whatever it sends over the socket: an agent known by its
+/// ancestry alone, with no marker and no claim (`fixture-agent`, which the
+/// builtin catalog knows), and a caller with no terminal (a session of its
+/// own, as a service manager's job or a command that forked out and
+/// called `setsid`). Both destinations, `test` and `unknown`, each with
+/// the right passphrase: refused `proof_refused`, logged with the reason,
+/// no attempt counted, and the item still live. The approval check without
+/// a passphrase (M2-13) is refused to them the same way, before the
+/// request is looked at: the guard never runs for them, and nothing is
+/// audited as `live_refused`. The positive control: the
+/// same calls from the person's terminal session change it (in
+/// [`live_to_test_needs_a_proof`]), and the ancestry child is an agent
+/// to the daemon by its ancestry (its run request shows the catalog's
+/// agent).
+///
+/// Mutation (Codex, round 2): the loosening's origin check dropped
+/// (`prove` taking the proof from any caller): each call changes the item
+/// and this fails.
+#[test]
+fn a_loosening_is_refused_to_an_unmarked_agent_and_a_caller_without_a_terminal() {
+    let f = Fixture::new();
+    let failures = client(&f.home).status().unwrap().approvals.proof_failures;
+    for (mode, reason) in [("ancestry", "agent"), ("unknown", "no_terminal")] {
+        let mut r = Requester::start(&f, mode);
+        let id = r.pending(&["STRIPE_SECRET_KEY=stripe/acme-live"]);
+        if mode == "ancestry" {
+            // An agent to the daemon by its ancestry, with no claim.
+            let d = f.shown(&id);
+            assert_eq!(d.subject.kind, SubjectKind::Agent, "{d:?}");
+            assert!(
+                d.subject
+                    .label
+                    .as_deref()
+                    .is_some_and(|l| l.contains("fixture agent")),
+                "{d:?}"
+            );
+        }
+        let (answer, _) = r.ask(&[&format!("check {id}")]);
+        assert_eq!(answer, "error proof_refused", "{mode}");
+        for to in ["test", "unknown"] {
+            let (answer, _) = r.ask(&[&format!("reclassify stripe/acme-live {to}")]);
+            assert_eq!(answer, "error proof_refused", "{mode} {to}");
+            assert_eq!(
+                f.target("stripe/acme-live").item.classification,
+                ClassificationView::Live,
+                "{mode} {to}"
+            );
+        }
+        for method in ["items.reclassify", "approve"] {
+            assert!(
+                f.d.log()
+                    .contains(&format!("proof refused method={method} reason={reason} ")),
+                "{mode} {method}: {}",
+                f.d.log()
+            );
+        }
+        drop(r);
+    }
+    assert!(
+        !f.d.log().contains("reason=live_not_ticked"),
+        "{}",
+        f.d.log()
+    );
+    assert_eq!(
+        client(&f.home).status().unwrap().approvals.proof_failures,
+        failures
+    );
     f.sweep();
 }
 

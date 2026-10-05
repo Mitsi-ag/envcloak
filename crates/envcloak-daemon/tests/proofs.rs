@@ -6,7 +6,9 @@
 //! orphan and shows no agent, yet no person can type a proof there, so
 //! `unlock`, `approve` and `pending.get` are refused before the passphrase
 //! is looked at, and audited; so are `items.target`, `items.rotate` and
-//! `items.remove` (T11). That a request from such a caller is still
+//! `items.remove` (T11), and `items.reclassify` towards `test` or
+//! `unknown` (M2-13: a loosening is a proof). That a request from such a
+//! caller is still
 //! decided, and that its own `envcloak approve` gets no grant, is in
 //! `crates/envcloak-cli/tests/approve.rs`.
 //!
@@ -21,6 +23,7 @@ use std::time::Duration;
 
 use common::{client, passphrase, seed_vault, start};
 use envcloak_core::SecretBytes;
+use envcloak_core::vault::{Classification, LockedVault, VaultPaths};
 use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{ClassificationView, ItemClassView, ItemView, TargetView, VaultState};
@@ -82,6 +85,17 @@ fn a_caller_without_a_terminal_gives_no_proof() {
         )
         .unwrap_err();
     assert_eq!(rpc_kind(e), ErrorKind::ProofRefused);
+    // And so is the check `envcloak approve` sends without a passphrase
+    // (M2-13), before the live-key guard is looked at.
+    let e = c
+        .approve_check(
+            "ABCDEFGH",
+            ApprovalOptions::session(Duration::from_secs(60)),
+            &[0u8; 32],
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(rpc_kind(e), ErrorKind::ProofRefused);
     // A malformed id is still a malformed id.
     let e = c.pending_get("not an id", &[]).unwrap_err();
     assert_eq!(rpc_kind(e), ErrorKind::InvalidParams);
@@ -132,16 +146,51 @@ fn a_caller_without_a_terminal_gives_no_proof() {
     assert_eq!(rpc_kind(rotated.unwrap_err()), ErrorKind::ProofRefused);
     let removed = c.items_remove(&target, passphrase(&cs), &[]);
     assert_eq!(rpc_kind(removed.unwrap_err()), ErrorKind::ProofRefused);
+    // A loosening reclassification is a proof (M2-13), towards either
+    // destination, with the right passphrase.
+    for to in [ClassificationView::Test, ClassificationView::Unknown] {
+        let e = c
+            .items_reclassify(&target, to, passphrase(&cs), &[])
+            .unwrap_err();
+        assert_eq!(rpc_kind(e), ErrorKind::ProofRefused, "{to:?}");
+    }
     assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
     assert!(
-        d.wait_for_log("proof refused method=items.remove", Duration::from_secs(5)),
+        d.wait_for_log(
+            "proof refused method=items.reclassify",
+            Duration::from_secs(5)
+        ),
         "{}",
         d.log()
     );
     let log = d.log();
-    for method in ["items.target", "items.rotate", "items.remove"] {
+    for method in [
+        "items.target",
+        "items.rotate",
+        "items.remove",
+        "items.reclassify",
+    ] {
         assert!(refused_in_log(&log, method), "{method}: {log}");
     }
     assert_no_canary(&d.log_bytes(), &cs);
+    // The item is as it was: live, as the registry classified it, never
+    // reclassified by hand (its classification's time is its creation's,
+    // and the row was never written again).
+    d.signal("-TERM");
+    assert!(d.wait_exit(Duration::from_secs(30)).is_some());
+    let v = LockedVault::open(&VaultPaths::under(common::data_dir(&home)))
+        .unwrap()
+        .unlock_with_passphrase(&passphrase(&cs))
+        .map_err(|(_, e)| e)
+        .unwrap();
+    let item = v
+        .items()
+        .iter()
+        .find(|m| m.slug.as_str() == "openai/acme-web")
+        .unwrap();
+    assert_eq!(item.details.classification, Classification::Live);
+    assert_eq!(item.classification_changed_at, Some(item.created_at));
+    assert_eq!(item.updated_at, item.created_at);
+    drop(v);
     home.assert_clean(&cs);
 }
