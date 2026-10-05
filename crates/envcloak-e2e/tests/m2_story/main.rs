@@ -10,9 +10,13 @@
 //! - [`install`] (M2-08): `envcloak agents install` and `uninstall` on
 //!   configurations the pinned hosts' own CLIs wrote, and the hosts
 //!   loading what it wrote (the hooks' denials, K-01's socket allowance).
+//! - [`live_guard`] (M2-13): step S9, the live-key guard: Claude Code's
+//!   `envcloak run --profile live` held with the test item named, the
+//!   person's approval without the tick refused, and with it one use.
 #![allow(clippy::unwrap_used)]
 
 mod install;
+mod live_guard;
 mod mcp;
 mod skeleton;
 
