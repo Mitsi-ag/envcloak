@@ -27,13 +27,16 @@
 //!   revocation, root exit, epochs, the world's changes and the clock
 //!   (R-M2b-13, R-M2b-17).
 //!
-//! [`totp`] provides RFC 6238 and injected-clock arithmetic (M2b-03a).
+//! - [`totp`]: RFC 6238 and injected-clock step arithmetic (M2b-03a).
+//! - [`otpauth`]: bounded enrollment parsing into wiping values (M2b-03a).
+//!
 //! The contract's
 //! invariants are checked by exhaustive enumeration of event orderings in
 //! `tests/enumeration.rs`.
 
 pub mod authorization;
 pub mod operation;
+pub mod otpauth;
 pub mod scope;
 pub mod statement;
 pub mod status;

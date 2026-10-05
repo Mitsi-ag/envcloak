@@ -29,3 +29,4 @@ crates/envcloak-exec/src/coverage.rs         # hands a run's values to the redac
 crates/envcloak-exec/src/spawn.rs            # puts a run's values in the child's environment, and nowhere else
 crates/envcloak-agents/src/hook/payload.rs   # the hook handler reads a host's payload in place to decide; only the decision and fixed text leave it
 crates/envcloak-signin/src/totp.rs           # RFC 6238 reads a seed into HMAC; generated digits stay in SecretBytes, never formatting or I/O
+crates/envcloak-signin/src/otpauth.rs        # enrollment parsed in place and decoded into wiping buffers; only typed parameters and SecretBytes leave
