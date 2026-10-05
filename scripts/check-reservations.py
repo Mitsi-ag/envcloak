@@ -839,31 +839,36 @@ def unique_or_fail(src, what, items):
 
 
 def enum_arms(src, enum, fn, value, convert=lambda x: x):
-    """{variant: value} from every arm `Enum::A | Enum::B => <value>` (or
-    `Self::A`) in the bodies of `fn <fn>`, for every variant of `enum`:
-    a variant with no such arm, or with two, a value given to two variants
-    and an arm naming no variant are errors. `convert` turns the matched
-    text into the value, or None if it cannot."""
+    """{variant: value} from the arms `Enum::A | Enum::B => <value>` (or
+    `Self::A`) of `<enum>::<fn>`, for every variant of `enum`. The
+    function is read whole, as `match_arms` reads a decoder: its body is
+    `match self { .. }` and nothing else, and every arm is one the reader
+    reads, with no attribute and no guard, so no arm the reader counts is
+    compiled out or never taken, and no arm it does not count gives a
+    value (Codex's review of M3-01, the class of a mapping read in part).
+    A variant with no such arm, or with two, a value given to two variants,
+    an arm naming no variant and an arm of another form are errors.
+    `convert` turns the matched text into the value, or None if it
+    cannot."""
     variants = [v for v, _ in enum_variants(src, enum)]
-    impls = [(m.end() - 1, src.block_end(m.end() - 1)) for m in re.finditer(r"\bimpl\s+%s\s*\{" % enum, src.skel)]
-    pairs = []
-    for start, end in src.fn_bodies(fn):
-        # `Self::` names the enum only in its own `impl` block.
-        names = "(?:%s|Self)" % enum if any(a < start < b for a, b in impls) else enum
-        path = r"%s::[A-Z][A-Za-z0-9]*" % names
-        arm = re.compile(r"((?:%s\s*\|\s*)*%s)\s*=>\s*%s" % (path, path, value))
-        for m in arm.finditer(src.code, start, end):
-            x = convert(m.group(2))
-            if x is None:
-                raise SourceError("%s: `fn %s` gives `%s` a value the reader cannot read (`%s`)" % (src.rel, fn, m.group(1), m.group(2)))
-            # The literal is the arm's whole expression: what follows it is
-            # the arm's end, never more of the value (review M2R-1).
-            after = src.skel[m.end():end].lstrip()
-            if not after or after[0] not in ",}":
-                value = src.code[m.start() + m.group(0).index("=>") + 2:m.end() + 20]
-                raise SourceError("%s: `fn %s` gives `%s` an expression the reader cannot read (`%s`): an arm's value is one literal" % (src.rel, fn, " ".join(m.group(1).split()), " ".join(value.split())))
-            for v in re.findall(r"(?:%s|Self)::([A-Z][A-Za-z0-9]*)" % enum, m.group(1)):
-                pairs.append((v, x))
+    _, arms = match_arms(src, fn, impl=enum, scrutinee="self")
+    path = r"(?:%s|Self)\s*::\s*[A-Z][A-Za-z0-9]*" % enum
+    paths = re.compile(r"(?:%s\s*\|\s*)*%s" % (path, path))
+    pairs, unread = [], []
+    for pat, val in arms:
+        m = re.match(value, val)
+        if not paths.fullmatch(pat) or not m:
+            unread.append("%s => %s" % (pat, val))
+            continue
+        x = convert(m.group(1))
+        if x is None:
+            raise SourceError("%s: `fn %s` gives `%s` a value the reader cannot read (`%s`)" % (src.rel, fn, pat, m.group(1)))
+        # The literal is the arm's whole expression, never the start of a
+        # longer one (review M2R-1).
+        if m.end() != len(val):
+            raise SourceError("%s: `fn %s` gives `%s` an expression the reader cannot read (`%s`): an arm's value is one literal" % (src.rel, fn, pat, val))
+        for v in re.findall(r"(?:%s|Self)\s*::\s*([A-Z][A-Za-z0-9]*)" % enum, pat):
+            pairs.append((v, x))
     by_variant, by_value = {}, {}
     for v, x in pairs:
         by_variant.setdefault(v, []).append(x)
@@ -879,6 +884,8 @@ def enum_arms(src, enum, fn, value, convert=lambda x: x):
     missing = [v for v in variants if v not in by_variant]
     if missing:
         raise SourceError("%s: `fn %s` has no `%s::<variant> => <value>` arm the reader can read for %s" % (src.rel, fn, enum, ", ".join(missing)))
+    if unread:
+        raise SourceError("%s: `fn %s` has an arm the reader cannot read (`%s`): it reads `%s::<Variant> => <value>`, with no attribute or guard" % (src.rel, fn, unread[0][:80], enum))
     return {v: xs[0] for v, xs in by_variant.items()}
 
 
@@ -890,28 +897,58 @@ MATCH = re.compile(r"\bmatch\b[^{;]*\{")
 INT_PATTERN = r"-?\s*(?:0x[0-9A-Fa-f_]+|0o[0-7_]+|0b[01_]+|[0-9][0-9_]*)(?:[iu](?:8|16|32|64|128|size))?"
 
 
-def match_arms(src, fn, impl=None):
-    """(pattern, value) of every arm of the one `match` in the one
-    `fn <fn>` (in an `impl <impl>` block when `impl` is given, else
-    anywhere in the file), each with its white space collapsed. A second
-    such function or none, a body with other than one `match`, and an arm
-    the reader cannot split are errors."""
-    bodies = src.fn_bodies(fn)
+def collapse(text):
+    """`text` with each run of white space one space, and none at the ends."""
+    return " ".join(text.split())
+
+
+def one_fn(src, fn, impl=None):
+    """(where, Fn) of the one `fn <fn>` with a body: in an inherent `impl
+    <impl>` block when `impl` is given, else anywhere in the file. A
+    second such function or none is an error."""
+    found = [f for f in fn_items(src) if f.name == fn and f.body]
     where = "`fn %s`" % fn
     if impl:
         spans = impl_spans(src, {impl}, traits=False)
-        bodies = [(a, b) for a, b in bodies if any(x < a < y for x, y in spans)]
+        found = [f for f in found if any(x < f.start < y for x, y in spans)]
         where = "`%s::%s`" % (impl, fn)
-    if len(bodies) != 1:
-        raise SourceError("%s has %d %s, not one the reader can read" % (src.rel, len(bodies), where))
-    a, b = bodies[0]
+    if len(found) != 1:
+        raise SourceError("%s has %d %s, not one the reader can read" % (src.rel, len(found), where))
+    return where, found[0]
+
+
+def match_arms(src, fn, impl=None, scrutinee=None, before="", after=""):
+    """(where, arms): the (pattern, value) of every arm of the one `match`
+    in the one `fn <fn>` (see `one_fn`), each with its white space
+    collapsed. The function's body must be `<before> match <scrutinee> {
+    <arms> } <after>` and nothing else, white space aside: the `match`
+    reads the input as the function took it (or as `before` read it), no
+    statement before it changes that input, and what the function gives
+    is the arm's value as `after` passes it on. So what the reader reads
+    of the arms is what the function computes (Codex's review of M3-01: a
+    decoder that changed its input before its `match` passed). A second
+    such function or none, a body of another form, and an arm the reader
+    cannot split are errors."""
+    if scrutinee is None:
+        raise SourceError("%s: the script reads `fn %s` without naming what it matches on" % (src.rel, fn))
+    where, f = one_fn(src, fn, impl)
+    a, b = f.body
     found = list(MATCH.finditer(src.skel, a, b))
     if len(found) != 1:
         raise SourceError("%s: %s holds %d `match`, not the one the reader reads" % (src.rel, where, len(found)))
-    open_ = found[0].end() - 1
+    m = found[0]
+    open_ = m.end() - 1
+    close = src.close_of(open_)
+    on = collapse(src.code[m.start() + len("match"):open_])
+    if on != scrutinee:
+        raise SourceError("%s: %s matches on `%s`, not on `%s`: the reader reads a `match` on the input as the function takes it, so no change to it goes unread" % (src.rel, where, on[:60], scrutinee))
+    head, tail = collapse(src.code[a + 1:m.start()]), collapse(src.code[close + 1:b - 1])
+    if head != before or tail != after:
+        raise SourceError("%s: %s is not `%smatch %s { .. }%s` alone (it has `%s` before its `match` and `%s` after it): the reader cannot read what code around the `match` does to its input or its value" % (
+            src.rel, where, before + " " if before else "", scrutinee, ("" if after.startswith(";") else " ") + after if after else "", head[:160], tail[:160]))
     arms = []
-    for x, y, _ in src.split_top(open_ + 1, src.close_of(open_)):
-        arm = " ".join(src.code[x:y].split())
+    for x, y, _ in src.split_top(open_ + 1, close):
+        arm = collapse(src.code[x:y])
         parts = arm.split("=>")
         if len(parts) != 2:
             raise SourceError("%s: %s has an arm the reader cannot read (`%s`)" % (src.rel, where, arm[:80]))
@@ -921,21 +958,83 @@ def match_arms(src, fn, impl=None):
     return where, arms
 
 
-def some_arms(src, enum, fn, impl=None):
-    """[(number, variant)] from `fn <fn>`'s arms `<integer>[ | <integer>]
-    [if <guard>] => Some(<enum>::<Variant>)` (`Self::` in the enum's own
-    `impl`), whose last arm is `_ => None`; any other arm is an error."""
-    where, arms = match_arms(src, fn, impl)
+# The guards a decoder's arm may carry, by decoder: each a condition on the
+# vault's schema, `<parameter> >= <constant>`, where the parameter is the
+# decoder's own, with its type, and the constant is defined once in the
+# file named. The constant must be at least 1 and at most CURRENT_SCHEMA
+# (vault/schema.rs), the schema every vault is written at and migrated to,
+# so the arm is taken for every vault the code writes now. Any other guard
+# is an error: a guard the reader does not read can leave an arm that no
+# input reaches (`2 if false`), and the decoder then refuses an entry the
+# code writes as unknown (Codex's review of M3-01).
+SCHEMA_GUARDS = {
+    "item_class_from": [("schema", "u16", "RECORDS_V2_FROM", "crates/envcloak-core/src/vault/items.rs")],
+}
+SCHEMA_RS = "crates/envcloak-core/src/vault/schema.rs"
+
+
+def const_u16(root, rel, name):
+    """The value of the one `const <name>: u16 = <integer>;` in `rel`."""
+    src = Source(rel, read(root, rel))
+    found = re.findall(r"\bconst\s+%s\s*:\s*u16\s*=\s*([^;{}]+);" % re.escape(name), src.skel)
+    if len(found) != 1:
+        raise SourceError("%s has %d `const %s: u16 = <integer>;`, not one the reader can read" % (rel, len(found), name))
+    n = int_value(found[0])
+    if n is None:
+        raise SourceError("%s: `const %s = %s` is not an integer literal the reader can read" % (rel, name, collapse(found[0])))
+    return n
+
+
+def schema_guards(root, src, fn):
+    """{guard text: what it reads} for the decoder `fn <fn>`: the guards
+    SCHEMA_GUARDS names for it, each checked here: the decoder has the
+    parameter with its type, and the constant is between 1 and
+    CURRENT_SCHEMA."""
+    out = {}
+    entries = SCHEMA_GUARDS.get(fn, ())
+    if not entries:
+        return out
+    _, f = one_fn(src, fn)
+    current = const_u16(root, SCHEMA_RS, "CURRENT_SCHEMA")
+    for param, ty, const, rel in entries:
+        if "%s: %s" % (param, ty) not in f.params:
+            raise SourceError("%s: `fn %s` has no parameter `%s: %s`, which the script's SCHEMA_GUARDS names for its guard" % (src.rel, fn, param, ty))
+        n = const_u16(root, rel, const)
+        if not 1 <= n <= current:
+            raise SourceError("%s: `%s` is %d, which is not between 1 and CURRENT_SCHEMA (%d): an arm guarded by `%s >= %s` is not taken for the vaults the code writes" % (rel, const, n, current, param, const))
+        out["%s >= %s" % (param, const)] = "the schema the vault was written at"
+    return out
+
+
+def some_arms(src, enum, fn, impl=None, guards=None):
+    """(where, [(number, variant)]) from `fn <fn>`'s arms `<integer>[ |
+    <integer>] [if <guard>] => Some(<enum>::<Variant>)` (`Self::` in the
+    enum's own `impl`), whose last arm is `_ => None`; any other arm is an
+    error. The function is `fn <fn>(<input>: <integer type>[, ..]) ->
+    Option<<enum>>` whose body is `match <input> { .. }` alone (see
+    `match_arms`), and a guard is one of `guards` (see `schema_guards`) or
+    an error, so no arm the reader counts is one no input reaches."""
+    where, f = one_fn(src, fn, impl)
+    first = re.fullmatch(r"([a-z_][a-z0-9_]*)\s*:\s*[iu](?:8|16|32|64|128|size)", f.params[0]) if f.params else None
+    if not first:
+        raise SourceError("%s: %s does not take its input as its first parameter, `<name>: <integer type>`, which the reader reads" % (src.rel, where))
     names = "(?:%s|Self)" % enum if impl == enum else enum
-    pattern = re.compile(r"(%s(?:\s*\|\s*%s)*)(?:\s+if\s+.+)?" % (INT_PATTERN, INT_PATTERN))
+    if not re.fullmatch(r"->\s*Option\s*<\s*%s\s*>" % names, f.ret):
+        raise SourceError("%s: %s gives `%s`, not `-> Option<%s>`" % (src.rel, where, f.ret[:60], enum))
+    where, arms = match_arms(src, fn, impl, scrutinee=first.group(1))
+    pattern = re.compile(r"(%s(?:\s*\|\s*%s)*)(?:\s+if\s+(.+))?" % (INT_PATTERN, INT_PATTERN))
     value = re.compile(r"Some\s*\(\s*%s\s*::\s*([A-Z][A-Za-z0-9]*)\s*\)" % names)
     if arms[-1] != ("_", "None"):
         raise SourceError("%s: %s does not end with `_ => None`" % (src.rel, where))
+    taken = guards or {}
     out = []
     for pat, val in arms[:-1]:
         p, v = pattern.fullmatch(pat), value.fullmatch(val)
         if not p or not v:
             raise SourceError("%s: %s has an arm the reader cannot read (`%s => %s`): it reads `<integer> => Some(%s::<Variant>)`" % (src.rel, where, pat[:60], val[:60], enum))
+        if p.group(2) is not None and p.group(2) not in taken:
+            raise SourceError("%s: %s guards an arm with `if %s`, which the reader does not take: a guard it does not read can leave an arm no input reaches; it takes only the schema conditions the script's SCHEMA_GUARDS names (%s)" % (
+                src.rel, where, p.group(2)[:60], ", ".join("`%s`" % g for g in sorted(taken)) or "none for this decoder"))
         for piece in p.group(1).split("|"):
             out.append((int_value(piece.strip()), v.group(1)))
     return where, out
@@ -989,7 +1088,11 @@ def check_all_list(src, enum, variants):
     variant left out is an entry the code writes and then cannot read back
     (review of M3-01, the class of a decoder that misses a declared entry).
     One `const ALL` in the enum's own `impl`, or none the reader can read,
-    is an error."""
+    is an error, and so is an entry with an attribute: a `#[cfg(..)]` on
+    an array element takes it out of the list the code builds (rustc
+    1.98, edition 2024, compiles it so), and the reader would count an entry
+    the decoder never finds (Codex's review of M3-01, the class of a
+    mapping read in part)."""
     spans = impl_spans(src, {enum}, traits=False)
     found = [m for m in ALL_LIST.finditer(src.skel)
              if m.group(1) in (enum, "Self") and any(a < m.start() < b for a, b in spans)]
@@ -997,8 +1100,8 @@ def check_all_list(src, enum, variants):
         raise SourceError("%s: `impl %s` has %d `const ALL: [%s; N] = [...]` the reader can read, not one" % (src.rel, enum, len(found), enum))
     open_ = found[0].end() - 1
     listed = []
-    for a, b, text in src.split_top(open_ + 1, src.close_of(open_)):
-        item = " ".join(text.split())
+    for a, b, _ in src.split_top(open_ + 1, src.close_of(open_)):
+        item = collapse(src.code[a:b])
         v = re.fullmatch(r"(?:%s|Self)\s*::\s*([A-Z][A-Za-z0-9]*)" % enum, item)
         if not v:
             raise SourceError("%s: `%s::ALL` holds an entry the reader cannot read (`%s`): it reads `%s::<Variant>`" % (src.rel, enum, item[:60], enum))
@@ -1013,11 +1116,32 @@ def check_all_list(src, enum, variants):
             src.rel, enum, ", ".join("`%s::%s`" % (enum, v) for v in missing)))
 
 
+def check_all_search(src, enum, fn, param, key):
+    """`<enum>::<fn>`, the decoder that searches `ALL`, is that search
+    and nothing else: `fn <fn>(<param>) -> Option<<enum>>` whose body is
+    `<enum>::ALL.into_iter().find(|k| <key> == <name>)`, `<name>` being
+    the parameter. So it compares what the reader reads (the declared
+    number, which `#[repr(u8)]` keeps to a byte, or the token `fn token`
+    gives) with its input as it took it, and gives the entry it finds; a
+    search that changes the input, adds a condition or gives another
+    value is refused (Codex's review of M3-01, the class of a decoder
+    read in part)."""
+    where, f = one_fn(src, fn, impl=enum)
+    name = param.split(":")[0].strip()
+    if f.params != [param] or not re.fullmatch(r"->\s*Option\s*<\s*(?:%s|Self)\s*>" % enum, f.ret):
+        raise SourceError("%s: %s is not `fn %s(%s) -> Option<%s>`, the decoder the reader reads" % (src.rel, where, fn, param, enum))
+    body = collapse(src.code[f.body[0] + 1:f.body[1] - 1])
+    want = ["%s::ALL.into_iter().find(|k| %s == %s)" % (e, key, name) for e in (enum, "Self")]
+    if body not in want:
+        raise SourceError("%s: %s is `%s`, not `%s`: the reader reads a decoder that searches `ALL` for its input as it took it, and nothing else" % (src.rel, where, body[:80], want[0]))
+
+
 def code_audit_kinds(root):
     src = Source(AUDIT_RS, read(root, AUDIT_RS))
     numbers = dict(numbered_variants(src, "AuditKind"))
     tokens = enum_arms(src, "AuditKind", "token", TOKEN_VALUE)
     check_all_list(src, "AuditKind", list(numbers))
+    check_all_search(src, "AuditKind", "from_u8", "v: u8", "*k as u8")
     return {tokens[v]: n for v, n in numbers.items()}
 
 
@@ -1026,6 +1150,7 @@ def code_error_kinds(root):
     codes = enum_arms(src, "ErrorKind", "code", CODE_VALUE, int_value)
     tokens = enum_arms(src, "ErrorKind", "token", TOKEN_VALUE)
     check_all_list(src, "ErrorKind", [v for v, _ in enum_variants(src, "ErrorKind")])
+    check_all_search(src, "ErrorKind", "from_token", "token: &str", "k.token()")
     return {tokens[v]: c for v, c in codes.items()}
 
 
@@ -1139,10 +1264,15 @@ def code_policy_kinds(root):
     policies module, each with its explicit number, which
     `PolicyRecord::decode` reads back exactly: each arm's kind is the
     number of the `PolicyKind` that `PolicyRecord::kind` gives the record
-    the arm makes."""
+    the arm makes. Both are read whole (see `match_arms`): `kind` is
+    `match self { .. }` alone, and `decode` reads the kind and then the
+    version as the record's first two bytes, matches on `(kind, version)`
+    as read, makes each record from its own decoder, refuses any other
+    pair as corrupt (`_ => return Err(corrupt())`, never a record) and
+    gives the record its `match` made (DECODE_BEFORE, DECODE_AFTER)."""
     src = Source(POLICIES_RS, read(root, POLICIES_RS))
     numbers = dict(numbered_variants(src, "PolicyKind"))
-    where_kind, kind_arms = match_arms(src, "kind", impl="PolicyRecord")
+    where_kind, kind_arms = match_arms(src, "kind", impl="PolicyRecord", scrutinee="self")
     record_kind = {}
     for pat, val in kind_arms:
         v = re.fullmatch(r"(?:PolicyKind|Self)\s*::\s*([A-Z][A-Za-z0-9]*)", val)
@@ -1154,16 +1284,19 @@ def code_policy_kinds(root):
             if r.group(1) in record_kind:
                 raise SourceError("%s: %s names `PolicyRecord::%s` twice" % (src.rel, where_kind, r.group(1)))
             record_kind[r.group(1)] = v.group(1)
-    where, arms = match_arms(src, "decode", impl="PolicyRecord")
+    where, f = one_fn(src, "decode", impl="PolicyRecord")
+    if f.params != ["b: &[u8]"]:
+        raise SourceError("%s: %s does not take `b: &[u8]`, the record's bytes the reader reads it from" % (src.rel, where))
+    where, arms = match_arms(src, "decode", impl="PolicyRecord", scrutinee="(kind, version)", before=DECODE_BEFORE, after=DECODE_AFTER)
     pattern = re.compile(r"\(\s*(%s)\s*,\s*(%s)\s*\)" % (INT_PATTERN, INT_PATTERN))
-    value = re.compile(r"(?:PolicyRecord|Self)\s*::\s*([A-Z][A-Za-z0-9]*)\s*\(.*\)")
-    if arms[-1][0] != "_":
-        raise SourceError("%s: %s does not end with a `_` arm" % (src.rel, where))
+    value = re.compile(r"(?:PolicyRecord|Self)\s*::\s*([A-Z][A-Za-z0-9]*)\s*\(\s*[A-Z][A-Za-z0-9]*\s*::\s*decode(?:_v[0-9]+)?\s*\(\s*&\s*mut\s+d\s*\)\s*\?\s*\)")
+    if arms[-1] != ("_", "return Err(corrupt())"):
+        raise SourceError("%s: %s does not end with `_ => return Err(corrupt())`: a pair it does not know is refused as corrupt, never read as a record" % (src.rel, where))
     decoded, versions = [], set()
     for pat, val in arms[:-1]:
         p, v = pattern.fullmatch(pat), value.fullmatch(val)
         if not p or not v:
-            raise SourceError("%s: %s has an arm the reader cannot read (`%s => %s`): it reads `(<kind>, <version>) => PolicyRecord::<Record>(..)`" % (src.rel, where, pat[:60], val[:60]))
+            raise SourceError("%s: %s has an arm the reader cannot read (`%s => %s`): it reads `(<kind>, <version>) => PolicyRecord::<Record>(<Type>::decode(&mut d)?)`" % (src.rel, where, pat[:60], val[:60]))
         n, version = int_value(p.group(1)), int_value(p.group(2))
         if (n, version) in versions:
             raise SourceError("%s: %s reads kind %d version %d twice" % (src.rel, where, n, version))
@@ -1179,6 +1312,14 @@ def code_policy_kinds(root):
     check_inverse(src, "PolicyKind", where, numbers, once)
     return {snake(v): n for v, n in numbers.items()}
 
+
+# What `PolicyRecord::decode` holds around its `match`, white space
+# collapsed: the kind is the record's first byte and the version its
+# second, each read once from the record's own bytes before the `match`,
+# and what it gives is the record the `match` made, once the bytes are
+# used up and the record keeps its kind's bounds.
+DECODE_BEFORE = "let mut d = Dec::new(b); let kind = d.u8()?; let version = d.u8()?; let record ="
+DECODE_AFTER = "; d.end()?; if !record.in_bounds() { return Err(corrupt()); } Ok(record)"
 
 STATE_RS = "crates/envcloak-core/src/vault/state.rs"
 
@@ -1198,7 +1339,7 @@ def code_item_classes(root):
     src = Source(AAD_RS, read(root, AAD_RS))
     numbers = dict(numbered_variants(src, "ItemClass"))
     state = Source(STATE_RS, read(root, STATE_RS))
-    where, decoded = some_arms(state, "ItemClass", "item_class_from")
+    where, decoded = some_arms(state, "ItemClass", "item_class_from", guards=schema_guards(root, state, "item_class_from"))
     check_inverse(state, "ItemClass", where, numbers, decoded)
     return {snake(v): n for v, n in numbers.items()}
 
