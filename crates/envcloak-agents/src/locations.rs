@@ -48,6 +48,8 @@ pub struct Locations {
     codex_home: PathBuf,
     /// `CODEX_SQLITE_HOME`, when it is set.
     codex_sqlite: Option<PathBuf>,
+    /// CodexBar config override, used only for inspection.
+    codexbar_config: Option<PathBuf>,
     /// Copilot CLI's directory: `COPILOT_HOME`, else `~/.copilot`.
     copilot_home: PathBuf,
     /// Kimi CLI's data root: `KIMI_SHARE_DIR`, else `~/.kimi`.
@@ -118,6 +120,7 @@ impl Locations {
             claude_json,
             codex_home,
             codex_sqlite,
+            codexbar_config: absolute(env("CODEXBAR_CONFIG")),
             copilot_home,
             kimi_share,
             kimi_code,
@@ -341,9 +344,21 @@ impl Locations {
     /// review, round 7: the catalog left them out).
     pub fn config_sources(&self) -> Vec<ConfigSource> {
         use ConfigFormat::{Json, Raw, Toml, Yaml};
-        use SourceKind::{Credentials, HostBackup, McpConfig};
+        use SourceKind::{Credentials, HostBackup, McpConfig, ProviderConfig};
         let h = &self.home;
-        vec![
+        let mut sources = vec![
+            Self::src(
+                self.xdg_config.join("codexbar/config.json"),
+                Json,
+                ProviderConfig,
+                "CodexBar config",
+            ),
+            Self::src(
+                h.join(".codexbar/config.json"),
+                Json,
+                ProviderConfig,
+                "CodexBar legacy config",
+            ),
             Self::src(
                 self.claude_json.clone(),
                 Json,
@@ -423,7 +438,18 @@ impl Locations {
                 McpConfig,
                 "Goose config",
             ),
-        ]
+        ];
+        if let Some(path) = &self.codexbar_config {
+            if !sources.iter().any(|s| s.path == *path) {
+                sources.push(Self::src(
+                    path.clone(),
+                    Json,
+                    ProviderConfig,
+                    "CodexBar config override",
+                ));
+            }
+        }
+        sources
     }
 
     /// The MCP configuration files a project can hold (Map C §3 item 8).

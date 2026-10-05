@@ -33,3 +33,5 @@ crates/envcloak-signin/src/otpauth.rs        # enrollment parsed in place and de
 
 crates/envcloak-scan/src/profile.rs          # parses bounded profile literals in place; never executes a profile
 crates/envcloak-scan/src/candidates.rs       # per-run keyed candidate hashes, never persisted or reported
+crates/envcloak-scan/src/agent_config.rs     # config bindings and envFile paths read only inside approved roots
+crates/envcloak-scan/src/json.rs             # bounded duplicate-key fingerprints; string decoding stays in wiping buffers

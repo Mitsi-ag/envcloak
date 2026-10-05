@@ -402,3 +402,49 @@ fn codex_settings_that_move_its_stores_are_read() {
         .count();
     assert_eq!(n, 1);
 }
+
+/// F-75's compile-only fixture now crosses the actual scanner boundary.
+#[test]
+fn fixture_catalog_sources_produce_a_finding() {
+    let home = fixture_home();
+    std::fs::write(
+        home.path().join(".claude.json"),
+        br#"{"mcpServers":{"fixture":{"env":{"TOKEN":"fixture-catalog-value"}}}}"#,
+    )
+    .unwrap();
+    let report =
+        envcloak_scan::scan_config_sources(&catalog(home.path()).config_sources()).unwrap();
+    assert_eq!(report.findings.len(), 1);
+    assert!(
+        report.findings[0]
+            .value
+            .as_ref()
+            .unwrap()
+            .ct_eq(b"fixture-catalog-value")
+    );
+}
+
+/// The documented provider config is an inspection source, not an MCP server.
+#[test]
+fn provider_config_paths_stay_in_the_catalog() {
+    let home = fixture_home();
+    let path = home.path().join(".config/codexbar/config.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        br#"{"version":1,"providers":[{"id":"fixture","apiKey":"fixture-provider-value"}]}"#,
+    )
+    .unwrap();
+    let sources = catalog(home.path()).config_sources();
+    assert!(
+        sources
+            .iter()
+            .any(|s| s.path == path && s.source_kind == SourceKind::ProviderConfig)
+    );
+    let report = envcloak_scan::scan_config_sources(&sources).unwrap();
+    assert!(report.findings.iter().any(|f| {
+        f.value
+            .as_ref()
+            .is_some_and(|v| v.ct_eq(b"fixture-provider-value"))
+    }));
+}

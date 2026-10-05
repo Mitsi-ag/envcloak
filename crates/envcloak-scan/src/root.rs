@@ -346,6 +346,9 @@ pub fn read_capped(
     };
     let (dir, name) = r.open_parent(rel).map_err(fail)?;
     let (mut f, m) = open_file(&dir, &name, cap).map_err(fail)?;
+    if m.dev() != r.dev() {
+        return Err(fail(ScanErrorKind::MountPoint));
+    }
     let stamp = FileStamp::of(&m);
     let size = usize::try_from(m.len()).map_err(|_| fail(ScanErrorKind::TooLarge))?;
     let mut buf = SecretBuf::with_capacity(size);
@@ -370,4 +373,37 @@ pub fn read_capped(
         return Err(fail(ScanErrorKind::Changed));
     }
     Ok((buf.freeze(), stamp))
+}
+
+/// A directory already opened component by component by a catalog scan.
+pub(crate) fn held_root(path: PathBuf, dir: File) -> std::io::Result<ScanRoot> {
+    let m = dir.metadata()?;
+    Ok(ScanRoot {
+        volume: volume_of(&dir)?,
+        dir,
+        path,
+        dev: m.dev(),
+        ino: m.ino(),
+    })
+}
+
+#[cfg(test)]
+mod scanner_device_tests {
+    use super::*;
+    /// Recording model of a file mount: the opened leaf's device differs
+    /// from the held root. No mounts or privileged host state are changed.
+    #[test]
+    fn leaf_mount_is_refused_before_reading() {
+        let dir = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).expect("temporary root")).expect("fixture");
+        std::fs::write(dir.path().join("profile"), b"fixture-value").expect("write");
+        let mut root = open_root(dir.path()).expect("root");
+        assert!(read_capped(&root, Path::new("profile"), 64).is_ok());
+        root.dev = root.dev.wrapping_add(1);
+        assert_eq!(
+            read_capped(&root, Path::new("profile"), 64)
+                .expect_err("mount refused")
+                .kind,
+            ScanErrorKind::MountPoint
+        );
+    }
 }
