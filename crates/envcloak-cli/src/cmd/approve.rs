@@ -10,13 +10,22 @@
 //! 2. it fetches the pending request from a verified daemon, which serves
 //!    it only to a caller that may give a proof (a terminal session with
 //!    no agent in it, SPEC §10b), and renders
-//!    the statement ([`render_statement`]): the caller, the project, every
-//!    binding, the full command line as an escaped list (cut past 2 KB
-//!    with a marker), and the grant the options ask for;
-//! 3. it reads the vault passphrase from `/dev/tty` with echo off, or from
+//!    the statement ([`render_statement`]): the caller, the project, the
+//!    same provider's test items the daemon proposes in place of live ones
+//!    with the `envcloak ref` line that binds each, every binding with its
+//!    classification and live tick, the full command line as an escaped
+//!    list (cut past 2 KB with a marker), and the grant the options ask
+//!    for;
+//! 3. the live-key guard (SPEC §10b): when the request is an agent's or an
+//!    unknown process's and the options leave a live binding unticked
+//!    ([`unticked_live`]), it shows the statement, which names the
+//!    `--live` flags it lacks, and exits with `live_not_ticked` before
+//!    any passphrase is read (L-10); the daemon refuses such an approval
+//!    too, before Argon2id runs, and audits it;
+//! 4. it reads the vault passphrase from `/dev/tty` with echo off, or from
 //!    the descriptor `--passphrase-fd` names, never from argv or the
 //!    environment;
-//! 4. it sends the passphrase once, with the SHA-256 of the canonical
+//! 5. it sends the passphrase once, with the SHA-256 of the canonical
 //!    statement it rendered ([`statement_digest`]) and the names of the
 //!    agent markers in its environment. The daemon verifies the passphrase
 //!    against the envelope and checks that the digest is its own pending
@@ -35,9 +44,11 @@ use envcloak_client::claims::refuse_if_claimed;
 use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use envcloak_client::tty::{Terminal, read_secret_fd};
+use envcloak_ipc::ClientError;
+use envcloak_ipc::proto::{ErrorKind, RpcError};
 use envcloak_policy::{
     ApprovalOptions, DEFAULT_TTL, EnvName, GrantId, MAX_AGENT_TTL, PendingId, Uses,
-    escape_for_display, render_statement, statement_digest,
+    escape_for_display, render_statement, statement_digest, unticked_live,
 };
 
 use super::fd_number;
@@ -131,6 +142,13 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
     // differs from the pending request is rejected by the daemon).
     let statement = render_statement(&descriptor, &a.options);
     let digest = statement_digest(&descriptor, &a.options);
+    // The live-key guard: the daemon would refuse this approval, so no
+    // passphrase is read for it. The statement says which ticks it lacks
+    // and which test items could be bound instead.
+    if !unticked_live(&descriptor, &a.options).is_empty() {
+        print!("{statement}");
+        return Err(ClientError::Rpc(RpcError::new(ErrorKind::LiveNotTicked)).into());
+    }
     let passphrase = match a.passphrase_fd {
         Some(fd) => {
             print!("{statement}");

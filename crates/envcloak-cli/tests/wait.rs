@@ -135,11 +135,12 @@ impl Fixture {
         }
     }
 
+    /// `envcloak approve <id> <how>`, with the live keys ticked where the
+    /// statement asks for them.
     fn approve(&self, id: &str, how: &[&str]) {
-        let mut args = vec!["approve", id];
-        args.extend_from_slice(how);
-        args.extend_from_slice(&["--passphrase-fd", "3"]);
-        let out = self.person(&args);
+        let out = common::approve_ticking(&self.home, id, how, &self.pass);
+        assert_no_canary(&out.stdout, &self.cs);
+        assert_no_canary(&out.stderr, &self.cs);
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     }
 

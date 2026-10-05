@@ -448,6 +448,60 @@ STRIPE_SECRET_KEY = \"stripe/acme-web\"
 SHORT_TOKEN = \"short/acme-web\"
 ";
 
+/// The `--live` ticks `envcloak approve` named when it refused an
+/// approval with `live_not_ticked` (SPEC §10b "Live-key guard"): the
+/// variables of its statement's line "Approve again with --live A --live
+/// B". Empty for any other output.
+pub fn live_ticks(out: &Output) -> Vec<String> {
+    if !stderr(out).starts_with("envcloak: live_not_ticked: ") {
+        return Vec::new();
+    }
+    let text = stdout(out);
+    let Some(tail) = text
+        .lines()
+        .find_map(|l| l.split("Approve again with ").nth(1))
+    else {
+        return Vec::new();
+    };
+    let words: Vec<&str> = tail
+        .split(", or bind")
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .split_whitespace()
+        .collect();
+    words
+        .windows(2)
+        .filter(|w| w[0] == "--live")
+        .map(|w| w[1].to_owned())
+        .collect()
+}
+
+/// `envcloak approve <id> <how>... --passphrase-fd 3` on a terminal of its
+/// own, as a person runs it, with `pass` on descriptor 3. When it refuses
+/// with `live_not_ticked` (an agent's or an unknown process's request with
+/// a live key, SPEC §10b "Live-key guard"), the person reads the statement
+/// and approves again with the `--live` ticks it names ([`live_ticks`]).
+/// The last output is returned. The guard's own tests name their ticks.
+pub fn approve_ticking(home: &TestHome, id: &str, how: &[&str], pass: &Path) -> Output {
+    let attempt = |ticks: &[String]| {
+        let mut args = vec!["approve", id];
+        args.extend_from_slice(how);
+        for t in ticks {
+            args.extend_from_slice(&["--live", t.as_str()]);
+        }
+        args.extend_from_slice(&["--passphrase-fd", "3"]);
+        run_on_terminal(home, &args, &[(3, pass, true)])
+    };
+    let out = attempt(&[]);
+    let ticks = live_ticks(&out);
+    if ticks.is_empty() {
+        out
+    } else {
+        attempt(&ticks)
+    }
+}
+
 /// Writes a project directory `name` in `home` with `manifest`, and
 /// returns the directory.
 pub fn project(home: &TestHome, name: &str, manifest: &str) -> PathBuf {

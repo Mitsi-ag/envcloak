@@ -26,7 +26,10 @@
 //!    never text from the file (docs/MANIFEST.md "Env files").
 //! 4. The daemon answers with the decision. When no grant covers the
 //!    request, it is pending: exit 125 with `approval_required
-//!    request=<id>`, naming `envcloak approve <id>`. With `--wait`, the
+//!    request=<id>`, naming `envcloak approve <id>`, and, for each live
+//!    binding whose provider has a test item, that item and the
+//!    `envcloak ref` line that binds it (SPEC §10b "Live-key guard": the
+//!    daemon proposes it and never substitutes it). With `--wait`, the
 //!    line is printed once and the CLI waits up to that long (at most the
 //!    request's 10-minute lifetime) without holding a connection: it asks
 //!    the request's state on fresh connections, backing off from 250 ms
@@ -93,6 +96,7 @@
 //! command line (gate 13): `--ref` names an item, never a value. The
 //! values never enter this process's environment or argv, or a file.
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -111,12 +115,12 @@ use envcloak_exec::{ChildExit, CoverageReport, ExecError, Label, RunSpec, ShortP
 use envcloak_ipc::proto::{EnvFileParams, ReleasedValue, RunAnswer, RunRequestParams};
 use envcloak_ipc::view::DecisionView;
 use envcloak_ipc::wait::{
-    CALL_GRACE, Fresh, MAX_WAIT, Notice, SystemClock, Waited, wait_for_run_with_grace,
+    CALL_GRACE, Fresh, MAX_WAIT, Notice, SystemClock, Transport, Waited, wait_for_run_with_grace,
 };
 use envcloak_ipc::{Client, ClientError};
 use envcloak_policy::{
-    Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PlainVar, find_manifest,
-    parse_env_file_refs,
+    Binding, EnvFileRefs, EnvName, GrantId, MAX_ENV_FILE, Mode, PendingId, PendingState, PlainVar,
+    Proposal, escape_for_display, find_manifest, parse_env_file_refs,
 };
 use zeroize::Zeroize;
 
@@ -483,7 +487,8 @@ fn request(a: RunArgs) -> Result<Ended, Failure> {
                 failure: Failure::new(
                     "approval_required",
                     format!(
-                        "request={id}: run \"envcloak approve {id}\" in a terminal you control"
+                        "request={id}: run \"envcloak approve {id}\" in a terminal you control{}",
+                        proposed(&answer.proposals)
                     ),
                 ),
                 code: RUN_FAILURE,
@@ -564,15 +569,22 @@ fn wait_for(
         )
     })?;
     let paths = run_paths()?;
-    let mut fresh = Fresh {
-        paths: &paths,
-        params,
+    let latest = RefCell::new(Vec::new());
+    let mut fresh = Proposing {
+        fresh: Fresh {
+            paths: &paths,
+            params,
+        },
+        latest: &latest,
     };
     let shown = words(wait);
     let mut notice = |n: Notice| match n {
+        // Announced right after the answer that named the request, whose
+        // proposals `latest` holds.
         Notice::Pending(id) => eprintln!(
             "envcloak: approval_required: request={id}: run \"envcloak approve {id}\" in a \
-             terminal you control; waiting up to {shown} for it"
+             terminal you control{}; waiting up to {shown} for it",
+            proposed(&latest.borrow())
         ),
         Notice::TooManyPending(e) => {
             let f = Failure::from(ClientError::Rpc(e));
@@ -610,6 +622,52 @@ fn wait_for(
                 grace.as_secs()
             ),
         )),
+    }
+}
+
+/// What the `approval_required` line adds for the test items the daemon
+/// proposes in place of live ones (SPEC §10b "Live-key guard"): for each,
+/// the variable, the live item, and the `envcloak ref` line that binds the
+/// test item. The daemon never substitutes one. Every name is escaped; the
+/// client took only an answer whose names have the daemon's shapes
+/// (`RunAnswer::well_formed`).
+fn proposed(proposals: &[Proposal]) -> String {
+    let e = escape_for_display;
+    proposals
+        .iter()
+        .map(|x| {
+            format!(
+                "; {} is bound to the live key {}: to use the test key {} instead, run `{}` \
+                 and run this again",
+                e(&x.env_name),
+                e(&x.live_slug),
+                e(&x.reference()),
+                x.ref_line()
+            )
+        })
+        .collect()
+}
+
+/// [`Fresh`], keeping the test items the latest `run.request` answer
+/// proposed, for the `approval_required` line that names its request.
+struct Proposing<'a> {
+    fresh: Fresh<'a>,
+    latest: &'a RefCell<Vec<Proposal>>,
+}
+
+impl Transport for Proposing<'_> {
+    fn traced(&mut self) -> bool {
+        self.fresh.traced()
+    }
+
+    fn request(&mut self, within: Duration) -> Result<RunAnswer, ClientError> {
+        let answer = self.fresh.request(within)?;
+        self.latest.replace(answer.proposals.clone());
+        Ok(answer)
+    }
+
+    fn poll(&mut self, id: &PendingId, within: Duration) -> Result<PendingState, ClientError> {
+        self.fresh.poll(id, within)
     }
 }
 

@@ -372,8 +372,12 @@ impl Fixture {
             .collect()
     }
 
+    /// `envcloak approve <id> --for 1h`, with the live keys ticked where
+    /// the statement asks for them.
     fn approve(&self, id: &str) {
-        let out = self.person(&["approve", id, "--for", "1h", "--passphrase-fd", "3"]);
+        let out = common::approve_ticking(&self.home, id, &["--for", "1h"], &self.pass);
+        assert_no_canary(&out.stdout, &self.cs);
+        assert_no_canary(&out.stderr, &self.cs);
         assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     }
 
@@ -2183,7 +2187,7 @@ fn a_call_cancelled_while_it_waits_starts_nothing_when_approved_after() {
         "the waiting run outlived the first SIGTERM: the call ended {took:?} after its \
          cancellation"
     );
-    let out = f.person(&["approve", &id, "--once", "--passphrase-fd", "3"]);
+    let out = common::approve_ticking(&f.home, &id, &["--once"], &f.pass);
     assert!(out.status.success(), "{}{}", stdout(&out), stderr(&out));
     assert_eq!(once_grants(&f), 1);
     assert!(!marker.exists(), "the cancelled call's command ran");

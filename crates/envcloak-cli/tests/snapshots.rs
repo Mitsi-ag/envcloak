@@ -381,9 +381,28 @@ fn every_command_prints_its_value_free_snapshot() {
     let out = s.agent(&["run", "--", "./emit"], &[]);
     let id = s.request_id(&out);
     s.snap("run-approval-required", &out);
+    // The request is an unknown process's, and binds two live keys: an
+    // approval without their ticks is refused before the passphrase is
+    // read (SPEC §10b "Live-key guard"), and the statement says which.
+    s.snap(
+        "approve-live-not-ticked",
+        &s.person(&["approve", &id, "--passphrase-fd", "3"], &[]),
+    );
     s.snap(
         "approve",
-        &s.person(&["approve", &id, "--passphrase-fd", "3"], &[]),
+        &s.person(
+            &[
+                "approve",
+                &id,
+                "--live",
+                "GITHUB_TOKEN",
+                "--live",
+                "OPENAI_API_KEY",
+                "--passphrase-fd",
+                "3",
+            ],
+            &[],
+        ),
     );
     s.snap("grants-list", &s.agent(&["grants", "list"], &[]));
     s.snap(
@@ -679,7 +698,17 @@ fn every_command_prints_its_value_free_json_snapshot() {
     let id = s.request_id(&out);
     // The grant ends with its root, the request's own process, as in the
     // first story: the list is empty (tests/approve.rs lists live ones).
-    let out = s.person(&["approve", &id, "--passphrase-fd", "3"], &[]);
+    let out = s.person(
+        &[
+            "approve",
+            &id,
+            "--live",
+            "OPENAI_API_KEY",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[],
+    );
     assert!(out.status.success(), "{}", stderr(&out));
     s.snap(
         "grants-list-json",

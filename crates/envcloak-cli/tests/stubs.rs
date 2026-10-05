@@ -30,7 +30,6 @@ const STUBS: &[(&[&str], &str)] = &[
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["mcp-bridge"], "`envcloak mcp-bridge`"),
     (&["standing"], "`envcloak standing`"),
-    (&["items", "reclassify"], "`envcloak items reclassify`"),
     (&["login"], "`envcloak login`"),
     (&["signin"], "`envcloak signin`"),
     (&["run", "--pty"], "`envcloak run --pty`"),
@@ -214,22 +213,23 @@ fn every_stub_exits_125_and_echoes_nothing() {
 }
 
 /// A subcommand that no task adds is a usage error, as any unknown
-/// command is, and is not echoed either.
+/// command is, and is not echoed either. `items` has its one subcommand
+/// since M2-13 (`reclassify`); its usage names it, with no stub left.
 #[test]
 fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
     let cs = canaries(fresh_seed());
     let home = TestHome::new();
     let mut cases = vec![
-        vec!["agents"],
-        vec!["agents", "--json"],
-        vec!["items"],
-        vec!["items", "list"],
+        (vec!["agents"], true),
+        (vec!["agents", "--json"], true),
+        (vec!["items"], false),
+        (vec!["items", "list"], false),
     ];
     for c in &cs {
-        cases.push(vec!["agents", c.as_str()]);
-        cases.push(vec!["items", c.as_str()]);
+        cases.push((vec!["agents", c.as_str()], true));
+        cases.push((vec!["items", c.as_str()], false));
     }
-    for args in cases {
+    for (args, stub) in cases {
         let out = run(&home, &args, &[]);
         assert_no_canary(&out.stdout, &cs);
         assert_no_canary(&out.stderr, &cs);
@@ -239,7 +239,12 @@ fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
             "{}",
             stderr(&out)
         );
-        assert!(stderr(&out).contains("in this build"), "{}", stderr(&out));
+        assert_eq!(
+            stderr(&out).contains("in this build"),
+            stub,
+            "{}",
+            stderr(&out)
+        );
     }
 }
 

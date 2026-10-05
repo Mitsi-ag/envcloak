@@ -128,12 +128,12 @@ impl Fixture {
     }
 
     /// `envcloak approve <id> <args>` from this process with the right
-    /// passphrase, expected to succeed. Returns what it printed.
+    /// passphrase, the live keys ticked where the statement asks for them,
+    /// expected to succeed. Returns what it printed.
     fn approve(&self, id: &str, args: &[&str]) -> String {
-        let mut argv = vec!["approve", id];
-        argv.extend_from_slice(args);
-        argv.extend_from_slice(&["--passphrase-fd", "3"]);
-        let out = self.person(&argv, &self.pass);
+        let out = common::approve_ticking(&self.home, id, args, &self.pass);
+        assert_no_canary(&out.stdout, &self.cs);
+        assert_no_canary(&out.stderr, &self.cs);
         let (o, e) = (stdout(&out), stderr(&out));
         assert!(out.status.success(), "{o}{e}");
         o
@@ -342,9 +342,19 @@ fn an_agents_request_needs_a_persons_approval() {
     assert!(out.stdout.is_empty());
 
     // S5: a wrong passphrase is refused and counted; the right one
-    // creates the grant. The statement is shown escaped.
+    // creates the grant. The statement is shown escaped. The OpenAI key is
+    // live, so each approval ticks it (SPEC §10b "Live-key guard").
     let out = f.person(
-        &["approve", &id, "--for", "1h", "--passphrase-fd", "3"],
+        &[
+            "approve",
+            &id,
+            "--for",
+            "1h",
+            "--live",
+            "OPENAI_API_KEY",
+            "--passphrase-fd",
+            "3",
+        ],
         &f.wrong,
     );
     assert_eq!(out.status.code(), Some(1));
@@ -417,7 +427,7 @@ fn an_agents_request_needs_a_persons_approval() {
     assert!(list.contains(&grant), "{list}");
     assert!(list.contains("agent EnvCloak test fixture agent"), "{list}");
     assert!(
-        list.contains("OPENAI_API_KEY=openai/acme-web, STRIPE_SECRET_KEY=stripe/acme-web"),
+        list.contains("OPENAI_API_KEY=openai/acme-web (live), STRIPE_SECRET_KEY=stripe/acme-web"),
         "{list}"
     );
     assert!(list.contains("session, "), "{list}");
@@ -690,7 +700,18 @@ fn an_empty_passphrase_line_sends_nothing() {
     let nothing = f.files.path().join("nothing");
     std::fs::write(&nothing, b"").unwrap();
     for input in [&empty_line, &nothing] {
-        let out = f.person(&["approve", &id, "--passphrase-fd", "3"], input);
+        // The live key ticked, so the passphrase is what is read.
+        let out = f.person(
+            &[
+                "approve",
+                &id,
+                "--live",
+                "OPENAI_API_KEY",
+                "--passphrase-fd",
+                "3",
+            ],
+            input,
+        );
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
         assert!(
             stderr(&out).starts_with("envcloak: no_input:"),
