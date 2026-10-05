@@ -487,11 +487,11 @@ fn a_failure_token_in_a_field_or_a_token_method_counts() {
     add_file(
         &t,
         CLIENT_STUB,
-        "const APP: &'static str = \"app_required\";\n\
-         pub fn a() -> Failure { Failure { token: \"pty_unavailable\", message: \"\".into() } }\n\
-         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"pty_monitor_lost\" } } }\n",
+        "const APP: &'static str = \"incomplete\";\n\
+         pub fn a() -> Failure { Failure { token: \"app_required\", message: \"\".into() } }\n\
+         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"not_started_by_daemon\" } } }\n",
     );
-    for token in ["pty_unavailable", "pty_monitor_lost", "app_required"] {
+    for token in ["app_required", "not_started_by_daemon", "incomplete"] {
         assert_fails(
             &t,
             &format!("`{token}` is reserved, but the code already has it ({CLIENT_STUB})"),
@@ -561,8 +561,8 @@ fn a_token_in_a_comment_a_string_or_a_test_module_does_not_count() {
         &t,
         CLIENT_STUB,
         "// Failure::new(\"app_required\", \"\")\n\
-         /* token: \"pty_unavailable\" */\n\
-         const TEXT: &str = \"Failure::new(\\\"pty_monitor_lost\\\", x)\";\n\
+         /* token: \"app_required\" */\n\
+         const TEXT: &str = \"Failure::new(\\\"not_started_by_daemon\\\", x)\";\n\
          #[cfg(test)]\n\
          mod tests {\n    \
              fn t() { let _ = Failure::new(\"not_in_this_build\", \"\"); }\n\
@@ -1344,19 +1344,19 @@ fn an_arm_whose_value_goes_on_past_its_literal_fails() {
 #[test]
 fn failure_tokens_in_every_form_the_code_can_write_count() {
     for body in [
-        "pub fn a() -> Failure { Failure::new(concat!(\"pty_\", \"unavailable\"), \"refused\") }\n",
-        "pub fn a() -> Failure { Failure::new(const { \"pty_unavailable\" }, \"refused\") }\n",
-        "pub fn a() -> Failure { Failure::new(if true { \"io\" } else { \"pty_unavailable\" }, \"x\") }\n",
-        "pub fn a() -> crate::Fail { crate::Fail::new(\"pty_unavailable\", \"refused\") }\n",
-        "pub fn a() -> Fail { envcloak_client::Fail::new(\"pty_unavailable\", \"refused\") }\n",
-        "use crate::fail::Failure as Oops;\npub fn a() -> Oops { Oops::new(\"pty_unavailable\", \"x\") }\n",
-        "type Bad = crate::Fail;\npub fn a() -> Bad { Bad::new(\"pty_unavailable\", \"x\") }\n",
+        "pub fn a() -> Failure { Failure::new(concat!(\"app_\", \"required\"), \"refused\") }\n",
+        "pub fn a() -> Failure { Failure::new(const { \"app_required\" }, \"refused\") }\n",
+        "pub fn a() -> Failure { Failure::new(if true { \"io\" } else { \"app_required\" }, \"x\") }\n",
+        "pub fn a() -> crate::Fail { crate::Fail::new(\"app_required\", \"refused\") }\n",
+        "pub fn a() -> Fail { envcloak_client::Fail::new(\"app_required\", \"refused\") }\n",
+        "use crate::fail::Failure as Oops;\npub fn a() -> Oops { Oops::new(\"app_required\", \"x\") }\n",
+        "type Bad = crate::Fail;\npub fn a() -> Bad { Bad::new(\"app_required\", \"x\") }\n",
     ] {
         let t = fixture();
         add_file(&t, CLIENT_STUB, body);
         assert_fails(
             &t,
-            &format!("`pty_unavailable` is reserved, but the code already has it ({CLIENT_STUB})"),
+            &format!("`app_required` is reserved, but the code already has it ({CLIENT_STUB})"),
         );
     }
     for body in [
@@ -1392,11 +1392,11 @@ fn a_failure_token_the_reader_cannot_read_fails() {
             "a failure token names `UNKNOWN_TOKEN`, which is no `&str` constant the reader knows",
         ),
         (
-            "pub fn a(x: &'static str) -> Failure { Failure::new(concat!(\"pty_\", x), \"x\") }\n",
+            "pub fn a(x: &'static str) -> Failure { Failure::new(concat!(\"app_\", x), \"x\") }\n",
             "`concat!` of something other than literals",
         ),
         (
-            "pub fn a() -> Failure { Failure::new(stringify!(pty_unavailable), \"x\") }\n",
+            "pub fn a() -> Failure { Failure::new(stringify!(app_required), \"x\") }\n",
             "a macro other than `concat!` of literals",
         ),
     ] {
@@ -1462,8 +1462,8 @@ fn a_failure_token_covered_only_by_an_unrelated_table_fails() {
 fn assert_counted(body: &str, file: &str) {
     for (token, expect) in [
         (
-            "pty_unavailable",
-            format!("`pty_unavailable` is reserved, but the code already has it ({file})"),
+            "app_required",
+            format!("`app_required` is reserved, but the code already has it ({file})"),
         ),
         (
             "zz_unreserved",
@@ -1541,7 +1541,7 @@ fn a_failure_literal_token_is_read_in_every_form_or_refused() {
     add_file(
         &t,
         CLIENT_STUB,
-        "pub fn a() -> Failure { let token = \"pty_unavailable\"; Failure { token, message: \"x\".into() } }\n",
+        "pub fn a() -> Failure { let token = \"app_required\"; Failure { token, message: \"x\".into() } }\n",
     );
     assert_fails(&t, "a failure token the reader cannot read (`token`)");
 }
@@ -1556,8 +1556,8 @@ fn a_failure_literal_token_is_read_in_every_form_or_refused() {
 #[test]
 fn a_helpers_token_used_other_than_handed_on_fails() {
     for body in [
-        "pub fn zz_h(token: &'static str) -> Failure { let token = \"pty_unavailable\"; Failure::new(token, \"x\") }\n",
-        "pub fn zz_h(token: &'static str) -> Failure { let f = |token| Failure::new(token, \"x\"); f(\"pty_unavailable\") }\n",
+        "pub fn zz_h(token: &'static str) -> Failure { let token = \"app_required\"; Failure::new(token, \"x\") }\n",
+        "pub fn zz_h(token: &'static str) -> Failure { let f = |token| Failure::new(token, \"x\"); f(\"app_required\") }\n",
         "pub fn zz_h(token: &'static str, o: Option<&'static str>) -> Failure { if let Some(token) = o { return Failure::new(token, \"x\"); } Failure::new(token, \"y\") }\n",
     ] {
         let t = fixture();
@@ -1591,15 +1591,15 @@ fn a_private_helpers_calls_in_its_modules_children_are_read() {
     let helper = "fn zz_h(token: &'static str) -> crate::fail::Failure { crate::fail::Failure::new(token, \"x\") }\nmod child;\n";
     for (body, expect) in [
         (
-            "pub fn g() -> crate::fail::Failure { super::zz_h(\"pty_unavailable\") }\n",
-            format!("`pty_unavailable` is reserved, but the code already has it ({child})"),
+            "pub fn g() -> crate::fail::Failure { super::zz_h(\"app_required\") }\n",
+            format!("`app_required` is reserved, but the code already has it ({child})"),
         ),
         (
-            "use super::zz_h;\npub fn g() -> crate::fail::Failure { zz_h(\"pty_unavailable\") }\n",
-            format!("`pty_unavailable` is reserved, but the code already has it ({child})"),
+            "use super::zz_h;\npub fn g() -> crate::fail::Failure { zz_h(\"app_required\") }\n",
+            format!("`app_required` is reserved, but the code already has it ({child})"),
         ),
         (
-            "use super::*;\npub fn g() -> Option<crate::fail::Failure> { Some(\"pty_unavailable\").map(zz_h) }\n",
+            "use super::*;\npub fn g() -> Option<crate::fail::Failure> { Some(\"app_required\").map(zz_h) }\n",
             "the token helper `zz_h` is used other than called by name".to_owned(),
         ),
     ] {
@@ -1629,16 +1629,16 @@ fn a_token_helper_or_failure_new_named_other_than_called_fails() {
     for (body, expect) in [
         (
             "pub fn zz_h(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
-             pub fn zz_g() -> Option<Failure> { Some(\"pty_unavailable\").map(zz_h) }\n",
+             pub fn zz_g() -> Option<Failure> { Some(\"app_required\").map(zz_h) }\n",
             "the token helper `zz_h` is used other than called by name",
         ),
         (
             "pub fn zz_h(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
-             mod inner { use super::zz_h as other; pub fn g() -> crate::fail::Failure { other(\"pty_unavailable\") } }\n",
+             mod inner { use super::zz_h as other; pub fn g() -> crate::fail::Failure { other(\"app_required\") } }\n",
             "the token helper `zz_h` is used other than called by name",
         ),
         (
-            "pub fn zz_g() -> Failure { let f = Failure::new; f(\"pty_unavailable\", \"x\") }\n",
+            "pub fn zz_g() -> Failure { let f = Failure::new; f(\"app_required\", \"x\") }\n",
             "`Failure::new` is used other than called",
         ),
     ] {
@@ -1676,8 +1676,8 @@ fn a_failures_token_is_set_only_where_it_is_made() {
     );
     assert_fails(&t, "`Failure`'s `token` field is public");
     for change in [
-        "impl Failure { pub fn zz(&mut self) { self.token = \"pty_unavailable\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { let _ = std::mem::replace(&mut self.token, \"pty_unavailable\"); } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.token = \"app_required\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { let _ = std::mem::replace(&mut self.token, \"app_required\"); } }\n",
     ] {
         let t = fixture();
         let path = t.home().join(FAIL);
@@ -1718,7 +1718,7 @@ fn a_token_method_the_reader_cannot_read_fails() {
             "a failure token the reader cannot read (`self.name`)",
         ),
         (
-            "pub enum K { A }\nconst NAMES: [&str; 1] = [\"pty_unavailable\"];\n\
+            "pub enum K { A }\nconst NAMES: [&str; 1] = [\"app_required\"];\n\
              impl K { pub fn token(self) -> crate::fail::ExitToken { match self { K::A => NAMES[0] } } }\n",
             "a failure token the reader cannot read (`NAMES[0]`)",
         ),
@@ -1773,14 +1773,14 @@ fn a_token_printed_from_a_placeholder_is_read_or_refused() {
             "a line printed as `envcloak: {t}:` takes its token from a variable",
         ),
         (
-            "pub fn d() { let why = \"pty_unavailable: x\"; eprintln!(\"envcloak: {why}\"); }\n",
+            "pub fn d() { let why = \"app_required: x\"; eprintln!(\"envcloak: {why}\"); }\n",
             "a usage line `envcloak: {why}` whose message the reader cannot trace",
         ),
         // In a function that calls `parse`, but printing another call's
         // message.
         (
             "fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(\"bad option\") }\n\
-             fn other() -> Result<(), &'static str> { Err(\"pty_unavailable: x\") }\n\
+             fn other() -> Result<(), &'static str> { Err(\"app_required: x\") }\n\
              pub fn run(a: &[&str]) { let _ = parse(a); match other() { Ok(()) => {}, Err(why) => eprintln!(\"envcloak: {why}\") } }\n",
             "a usage line `envcloak: {why}` whose message the reader cannot trace",
         ),
@@ -1806,11 +1806,11 @@ fn a_token_printed_from_a_placeholder_is_read_or_refused() {
         &t,
         "crates/envcloak-cli/src/cmd/add.rs",
         "Err(\"unknown or repeated option\")",
-        "Err(\"pty_unavailable: unknown or repeated option\")",
+        "Err(\"app_required: unknown or repeated option\")",
     );
     assert_fails(
         &t,
-        "`pty_unavailable` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/add.rs)",
+        "`app_required` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/add.rs)",
     );
 }
 
@@ -1847,7 +1847,7 @@ fn append_to(t: &TestHome, rel: &str, text: &str) {
 /// fail.rs names `Failure`'s token only where the reader has read it or
 /// knows it changes nothing (verifier review of M2-RES1: a destructuring
 /// `let Failure { token, .. } = &mut f; *token = t;` changed a made
-/// failure's token unseen, so `from_parts("pty_unavailable")` passed).
+/// failure's token unseen, so `from_parts("app_required")` passed).
 /// Every way to reach the field is refused: a pattern that binds it
 /// (against `&mut`, with `ref mut`, `token: ref mut`, in an `if let`), an
 /// assignment through a parenthesized place, `clone_from`, a macro that
@@ -1868,17 +1868,17 @@ fn fail_rs_names_a_failures_token_only_where_it_is_read() {
     add_file(
         &t,
         CLIENT_STUB,
-        "pub fn g() -> crate::fail::Failure { crate::fail::Failure::from_parts(\"pty_unavailable\") }\n",
+        "pub fn g() -> crate::fail::Failure { crate::fail::Failure::from_parts(\"app_required\") }\n",
     );
     let named = "`Failure`'s `token` is named where the reader cannot tell it is not changed";
     assert_fails(&t, named);
     for change in [
-        "impl Failure { pub fn zz(&mut self) { let Failure { ref mut token, .. } = *self; *token = \"pty_unavailable\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { let Failure { token: ref mut x, .. } = *self; *x = \"pty_unavailable\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { if let Failure { token, .. } = self { *token = \"pty_unavailable\"; } } }\n",
-        "impl Failure { pub fn zz(&mut self) { (self.token) = \"pty_unavailable\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { self.token.clone_from(&\"pty_unavailable\"); } }\n",
-        "macro_rules! zz_set { ($f:expr) => { let Failure { token, .. } = $f; *token = \"pty_unavailable\"; }; }\n\
+        "impl Failure { pub fn zz(&mut self) { let Failure { ref mut token, .. } = *self; *token = \"app_required\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { let Failure { token: ref mut x, .. } = *self; *x = \"app_required\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { if let Failure { token, .. } = self { *token = \"app_required\"; } } }\n",
+        "impl Failure { pub fn zz(&mut self) { (self.token) = \"app_required\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.token.clone_from(&\"app_required\"); } }\n",
+        "macro_rules! zz_set { ($f:expr) => { let Failure { token, .. } = $f; *token = \"app_required\"; }; }\n\
          impl Failure { pub fn zz(&mut self) { zz_set!(self); } }\n",
         "struct Zz { token: &'static str }\n\
          pub fn zz(t: &'static str) { let z = Zz { token: t }; eprintln!(\"envcloak: {}: x\", z.token); }\n",
@@ -1928,7 +1928,7 @@ fn a_failure_is_made_no_way_the_reader_does_not_read() {
     add_file(
         &t,
         "crates/envcloak-client/src/fail/zz_child.rs",
-        "impl super::Failure { pub fn zz(&mut self) { self.token = \"pty_unavailable\"; } }\n",
+        "impl super::Failure { pub fn zz(&mut self) { self.token = \"app_required\"; } }\n",
     );
     assert_fails(&t, "fail.rs declares a module in another file");
 }
@@ -1949,7 +1949,7 @@ fn a_raw_identifier_is_read_as_its_name() {
     append_to(
         &t,
         FAIL,
-        "impl Failure { pub fn zz(&mut self) { self.r#token = \"pty_unavailable\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.r#token = \"app_required\"; } }\n",
     );
     assert_fails(&t, "`Failure`'s token is changed after it is made");
 }
@@ -1959,8 +1959,8 @@ const ADD_RS: &str = "crates/envcloak-cli/src/cmd/add.rs";
 
 /// Every message `fn parse` can give a usage line, `envcloak: {why}`, is
 /// read as a token argument (verifier review of M2-RES1: `concat!`, a
-/// constant and a helper's `ParseError::Usage("pty_unavailable: ...")`
-/// each printed `envcloak: pty_unavailable: ...` and passed). A message
+/// constant and a helper's `ParseError::Usage("app_required: ...")`
+/// each printed `envcloak: app_required: ...` and passed). A message
 /// from `concat!` or a constant counts; one from a helper, a `?` on a
 /// helper's result, a `From` that makes its own message (in run.rs or in
 /// another file) or a last expression other than `Ok`/`Err` is refused.
@@ -1971,26 +1971,26 @@ const ADD_RS: &str = "crates/envcloak-cli/src/cmd/add.rs";
 #[test]
 fn every_message_fn_parse_can_give_is_read() {
     let grace = "return Err(\"--wait-grace needs --wait\".into());";
-    let reserved = format!("`pty_unavailable` is reserved, but the code already has it ({RUN_RS})");
+    let reserved = format!("`app_required` is reserved, but the code already has it ({RUN_RS})");
     for (to, extra, expect) in [
         (
-            "return Err(concat!(\"pty_unavailable\", \": no terminal\").into());",
+            "return Err(concat!(\"app_required\", \": no terminal\").into());",
             "",
             reserved.as_str(),
         ),
         (
             "return Err(ZZ_WHY.into());",
-            "const ZZ_WHY: &str = \"pty_unavailable: no terminal\";\n",
+            "const ZZ_WHY: &str = \"app_required: no terminal\";\n",
             reserved.as_str(),
         ),
         (
             "return Err(zz_why());",
-            "fn zz_why() -> ParseError { ParseError::Usage(\"pty_unavailable: no terminal\") }\n",
+            "fn zz_why() -> ParseError { ParseError::Usage(\"app_required: no terminal\") }\n",
             "`fn parse` gives an error the reader cannot read",
         ),
         (
             "zz_check()?;",
-            "fn zz_check() -> Result<(), &'static str> { Err(\"pty_unavailable: x\") }\n",
+            "fn zz_check() -> Result<(), &'static str> { Err(\"app_required: x\") }\n",
             "`fn parse` has a `?` whose error the reader cannot read",
         ),
     ] {
@@ -2004,7 +2004,7 @@ fn every_message_fn_parse_can_give_is_read() {
         &t,
         RUN_RS,
         "        ParseError::Usage(why)\n",
-        "        let _ = why;\n        ParseError::Usage(\"pty_unavailable: x\")\n",
+        "        let _ = why;\n        ParseError::Usage(\"app_required: x\")\n",
     );
     assert_fails(
         &t,
@@ -2014,7 +2014,7 @@ fn every_message_fn_parse_can_give_is_read() {
     append_to(
         &t,
         "crates/envcloak-cli/src/main.rs",
-        "impl From<u8> for crate::cmd::run::ParseError { fn from(_: u8) -> Self { Self::Usage(\"pty_unavailable: x\") } }\n",
+        "impl From<u8> for crate::cmd::run::ParseError { fn from(_: u8) -> Self { Self::Usage(\"app_required: x\") } }\n",
     );
     assert_fails(&t, &format!("the error of `fn parse`, outside {RUN_RS}"));
     let t = fixture();
@@ -2022,7 +2022,7 @@ fn every_message_fn_parse_can_give_is_read() {
         &t,
         ADD_RS,
         "    Ok(a)\n}\n\npub fn run",
-        "    zz(a)\n}\n\nfn zz(a: AddArgs) -> Result<AddArgs, &'static str> { let _ = a; Err(\"pty_unavailable: x\") }\n\npub fn run",
+        "    zz(a)\n}\n\nfn zz(a: AddArgs) -> Result<AddArgs, &'static str> { let _ = a; Err(\"app_required: x\") }\n\npub fn run",
     );
     assert_fails(
         &t,
@@ -2035,16 +2035,16 @@ fn every_message_fn_parse_can_give_is_read() {
         ".ok_or(\"an option needs a name after it\")?",
         ".ok_or(ZZ_WHY)?",
     );
-    append_to(&t, ADD_RS, "const ZZ_WHY: &str = \"pty_unavailable: x\";\n");
+    append_to(&t, ADD_RS, "const ZZ_WHY: &str = \"app_required: x\";\n");
     assert_fails(
         &t,
-        &format!("`pty_unavailable` is reserved, but the code already has it ({ADD_RS})"),
+        &format!("`app_required` is reserved, but the code already has it ({ADD_RS})"),
     );
 }
 
 /// A line made at compile time is read wherever its text is, or refused
 /// (verifier review of M2-RES1: `eprintln!(concat!("envcloak: ",
-/// "pty_unavailable", ": x"))` passed). `concat!` in any brackets is read
+/// "app_required", ": x"))` passed). `concat!` in any brackets is read
 /// joined; a literal holding the line anywhere counts (a slice of it
 /// prints it), with any white space after `envcloak:`; a placeholder
 /// after a newline takes the argument its place among the placeholders
@@ -2080,7 +2080,7 @@ fn a_line_made_at_compile_time_is_read_or_refused() {
             "a failure token the reader cannot read (`t`)",
         ),
         (
-            "pub fn zz_d() { eprintln!(stringify!(envcloak: pty_unavailable: x)); }\n",
+            "pub fn zz_d() { eprintln!(stringify!(envcloak: app_required: x)); }\n",
             "`stringify!` of text that holds `envcloak`",
         ),
         (
@@ -2092,7 +2092,7 @@ fn a_line_made_at_compile_time_is_read_or_refused() {
             "`env!` of a variable other than Cargo's own package variables",
         ),
         (
-            "pub fn zz_d() { eprintln!(concat!(env!(\"CARGO_PKG_NAME\"), \": pty_unavailable: x\")); }\n",
+            "pub fn zz_d() { eprintln!(concat!(env!(\"CARGO_PKG_NAME\"), \": app_required: x\")); }\n",
             "`concat!` of something other than literals",
         ),
     ] {
@@ -2158,7 +2158,7 @@ fn a_constant_is_read_by_its_whole_value() {
         &t,
         CLIENT_STUB,
         "mod zz_m { pub const ZZ_T: &str = \"io\"; }\n\
-         #[allow(non_snake_case)]\npub fn zz_a() -> Failure { let ZZ_T = \"pty_unavailable\"; Failure::new(ZZ_T, \"x\") }\n",
+         #[allow(non_snake_case)]\npub fn zz_a() -> Failure { let ZZ_T = \"app_required\"; Failure::new(ZZ_T, \"x\") }\n",
     );
     assert_fails(&t, "`non_snake_case` is allowed");
     let t = fixture();
@@ -2274,7 +2274,7 @@ fn fn_parse_is_read_as_narrowly_as_a_token() {
         &t,
         "crates/envcloak-client/src/zz_other.rs",
         "pub fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(ZZ_WHY) }\n\
-         const ZZ_WHY: &str = \"pty_unavailable: x\";\n",
+         const ZZ_WHY: &str = \"app_required: x\";\n",
     );
     add_file(
         &t,
@@ -2297,14 +2297,14 @@ fn fn_parse_is_read_as_narrowly_as_a_token() {
     append_to(
         &t,
         ADD_RS,
-        "macro_rules! zz_bail { () => { return Err(zz_why()) }; }\nfn zz_why() -> &'static str { \"pty_unavailable: x\" }\n",
+        "macro_rules! zz_bail { () => { return Err(zz_why()) }; }\nfn zz_why() -> &'static str { \"app_required: x\" }\n",
     );
     assert_fails(&t, "`fn parse` calls a macro (`zz_bail!(`)");
     let t = fixture();
     append_to(
         &t,
         RUN_RS,
-        "macro_rules! zz_conv { ($t:ty) => { impl From<u8> for $t { fn from(_: u8) -> Self { ParseError::Usage(\"pty_unavailable: x\") } } }; }\n\
+        "macro_rules! zz_conv { ($t:ty) => { impl From<u8> for $t { fn from(_: u8) -> Self { ParseError::Usage(\"app_required: x\") } } }; }\n\
          zz_conv!(ParseError);\n",
     );
     assert_fails(&t, "a conversion a macro makes for a type it is given");
@@ -2326,7 +2326,7 @@ fn a_source_directory_that_cannot_be_listed_fails() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("mod.rs"),
-        "pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(\"pty_unavailable\", \"x\") }\n",
+        "pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(\"app_required\", \"x\") }\n",
     )
     .unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -2356,12 +2356,12 @@ fn a_source_directory_that_cannot_be_listed_fails() {
 #[test]
 fn non_ascii_code_is_refused_without_rejecting_unicode_text() {
     for body in [
-        r#"use crate::fail::Failure as Φ; pub fn make()->Φ { Φ::new("pty_unavailable", "") }"#,
-        r#"type Φ=crate::fail::Failure; pub fn make()->Φ { Φ::new("pty_unavailable", "") }"#,
-        r#"use crate::fail::Failure as AliasΦ; pub fn make()->AliasΦ { AliasΦ::new("pty_unavailable", "") }"#,
-        r#"type AliasΦ=crate::fail::Failure; pub fn make()->AliasΦ { AliasΦ::new("pty_unavailable", "") }"#,
-        r#"mod δοκιμή { pub use crate::fail::Failure; } pub fn make()->δοκιμή::Failure { δοκιμή::Failure::new("pty_unavailable", "") }"#,
-        r#"use crate::fail::Failure as r#Φ; pub fn make()->r#Φ { r#Φ::new("pty_unavailable", "") }"#,
+        r#"use crate::fail::Failure as Φ; pub fn make()->Φ { Φ::new("app_required", "") }"#,
+        r#"type Φ=crate::fail::Failure; pub fn make()->Φ { Φ::new("app_required", "") }"#,
+        r#"use crate::fail::Failure as AliasΦ; pub fn make()->AliasΦ { AliasΦ::new("app_required", "") }"#,
+        r#"type AliasΦ=crate::fail::Failure; pub fn make()->AliasΦ { AliasΦ::new("app_required", "") }"#,
+        r#"mod δοκιμή { pub use crate::fail::Failure; } pub fn make()->δοκιμή::Failure { δοκιμή::Failure::new("app_required", "") }"#,
+        r#"use crate::fail::Failure as r#Φ; pub fn make()->r#Φ { r#Φ::new("app_required", "") }"#,
         r#"type é=crate::fail::Failure;"#,
         r#"type é=crate::fail::Failure;"#,
         r#"pub fn borrowed<'α>(value: &'α str)->&'α str { value }"#,
@@ -2376,7 +2376,7 @@ fn non_ascii_code_is_refused_without_rejecting_unicode_text() {
         pub fn text()->&'static str { "Φ δοκιμή" }"#,
         r###"pub const TEXT: &str = r##"Φ δοκιμή"##; pub const LETTER: char = 'Φ';"###,
         r#"#[doc = "Φ"] pub fn make()->crate::fail::Failure { crate::fail::Failure::new("daemon_unavailable", "Φ") }"#,
-        r#"#[cfg(test)] mod tests { type Φ=crate::fail::Failure; fn make()->Φ { Φ::new("pty_unavailable", "") } }"#,
+        r#"#[cfg(test)] mod tests { type Φ=crate::fail::Failure; fn make()->Φ { Φ::new("app_required", "") } }"#,
     ] {
         let t = fixture();
         add_file(&t, CLIENT_STUB, body);
@@ -2429,25 +2429,25 @@ fn a_constructor_is_read_however_its_path_is_written() {
         ),
         (
             STATUS_RS,
-            "\npub fn zz() -> Option<envcloak_client::Failure> { Some(\"pty_unavailable\").map(|t| (t, \"x\")).map(|(t, m)| (::envcloak_client::Fail::new)(t, m)) }\n",
+            "\npub fn zz() -> Option<envcloak_client::Failure> { Some(\"app_required\").map(|t| (t, \"x\")).map(|(t, m)| (::envcloak_client::Fail::new)(t, m)) }\n",
             "`Fail::new` is used other than called",
         ),
         (
             CLIENT_STUB,
-            "macro_rules! zz_mk { ($t:ty) => { <$t>::new(\"pty_unavailable\", \"x\") }; }\n\
+            "macro_rules! zz_mk { ($t:ty) => { <$t>::new(\"app_required\", \"x\") }; }\n\
              pub fn zz() -> crate::fail::Failure { zz_mk!(crate::fail::Failure) }\n",
             "`<$t>::new` is called on a macro's metavariable",
         ),
         (
             CLIENT_STUB,
-            "macro_rules! zz_mk { ($t:ident) => { $t::new(\"pty_unavailable\", \"x\") }; }\n\
+            "macro_rules! zz_mk { ($t:ident) => { $t::new(\"app_required\", \"x\") }; }\n\
              pub fn zz() -> crate::fail::Failure { use crate::fail::Failure; zz_mk!(Failure) }\n",
             "`$t::new` is called on a macro's metavariable",
         ),
         (
             CLIENT_STUB,
             "macro_rules! zz_ty { () => { crate::fail::Failure }; }\n\
-             pub fn zz() -> crate::fail::Failure { <zz_ty!()>::new(\"pty_unavailable\", \"x\") }\n",
+             pub fn zz() -> crate::fail::Failure { <zz_ty!()>::new(\"app_required\", \"x\") }\n",
             "`<zz_ty!()>::new` is called on a type the reader cannot read",
         ),
         (
@@ -2485,14 +2485,14 @@ fn a_function_a_trait_calls_unnamed_takes_no_token() {
         (
             CLIENT_STUB,
             "impl From<&'static str> for crate::fail::Failure { fn from(token: &'static str) -> Self { Self::new(token, \"x\") } }\n\
-             pub fn zz() -> crate::fail::Failure { \"pty_unavailable\".into() }\n",
+             pub fn zz() -> crate::fail::Failure { \"app_required\".into() }\n",
             "from",
         ),
         (
             FAIL,
             "pub trait ZzCtor { fn new(token: ExitToken) -> Self; }\n\
              impl ZzCtor for Failure { fn new(token: ExitToken) -> Self { Failure::new(token, \"x\") } }\n\
-             pub fn zz<T: ZzCtor>() -> T { T::new(\"pty_unavailable\") }\n",
+             pub fn zz<T: ZzCtor>() -> T { T::new(\"app_required\") }\n",
             "new",
         ),
         (
@@ -2531,32 +2531,32 @@ fn a_name_or_type_a_macro_gives_is_refused() {
     for (body, expect) in [
         (
             "macro_rules! zz_imp { ($n:ident) => { use crate::fail::Failure as $n; }; }\nzz_imp!(Q);\n\
-             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"app_required\", \"x\") }\n",
             "an import built from a macro's metavariable",
         ),
         (
             "macro_rules! zz_imp { ($p:path) => { use $p as Q; }; }\nzz_imp!(crate::fail::Failure);\n\
-             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"app_required\", \"x\") }\n",
             "an import built from a macro's metavariable",
         ),
         (
             "macro_rules! zz_al { ($t:ty) => { type Q = $t; }; }\nzz_al!(crate::fail::Failure);\n\
-             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"app_required\", \"x\") }\n",
             "the type alias `Q` is of a type a macro gives (`$t`)",
         ),
         (
             "macro_rules! zz_ty { () => { crate::fail::Failure }; }\ntype Q = zz_ty!();\n\
-             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"app_required\", \"x\") }\n",
             "the type alias `Q` is of a type a macro gives (`zz_ty!()`)",
         ),
         (
             "macro_rules! zz_al { ($n:ident) => { type $n = crate::fail::Failure; }; }\nzz_al!(Q);\n\
-             pub fn zz() -> Q { Q::new(\"pty_unavailable\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"app_required\", \"x\") }\n",
             "a type alias named by a macro's metavariable",
         ),
         (
             "pub const ZZ_T: &str = \"io\";\n\
-             mod zz_m { macro_rules! zz_c { ($n:ident) => { const $n: &str = \"pty_unavailable\"; }; }\n\
+             mod zz_m { macro_rules! zz_c { ($n:ident) => { const $n: &str = \"app_required\"; }; }\n\
              zz_c!(ZZ_T); pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(ZZ_T, \"x\") } }\n",
             "a `fn`, `const` or `static` named by a macro's metavariable",
         ),
@@ -2591,7 +2591,7 @@ fn a_name_or_type_a_macro_gives_is_refused() {
 /// this fails.
 #[test]
 fn the_compiler_reads_no_rust_the_reader_does_not() {
-    let hidden = "pub fn h() -> envcloak_client::Failure { envcloak_client::Failure::new(\"pty_unavailable\", \"x\") }\n";
+    let hidden = "pub fn h() -> envcloak_client::Failure { envcloak_client::Failure::new(\"app_required\", \"x\") }\n";
     // A macro can make the attribute from `path = ".."` it is given.
     let t = fixture();
     append_to(
@@ -2764,11 +2764,11 @@ fn the_statement_domain_reader_reads_what_tests_bring_in() {
 /// A placeholder right after `envcloak:` prints its value where a token
 /// goes, with or without white space before it: padding (`{:>16}`) or the
 /// value itself can give the space (verifier review of M2-RES1:
-/// `envcloak:{:>16}: x` printed `envcloak:  pty_unavailable: x` and
+/// `envcloak:{:>16}: x` printed `envcloak:  app_required: x` and
 /// passed). It is read, its value counted without the white space around
 /// it; a value printed mid-line, not followed by `:`, counts by the token
 /// it starts with when the reader can read it. A token put together from
-/// pieces (`{}{}:`, `pty_{}:`) or a colon a value brings after `envcloak`
+/// pieces (`{}{}:`, `app_{}:`) or a colon a value brings after `envcloak`
 /// (`envcloak{}`) is refused. A count printed mid-line passes.
 ///
 /// Mutation checked: placeholders read only after `envcloak:` and white
@@ -2783,9 +2783,9 @@ fn a_placeholder_right_after_envcloak_is_read() {
         assert_counted(body, CLIENT_STUB);
     }
     for body in [
-        "pub fn d() { eprintln!(\"envcloak: {}{}: x\", \"pty_\", \"unavailable\"); }\n",
-        "pub fn d() { eprintln!(\"envcloak: pty_{}: x\", \"unavailable\"); }\n",
-        "pub fn d() { eprintln!(\"envcloak{} x\", \": pty_unavailable:\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak: {}{}: x\", \"app_\", \"required\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak: app_{}: x\", \"required\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak{} x\", \": app_required:\"); }\n",
     ] {
         let t = fixture();
         add_file(&t, CLIENT_STUB, body);
@@ -2939,7 +2939,7 @@ fn compile_and_run(main: &Path, libs: &[(String, PathBuf)], deps: &Path, label: 
 #[test]
 fn a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused() {
     let (libs, deps) = client_libraries();
-    let (reserved, landed, unknown) = ("pty_unavailable", "daemon_unavailable", "zz_unregistered");
+    let (reserved, landed, unknown) = ("app_required", "daemon_unavailable", "zz_unregistered");
     let direct = |form: &str, value: &str| {
         format!(
             "pub fn make() -> envcloak_client::fail::Failure {{ {form}({value}, String::new()) }}\n"
