@@ -401,9 +401,14 @@ const DETACH: &str = "import os, sys\nos.setsid()\nos.execv(sys.argv[1], sys.arg
 /// The counting fixture: `counter.py DIR WHO [VAR]`. Appends a line to
 /// `DIR/WHO-<SIG>` for each SIGINT, SIGQUIT, SIGTERM and SIGHUP it gets;
 /// prints `JOB-READY <pid> <pgid>` (and, with `VAR`, the variable's
-/// length), then `GOT [<line>]` for each line it reads, and exits 0 on
-/// `done` or at the end of its input.
-const COUNTER: &str = r#"import os, signal, sys
+/// length), then `GOT [<line>]` for each line it reads (one read of its
+/// terminal, which in canonical mode is one line), and exits 0 on `done`
+/// or at the end of its input. It never blocks in a read for more than
+/// 50 ms: Python runs a signal's handler only between its own steps, so a
+/// signal caught while a handler for the one before is still running, and
+/// before the read it then goes back to, would otherwise wait for the next
+/// key (a SIGINT lost for 30 seconds on macOS CI, run 37297793188).
+const COUNTER: &str = r#"import os, select, signal, sys
 d, who = sys.argv[1], sys.argv[2]
 names = {signal.SIGINT: 'INT', signal.SIGQUIT: 'QUIT', signal.SIGTERM: 'TERM', signal.SIGHUP: 'HUP'}
 def got(sig, frame):
@@ -417,7 +422,10 @@ if len(sys.argv) > 3:
 os.write(1, b'JOB-READY %d %d%s\n' % (os.getpid(), os.getpgrp(), extra))
 while True:
     try:
-        line = sys.stdin.buffer.readline()
+        ready, _, _ = select.select([0], [], [], 0.05)
+        if not ready:
+            continue
+        line = os.read(0, 65536)
     except OSError:
         break
     if not line or line.strip() == b'done':
