@@ -180,7 +180,7 @@ fn repeated_assignment_separators_do_not_multiply_readings() {
     )
     .unwrap();
     assert!(report.complete());
-    assert_eq!(raw, 2, "one token and one assignment reading");
+    assert_eq!(raw, 3, "whole token, first RHS and final delimited value");
 }
 
 #[test]
