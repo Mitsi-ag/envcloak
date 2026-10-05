@@ -28,8 +28,9 @@ Rules (the id is what a finding and an allowlist entry name):
   launch-input   anything the starter of the app controls: `CommandLine`,
                  `.arguments`, `.environment` (other than SwiftUI's
                  `.environment(...)` modifier), `getenv`, `environ`,
-                 `_NSGetArgv`, `_NSGetArgc`, `_NSGetEnviron`, the standard
-                 input, `UserDefaults` and `@AppStorage` (launch arguments
+                 `_NSGetArgv`, `_NSGetArgc`, `_NSGetEnviron`, the app's own
+                 standard input (`FileHandle.standardInput`, `stdin`,
+                 `readLine`), `UserDefaults` and `@AppStorage` (launch arguments
                  `-key value` land in the defaults' argument domain).
   side-door      SPEC §12 "No side doors": Info.plist keys for URL schemes,
                  AppleScript, Services, documents, exported types, Handoff
@@ -41,8 +42,9 @@ Rules (the id is what a finding and an allowlist entry name):
                  (rule 2: none may approve, reveal or write).
   gated-key      a keyboard shortcut on a button whose title starts with
                  Approve, Reveal, Replace or Remove (rule 2).
-  log            `print`, `debugPrint`, `dump`, `NSLog` and the C stdio
-                 writers; in a log call (`os_log`, or a `Logger` level
+  log            `print`, `debugPrint`, `dump`, `NSLog`, the C stdio
+                 writers and the app's own `FileHandle.standardError` and
+                 `.standardOutput` (a child's streams are fine); in a log call (`os_log`, or a `Logger` level
                  method given a string literal) every interpolation is
                  `\\(x.logToken)` (rule 3: a launch environment can make the
                  log store "private" arguments in the clear, docs/APP.md
@@ -169,7 +171,11 @@ PRINTERS = {
     "perror",
     "fwrite",
 }
-STDIO_WRITERS = {"standardError", "standardOutput", "stderr", "stdout"}
+# The process's own standard streams: FileHandle.standardError and
+# .standardOutput, and the C globals. Setting a child's streams
+# (`process.standardOutput = pipe`) is not writing to the app's own.
+FILEHANDLE_WRITERS = {"standardError", "standardOutput"}
+C_STREAM_WRITERS = {"stderr", "stdout"}
 LOG_LEVELS = {"debug", "info", "notice", "error", "warning", "fault", "critical", "trace", "log"}
 LAUNCH_NAMES = {
     "CommandLine",
@@ -179,9 +185,7 @@ LAUNCH_NAMES = {
     "_NSGetEnviron",
     "_NSGetArgv",
     "_NSGetArgc",
-    "standardInput",
     "readLine",
-    "stdin",
     "NSArgumentDomain",
     "argumentDomain",
     "UserDefaults",
@@ -675,8 +679,15 @@ def check_product_swift(rel, toks, brand):
                     find("log", rel, t.line, "`%s` writes outside the unified log (use Logger with LogToken)" % name)
             if name in PRINTERS and prev(k) is not None and prev(k).text == "func":
                 find("log", rel, t.line, "a function named `%s`" % name)
-            if name in STDIO_WRITERS:
-                find("log", rel, t.line, "`%s` writes to a standard stream" % name)
+            own_handle = is_member(k) and prev(k, 2) is not None and prev(k, 2).text == "FileHandle"
+            if name in FILEHANDLE_WRITERS and own_handle:
+                find("log", rel, t.line, "`FileHandle.%s` writes to the app's own standard stream" % name)
+            if name in C_STREAM_WRITERS and not is_member(k):
+                find("log", rel, t.line, "`%s` writes to the app's own standard stream" % name)
+            if name == "standardInput" and own_handle:
+                find("launch-input", rel, t.line, "`FileHandle.standardInput` reads what the app's starter controls")
+            if name == "stdin" and not is_member(k):
+                find("launch-input", rel, t.line, "`stdin` reads what the app's starter controls")
             if name == "logToken" and rel != LOG_TOKEN_FILE:
                 p = prev(k)
                 if p is not None and p.kind == "id" and p.text in ("var", "let", "func", "case", "subscript"):
