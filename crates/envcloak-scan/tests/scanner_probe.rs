@@ -51,31 +51,38 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
             2,
         ));
     }
-    let session = probe_canaries(&cs, ProbeMode::Wiping);
-    for (input, format) in &inputs {
-        match format {
-            0 => drop(parse_profile(input, Shell::Posix)),
-            1 => drop(parse_config(input, ConfigFormat::Json)),
-            2 => drop(parse_config(input, ConfigFormat::Toml)),
-            _ => {
-                use secrecy::ExposeSecret;
-                #[allow(clippy::disallowed_methods)]
-                let bytes = input.expose_secret();
-                drop(
-                    scan_reader(
-                        &mut std::io::Cursor::new(bytes),
-                        ConfigFormat::Jsonl,
-                        Default::default(),
-                        Budget::default(),
-                        &mut |_| true,
-                    )
-                    .unwrap(),
-                );
+    for mode in [ProbeMode::Unwiped, ProbeMode::Wiping] {
+        let session = probe_canaries(&cs, mode);
+        for (input, format) in &inputs {
+            if mode == ProbeMode::Unwiped && *format == 2 {
+                continue;
+            }
+            match format {
+                0 => drop(parse_profile(input, Shell::Posix)),
+                1 => drop(parse_config(input, ConfigFormat::Json)),
+                2 => drop(parse_config(input, ConfigFormat::Toml)),
+                _ => {
+                    use secrecy::ExposeSecret;
+                    #[allow(clippy::disallowed_methods)]
+                    let bytes = input.expose_secret();
+                    drop(
+                        scan_reader(
+                            &mut std::io::Cursor::new(bytes),
+                            ConfigFormat::Jsonl,
+                            Default::default(),
+                            Budget::default(),
+                            &mut |_| true,
+                        )
+                        .unwrap(),
+                    );
+                }
             }
         }
+        let report = session.finish();
+        assert!(report.freed > 0);
+        assert_eq!(report.released_with_needle, 0, "{report:?}");
+        if mode == ProbeMode::Wiping {
+            assert_eq!(report.not_zeroed, 0, "{report:?}");
+        }
     }
-    let report = session.finish();
-    assert!(report.freed > 0);
-    assert_eq!(report.released_with_needle, 0, "{report:?}");
-    assert_eq!(report.not_zeroed, 0, "{report:?}");
 }
