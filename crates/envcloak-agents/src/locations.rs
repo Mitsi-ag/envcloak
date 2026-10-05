@@ -202,6 +202,11 @@ impl Locations {
         self.codex_system.join("config.toml")
     }
 
+    /// The hook file beside Codex's system layer.
+    pub fn codex_system_hooks(&self) -> PathBuf {
+        self.codex_system.join("hooks.json")
+    }
+
     /// Codex's legacy managed configuration, merged above every other
     /// layer.
     pub fn codex_managed_config(&self) -> PathBuf {

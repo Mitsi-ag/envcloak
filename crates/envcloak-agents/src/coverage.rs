@@ -677,20 +677,39 @@ pub struct ProgramSeen {
     pub sha256: Option<String>,
 }
 
+/// The part of a file the host rewrites while it runs that concerns
+/// EnvCloak, by the SHA-256 of its canonical JSON: Claude Code's
+/// `.claude.json`, where it records its own state on every run (and which
+/// it creates in a fresh home; measured on 2.1.280), so the file's bytes
+/// say nothing about what a probe ran under, and the registration of
+/// EnvCloak's server there says everything (the verifier's round-2
+/// finding: a changed command or timeout left the fingerprint as it was).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartSeen {
+    pub role: String,
+    pub path: String,
+    pub sha256: String,
+}
+
 /// What a probe's result depends on beyond the facts above (Codex F-132:
 /// a hook's timeout, the program it runs, every other setting of the
 /// files the host reads): every configuration file the host reads, by its
-/// bytes' SHA-256, and every program EnvCloak's hooks run, by its
+/// bytes' SHA-256, the parts of the files it rewrites that concern
+/// EnvCloak ([`PartSeen`]), and every program EnvCloak's hooks run, by its
 /// SHA-256. Nothing a setting holds is kept.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Context {
     pub files: Vec<FileSeen>,
+    #[serde(default)]
+    pub parts: Vec<PartSeen>,
     pub programs: Vec<ProgramSeen>,
-    /// Everything a result depends on was identified: false when a program
-    /// a hook runs is there but cannot be read, or the hooks of EnvCloak's
-    /// Claude Code plugin cannot be found. A context not read is not
-    /// complete either.
+    /// Everything a result depends on was identified: false when a
+    /// configuration file or a folder of them is there but cannot be read
+    /// (what it holds could change unseen), a program a hook runs is there
+    /// but cannot be read, or the hooks of EnvCloak's Claude Code plugin
+    /// cannot be found. A context not read is not complete either.
     pub complete: bool,
 }
 
@@ -722,6 +741,20 @@ pub struct ConfigSet {
     /// Claude Code: the deny rule `Read(**/.env*)`, which covers `@`
     /// mentions no hook sees.
     pub read_deny: bool,
+    /// Claude Code: a deny rule for its file tools other than EnvCloak's
+    /// `Read(**/.env*)`, at any level: a refusal of a `.env` read in the
+    /// host's own words may then be that rule's, not EnvCloak's (the
+    /// verifier's round-2 finding), so the probe's rule case does not
+    /// count it.
+    #[serde(default)]
+    pub foreign_read_deny: bool,
+    /// A `UserPromptSubmit` hook that is not EnvCloak's, in any file the
+    /// host reads hooks from: a blocked prompt the host reports may then
+    /// be that hook's, so the prompt probe's witness of the block does
+    /// not count where it does not name EnvCloak (Codex's, which names
+    /// none).
+    #[serde(default)]
+    pub foreign_prompt_hook: bool,
     /// The host's shell runs in its sandbox by default (Claude Code's
     /// `sandbox.enabled`; Codex unless its effective `sandbox_mode` is
     /// `danger-full-access`).
@@ -731,8 +764,12 @@ pub struct ConfigSet {
 }
 
 /// The version of what [`ConfigSet::fingerprint`] covers: when it changes,
-/// a result kept under the old one is no longer current.
-pub const CONTEXT_FORMAT: u32 = 1;
+/// a result kept under the old one is no longer current. 2 since the
+/// context holds Claude Code's registration of EnvCloak's server, its
+/// `.mcp.json` files and Codex's project hook files, is read for the
+/// host's working directory, and is incomplete where a file cannot be
+/// read.
+pub const CONTEXT_FORMAT: u32 = 2;
 
 impl ConfigSet {
     /// The probe context's fingerprint, which keys the probe cache (its
@@ -890,11 +927,16 @@ fn read_json(path: &Path, cap: u64) -> Read {
 
 impl Context {
     /// Keeps how `path` (a `role` to the host) was found: its state and
-    /// its bytes' SHA-256.
+    /// its bytes' SHA-256. One that is there but cannot be read leaves the
+    /// context incomplete: what it holds could change and nothing here
+    /// would (Codex cycle418: unknown content supports no current result).
     fn note(&mut self, role: &str, path: &Path, got: &Option<Option<Zeroizing<Vec<u8>>>>) {
         let (state, sha256) = match got {
             Some(None) => (FileState::Absent, None),
-            None => (FileState::Unreadable, None),
+            None => {
+                self.complete = false;
+                (FileState::Unreadable, None)
+            }
             Some(Some(b)) => (FileState::Read, Some(hex(&Sha256::digest(b.as_slice())))),
         };
         self.files.push(FileSeen {
@@ -1095,6 +1137,185 @@ fn merge_hooks(a: Hooks, b: Hooks) -> Hooks {
     }
 }
 
+/// Whether `cmd` is one of EnvCloak's hook commands for `host` and
+/// `event`: `<envcloak> hook --host <host> --event <event>`, the program
+/// named `envcloak` (by an absolute path, quoted or not, or found on
+/// `PATH`, as the plugin's).
+fn envcloak_command(cmd: &str, host: Host, event: Event) -> bool {
+    let tail = format!(" hook --host {} --event {}", host.id(), event.name());
+    cmd.strip_suffix(tail.as_str()).is_some_and(|exe| {
+        let exe = exe
+            .strip_prefix('\'')
+            .and_then(|x| x.strip_suffix('\''))
+            .unwrap_or(exe);
+        Path::new(exe).file_name() == Some(std::ffi::OsStr::new("envcloak"))
+    })
+}
+
+/// Whether `settings` (a host's settings or hook file) holds a
+/// `UserPromptSubmit` hook that is not EnvCloak's: a command of another
+/// program, or a hook of another type (a prompt or an agent hook).
+fn foreign_prompt_hook(settings: &Value, host: Host) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(Event::UserPromptSubmit.name()))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|g| {
+            g.get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .any(|h| {
+            !h.get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| envcloak_command(c, host, Event::UserPromptSubmit))
+        })
+}
+
+/// Whether a Claude Code permission rule names EnvCloak's
+/// `run_with_secrets`: the tool itself, or every tool of EnvCloak's server.
+fn names_run_with_secrets(rule: &str) -> bool {
+    matches!(
+        rule,
+        "mcp__envcloak__run_with_secrets" | "mcp__envcloak__*" | "mcp__envcloak"
+    )
+}
+
+/// Whether a Claude Code permission rule is one for its file tools
+/// (`Read`, with or without a specifier), which can refuse a `.env` read.
+fn file_tool_rule(rule: &str) -> bool {
+    rule == "Read" || rule.starts_with("Read(")
+}
+
+/// The rules of Claude Code's settings that name `run_with_secrets`.
+#[derive(Debug, Clone, Copy, Default)]
+struct ToolRules {
+    allow: bool,
+    ask: bool,
+    deny: bool,
+}
+
+/// How Claude Code lets an agent call `run_with_secrets`, from the
+/// permission mode its settings give (`defaultMode`, the highest level
+/// that sets it), whether bypass is switched off
+/// (`disableBypassPermissionsMode`), and the rules that name the tool at
+/// any level. Measured on the pinned 2.1.280 (`-p`, a tool the rules
+/// name): a `deny` or an `ask` rule stops the call in every mode,
+/// `bypassPermissions` included; `bypassPermissions` runs it with no rule;
+/// `default`, `manual`, `acceptEdits` and `dontAsk` run it only with an
+/// `allow` rule. `Some(true)` callable, `Some(false)` asked or refused,
+/// `None` not known (`plan`, `auto`, a mode not recognised, or bypass
+/// switched off, where what the host does instead was not measured).
+fn claude_approval(mode: Option<&str>, bypass_off: bool, rules: ToolRules) -> Option<bool> {
+    if rules.deny || rules.ask {
+        return Some(false);
+    }
+    match mode.unwrap_or("default") {
+        "bypassPermissions" if !bypass_off => Some(true),
+        "default" | "manual" | "acceptEdits" | "dontAsk" => Some(rules.allow),
+        _ => None,
+    }
+}
+
+/// `v` with every object's keys in order, so that the same content always
+/// gives the same bytes.
+fn canonical(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for k in keys {
+                out.insert(k.clone(), canonical(&m[k]));
+            }
+            Value::Object(out)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
+/// What Claude Code's `.claude.json` (`v`; `Null` when there is none)
+/// says about EnvCloak's server for a session in one of `dirs` (the
+/// working directory and every folder above it, the keys Claude Code
+/// files a project's local scope under): the user-scope entry, and for
+/// each of those folders the local-scope entry and the person's settings
+/// about EnvCloak's server there (disabled; a project's servers enabled
+/// or disabled). Canonical, with nothing where nothing concerns it, so
+/// the host's own bookkeeping in the file, and the file's creation, give
+/// the same value. And whether an entry registers the server.
+fn claude_registration(v: &Value, dirs: &[PathBuf]) -> (Value, bool) {
+    let server = |x: Option<&Value>| {
+        x.and_then(|s| s.get(claude::MCP_SERVERS))
+            .and_then(|s| s.get(claude::SERVER))
+            .cloned()
+    };
+    let lists = |e: &Value, k: &str| {
+        e.get(k)
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(claude::SERVER)))
+    };
+    let user = server(Some(v));
+    let mut registered = user.is_some();
+    let mut projects = serde_json::Map::new();
+    let all = v.get("projects").and_then(Value::as_object);
+    for d in dirs {
+        let key = d.to_string_lossy();
+        let Some(e) = all.and_then(|p| p.get(key.as_ref())) else {
+            continue;
+        };
+        let local = server(Some(e));
+        registered |= local.is_some();
+        let mut part = serde_json::Map::new();
+        if let Some(s) = local {
+            part.insert("server".to_owned(), s);
+        }
+        for (k, name) in [
+            ("disabledMcpServers", "disabled"),
+            ("enabledMcpjsonServers", "mcpjson_enabled"),
+            ("disabledMcpjsonServers", "mcpjson_disabled"),
+        ] {
+            if lists(e, k) {
+                part.insert(name.to_owned(), Value::Bool(true));
+            }
+        }
+        if let Some(all) = e.get("enableAllProjectMcpServers").filter(|x| !x.is_null()) {
+            part.insert("all_project".to_owned(), all.clone());
+        }
+        if !part.is_empty() {
+            projects.insert(key.into_owned(), Value::Object(part));
+        }
+    }
+    let out = serde_json::json!({
+        "user": user.unwrap_or(Value::Null),
+        "projects": projects,
+    });
+    (canonical(&out), registered)
+}
+
+/// The nearest folder at or above `cwd` holding a `.git` (a folder, or a
+/// file as a worktree's): Claude Code reads its local settings there as
+/// well as in the working directory (measured on the pinned 2.1.280).
+/// `None` when there is none; a `.git` that cannot be looked at leaves
+/// the context incomplete, the search stopped there.
+fn git_root(cwd: &Path, ctx: &mut Context) -> Option<PathBuf> {
+    for d in cwd.ancestors() {
+        let dot = d.join(".git");
+        match std::fs::symlink_metadata(&dot) {
+            Ok(_) => return Some(d.to_path_buf()),
+            Err(e) if not_there(&e) => {}
+            Err(_) => {
+                ctx.note("git_dir", &dot, &None);
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// Where Claude Code reads managed settings on this system.
 pub fn claude_managed_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
@@ -1110,9 +1331,10 @@ fn flag(v: &Value, key: &str) -> bool {
 }
 
 impl ConfigSet {
-    /// Reads `host`'s configuration for a session in `project` (the
-    /// directory of the nearest manifest, or the working directory), from
-    /// the files `locations` names and the system directories
+    /// Reads `host`'s configuration for a session whose working directory
+    /// is `cwd` (resolved here: Codex review of M2-09, the files of the
+    /// directory a host runs in, not of the nearest manifest's), from the
+    /// files `locations` names and the system directories
     /// (`claude_managed` for Claude Code's managed settings), with `env`
     /// for the switches a host reads from its environment (and `PATH`,
     /// where the plugin's hooks find `envcloak`). Read-only; no value of a
@@ -1121,7 +1343,7 @@ impl ConfigSet {
         host: Host,
         locations: &Locations,
         claude_managed: &Path,
-        project: &Path,
+        cwd: &Path,
         env: &dyn Fn(&str) -> Option<OsString>,
     ) -> ConfigSet {
         let mut cs = ConfigSet {
@@ -1133,19 +1355,29 @@ impl ConfigSet {
             },
             ..ConfigSet::default()
         };
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         match host {
-            Host::ClaudeCode => read_claude(&mut cs, locations, claude_managed, project, env),
-            Host::Codex => read_codex(&mut cs, locations, project),
+            Host::ClaudeCode => read_claude(&mut cs, locations, claude_managed, &cwd, env),
+            Host::Codex => read_codex(&mut cs, locations, &cwd),
         }
         cs
     }
 }
 
+/// Claude Code's configuration for a session in `cwd`, as the pinned
+/// 2.1.280 reads it (measured: docs/INSTALLERS.md, "What `agents status`
+/// reads"): the user's settings; the project's settings in the working
+/// directory only; the local settings there and at the git root above it;
+/// the managed settings and their drop-ins; the user-scope and local-scope
+/// registrations of MCP servers in `.claude.json` (the parts that concern
+/// EnvCloak's: [`claude_registration`]); every `.mcp.json` from the
+/// working directory up; the organization's `managed-mcp.json`; and, with
+/// EnvCloak's plugin enabled, its files ([`plugin_context`]).
 fn read_claude(
     cs: &mut ConfigSet,
     l: &Locations,
     managed_dir: &Path,
-    project: &Path,
+    cwd: &Path,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) {
     cs.config_dir_moved = env("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty());
@@ -1175,19 +1407,20 @@ fn read_claude(
             cs.context.note("claude_managed_dir", &drop_in, &None);
         }
     }
+    let mut local = vec![cwd.join(".claude").join("settings.local.json")];
+    if let Some(root) = git_root(cwd, &mut cs.context).filter(|r| r != cwd) {
+        local.push(root.join(".claude").join("settings.local.json"));
+    }
     let levels: [(&str, Vec<PathBuf>); 4] = [
         ("user", vec![l.claude_settings()]),
-        (
-            "project",
-            vec![project.join(".claude").join("settings.json")],
-        ),
-        (
-            "local",
-            vec![project.join(".claude").join("settings.local.json")],
-        ),
+        ("project", vec![cwd.join(".claude").join("settings.json")]),
+        ("local", local),
         ("managed", managed),
     ];
     let mut sandbox: [Option<bool>; 4] = [None; 4];
+    let mut mode: [Option<String>; 4] = Default::default();
+    let mut rules = ToolRules::default();
+    let mut bypass_off = false;
     let mut plugin = false;
     let mut programs = Vec::new();
     for (i, (level, files)) in levels.iter().enumerate() {
@@ -1215,14 +1448,38 @@ fn read_claude(
                         cs.managed_hooks.mcp |= h.mcp == HookState::Present;
                     }
                     cs.hooks = merge_hooks(cs.hooks, h);
+                    cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::ClaudeCode);
                     plugin |= claude::plugin_enabled(&v);
-                    if v.get("permissions")
-                        .and_then(|p| p.get("deny"))
-                        .and_then(Value::as_array)
-                        .is_some_and(|d| d.iter().any(|r| r.as_str() == Some(claude::READ_DENY)))
-                    {
-                        cs.read_deny = true;
+                    let perms = v.get("permissions");
+                    let list = |k: &str| {
+                        perms
+                            .and_then(|p| p.get(k))
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<&str>>()
+                    };
+                    for r in list("deny") {
+                        if r == claude::READ_DENY {
+                            cs.read_deny = true;
+                        } else if file_tool_rule(r) {
+                            cs.foreign_read_deny = true;
+                        }
                     }
+                    rules.deny |= list("deny").into_iter().any(names_run_with_secrets);
+                    rules.ask |= list("ask").into_iter().any(names_run_with_secrets);
+                    rules.allow |= list("allow").into_iter().any(names_run_with_secrets);
+                    if let Some(m) = perms
+                        .and_then(|p| p.get("defaultMode"))
+                        .and_then(Value::as_str)
+                    {
+                        mode[i] = Some(m.to_owned());
+                    }
+                    bypass_off |= perms
+                        .and_then(|p| p.get("disableBypassPermissionsMode"))
+                        .and_then(Value::as_str)
+                        == Some("disable");
                     if *level == "managed" && flag(&v, "allowManagedHooksOnly") {
                         cs.managed_only = true;
                     }
@@ -1232,24 +1489,6 @@ fn read_claude(
                         .and_then(Value::as_bool)
                     {
                         sandbox[i] = Some(on);
-                    }
-                    if let Some(allow) = v
-                        .get("permissions")
-                        .and_then(|p| p.get("allow"))
-                        .and_then(Value::as_array)
-                    {
-                        if allow.iter().any(|r| {
-                            matches!(
-                                r.as_str(),
-                                Some(
-                                    "mcp__envcloak__run_with_secrets"
-                                        | "mcp__envcloak__*"
-                                        | "mcp__envcloak"
-                                )
-                            )
-                        }) {
-                            cs.server.run_with_secrets_approved = Some(true);
-                        }
                     }
                     flag(&v, "disableAllHooks")
                 }
@@ -1266,6 +1505,7 @@ fn read_claude(
     }
     // The highest level that says decides (managed, local, project, user).
     cs.sandboxed_shell = sandbox.iter().rev().flatten().next().copied() == Some(true);
+    let mode = mode.iter().rev().flatten().next().map(String::as_str);
     if plugin {
         // The plugin carries EnvCloak's hooks and its MCP server (docs/
         // INSTALLERS.md, "Claude Code plugin").
@@ -1278,22 +1518,75 @@ fn read_claude(
         plugin_context(&mut cs.context, l, env, &mut programs);
     }
     cs.context.programs(programs);
-    if let Read::Json(v) = read_json(l.claude_json(), MAX_CLAUDE_JSON) {
-        if v.get(claude::MCP_SERVERS)
-            .and_then(|s| s.get(claude::SERVER))
-            .is_some()
+    // The registrations of EnvCloak's server: `.claude.json` by the parts
+    // that concern it, every `.mcp.json` from the working directory up
+    // (measured: each is read), the organization's `managed-mcp.json`.
+    let dirs: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
+    let claude_json = l.claude_json();
+    let got = read_capped(claude_json, MAX_CLAUDE_JSON);
+    let parsed = match &got {
+        Some(None) => Some(Value::Null),
+        Some(Some(b)) => serde_json::from_slice::<Value>(b).ok(),
+        None => None,
+    };
+    match parsed {
+        Some(v) => {
+            let (part, registered) = claude_registration(&v, &dirs);
+            cs.server.registered |= registered;
+            let bytes = serde_json::to_vec(&part).unwrap_or_default();
+            cs.context.parts.push(PartSeen {
+                role: "claude_registration".to_owned(),
+                path: claude_json.to_string_lossy().into_owned(),
+                sha256: hex(&Sha256::digest(&bytes)),
+            });
+        }
+        // There, but not readable JSON within its cap: what it registers
+        // is not known, and no result is current.
+        None => cs.context.note("claude_registration", claude_json, &None),
+    }
+    for d in &dirs {
+        if let Read::Json(v) =
+            cs.context
+                .json("claude_mcp_json", &d.join(".mcp.json"), MAX_SETTINGS)
         {
-            cs.server.registered = true;
+            cs.server.registered |= v
+                .get(claude::MCP_SERVERS)
+                .and_then(|s| s.get(claude::SERVER))
+                .is_some();
         }
     }
-    if cs.server.registered && cs.server.run_with_secrets_approved.is_none() {
-        cs.server.run_with_secrets_approved = Some(false);
+    let organization = match cs.context.json(
+        "claude_managed_mcp",
+        &managed_dir.join("managed-mcp.json"),
+        MAX_SETTINGS,
+    ) {
+        Read::Absent => false,
+        Read::Json(v) => {
+            cs.server.registered |= v
+                .get(claude::MCP_SERVERS)
+                .and_then(|s| s.get(claude::SERVER))
+                .is_some();
+            true
+        }
+        _ => true,
+    };
+    if cs.server.registered {
+        // Where an organization decides which servers run, how this one is
+        // let run was not measured: not known.
+        cs.server.run_with_secrets_approved = if organization {
+            None
+        } else {
+            claude_approval(mode, bypass_off, rules)
+        };
     }
 }
 
 /// What EnvCloak's Claude Code plugin adds to the context: Claude Code's
 /// record of its installed plugins (`plugins/installed_plugins.json`),
-/// the hook file of each install of the `envcloak` plugin it names, and
+/// the hook file of each install of the `envcloak` plugin it names, the
+/// files that register its MCP server there (`.mcp.json`, and the
+/// manifest `.claude-plugin/plugin.json`, which can hold servers too: the
+/// class of the verifier's round-2 finding, a registration left out), and
 /// the `envcloak` those hooks find on `PATH`. Any of them not found leaves
 /// the context incomplete: a result kept for a plugin install is current
 /// only while all of them are known.
@@ -1328,6 +1621,16 @@ fn plugin_context(
             match ctx.json("claude_plugin_hooks", &hooks, MAX_SETTINGS) {
                 Read::Json(_) => found = true,
                 _ => ctx.complete = false,
+            }
+            for (role, file) in [
+                ("claude_plugin_mcp", Path::new(dir).join(".mcp.json")),
+                (
+                    "claude_plugin_manifest",
+                    Path::new(dir).join(".claude-plugin").join("plugin.json"),
+                ),
+            ] {
+                let got = read_capped(&file, MAX_SETTINGS);
+                ctx.note(role, &file, &got);
             }
         }
     }
@@ -1458,6 +1761,14 @@ fn codex_merge(layers: &[&CodexLayer]) -> CodexMerged {
 /// that sets it; the sandbox and the approval are what every reading of
 /// the merge agrees on, the sandboxed shell when any reading has it, and
 /// the approval not known when the readings disagree.
+///
+/// Hooks: EnvCloak's are read from the user's `hooks.json`, where the
+/// installer writes them. Codex also runs the hooks of a trusted
+/// project's `.codex/hooks.json`, from the project root down to the
+/// working directory (measured on the pinned 0.159.2; an untrusted
+/// project's do not run), and a system `hooks.json` sits beside the
+/// system layer: each is kept in the context, and a prompt hook there
+/// that is not EnvCloak's is said so ([`ConfigSet::foreign_prompt_hook`]).
 fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
     cs.override_file = l.codex_instructions_override().exists();
     let ctx = &mut cs.context;
@@ -1482,6 +1793,7 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
     // `.codex` that is Codex's own directory is not a project layer.
     let own = std::fs::canonicalize(l.codex_home()).ok();
     let mut projects: Vec<CodexLayer> = Vec::new();
+    let mut hook_files = vec![("codex_system_hooks", l.codex_system_hooks())];
     for d in project.ancestors() {
         let dot = d.join(".codex");
         let is_own = own.is_some() && std::fs::canonicalize(&dot).ok() == own;
@@ -1491,6 +1803,7 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
                 "codex_project",
                 &Locations::codex_project_config(d),
             ));
+            hook_files.push(("codex_project_hooks", dot.join("hooks.json")));
         }
     }
     // Merged from the root down.
@@ -1585,11 +1898,25 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
         };
     }
     let mut programs = Vec::new();
-    if let Read::Json(v) = cs
+    match cs
         .context
         .json("codex_hooks", &l.codex_hooks(), MAX_SETTINGS)
     {
-        cs.hooks = hooks_of(&v, Host::Codex, "Bash", "mcp__.*", &mut programs);
+        Read::Json(v) => {
+            cs.hooks = hooks_of(&v, Host::Codex, "Bash", "mcp__.*", &mut programs);
+            cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Codex);
+        }
+        Read::Absent => {}
+        // What it holds is not known: a hook of someone else's may be
+        // there.
+        _ => cs.foreign_prompt_hook = true,
+    }
+    for (role, file) in hook_files {
+        match cs.context.json(role, &file, MAX_SETTINGS) {
+            Read::Json(v) => cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Codex),
+            Read::Absent => {}
+            _ => cs.foreign_prompt_hook = true,
+        }
     }
     cs.context.programs(programs);
 }
