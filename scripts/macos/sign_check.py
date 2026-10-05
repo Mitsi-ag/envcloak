@@ -23,22 +23,34 @@ app's: a helper or CLI that was not inspected inherits nothing.
    was made before an inner one changed (the helper, then the CLI, then the
    app: SPEC §12).
 3. Entitlements, parsed as a property list (`codesign --display
-   --entitlements - --xml`): none holds `com.apple.security.get-task-allow`,
-   any `com.apple.security.cs.` key (the hardened runtime's exceptions:
+   --entitlements - --xml`): none holds a key outside ENTITLEMENTS (empty
+   in M3-02: the ad hoc build signs none, and M3-10 adds the keychain
+   group's keys for the development tier when it needs them). The forbidden
+   keys get their own message: `com.apple.security.get-task-allow`, any
+   `com.apple.security.cs.` key (the hardened runtime's exceptions:
    allow-jit, allow-unsigned-executable-memory,
    allow-dyld-environment-variables, disable-library-validation,
-   disable-executable-page-protection, debugger, and any later one) or any
+   disable-executable-page-protection, debugger, and any later one) and any
    `com.apple.security.temporary-exception.` key. A key counts when it is
    present, whatever its value.
-4. Bundles. The app's and the helper's Info.plist name their identifiers
-   and executables, the helper is background-only, and no Info.plist in the
-   bundle holds a side door (URL types, AppleScript, Services, documents,
-   exported or imported types, user activities, extensions; SPEC §12).
-5. Layout. Contents/Library/LaunchAgents/ai.envcloak.agent.plist is labelled
-   ai.envcloak.agent and its BundleProgram is the helper's executable
-   (SPEC §12; registered by M3-18).
-6. Architectures. The three executables are built for the same
-   architectures (`lipo -archs`).
+4. Bundles. The app's and the helper's Info.plist hold only the keys their
+   sources in apps/macos/Support/ set and the build keys Xcode adds (any
+   other key, such as LSEnvironment, which would set the app's
+   environment, fails), name their identifiers and executables, the helper
+   is background-only, and no Info.plist in the bundle holds a side door
+   (URL types, AppleScript, Services, documents, exported or imported
+   types, user activities, extensions; SPEC §12).
+5. Layout. Contents/Library/LaunchAgents/ai.envcloak.agent.plist is exactly
+   EXPECTED_AGENT, key for key and value for value (its label, its
+   BundleProgram, the helper's executable, its arguments, and the launchd
+   settings of packaging/launchd/; SPEC §12, registered by M3-18): an
+   added key (EnvironmentVariables, MachServices, Program), a changed
+   argument or a dropped limit fails.
+6. Architectures. Each executable is built for one architecture, the same
+   for all three (`lipo -archs`): `codesign --display` reports only the
+   host's slice of a universal file, so a slice signed without the runtime
+   or with a forbidden entitlement would pass unseen. Universal builds
+   arrive with M7, which reads each slice (`--arch`).
 7. No test-only input. No executable holds the names of SwiftPM's
    Debug-only environment override of a package's resource bundle
    (`PACKAGE_RESOURCE_BUNDLE_PATH`, `PACKAGE_RESOURCE_BUNDLE_URL`, read by
@@ -78,6 +90,54 @@ MACHO_MAGIC = {
     b"\xbe\xba\xfe\xca",
     b"\xca\xfe\xba\xbf",
     b"\xbf\xba\xfe\xca",
+}
+# Entitlement keys a shipped executable may carry. Empty in M3-02; M3-10
+# adds the keychain group's (D3-05) with the development tier.
+ENTITLEMENTS = frozenset()
+# The bundled LaunchAgent, exactly (apps/macos/Support/LaunchAgents/; a test
+# keeps the source equal to this).
+EXPECTED_AGENT = {
+    "Label": "ai.envcloak.agent",
+    "BundleProgram": "Contents/Helpers/EnvCloakAgent.app/Contents/MacOS/envcloakd",
+    "ProgramArguments": ["envcloakd", "--foreground"],
+    "AssociatedBundleIdentifiers": ["ai.envcloak.app"],
+    "RunAtLoad": True,
+    "KeepAlive": {"SuccessfulExit": False},
+    "ProcessType": "Interactive",
+    "Umask": 0o77,
+    "SoftResourceLimits": {"Core": 0},
+    "HardResourceLimits": {"Core": 0},
+}
+# Info.plist keys: what apps/macos/Support/*-Info.plist set, and what Xcode
+# adds when it builds (the icon's keys for the app, the build machine and
+# the DT* toolchain keys).
+BUILD_KEYS = {"BuildMachineOSBuild", "CFBundleSupportedPlatforms"}
+APP_INFO_KEYS = {
+    "CFBundleDevelopmentRegion",
+    "CFBundleDisplayName",
+    "CFBundleExecutable",
+    "CFBundleIdentifier",
+    "CFBundleInfoDictionaryVersion",
+    "CFBundleName",
+    "CFBundlePackageType",
+    "CFBundleShortVersionString",
+    "CFBundleVersion",
+    "LSApplicationCategoryType",
+    "LSMinimumSystemVersion",
+    "CFBundleIconFile",
+    "CFBundleIconName",
+}
+HELPER_INFO_KEYS = {
+    "CFBundleDevelopmentRegion",
+    "CFBundleExecutable",
+    "CFBundleIdentifier",
+    "CFBundleInfoDictionaryVersion",
+    "CFBundleName",
+    "CFBundlePackageType",
+    "CFBundleShortVersionString",
+    "CFBundleVersion",
+    "LSBackgroundOnly",
+    "LSMinimumSystemVersion",
 }
 SIDE_DOOR_KEYS = (
     "CFBundleURLTypes",
@@ -190,6 +250,8 @@ def signature(app, rel, want_id):
         for key in keys:
             if forbidden(key):
                 fail("%s: carries the entitlement %s" % (rel, key))
+            elif key not in ENTITLEMENTS:
+                fail("%s: carries the entitlement %s, which no tier signs yet" % (rel, key))
     with open(path, "rb") as f:
         data = f.read()
     for name in TEST_ONLY_INPUTS:
@@ -200,6 +262,8 @@ def signature(app, rel, want_id):
         fail("%s: lipo cannot read its architectures (%s)" % (rel, err.decode("utf-8", "replace").strip()))
     else:
         facts["archs"] = sorted(out.decode().split())
+        if len(facts["archs"]) != 1:
+            fail("%s: built for %s; codesign shows one slice's signature, so one architecture until M7" % (rel, " and ".join(facts["archs"]) or "no architecture"))
     return facts
 
 
@@ -220,13 +284,21 @@ def read_plist(app, rel):
     return data
 
 
+def unknown_keys(rel, data, allowed):
+    for key in sorted(data):
+        if key not in allowed and key not in BUILD_KEYS and not re.match(r"^DT[A-Za-z]+$", key):
+            fail("%s: holds %s, a key its source does not set" % (rel, key))
+
+
 def bundles(app):
     info = read_plist(app, "Contents/Info.plist")
     if info is not None:
+        unknown_keys("Contents/Info.plist", info, APP_INFO_KEYS)
         if info.get("CFBundleIdentifier") != "ai.envcloak.app" or info.get("CFBundleExecutable") != "EnvCloakApp":
             fail("Contents/Info.plist: not ai.envcloak.app with the executable EnvCloakApp")
     helper = read_plist(app, HELPER + "/Contents/Info.plist")
     if helper is not None:
+        unknown_keys(HELPER + "/Contents/Info.plist", helper, HELPER_INFO_KEYS)
         if helper.get("CFBundleIdentifier") != "ai.envcloak.agent" or helper.get("CFBundleExecutable") != "envcloakd":
             fail("%s/Contents/Info.plist: not ai.envcloak.agent with the executable envcloakd" % HELPER)
         if helper.get("LSBackgroundOnly") is not True:
@@ -244,13 +316,27 @@ def bundles(app):
                     fail("%s: holds %s, a side door (SPEC §12)" % (rel, key))
     agent = read_plist(app, LAUNCH_AGENT)
     if agent is not None:
-        if agent.get("Label") != "ai.envcloak.agent":
-            fail("%s: Label is not ai.envcloak.agent" % LAUNCH_AGENT)
+        for key in sorted(set(agent) | set(EXPECTED_AGENT)):
+            if key not in EXPECTED_AGENT:
+                fail("%s: holds %s, which the agent's plist does not set" % (LAUNCH_AGENT, key))
+            elif key not in agent:
+                fail("%s: lacks %s" % (LAUNCH_AGENT, key))
+            elif not same_plist_value(agent[key], EXPECTED_AGENT[key]):
+                fail("%s: %s is not what the agent's plist sets" % (LAUNCH_AGENT, key))
         program = agent.get("BundleProgram")
-        if program != HELPER + "/Contents/MacOS/envcloakd":
-            fail("%s: BundleProgram is not the helper's envcloakd" % LAUNCH_AGENT)
-        elif not os.path.isfile(os.path.join(app, program)):
+        if isinstance(program, str) and not os.path.isfile(os.path.join(app, program)):
             fail("%s: BundleProgram names a file the bundle lacks" % LAUNCH_AGENT)
+
+
+def same_plist_value(a, b):
+    """Equal as property-list values: a boolean is never an integer."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return set(a) == set(b) and all(same_plist_value(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(same_plist_value(x, y) for x, y in zip(a, b))
+    return a == b
 
 
 def main(argv):
@@ -293,7 +379,7 @@ def main(argv):
     if problems:
         print("sign-check: %s failed (%d problem(s))" % (app, len(problems)), file=sys.stderr)
         return 1
-    print("sign-check: ok (%s: %d executables, hardened runtime, no forbidden entitlement)" % (app, len(facts)), file=sys.stderr)
+    print("sign-check: ok (%s: %d executables, hardened runtime, no entitlement outside the list, one architecture)" % (app, len(facts)), file=sys.stderr)
     return 0
 
 

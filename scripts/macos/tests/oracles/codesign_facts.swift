@@ -2,14 +2,22 @@
 // Security framework's own view (SecStaticCode), where sign_check.py reads
 // `codesign --display` text. For each path given it prints, as one JSON
 // object: the signing identifier, the code directory flags, whether the
-// hardened runtime bit is set, the entitlement keys, and whether the code
-// passes a strict static validity check with nested code. Compiled with
-// swiftc at test time; it reads signatures and changes nothing.
+// hardened runtime bit is set, the entitlement keys, whether the code
+// passes a strict static validity check with nested code, and, for each of
+// arm64 and x86_64 that the file holds, that slice's own flags and runtime
+// bit (SecStaticCodeCreateWithPathAndAttributes with
+// kSecCodeAttributeArchitecture). Compiled with swiftc at test time; it
+// reads signatures and changes nothing.
 //
 // Usage: codesign_facts path...
 
 import Foundation
 import Security
+
+struct Slice: Encodable {
+    var flags: UInt32?
+    var runtime: Bool
+}
 
 struct Facts: Encodable {
     var identifier: String?
@@ -18,6 +26,7 @@ struct Facts: Encodable {
     var entitlements: [String]?
     var valid: Bool
     var error: String?
+    var slices: [String: Slice] = [:]
 }
 
 let runtimeFlag: UInt32 = 0x10000
@@ -47,6 +56,17 @@ func facts(_ path: String) -> Facts {
         result.entitlements = entitlements.keys.sorted()
     } else {
         result.entitlements = []
+    }
+    for arch in ["arm64", "x86_64"] {
+        var sliceCode: SecStaticCode?
+        let attributes = [kSecCodeAttributeArchitecture as String: arch] as CFDictionary
+        guard SecStaticCodeCreateWithPathAndAttributes(url, [], attributes, &sliceCode) == errSecSuccess, let sliceCode else { continue }
+        var sliceInfo: CFDictionary?
+        guard SecCodeCopySigningInformation(sliceCode, SecCSFlags(rawValue: kSecCSSigningInformation), &sliceInfo) == errSecSuccess,
+              let sliceDict = sliceInfo as? [String: Any],
+              let number = sliceDict[kSecCodeInfoFlags as String] as? NSNumber
+        else { continue }
+        result.slices[arch] = Slice(flags: number.uint32Value, runtime: number.uint32Value & runtimeFlag != 0)
     }
     let check = SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckNestedCode | kSecCSCheckAllArchitectures)
     let validity = SecStaticCodeCheckValidity(code, check, nil)

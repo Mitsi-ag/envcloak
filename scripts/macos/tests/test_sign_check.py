@@ -19,16 +19,20 @@ import json
 import os
 import plistlib
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+
+sys.dont_write_bytecode = True
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(SCRIPTS))
 SIGN_CHECK = os.path.join(SCRIPTS, "sign-check.sh")
 LAUNCH_AGENT = os.path.join(ROOT, "apps/macos/Support/LaunchAgents/ai.envcloak.agent.plist")
+AGENT_PLIST = "Contents/Library/LaunchAgents/ai.envcloak.agent.plist"
 APP_EXE = "Contents/MacOS/EnvCloakApp"
 CLI_EXE = "Contents/MacOS/envcloak"
 HELPER = "Contents/Helpers/EnvCloakAgent.app"
@@ -61,14 +65,35 @@ class Workspace:
             f.write('#include <stdlib.h>\nint main(void) { return getenv("PACKAGE_RESOURCE" "_BUNDLE_PATH") != 0; }\n')
         self.native = os.path.join(self.dir, "native")
         self.x86 = os.path.join(self.dir, "x86")
+        self.arm = os.path.join(self.dir, "arm")
         self.debug = os.path.join(self.dir, "debug")
-        for out, arch, source in ((self.native, None, src), (self.x86, "x86_64", src), (self.debug, None, debug_src)):
+        for out, arch, source in ((self.native, None, src), (self.x86, "x86_64", src), (self.arm, "arm64", src), (self.debug, None, debug_src)):
             cmd = ["cc", "-O0", "-o", out, source]
             if arch:
                 cmd[1:1] = ["-arch", arch]
             p = run(cmd)
             if p.returncode != 0:
                 raise RuntimeError("cc failed: %s" % p.stderr.decode())
+        # Universal programs: `fat` for whoever signs it, and `fat_cli`
+        # whose slices were signed apart before lipo joined them, as the
+        # CLI with the runtime on arm64 only.
+        self.fat = os.path.join(self.dir, "fat")
+        self.fat_cli = os.path.join(self.dir, "fat_cli")
+        slices = []
+        for arch, prog, runtime in (("arm64", self.arm, True), ("x86_64", self.x86, False)):
+            signed = os.path.join(self.dir, "slice-" + arch)
+            shutil.copy(prog, signed)
+            cmd = ["codesign", "--force", "--sign", "-", "--timestamp=none", "--identifier", "ai.envcloak.cli"]
+            if runtime:
+                cmd += ["--options", "runtime"]
+            p = run(cmd + [signed])
+            if p.returncode != 0:
+                raise RuntimeError("codesign failed: %s" % p.stderr.decode())
+            slices.append(signed)
+        for out, parts in ((self.fat, [self.arm, self.x86]), (self.fat_cli, slices)):
+            p = run(["lipo", "-create"] + parts + ["-output", out])
+            if p.returncode != 0:
+                raise RuntimeError("lipo failed: %s" % p.stderr.decode())
         self.oracle = os.path.join(self.dir, "codesign_facts")
         p = run(["swiftc", "-O", "-o", self.oracle, os.path.join(HERE, "oracles", "codesign_facts.swift")])
         if p.returncode != 0:
@@ -104,11 +129,12 @@ def write_plist(path, data):
 class Bundle:
     """A bundle with the real layout, built from the compiled program."""
 
-    def __init__(self, cli_arch="native", app_exe=APP_EXE, app_prog=None):
+    def __init__(self, cli_arch="native", app_exe=APP_EXE, app_prog=None, cli_prog=None, daemon_prog=None):
         WS.count += 1
         self.root = os.path.join(WS.dir, "b%d" % WS.count)
         self.app = os.path.join(self.root, "EnvCloak.app")
-        for rel, prog in ((app_exe, app_prog or WS.native), (CLI_EXE, WS.x86 if cli_arch == "x86" else WS.native), (DAEMON_EXE, WS.native)):
+        cli = cli_prog or (WS.x86 if cli_arch == "x86" else WS.native)
+        for rel, prog in ((app_exe, app_prog or WS.native), (CLI_EXE, cli), (DAEMON_EXE, daemon_prog or WS.native)):
             os.makedirs(os.path.dirname(self.path(rel)), exist_ok=True)
             shutil.copy(prog, self.path(rel))
             os.chmod(self.path(rel), 0o755)
@@ -169,6 +195,23 @@ class Bundle:
     def oracle(self, rel):
         target = self.app if rel == APP_EXE else (self.path(HELPER) if rel == DAEMON_EXE else self.path(rel))
         return WS.facts([target])[target]
+
+    def edit_plist(self, rel, change):
+        with open(self.path(rel), "rb") as f:
+            data = plistlib.load(f)
+        change(data)
+        write_plist(self.path(rel), data)
+
+
+def fat_archs(path):
+    """The architectures a universal file's own header lists (an
+    independent read of what lipo reports)."""
+    names = {0x0100000C: "arm64", 0x01000007: "x86_64"}
+    with open(path, "rb") as f:
+        magic, count = struct.unpack(">II", f.read(8))
+        if magic != 0xCAFEBABE:
+            return []
+        return sorted(names.get(struct.unpack(">iiIII", f.read(20))[0], "?") for _ in range(count))
 
 
 class SignCheck(unittest.TestCase):
@@ -302,13 +345,71 @@ class SignCheck(unittest.TestCase):
 
     def test_a_launch_agent_that_starts_something_else_is_refused(self):
         b = Bundle()
-        rel = "Contents/Library/LaunchAgents/ai.envcloak.agent.plist"
-        with open(b.path(rel), "rb") as f:
-            agent = plistlib.load(f)
-        agent["BundleProgram"] = "Contents/MacOS/envcloak"
-        write_plist(b.path(rel), agent)
+        b.edit_plist(AGENT_PLIST, lambda agent: agent.__setitem__("BundleProgram", "Contents/MacOS/envcloak"))
         b.sign()
-        self.refused(b, "BundleProgram is not the helper's envcloakd")
+        self.refused(b, "BundleProgram is not what the agent's plist sets")
+
+    def test_each_change_to_the_launch_agent_is_refused(self):
+        def set_key(key, value):
+            return lambda agent: agent.__setitem__(key, value)
+
+        cases = [
+            ("an added environment", set_key("EnvironmentVariables", {"OS_ACTIVITY_DT_MODE": "YES"}), "holds EnvironmentVariables"),
+            ("an added Mach service", set_key("MachServices", {"ai.envcloak.agent": True}), "holds MachServices"),
+            ("an added Program", set_key("Program", "/bin/sh"), "holds Program"),
+            ("changed arguments", set_key("ProgramArguments", ["envcloakd", "--foreground", "--socket", "/tmp/x"]), "ProgramArguments is not"),
+            ("a dropped core limit", lambda agent: agent.pop("HardResourceLimits"), "lacks HardResourceLimits"),
+            # `false` equals 0 in Python; in the plist it is not an integer.
+            ("a core limit written as false", set_key("HardResourceLimits", {"Core": False}), "HardResourceLimits is not"),
+            ("a wider umask", set_key("Umask", 18), "Umask is not"),
+            ("a umask of the wrong type", set_key("Umask", "63"), "Umask is not"),
+            ("a restart on every exit", set_key("KeepAlive", True), "KeepAlive is not"),
+        ]
+        for name, change, needle in cases:
+            with self.subTest(case=name):
+                b = Bundle()
+                b.edit_plist(AGENT_PLIST, change)
+                b.sign()
+                self.refused(b, needle)
+
+    def test_the_bundled_launch_agent_source_is_what_sign_check_expects(self):
+        sys.path.insert(0, SCRIPTS)
+        try:
+            import sign_check
+        finally:
+            sys.path.pop(0)
+        with open(LAUNCH_AGENT, "rb") as f:
+            self.assertTrue(sign_check.same_plist_value(plistlib.load(f), sign_check.EXPECTED_AGENT))
+
+    def test_an_info_plist_key_outside_its_source_is_refused(self):
+        for rel, key, value in (
+            ("Contents/Info.plist", "LSEnvironment", {"CFFIXED_USER_HOME": "/tmp/elsewhere"}),
+            ("Contents/Info.plist", "NSPrincipalClass", "NSApplication"),
+            (HELPER + "/Contents/Info.plist", "LSEnvironment", {"OS_ACTIVITY_DT_MODE": "YES"}),
+        ):
+            with self.subTest(plist=rel, key=key):
+                b = Bundle()
+                b.edit_plist(rel, lambda info: info.__setitem__(key, value))
+                b.sign()
+                self.refused(b, "%s: holds %s, a key its source does not set" % (rel, key))
+
+    def test_an_entitlement_no_tier_signs_is_refused(self):
+        for key in ("com.apple.security.network.client", "com.apple.developer.team-identifier"):
+            with self.subTest(key=key):
+                b = Bundle().sign(app={"entitlements": {key: True}})
+                self.assertIn(key, b.oracle(APP_EXE)["entitlements"])
+                self.refused(b, APP_EXE + ": carries the entitlement %s, which no tier signs yet" % key)
+
+    def test_a_universal_cli_with_an_unhardened_slice_is_refused(self):
+        # Every executable universal (so the architecture sets agree) and
+        # the CLI's x86_64 slice signed without the runtime: codesign
+        # --display reads the host's slice only, which has it.
+        b = Bundle(app_prog=WS.fat, cli_prog=WS.fat_cli, daemon_prog=WS.fat).sign(skip=("cli",))
+        self.assertEqual(fat_archs(b.path(CLI_EXE)), ["arm64", "x86_64"])
+        facts = b.oracle(CLI_EXE)
+        self.assertTrue(facts["slices"]["arm64"]["runtime"], facts)
+        self.assertFalse(facts["slices"]["x86_64"]["runtime"], facts)
+        self.refused(b, CLI_EXE + ": built for arm64 and x86_64")
 
     def test_an_app_executable_named_like_the_cli_is_refused(self):
         # `EnvCloak` and `envcloak` are one file on a case-insensitive
