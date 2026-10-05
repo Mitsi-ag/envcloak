@@ -43,6 +43,17 @@ final class LaunchTests: XCTestCase {
         wait(for: [opened], timeout: 25)
     }
 
+    /// About opens from the app menu only; SwiftUI would also list a
+    /// `Window` scene in the Window menu unless its commands are removed.
+    @MainActor
+    func testAboutIsInTheMenuBarOnce() throws {
+        func titles(_ menu: NSMenu) -> [String] {
+            menu.items.flatMap { [$0.title] + ($0.submenu.map(titles) ?? []) }
+        }
+        let menu = try XCTUnwrap(NSApp.mainMenu)
+        XCTAssertEqual(titles(menu).filter { $0 == "About EnvCloak" }.count, 1)
+    }
+
     func testTheBundleHasNoSideDoor() throws {
         let info = try XCTUnwrap(Bundle.main.infoDictionary)
         XCTAssertEqual(Self.sideDoors(in: info), [])
