@@ -43,17 +43,19 @@ def generated_cases(home):
             add(('export_' if exported else 'assign_')+name,
                 prefix+b'EC_ORACLE_A='+encoded+b'\n',a+b'y' if expanded_braces else value,
                 policy='manual_expansion_proposed' if expanded_braces else 'literal_candidate',
-                rewrite=not expanded_braces)
+                rewrite=not expanded_braces and name != 'quoted_cr')
     add('export_quoted_braces',b"export EC_ORACLE_A='"+a+b"{x,y}'\n",a+b'{x,y}')
     add('trailing_comment',b'EC_ORACLE_A='+a+b' # ignored\n',a)
+    add('comment_dollar',b'EC_ORACLE_A='+a+b' # $OTHER ignored\n',a)
+    add('comment_backtick',b'EC_ORACLE_A='+a+b' # `ignored`\n',a)
     add('comment_backslash',b'EC_ORACLE_A='+a+b' # ignored\\\n',a)
     add('crlf_assignment',b'EC_ORACLE_A='+a+b'\r\n',a+b'\r',rewrite=False)
     add('quoted_multiline',b"EC_ORACLE_A='"+a+b'\n'+b+b"'\n",a+b'\n'+b,rewrite=False)
     add('continuation',b'EC_ORACLE_A='+a+b'\\\n'+b+b'\n',a+b,rewrite=False)
     add('double_continuation',b'EC_ORACLE_A="'+a+b'\\\n'+b+b'"\n',a+b,rewrite=False)
-    add('same_line_semicolon',b'EC_ORACLE_A='+a+b'; EC_ORACLE_B='+b+b'\n',a,b,rewrite=False)
-    add('same_line_export',b'export EC_ORACLE_A='+a+b' EC_ORACLE_B='+b+b'\n',a,b,rewrite=False)
-    add('same_line_and',b'EC_ORACLE_A='+a+b' && EC_ORACLE_B='+b+b'\n',a,b,rewrite=False)
+    add('same_line_semicolon',b'EC_ORACLE_A='+a+b'; EC_ORACLE_B='+b+b'\n',a,b,policy='manual_context',rewrite=False)
+    add('same_line_export',b'export EC_ORACLE_A='+a+b' EC_ORACLE_B='+b+b'\n',a,b,policy='manual_context',rewrite=False)
+    add('same_line_and',b'EC_ORACLE_A='+a+b' && EC_ORACLE_B='+b+b'\n',a,b,policy='manual_context',rewrite=False)
     # Policy expectations are independent of actual Bash decoding. The plan
     # conservatively reports names only whenever the value syntax contains $/`.
     add('single_dollar',b"EC_ORACLE_A='$"+a+b"'\n",b'$'+a,policy='template_name_only',rewrite=False)

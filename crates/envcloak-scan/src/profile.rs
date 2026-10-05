@@ -117,7 +117,16 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
         }
         let fish = shell == Shell::Fish;
         if fish {
-            if let Some(rest) = text.strip_prefix(b"set -x ") {
+            if let Some(rest) = [
+                b"set -x ".as_slice(),
+                b"set -gx ",
+                b"set -Ux ",
+                b"set -xg ",
+                b"set -xU ",
+            ]
+            .iter()
+            .find_map(|prefix| text.strip_prefix(*prefix))
+            {
                 text = rest;
             } else {
                 report.issue("", "unsupported_syntax");
@@ -139,8 +148,8 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
                 rhs = &rhs[1..];
             }
         }
-        let template = rhs.contains(&b'$') || rhs.contains(&b'`');
         let (value, used, unsupported) = word(rhs, fish, exported);
+        let template = rhs[..used].contains(&b'$') || rhs[..used].contains(&b'`');
         let tail = &rhs[used..];
         let tail = tail
             .iter()
@@ -205,8 +214,9 @@ fn word(bytes: &[u8], fish: bool, exported: bool) -> (SecretBytes, usize, bool) 
         }
         if q == 0
             && (b == b'~'
+                || matches!(b, b'(' | b')')
                 || (exported && matches!(b, b'{' | b'}'))
-                || (fish && matches!(b, b'*' | b'?' | b'{' | b'}' | b'(')))
+                || (fish && matches!(b, b'*' | b'?' | b'{' | b'}')))
         {
             unsupported = true;
         }
