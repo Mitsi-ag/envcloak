@@ -385,8 +385,8 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 27 | `agents_config` | M2-08 | reserved | an agent config EnvCloak changed, with its backup |
 | 28 | `migrate_mcp` | M2-20 | reserved | a `migrate-mcp` run and what it rewrote |
 | 29 | `managed_register` | M2-27 | reserved | a managed server registered, updated (a new revision) or removed |
-| 30 | `reclassify` | M2-13 | reserved | an item's classification changed |
-| 31 | `live_refused` | M2-13 | reserved | an approval refused for an unticked live binding |
+| 30 | `reclassify` | M2-13 | landed | an item's classification changed |
+| 31 | `live_refused` | M2-13 | landed | an approval refused for an unticked live binding |
 | 32 | `standing_create` | M2-15 | reserved | a standing approval created |
 | 33 | `standing_revoke` | M2-15 | reserved | standing approvals revoked |
 | 34 | `standing_grant` | M2-15 | reserved | a session grant minted from a standing approval, before any value leaves |

@@ -345,13 +345,24 @@ fn an_unknown_task_or_status_fails() {
 #[test]
 fn a_malformed_name_or_row_fails() {
     let t = fixture();
-    edit(&t, IPC, "| `live_not_ticked` |", "| `Live_not_ticked` |");
+    // The reservation row (the error tokens table lists the token too).
+    edit(
+        &t,
+        IPC,
+        "| `live_not_ticked` | -32038 | M2-13 |",
+        "| `Live_not_ticked` | -32038 | M2-13 |",
+    );
     assert_fails(
         &t,
         "`Live_not_ticked` is not a well-formed name for this table",
     );
     let t = fixture();
-    edit(&t, IPC, "| `live_not_ticked` |", "| live_not_ticked |");
+    edit(
+        &t,
+        IPC,
+        "| `live_not_ticked` | -32038 | M2-13 |",
+        "| live_not_ticked | -32038 | M2-13 |",
+    );
     assert_fails(&t, "'live_not_ticked' is not one backticked name");
     let t = fixture();
     edit(
