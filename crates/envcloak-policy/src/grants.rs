@@ -29,6 +29,18 @@
 //! grant already covers apart, since the new grant holds the whole
 //! request.
 //!
+//! **The live-key guard** (SPEC §10b, M2). For an agent or unknown
+//! subject, an approval whose statement leaves a live-classified binding
+//! unticked creates no grant ([`ApproveError::LiveNotTicked`]); a terminal
+//! subject's approvals are as in M1. The classifications are read from the
+//! vault when the statement is shown and again when it is approved
+//! ([`Pending::current`]), and a grant holds a binding of such a subject
+//! only with its tick while the item is live by the classification the
+//! request read (L-09): an item that became live after the approval is not
+//! held. Rules 1 to 7 are otherwise unchanged. A reclassification ends the
+//! grants and pending requests that bind the item
+//! ([`GrantStore::on_item_reclassified`]).
+//!
 //! **Lifetimes.** Grants last [`DEFAULT_TTL`] by default; grants rooted
 //! at a known agent process [`MAX_AGENT_TTL`] at most, and all others
 //! (terminal and unknown subjects, and agent subjects by their claims
@@ -57,7 +69,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use envcloak_core::vault::{FieldId, FieldName, ItemId, Slug};
+use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, ItemMeta, Slug};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -70,7 +82,7 @@ use crate::manifest::Mode;
 use crate::names::EnvName;
 use crate::pending::{Busy, Outcomes, Pending, PendingId, PendingState, PollLimiter};
 use crate::project::ProjectIdentity;
-use crate::statement::{PendingDescriptor, statement_digest};
+use crate::statement::{PendingDescriptor, live_guarded, statement_digest, unticked_live};
 
 /// A session grant's length when the approver names none.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(8 * 3600);
@@ -142,7 +154,8 @@ pub enum Uses {
 }
 
 /// What the approver chooses: `--once` or `--for <duration>`, and the
-/// live bindings ticked (`--live NAME`; stored in M1, enforced in M2).
+/// live bindings ticked (`--live NAME`), which the live-key guard requires
+/// for an agent's or an unknown subject's live bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalOptions {
@@ -270,9 +283,10 @@ impl Grant {
     }
 
     /// Whether the grant covers `r` by rules 5 to 7 (the project, the
-    /// bindings and the mode). Rules 3 and 4 are the evidence's.
+    /// bindings and the mode), and the live-key guard. Rules 3 and 4 are
+    /// the evidence's.
     fn covers(&self, r: &AccessRequest) -> bool {
-        self.covers_project_and_mode(r) && r.bindings.iter().all(|b| self.has_binding(b))
+        self.covers_project_and_mode(r) && r.bindings.iter().all(|b| self.holds(b, r))
     }
 
     /// Rules 5 and 7: the same project, and a mode at least as strict.
@@ -280,13 +294,20 @@ impl Grant {
         self.project == r.project && r.mode >= self.mode
     }
 
-    /// Whether the grant holds binding `b`, by (env name, item id, field
-    /// id).
-    fn has_binding(&self, b: &BoundRef) -> bool {
+    /// Whether the grant holds binding `b` of request `r`: by (env name,
+    /// item id, field id) (rule 6), and, where the live-key guard applies
+    /// (an agent or unknown grant or subject), only with its tick when the
+    /// item is live now. The classification is the one `r` read from the
+    /// vault when it was made, never one recorded at approval (L-09): an
+    /// item that became live since is not held without a tick, whatever
+    /// ended or did not end the grant then.
+    fn holds(&self, b: &BoundRef, r: &AccessRequest) -> bool {
+        let guarded = live_guarded(self.kind) || live_guarded(r.subject.kind());
         self.bindings.iter().any(|g| {
             g.env_name == b.binding.env_name
                 && g.item == b.binding.item
                 && g.field == b.binding.field
+                && (g.live || !guarded || b.binding.classification != Classification::Live)
         })
     }
 }
@@ -395,6 +416,10 @@ pub enum ApproveError {
     /// ([`SubjectEvidence::proof_refusal`]).
     ProofRefused,
     InvalidOptions(OptionsError),
+    /// The live-key guard (SPEC §10b): the request is an agent's or an
+    /// unknown subject's, and the approval leaves a live-classified
+    /// binding unticked ([`crate::unticked_live`]). No grant is made.
+    LiveNotTicked,
     /// [`MAX_GRANTS`] exist already.
     TooManyGrants,
 }
@@ -610,7 +635,7 @@ impl GrantStore {
             .collect();
         r.bindings
             .iter()
-            .map(|b| grants.iter().any(|g| g.has_binding(b)))
+            .map(|b| grants.iter().any(|g| g.holds(b, r)))
             .collect()
     }
 
@@ -672,15 +697,25 @@ impl GrantStore {
         self.pending.get(id).filter(|p| !p.expired(now))
     }
 
-    /// What an approval surface shows for pending request `id`.
-    pub fn pending_descriptor(&self, id: &PendingId, now: &Now) -> Option<&PendingDescriptor> {
-        self.pending(id, now).map(|p| &p.descriptor)
+    /// What an approval surface shows for pending request `id`, built from
+    /// `items`, the vault's metadata now ([`Pending::current`]): each
+    /// binding's classification read from its item, and the test items
+    /// proposed for the live ones.
+    pub fn pending_descriptor(
+        &self,
+        id: &PendingId,
+        now: &Now,
+        items: &[ItemMeta],
+    ) -> Option<PendingDescriptor> {
+        self.pending(id, now).and_then(|p| p.current(items))
     }
 
     /// Everything [`GrantStore::approve`] checks apart from the proof, so
     /// a daemon can refuse before it runs Argon2id: the request exists,
     /// the options are within bounds, the digest is this request's with
-    /// these options, and there is room for a grant.
+    /// these options as the vault's `items` make its statement now
+    /// ([`Pending::current`]), the live-key guard, and there is room for a
+    /// grant.
     ///
     /// # Errors
     /// As [`GrantStore::approve`], except [`ApproveError::ProofRefused`].
@@ -690,8 +725,12 @@ impl GrantStore {
         opts: &ApprovalOptions,
         digest: [u8; 32],
         now: &Now,
+        items: &[ItemMeta],
     ) -> Result<(), ApproveError> {
         let p = self.pending(id, now).ok_or(ApproveError::NoSuchRequest)?;
+        // The statement as it reads now: classifications and proposals
+        // from the vault, never the ones of an earlier reading (L-09).
+        let shown = p.current(items).ok_or(ApproveError::NoSuchRequest)?;
         let max = max_ttl(&p.request.subject);
         if opts.ttl_secs == 0 {
             return Err(ApproveError::InvalidOptions(OptionsError::TtlZero));
@@ -706,13 +745,45 @@ impl GrantStore {
         {
             return Err(ApproveError::InvalidOptions(OptionsError::LiveNotBound));
         }
-        if statement_digest(&p.descriptor, opts) != digest {
+        if statement_digest(&shown, opts) != digest {
             return Err(ApproveError::StatementMismatch);
+        }
+        // The live-key guard, on the statement the approver read and the
+        // daemon rebuilt: the same classifications.
+        if !unticked_live(&shown, opts).is_empty() {
+            return Err(ApproveError::LiveNotTicked);
         }
         if self.grants.len() >= MAX_GRANTS {
             return Err(ApproveError::TooManyGrants);
         }
         Ok(())
+    }
+
+    /// The items whose live bindings an approval of pending request `id`
+    /// with `opts` leaves unticked, by id and slug, as the vault's `items`
+    /// make its statement now: what a `live_not_ticked` refusal is audited
+    /// with. Empty for a request the guard does not apply to, and for one
+    /// that is gone.
+    pub fn unticked_items(
+        &self,
+        id: &PendingId,
+        opts: &ApprovalOptions,
+        now: &Now,
+        items: &[ItemMeta],
+    ) -> Vec<(ItemId, Slug)> {
+        let Some(p) = self.pending(id, now) else {
+            return Vec::new();
+        };
+        let Some(shown) = p.current(items) else {
+            return Vec::new();
+        };
+        let unticked = unticked_live(&shown, opts);
+        p.request
+            .bindings
+            .iter()
+            .filter(|b| unticked.contains(&b.binding.env_name.as_str()))
+            .map(|b| (b.binding.item, b.slug.clone()))
+            .collect()
     }
 
     /// Approves pending request `id` with a verified `proof`, the
@@ -726,8 +797,11 @@ impl GrantStore {
     /// [`ApproveError::InvalidOptions`] for a length beyond the subject's
     /// bound or a live name not bound,
     /// [`ApproveError::StatementMismatch`] when `digest` is not that of
-    /// this request with `opts`, [`ApproveError::TooManyGrants`] at the
-    /// bound. The request stays pending on every error.
+    /// this request with `opts` as the vault's `items` make its statement
+    /// now, [`ApproveError::LiveNotTicked`] when the live-key guard applies
+    /// and `opts` leaves a live binding unticked,
+    /// [`ApproveError::TooManyGrants`] at the bound. The request stays
+    /// pending on every error.
     pub fn approve(
         &mut self,
         id: &PendingId,
@@ -735,6 +809,7 @@ impl GrantStore {
         opts: ApprovalOptions,
         digest: [u8; 32],
         now: &Now,
+        items: &[ItemMeta],
     ) -> Result<GrantId, ApproveError> {
         self.expire(now);
         if self.pending(id, now).is_none() {
@@ -743,7 +818,7 @@ impl GrantStore {
         if proof.approver.proof_refusal().is_some() {
             return Err(ApproveError::ProofRefused);
         }
-        self.check_approval(id, &opts, digest, now)?;
+        self.check_approval(id, &opts, digest, now, items)?;
         let p = self.pending.remove(id).ok_or(ApproveError::NoSuchRequest)?;
         self.ended
             .record(*id, p.request.subject.root(), PendingState::Approved, now);

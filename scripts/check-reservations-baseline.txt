@@ -377,7 +377,6 @@ reason unsupported_version
 reason value_too_large
 reason wrong_type
 
-statement_domain envcloak-statement/1
 
 table_tag header 1
 table_tag items 2

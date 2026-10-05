@@ -4,8 +4,12 @@
 //!
 //! A [`Pending`] keeps the [`AccessRequest`] as the daemon built it (the
 //! evidence, the project, the bound items) and the [`PendingDescriptor`]
-//! an approval surface receives, made once at creation so that what the
-//! approver sees is what the daemon's digest covers. The daemon nonce is
+//! an approval surface receives, made at creation. What follows the vault
+//! (each binding's classification, and the test items proposed for live
+//! ones) is built again from the vault each time the request is shown and
+//! when it is approved ([`Pending::current`], L-09), and the digest is
+//! taken over that: a statement read before either changed does not
+//! approve the request as it is now (`statement_mismatch`). The daemon nonce is
 //! 32 random bytes; the id is 8 Crockford base32 characters, unique among
 //! the pending requests and the outcomes remembered (the store draws again
 //! on a clash).
@@ -36,7 +40,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use envcloak_core::vault::Classification;
+use envcloak_core::vault::{Classification, ItemMeta};
 use serde::{Deserialize, Serialize};
 
 use crate::effective::SubjectKind;
@@ -44,7 +48,7 @@ use crate::evidence::ProcessInstance;
 use crate::grants::{AccessRequest, Now};
 use crate::ids;
 use crate::statement::{
-    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, SubjectSummary,
+    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, SubjectSummary, proposals,
 };
 
 /// How long a pending request waits for an approval.
@@ -321,6 +325,23 @@ impl Pending {
         }
     }
 
+    /// The descriptor as an approval surface receives it now, from
+    /// `items`, the vault's metadata now (L-09): each binding's
+    /// classification read from its item, and the test items proposed for
+    /// the live ones ([`proposals`]); the rest as it was made at creation.
+    /// `None` when a bound item is gone (its removal ends the request, so
+    /// a vault that lacks one is not the vault the request was made
+    /// from).
+    pub fn current(&self, items: &[ItemMeta]) -> Option<PendingDescriptor> {
+        let mut d = self.descriptor.clone();
+        for (shown, b) in d.bindings.iter_mut().zip(&self.request.bindings) {
+            let item = items.iter().find(|m| m.id == b.binding.item)?;
+            shown.classification = classification_word(item.details.classification).to_owned();
+        }
+        d.proposals = proposals(&self.request.bindings, items);
+        Some(d)
+    }
+
     /// Whether the request has expired at `now`.
     pub fn expired(&self, now: &Now) -> bool {
         now.awake.saturating_sub(self.opened) >= PENDING_TTL
@@ -402,6 +423,9 @@ fn describe(
                 granted: granted.get(k).copied().unwrap_or(false),
             })
             .collect(),
+        // Built from the vault each time the request is shown or approved
+        // (`Pending::current`).
+        proposals: Vec::new(),
         mode: r.mode,
         argv: r.argv_display.clone(),
     }
