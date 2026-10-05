@@ -66,18 +66,15 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 
-if [ "${1:-}" = "--swift" ]; then
-  [ $# -ge 2 ] || {
-    echo "usage: scripts/check-sources.sh --swift <xcodebuild derived data> [workspace-root]" >&2
-    exit 2
-  }
-  derived="$(cd "$2" && pwd -P)"
-  root="$(cd "${3:-$here/..}" && pwd -P)"
-  # The listing is named <prefix>.<pid>.<run>.<random>, <run> drawn once
-  # from /dev/urandom, and the exit trap removes every such name of this
-  # run (not an earlier run's of the same pid), so it goes however the
-  # script stops; the four signals leave through that trap (bash runs no
-  # EXIT trap on SIGQUIT or SIGPIPE, measured with 3.2 and 5.3).
+# make_listing NAME: makes this run's listing file and sets $listed to it.
+# It is named $TMPDIR/NAME.<pid>.<run>.<random>, <run> drawn once from
+# /dev/urandom, and the exit trap removes every such name of this run (not
+# an earlier run's of the same pid), so it goes however the script stops:
+# the four signals leave through that trap (bash runs no EXIT trap on
+# SIGQUIT or SIGPIPE, measured with 3.2 and 5.3), and a name made in the
+# instant before it reached a variable is removed too.
+make_listing() {
+  local candidate
   run_token="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
   case "$run_token" in
     [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
@@ -87,7 +84,7 @@ if [ "${1:-}" = "--swift" ]; then
       ;;
   esac
   prefix="${TMPDIR:-/tmp}"
-  prefix="${prefix%/}/check-sources-swift.$$.$run_token"
+  prefix="${prefix%/}/$1.$$.$run_token"
   trap 'rm -f "$prefix".*' EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -106,6 +103,16 @@ if [ "${1:-}" = "--swift" ]; then
     echo "check-sources: cannot make a listing named $prefix.*" >&2
     exit 1
   }
+}
+
+if [ "${1:-}" = "--swift" ]; then
+  [ $# -ge 2 ] || {
+    echo "usage: scripts/check-sources.sh --swift <xcodebuild derived data> [workspace-root]" >&2
+    exit 2
+  }
+  derived="$(cd "$2" && pwd -P)"
+  root="$(cd "${3:-$here/..}" && pwd -P)"
+  make_listing check-sources-swift
   bash "$here/macos/check-swift.sh" --list-swift --root "$root" >"$listed"
   python3 "$here/macos/check_compiled_swift.py" "$derived" "$listed"
   exit 0
@@ -114,8 +121,8 @@ fi
 root="$(cd "${1:-$here/..}" && pwd -P)"
 cd "$root"
 
-scanned="$(mktemp "${TMPDIR:-/tmp}/check-sources.XXXXXX")"
-trap 'rm -f "$scanned"' EXIT
+make_listing check-sources
+scanned="$listed"
 bash "$here/check-unsafe.sh" --list-rust "$root" >"$scanned"
 
 python3 - "$root" "$scanned" <<'PY'
