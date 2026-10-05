@@ -236,6 +236,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `result_unrecorded`, `created_by_agent` | `restore_refused` |
 | `substituted` | `files_backup_failed` |
 | `limited` | `too_many_checks` (from `scan.match`) |
+| `code_selecting_variable`, `interpreter_option` | `code_selecting_env` (from `managed.register`, `managed.update_plan` and `managed.update`; their `invalid_params` carries `not_found`, `not_regular_file`, `too_large`, `invalid_env_name` and `invalid_path` from the rows above) |
 
 ## Lock
 

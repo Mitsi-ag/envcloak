@@ -30,6 +30,11 @@ fn warnings_lint() -> String {
     ["warn", "ings"].concat()
 }
 
+/// `clippy::disallowed_methods`, the lint both allowlists may relax.
+fn disallowed_lint() -> String {
+    ["clippy::disallowed", "_methods"].concat()
+}
+
 /// `expose_secret`, the method clippy.toml forbids.
 fn expose_method() -> String {
     ["expose", "_secret"].concat()
@@ -105,12 +110,25 @@ fn clean_tree() -> TestHome {
     write(
         &r,
         "clippy.toml",
-        "disallowed-methods = [\n  { path = \"secrecy::ExposeSecret::expose_secret\" },\n  { path = \"secrecy::ExposeSecretMut::expose_secret_mut\" },\n]\n",
+        "disallowed-methods = [\n  { path = \"secrecy::ExposeSecret::expose_secret\" },\n  { path = \"secrecy::ExposeSecretMut::expose_secret_mut\" },\n  { path = \"libc::kill\" },\n  { path = \"libc::killpg\" },\n]\n",
     );
     write(
         &r,
         "security/expose-allowlist.txt",
         "# comment\n\ncrates/envcloak-core/src/secret.rs  # the secret types\n",
+    );
+    write(
+        &r,
+        "security/signal-allowlist.txt",
+        "# comment\n\ncrates/envcloak-sys/src/owned.rs  # the one signal call\n",
+    );
+    write(
+        &r,
+        "crates/envcloak-sys/src/owned.rs",
+        &format!(
+            "#[allow({})]\npub fn kill_number() {{}}\n",
+            disallowed_lint()
+        ),
     );
     write(
         &r,
@@ -809,7 +827,7 @@ fn listed_files_may_not_define_macros() {
     );
     assert_fails(
         &t,
-        "crates/envcloak-core/src/secret.rs:4: files listed in security/expose-allowlist.txt may not define macros",
+        "crates/envcloak-core/src/secret.rs:4: files listed in security/expose-allowlist.txt or security/signal-allowlist.txt may not define macros",
     );
 
     // Elsewhere a macro is fine.
@@ -835,7 +853,7 @@ fn listed_files_may_not_declare_out_of_line_modules() {
     write(&r, "crates/envcloak-core/src/secret/leak.rs", "fn f() {}\n");
     assert_fails(
         &t,
-        "crates/envcloak-core/src/secret.rs:3: files listed in security/expose-allowlist.txt may not declare out-of-line modules",
+        "crates/envcloak-core/src/secret.rs:3: files listed in security/expose-allowlist.txt or security/signal-allowlist.txt may not declare out-of-line modules",
     );
 
     // The same declaration in an unlisted file is fine.
@@ -923,6 +941,68 @@ fn the_clippy_cfg_fails() {
         "#![allow(clippy::unwrap_used)]\n#[cfg_attr(test, allow(clippy\n    ::too_many_lines))]\n#[clippy::msrv = \"1.85\"]\nfn f() {\n    let clippy_lints = 1;\n    let _ = clippy_lints;\n}\n",
     );
     assert_passes(&t);
+}
+
+/// M2 plan D-34: clippy.toml forbids `libc::kill` and `libc::killpg` too,
+/// and only files on security/signal-allowlist.txt (which must exist, and
+/// whose entries must) may allow `disallowed_methods` for them; a file on
+/// that list alone still may not name `expose_secret`, so the two lists
+/// share the lint and never the names. The clean tree, with its one listed
+/// signal file, passes (the positive control).
+#[test]
+fn signal_calls_are_allowed_only_on_the_signal_list() {
+    assert_passes(&clean_tree());
+    for missing in ["libc::kill\" }", "libc::killpg\" }"] {
+        let t = clean_tree();
+        let path = t.home().join("clippy.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = format!("  {{ path = \"{missing},\n");
+        assert_eq!(text.matches(line.as_str()).count(), 1, "{line}");
+        std::fs::write(&path, text.replacen(line.as_str(), "", 1)).unwrap();
+        let name = missing.trim_end_matches("\" }");
+        assert_fails(
+            &t,
+            &format!("clippy.toml: disallowed-methods must list {name}\n"),
+        );
+    }
+
+    let t = clean_tree();
+    std::fs::remove_file(t.home().join("security/signal-allowlist.txt")).unwrap();
+    assert_fails(&t, "security/signal-allowlist.txt is missing");
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "security/signal-allowlist.txt",
+        "crates/envcloak-sys/src/owned.rs\ncrates/gone/src/lib.rs\n",
+    );
+    assert_fails(
+        &t,
+        "security/signal-allowlist.txt: listed file crates/gone/src/lib.rs does not exist",
+    );
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/child.rs",
+        &format!("#[allow({})]\npub fn kill() {{}}\n", disallowed_lint()),
+    );
+    assert_fails(
+        &t,
+        "crates/envcloak-sys/src/child.rs:1: allows disallowed_methods but is not listed in security/expose-allowlist.txt or security/signal-allowlist.txt",
+    );
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/owned.rs",
+        &format!(
+            "#[allow({})]\npub fn kill_number() {{}}\npub fn open(s: &S) {{ s.{}(); }}\n",
+            disallowed_lint(),
+            expose_method()
+        ),
+    );
+    assert_fails(&t, "crates/envcloak-sys/src/owned.rs");
 }
 
 #[test]

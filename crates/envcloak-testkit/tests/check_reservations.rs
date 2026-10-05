@@ -3243,6 +3243,7 @@ fn a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused() {
 }
 
 const MONITOR: &str = "crates/envcloak-sys/src/pty_monitor.rs";
+const CONTROL: &str = "crates/envcloak-ipc/src/control.rs";
 
 /// The control-message reader (M2-17, Codex's review of PR #27): the PTY
 /// monitor's messages are the variants of its `Report` and `Command`
@@ -3325,13 +3326,37 @@ fn a_control_message_the_reader_cannot_read_is_refused() {
     edit(
         &t,
         IPC,
-        "| `runner` | `Release` | M2-27 | reserved |",
-        "| `runner` | `Release` | M2-27 | landed |",
+        "| `supervisor` | `Publish` | M2b-05 | reserved |",
+        "| `supervisor` | `Publish` | M2b-05 | landed |",
     );
     assert_fails(
         &t,
-        "`runner Release` is `landed`, but the code has no such entry",
+        "`supervisor Publish` is `landed`, but the code has no such entry",
     );
+}
+
+/// The runner's channel (M2-27) has a reader: its messages are the
+/// variants of `ToRunner` and `FromRunner` in envcloak-ipc's `control`
+/// module, and the table's `landed` rows must name exactly those. A
+/// variant renamed in the code leaves its row naming nothing (and the new
+/// name unlisted); the tree as it is passes (the positive control).
+#[test]
+fn the_runner_channel_is_read_from_its_enums() {
+    assert_passes(&fixture().home());
+    let t = fixture();
+    edit(&t, CONTROL, "    Confirmed,\n", "    Accepted,\n");
+    assert_fails(
+        &t,
+        "`runner Confirmed` is `landed`, but the code has no such entry",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        CONTROL,
+        "    ConfirmSpawn(u32),\n",
+        "    ConfirmSpawn(u32),\n    Spawned(u32),\n",
+    );
+    assert_fails(&t, "runner Spawned");
 }
 
 /// A same-named enum in an inactive item, unused module or unexpanded
