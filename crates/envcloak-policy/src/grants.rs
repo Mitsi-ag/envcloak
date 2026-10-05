@@ -78,7 +78,7 @@ use crate::effective::SubjectKind;
 use crate::evidence::{ProcessInstance, SubjectEvidence};
 use crate::flood::{FloodControl, MAX_PENDING, MAX_PENDING_PER_ROOT};
 use crate::ids;
-use crate::manifest::Mode;
+use crate::manifest::{BindingSource, Mode};
 use crate::names::EnvName;
 use crate::pending::{Busy, Outcomes, Pending, PendingId, PendingState, PollLimiter};
 use crate::project::ProjectIdentity;
@@ -213,6 +213,9 @@ pub struct BoundRef {
     pub field_name: FieldName,
     /// No adopted project uses the item yet (SPEC §6.4 "Adoption").
     pub first_use: bool,
+    /// The layer the binding came from ([`crate::resolve_sourced`]), which
+    /// a proposal's advice follows. Not part of the match (rule 6).
+    pub source: BindingSource,
 }
 
 /// A request as the daemon built it from the wire, the vault and the

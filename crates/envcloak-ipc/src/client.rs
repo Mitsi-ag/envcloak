@@ -534,7 +534,31 @@ impl Client {
             request: id.to_owned(),
             options,
             digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
-            passphrase: WireSecret::new(passphrase),
+            passphrase: Some(WireSecret::new(passphrase)),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `approve` of request `id` without the passphrase: a check that never
+    /// grants (see [`Approve`]). The daemon refuses with the first check
+    /// before the proof that fails (`live_not_ticked`, audited, where the
+    /// live-key guard does), or `invalid_params` when none does.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; an answer that is not an error is the daemon's
+    /// to explain, and the caller treats it as malformed.
+    pub fn approve_check(
+        &mut self,
+        id: &str,
+        options: ApprovalOptions,
+        digest: &[u8; 32],
+        claims: &[String],
+    ) -> Result<ApprovedView, ClientError> {
+        self.call::<Approve>(&ApproveParams {
+            request: id.to_owned(),
+            options,
+            digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            passphrase: None,
             claims: claims.to_vec(),
         })
     }

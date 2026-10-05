@@ -52,7 +52,11 @@
 //! for live ones, L-09), the live-key guard must hold (an agent's or an
 //! unknown subject's live bindings each ticked, or `live_not_ticked`,
 //! audited with the items left unticked), and the attempt limiter must
-//! admit the attempt. Argon2id then runs outside the state lock, with the
+//! admit the attempt. An `approve` sent without a passphrase is a check
+//! (`envcloak approve` sends one where the guard refuses, so the refusal
+//! is this daemon's, and audited): it runs every check above but the
+//! limiter's and ends there, `invalid_params` when none refused, with no
+//! attempt counted and nothing granted. Argon2id then runs outside the state lock, with the
 //! vault taken out as an unlock takes it, one proof at a time; the store
 //! checks all of it again against the vault after.
 //!
@@ -100,10 +104,10 @@ use envcloak_ipc::view::{
 use envcloak_ipc::{Frame, RpcError, WireSecret};
 use envcloak_policy::{
     AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BindError, BindErrorKind, Binding,
-    BoundRef, Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError, Mode, Now,
-    PENDING_TTL, Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance, ProfileName,
-    ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
-    effective_policy, gather_hashed, load_project, proposals, resolve,
+    BindingSource, BoundRef, Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError,
+    Mode, Now, PENDING_TTL, Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance,
+    ProfileName, ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy,
+    bind_items, effective_policy, gather_hashed, load_project, proposals, resolve_sourced,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -226,14 +230,20 @@ fn approve_error(e: ApproveError) -> RpcError {
     }
 }
 
-/// The bindings a run asks for, bound to the vault's items and carrying
-/// what the approval shows, plus whether the project is new to the vault.
+/// The bindings a run asks for, each with the layer that set it, bound to
+/// the vault's items and carrying what the approval shows, plus whether
+/// the project is new to the vault.
 fn bind_request(
     vault: &Vault,
-    bindings: &[Binding],
+    sourced: &[(Binding, BindingSource)],
     project_key: &envcloak_core::vault::ProjectKey,
 ) -> Result<(Vec<BoundRef>, bool), RpcError> {
-    let bound = bind_items(bindings, vault.items()).map_err(|e| bind_error(&e))?;
+    let bindings: Vec<Binding> = sourced.iter().map(|(b, _)| b.clone()).collect();
+    let bound = bind_items(&bindings, vault.items()).map_err(|e| bind_error(&e))?;
+    // `bind_items` answers in the order it was given, one for each.
+    if bound.len() != sourced.len() {
+        return Err(RpcError::new(ErrorKind::Internal));
+    }
     // No grant is evaluated from a vault that failed its integrity check:
     // its project index cannot be trusted either.
     let tampered = |_| RpcError::new(ErrorKind::VaultTampered);
@@ -247,7 +257,8 @@ fn bind_request(
         .collect();
     let refs = bound
         .into_iter()
-        .map(|b| {
+        .zip(sourced.iter().map(|(_, layer)| layer.clone()))
+        .map(|(b, source)| {
             let item = vault
                 .item(b.item)
                 .ok_or(RpcError::new(ErrorKind::Internal))?;
@@ -267,6 +278,7 @@ fn bind_request(
                 field_name: field.name.clone(),
                 first_use,
                 binding: b,
+                source,
             })
         })
         .collect::<Result<Vec<_>, RpcError>>()?;
@@ -377,7 +389,7 @@ pub fn run_request(
     // The daemon opens the manifest itself; nothing the caller sent about
     // its contents is used.
     let project = load_project(manifest_path).map_err(manifest_error)?;
-    let bindings = resolve(
+    let bindings = resolve_sourced(
         &project.manifest,
         profile.as_ref(),
         &refs,
@@ -802,14 +814,17 @@ pub fn approve(
     peer: &PeerIdentity,
     p: ApproveParams,
 ) -> Result<ApprovedView, RpcError> {
-    let pass = p.passphrase.into_inner();
+    // Without a passphrase the call is a check: every check before the
+    // proof runs, and it ends at the proof (`invalid_params`), never in a
+    // grant.
+    let pass = p.passphrase.map(WireSecret::into_inner);
     let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let digest = digest_of(&p.digest).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     refuse_if_traced()?;
     let approver = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &approver, "approve")?;
     let _gate = locked(&shared.proof_gate);
-    let (vault, generation) = {
+    let (vault, generation, pass) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
         let items = s.unlocked()?.items().to_vec();
@@ -831,10 +846,14 @@ pub fn approve(
             }
             Err(e) => return Err(approve_error(e)),
         }
+        // A check ends here, before the attempt limiter: no attempt is
+        // made, and none counted.
+        let pass = pass.ok_or(RpcError::new(ErrorKind::InvalidParams))?;
         s.limiter()
             .check(&now)
             .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
-        s.begin_proof()?
+        let (vault, generation) = s.begin_proof()?;
+        (vault, generation, pass)
     };
     let verified = vault.verify_passphrase(&pass);
     drop(pass);

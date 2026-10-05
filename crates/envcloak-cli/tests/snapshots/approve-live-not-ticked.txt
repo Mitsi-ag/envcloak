@@ -12,6 +12,6 @@ Approval request <REQ1>
     [0] ./emit
   grant: every request from this process tree for <DUR>
   live keys: a process of unknown origin gets a live key only where you tick it, and this approval leaves 2 unticked, so it creates no grant (live_not_ticked). Approve again with --live GITHUB_TOKEN --live OPENAI_API_KEY.
-The passphrase you enter approves exactly this, and nothing else.
+Nothing is approved: no passphrase is asked for an approval that leaves a live key unticked.
 --- stderr
-envcloak: live_not_ticked: the request is an agent's or an unknown process's, and the approval leaves a live key unticked, so no grant was made: tick each live binding with --live NAME, or bind the test key the statement proposes
+envcloak: live_not_ticked: the request is an agent's or an unknown process's, and the approval leaves a live key unticked, so no grant was made: tick each live binding with --live NAME

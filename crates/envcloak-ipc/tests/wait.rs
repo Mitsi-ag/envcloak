@@ -1236,6 +1236,7 @@ fn request_of(n: i32, item: (ItemId, FieldId)) -> AccessRequest {
             slug: Slug::new("openai/acme-web").unwrap(),
             field_name: FieldName::new("value").unwrap(),
             first_use: false,
+            source: envcloak_policy::BindingSource::Env,
         }],
         mode: Mode::Inject,
         argv_display: vec![format!("./job-{n}")],

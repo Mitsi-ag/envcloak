@@ -408,7 +408,14 @@ pub struct PendingListParams {
 }
 
 /// `approve`: creates a grant from a pending request with the passphrase
-/// as the proof (SPEC §10b "Approval proofs").
+/// as the proof (SPEC §10b "Approval proofs"). Sent without the
+/// passphrase, it is a check, and never a grant: the daemon runs every
+/// check that comes before the proof, the live-key guard's included (a
+/// `live_not_ticked` refusal is audited as one with the passphrase is),
+/// and refuses with the first that fails, or with `invalid_params` when
+/// none does. `envcloak approve` asks so where the guard would refuse, so
+/// that the refusal is the daemon's and audited, and no passphrase is
+/// read for it.
 #[derive(Debug)]
 pub struct Approve;
 
@@ -426,7 +433,9 @@ pub struct ApproveParams {
     /// SHA-256 of the canonical statement the approver read, as 64 hex
     /// characters (`envcloak_policy::statement_digest`).
     pub digest: String,
-    pub passphrase: WireSecret,
+    /// The proof. Without it the call is a check ([`Approve`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<WireSecret>,
     /// As [`UnlockParams::claims`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
@@ -1902,8 +1911,7 @@ impl ErrorKind {
             }
             ErrorKind::LiveNotTicked => {
                 "the request is an agent's or an unknown process's, and the approval leaves a live \
-                 key unticked, so no grant was made: tick each live binding with --live NAME, or \
-                 bind the test key the statement proposes"
+                 key unticked, so no grant was made: tick each live binding with --live NAME"
             }
             ErrorKind::Internal => "the daemon failed",
         }

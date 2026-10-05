@@ -76,8 +76,8 @@ pub use grants::{
 };
 pub use limiter::{AttemptLimiter, FIRST_WAIT, FREE_ATTEMPTS, MAX_WAIT};
 pub use manifest::{
-    AgentsPolicy, Manifest, ManifestError, ManifestErrorKind, ManifestPolicy, Mode, Origin,
-    parse_manifest, resolve,
+    AgentsPolicy, BindingSource, Manifest, ManifestError, ManifestErrorKind, ManifestPolicy, Mode,
+    Origin, parse_manifest, resolve, resolve_sourced,
 };
 pub use names::{Binding, EnvName, ProfileName, Reference, VALUE_RUN, value_shaped};
 pub use pending::{
@@ -88,7 +88,8 @@ pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
 };
 pub use statement::{
-    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, Proposal, RENDER_LIMIT,
-    STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped, escape_for_display,
-    live_guarded, proposals, render_statement, statement_digest, unticked_live,
+    BindingSummary, HIDDEN, PendingDescriptor, ProcessSummary, ProjectSummary, Proposal,
+    RENDER_LIMIT, STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped,
+    escape_for_display, live_guarded, proposals, proposed_for, render_statement,
+    render_statement_with, shown_name, statement_digest, unticked_live,
 };

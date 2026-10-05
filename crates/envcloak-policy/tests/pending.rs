@@ -132,6 +132,7 @@ fn request(subject: SubjectEvidence, argv: &str, item: &(ItemId, FieldId)) -> Ac
             slug: Slug::new("openai/acme-web").unwrap(),
             field_name: FieldName::new("value").unwrap(),
             first_use: false,
+            source: envcloak_policy::BindingSource::Env,
         }],
         mode: Mode::Inject,
         argv_display: vec![argv.to_owned()],
