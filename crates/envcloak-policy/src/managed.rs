@@ -149,8 +149,9 @@ pub enum CodeSelecting {
 }
 
 impl DeclError {
-    /// The reason token the refusal carries.
-    pub fn token(self) -> &'static str {
+    /// A word for the refusal (the protocol's reason for the two
+    /// `code_selecting_env` cases).
+    pub fn word(self) -> &'static str {
         match self {
             DeclError::CodeSelecting(CodeSelecting::Variable) => "code_selecting_variable",
             DeclError::CodeSelecting(CodeSelecting::InterpreterOption) => "interpreter_option",
@@ -470,7 +471,7 @@ pub fn new_launch_id() -> [u8; 16] {
 
 /// The first line of an update statement (docs/IPC.md "Statement
 /// domains").
-pub const UPDATE_DOMAIN: &[u8] = b"envcloak-managed-update/1\n";
+pub const UPDATE_DOMAIN: &[u8] = b"envcloak-update-statement/1\n";
 
 struct Enc(Vec<u8>);
 
@@ -570,6 +571,30 @@ pub fn update_statement(
     launch(&mut e, old);
     launch(&mut e, new);
     e.0
+}
+
+/// SHA-256 of a registered launch's canonical encoding (every field, as
+/// [`update_statement`] encodes each side), under its own domain: what an
+/// audit entry names a launch by, never its contents.
+pub fn launch_digest(l: &RegisteredLaunch) -> [u8; 32] {
+    let mut e = Enc(Vec::with_capacity(512));
+    e.0.extend_from_slice(b"envcloak-launch/1\n");
+    e.bytes(&l.launch_id);
+    launch(&mut e, l);
+    Sha256::digest(&e.0).into()
+}
+
+/// The suffix of every binding name of a bridged server's managed
+/// manifest (D-18): `_O` and the first 16 hex digits, upper case, of the
+/// SHA-256 of the origin, so the origin is part of each binding's
+/// identity and an edited origin is a new binding, which prompts.
+pub fn bridge_binding_suffix(origin: &str) -> String {
+    let d = Sha256::digest(origin.as_bytes());
+    let mut s = String::from("_O");
+    for b in &d[..8] {
+        s.push_str(&format!("{b:02X}"));
+    }
+    s
 }
 
 /// SHA-256 of [`update_statement`].

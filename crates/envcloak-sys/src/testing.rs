@@ -1178,6 +1178,15 @@ pub(crate) fn trace() -> bool {
     *ON.get_or_init(|| std::env::var_os(TRACE).is_some_and(|v| v == "1"))
 }
 
+/// The variables of this process whose names start `ENVCLOAK_TEST_`
+/// ([`crate::test_hook_vars`]).
+pub(crate) fn hook_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::os::unix::ffi::OsStrExt;
+    std::env::vars_os()
+        .filter(|(k, _)| k.as_bytes().starts_with(b"ENVCLOAK_TEST_"))
+        .collect()
+}
+
 /// Names the [`crate::fail_point`] at which a test build fails.
 pub const FAIL_SITE: &str = "ENVCLOAK_TEST_FAIL";
 

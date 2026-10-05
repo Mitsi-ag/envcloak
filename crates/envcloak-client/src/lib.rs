@@ -26,6 +26,7 @@ pub mod connect;
 pub mod doctor_report;
 pub mod fail;
 pub mod gitignore;
+pub mod managed;
 pub mod manifest_edit;
 pub mod render;
 pub mod run_status;

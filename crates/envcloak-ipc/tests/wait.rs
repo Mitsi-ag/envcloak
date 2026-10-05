@@ -730,6 +730,9 @@ fn a_silent_daemon_holds_a_wait_no_longer_than_its_limit() {
             env_file: None,
             argv: vec!["./emit".to_owned()],
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         };
         let mut t = Fresh {
             paths: &paths,
@@ -958,6 +961,9 @@ fn run_params(argv: Vec<String>) -> envcloak_ipc::proto::RunRequestParams {
         env_file: None,
         argv,
         claims: Vec::new(),
+        launch: None,
+        bridge: None,
+        fds: Vec::new(),
     }
 }
 

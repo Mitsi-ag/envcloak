@@ -468,6 +468,7 @@ pub fn run_request(
         mode: policy.mode,
         argv_display: p.argv,
         new_project,
+        managed: None,
     };
     // A `once` grant is consumed under the same lock as the decision, so
     // of concurrent requests exactly one is covered by it (gate 30).

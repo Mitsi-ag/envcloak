@@ -328,6 +328,9 @@ fn an_env_file_crosses_as_references_and_names_only() {
         env_file: Some(sent),
         argv: vec!["./emit".into()],
         claims: Vec::new(),
+        launch: None,
+        bridge: None,
+        fds: Vec::new(),
     };
     let f = proto::request_frame::<RunRequest>(7, &params).unwrap();
     let mut bytes = Vec::new();

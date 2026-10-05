@@ -69,6 +69,9 @@ impl Fixture {
             env_file: None,
             argv: vec!["./emit".to_owned()],
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         })
     }
 

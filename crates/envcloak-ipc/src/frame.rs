@@ -240,6 +240,29 @@ impl Frame {
         Ok(Frame { body })
     }
 
+    /// Writes the header, with `fds` attached to its first byte
+    /// (`SCM_RIGHTS`, M2 task M2-27: the pipe ends a managed request hands
+    /// over), and then the body, on the connected Unix socket `sock`. A
+    /// descriptor is never data: the body holds only the request.
+    ///
+    /// # Errors
+    /// [`FrameError::Io`] when writing fails, or with more descriptors than
+    /// [`envcloak_sys::fdpass::MAX_FDS`].
+    #[allow(clippy::disallowed_methods)] // Sends the body to a verified peer.
+    pub fn write_with_fds(
+        &self,
+        sock: &std::os::unix::net::UnixStream,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), FrameError> {
+        use std::os::fd::AsFd;
+        let len = u32::try_from(self.body.len()).map_err(|_| FrameError::TooLarge)?;
+        let io = |e: io::Error| FrameError::Io(e.kind());
+        envcloak_sys::fdpass::send_with_fds(sock.as_fd(), &len.to_be_bytes(), fds).map_err(io)?;
+        let mut w = sock;
+        w.write_all(self.body.expose_secret()).map_err(io)?;
+        w.flush().map_err(io)
+    }
+
     /// Writes the header and the body.
     ///
     /// # Errors

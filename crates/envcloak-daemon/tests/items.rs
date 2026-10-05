@@ -98,6 +98,9 @@ impl Fixture {
             env_file: None,
             argv: vec!["./emit".into()],
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         };
         let DecisionView::Pending { request } =
             client(&self.home).run_request(&params).unwrap().decision
@@ -129,6 +132,9 @@ impl Fixture {
                 env_file: None,
                 argv: vec!["./emit".into()],
                 claims: Vec::new(),
+                launch: None,
+                bridge: None,
+                fds: Vec::new(),
             })
             .map(|a| a.decision)
     }
@@ -905,6 +911,9 @@ fn a_rotation_reclassifies_the_item_and_only_then_ends_its_grants() {
                 env_file: None,
                 argv: vec!["./emit".into()],
                 claims: Vec::new(),
+                launch: None,
+                bridge: None,
+                fds: Vec::new(),
             })
             .unwrap()
             .decision

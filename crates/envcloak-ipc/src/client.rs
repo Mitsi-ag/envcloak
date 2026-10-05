@@ -61,6 +61,10 @@ use crate::proto::{
     ImportVerify, PendingList, PendingListParams, PendingPoll, PendingStateParams, RecoverParams,
     RecoveryConfirm, RecoveryConfirmParams, RestoredFiles, VaultRecover, VerifyParams,
 };
+use crate::proto::{
+    FdRole, ManagedRegister, ManagedRegisterParams, ManagedUnregister, ManagedUnregisterParams,
+    ManagedUpdate, ManagedUpdateParams, ManagedUpdatePlan, ManagedUpdatePlanParams,
+};
 use crate::proto::{ItemsMarkExposed, MarkExposedParams, ScanMatch, ScanMatchParams};
 use crate::proto::{ItemsReclassify, ReclassifyParams};
 use crate::view::{
@@ -77,6 +81,9 @@ use crate::view::{
     RecoveryConfirmedView, VerifyView,
 };
 use crate::view::{ClassificationView, ReclassifiedView};
+use crate::view::{
+    ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
+};
 use crate::view::{MarkedView, ScanMatchView};
 use crate::wire_secret::WireSecret;
 
@@ -1005,6 +1012,160 @@ impl Client {
     /// As [`Client::call`].
     pub fn backup_v2_list(&mut self) -> Result<BackupListView, ClientError> {
         self.call::<BackupList>(&NoParams {})
+    }
+
+    /// Calls method `M` with `fds` attached to the request's first byte
+    /// (`SCM_RIGHTS`), as [`Client::call`] calls it otherwise. Only on a
+    /// connection made with [`Client::connect`]: a waiter's connection
+    /// ([`Client::connect_by`]) is non-blocking, and a descriptor is handed
+    /// over on a call of its own.
+    ///
+    /// # Errors
+    /// As [`Client::call`]; [`ClientError::Protocol`] on a waiter's
+    /// connection.
+    pub fn call_with_fds<M: Method>(
+        &mut self,
+        params: &M::Params,
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<M::Output, ClientError> {
+        if self.by.is_some() {
+            return Err(ClientError::Protocol);
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let request = proto::request_frame::<M>(id, params)?;
+        request.write_with_fds(&self.stream, fds)?;
+        drop(request);
+        let response = Frame::read_from(&mut self.stream)?;
+        proto::parse_response::<M::Output>(&response, id).map_err(|e| match e {
+            ResponseError::Rpc(e) => ClientError::Rpc(e),
+            ResponseError::Protocol => ClientError::Protocol,
+        })
+    }
+
+    /// `run.request` for a managed server's launch or bridge (SPEC §6.6, M2
+    /// task M2-27), handing over `fds`, whose roles the request names
+    /// (`p.fds` is set from them). A covered answer is `started`, never a
+    /// value: the client receives none, and an answer that carries one is
+    /// [`ClientError::Protocol`].
+    ///
+    /// # Errors
+    /// As [`Client::call_with_fds`].
+    pub fn run_request_with_fds(
+        &mut self,
+        p: &RunRequestParams,
+        fds: &ClientFds,
+    ) -> Result<RunAnswer, ClientError> {
+        let mut p = p.clone();
+        p.fds = fds.roles();
+        let answer = self.call_with_fds::<RunRequest>(&p, &fds.borrowed())?;
+        if !answer.values.is_empty() || !answer.well_formed() {
+            return Err(ClientError::Protocol);
+        }
+        Ok(answer)
+    }
+
+    /// `managed.register`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn register_managed(
+        &mut self,
+        p: &ManagedRegisterParams,
+    ) -> Result<ManagedRegisteredView, ClientError> {
+        self.call::<ManagedRegister>(p)
+    }
+
+    /// `managed.unregister`: by the record's id or its `<agent>/<server>`
+    /// name.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn unregister_managed(
+        &mut self,
+        id: &str,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<ManagedUnregisteredView, ClientError> {
+        self.call::<ManagedUnregister>(&ManagedUnregisterParams {
+            id: id.to_owned(),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `managed.update_plan`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn plan_managed_update(
+        &mut self,
+        launch: &str,
+        changes: &envcloak_policy::managed::LaunchChanges,
+        claims: &[String],
+    ) -> Result<ManagedUpdatePlanView, ClientError> {
+        self.call::<ManagedUpdatePlan>(&ManagedUpdatePlanParams {
+            launch: launch.to_owned(),
+            changes: changes.clone(),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `managed.update`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn update_managed(
+        &mut self,
+        launch: &str,
+        changes: &envcloak_policy::managed::LaunchChanges,
+        digest: &str,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<ManagedUpdatedView, ClientError> {
+        self.call::<ManagedUpdate>(&ManagedUpdateParams {
+            launch: launch.to_owned(),
+            changes: changes.clone(),
+            digest: digest.to_owned(),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+    }
+}
+
+/// The pipe ends a managed request hands over (SPEC §6.6, M2 plan D-36):
+/// what the server (or relay) reads, what it writes, optionally its
+/// standard error, and the lifeline, the read end of a pipe whose write
+/// end the client keeps and never writes, so that its end of file says
+/// the client is gone. The daemon passes them to the runner it starts;
+/// the client keeps the other ends.
+#[derive(Debug)]
+pub struct ClientFds {
+    pub stdin: std::os::fd::OwnedFd,
+    pub stdout: std::os::fd::OwnedFd,
+    pub stderr: Option<std::os::fd::OwnedFd>,
+    pub lifeline: std::os::fd::OwnedFd,
+}
+
+impl ClientFds {
+    /// The roles, in the order [`ClientFds::borrowed`] attaches them.
+    pub fn roles(&self) -> Vec<FdRole> {
+        let mut r = vec![FdRole::Stdin, FdRole::Stdout];
+        if self.stderr.is_some() {
+            r.push(FdRole::Stderr);
+        }
+        r.push(FdRole::Lifeline);
+        r
+    }
+
+    /// The descriptors, in the order of [`ClientFds::roles`].
+    pub fn borrowed(&self) -> Vec<BorrowedFd<'_>> {
+        let mut v = vec![self.stdin.as_fd(), self.stdout.as_fd()];
+        if let Some(e) = &self.stderr {
+            v.push(e.as_fd());
+        }
+        v.push(self.lifeline.as_fd());
+        v
     }
 }
 

@@ -82,6 +82,9 @@ impl Fixture {
                 env_file: None,
                 argv: argv.to_vec(),
                 claims: Vec::new(),
+                launch: None,
+                bridge: None,
+                fds: Vec::new(),
             })
             .unwrap()
             .decision

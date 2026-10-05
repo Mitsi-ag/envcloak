@@ -82,6 +82,9 @@ impl Fixture {
             env_file: None,
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         }
     }
 
@@ -163,6 +166,9 @@ fn pending_child() {
                 env_file: None,
                 argv: vec!["./child".to_owned()],
                 claims: Vec::new(),
+                launch: None,
+                bridge: None,
+                fds: Vec::new(),
             })
             .unwrap();
         println!("\nid={}", pending(&answer.decision));

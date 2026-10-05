@@ -260,8 +260,9 @@ takes no `landed` row: the task that lands one adds its reader first. The
 policy kinds are read from `PolicyKind` in the vault's policies module
 (M2-07). The control messages are read, channel by channel, from the
 enums CONTROL_CHANNELS names (M2-17: the PTY monitor's `Report` and
-`Command`); a channel it does not name has no reader yet, so its rows
-stay `reserved`, and a `landed` row there fails as one the code lacks.
+`Command`; M2-27: the runner's `ToRunner` and `FromRunner`); a channel it
+does not name has no reader yet, so its rows stay `reserved`, and a
+`landed` row there fails as one the code lacks.
 
 Usage: scripts/check-reservations.py [--root <repository root>]
 Prints "check-reservations: ok" and exits 0, or names every problem on
@@ -2930,6 +2931,7 @@ def code_mcp_tools(root):
 # adds one.
 CONTROL_CHANNELS = {
     "pty_monitor": ("crates/envcloak-sys/src/pty_monitor.rs", ("Report", "Command")),
+    "runner": ("crates/envcloak-ipc/src/control.rs", ("ToRunner", "FromRunner")),
 }
 ENUM_DECL = re.compile(r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)")
 VARIANT = re.compile(r"([A-Z][A-Za-z0-9]*)(\s*\((?:[^()]|\([^()]*\))*\))?")
