@@ -89,6 +89,40 @@ pub fn force_no_group_signal(on: bool) {
     NO_GROUP_SIGNAL.store(on, Ordering::SeqCst);
 }
 
+/// Whether this Linux kernel signals a process group through a pidfd
+/// (`PIDFD_SIGNAL_PROCESS_GROUP`, Linux 6.9), asked of the kernel with
+/// signal 0 on this process's own pidfd: where it does not (or has no
+/// `pidfd_open`, before 5.3), `forward_signal` narrows SIGTERM and SIGHUP
+/// to the command's group (M2 plan D-35). For tests that expect the
+/// narrowed counts there.
+#[cfg(target_os = "linux")]
+pub fn group_signal_supported() -> bool {
+    // SAFETY: pidfd_open on this process itself; the descriptor is closed
+    // below.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) };
+    let Ok(fd) = libc::c_int::try_from(fd) else {
+        return false;
+    };
+    if fd < 0 {
+        return false;
+    }
+    // SAFETY: signal 0 checks and sends nothing; flag 4 is
+    // PIDFD_SIGNAL_PROCESS_GROUP.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd,
+            0,
+            std::ptr::null::<libc::siginfo_t>(),
+            4u32,
+        )
+    };
+    let refused = rc != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL);
+    // SAFETY: closes the descriptor opened above.
+    unsafe { libc::close(fd) };
+    !refused
+}
+
 /// How a test makes a process have its children reaped by the kernel on
 /// their own, as a parent or a library may leave it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
