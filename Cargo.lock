@@ -373,6 +373,7 @@ dependencies = [
 name = "envcloak-lint-canary"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "secrecy",
 ]
 
@@ -489,6 +490,7 @@ dependencies = [
  "envcloak-sys",
  "libc",
  "proptest",
+ "sha2",
  "tempfile",
  "zeroize",
 ]

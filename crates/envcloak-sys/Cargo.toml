@@ -69,4 +69,7 @@ harness = false
 # Enables the `testing` feature for this crate's own tests.
 envcloak-sys = { path = ".", features = ["testing"] }
 proptest.workspace = true
+# The macOS cdhash test hashes the code directory the static reading
+# finds (tests/launch.rs).
+sha2.workspace = true
 tempfile.workspace = true

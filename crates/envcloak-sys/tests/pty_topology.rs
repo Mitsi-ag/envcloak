@@ -224,15 +224,15 @@ fn a_session_leading_child_does_not_stop_on_the_suspend_character() {
         "the suspend character stopped a session leader"
     );
     // SIGSTOP to the owned, unreaped child does stop it.
-    // SAFETY: kill on this process's own unreaped child.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    // kill on this process's own unreaped child.
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGSTOP), 0);
     assert_eq!(
         wait_child(pid, libc::WSTOPPED),
         Some((libc::CLD_STOPPED, libc::SIGSTOP))
     );
     screen.type_bytes(b"line-three\n");
-    // SAFETY: as above.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    // as above.
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGCONT), 0);
     screen.expect("line-three\r\n", 1, "SIGCONT gave cat its input back");
     screen.type_bytes(&[settings.interrupt_char().unwrap()]);
     let status = child.wait().unwrap();
@@ -438,9 +438,9 @@ fn a_monitor_that_dies_ends_the_channel_for_the_cli() {
     screen.type_bytes(b"line-one\n");
     screen.expect("line-one\r\n", 1, "cat runs under the monitor");
     let pid = i32::try_from(monitor.monitor_id()).unwrap();
-    // SAFETY: the monitor is this process's own, unreaped child (the
+    // the monitor is this process's own, unreaped child (the
     // session monitor's handle holds it).
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGKILL), 0);
     let lost = monitor.next_event(Some(DEADLINE));
     assert!(
         matches!(&lost, Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
@@ -898,8 +898,8 @@ fn stop_own_group() {
         let mut act: libc::sigaction = std::mem::zeroed();
         act.sa_sigaction = libc::SIG_DFL;
         libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut());
-        libc::kill(0, libc::SIGTSTP);
     }
+    envcloak_sys::testing::kill_raw(0, libc::SIGTSTP);
 }
 
 /// The probe: reports where it runs, as the kernel sees it from inside,

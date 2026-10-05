@@ -530,8 +530,8 @@ fn wait_for_file(path: &Path) -> bool {
 /// A self-raised SIGTERM, counted: each process's positive control that
 /// its counters work.
 fn raise_term() {
-    // SAFETY: SIGTERM to this process itself, which counts it.
-    unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+    // SIGTERM to this process itself, which counts it.
+    envcloak_sys::testing::kill_raw(i32::try_from(std::process::id()).unwrap(), libc::SIGTERM);
 }
 
 /// The family's leader, the command: leads the terminal's foreground
@@ -825,9 +825,9 @@ fn signals_to_a_stopped_command_wait_for_it_and_the_monitor_passes_them_on() {
             Ok(()) => how.push(format!("SIG{name} TIOCSIG")),
             Err(e) => {
                 assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "SIG{name}: {e}");
-                // SAFETY: the monitor is this process's own, unreaped child
+                // the monitor is this process's own, unreaped child
                 // (the session monitor's handle holds it).
-                assert_eq!(unsafe { libc::kill(monitor_pid, sig) }, 0);
+                assert_eq!(envcloak_sys::testing::kill_raw(monitor_pid, sig), 0);
                 how.push(format!("SIG{name} to the monitor"));
             }
         }
