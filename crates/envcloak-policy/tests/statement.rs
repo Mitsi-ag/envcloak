@@ -703,9 +703,9 @@ Approval request ABCDEFGH
   manifest: /src/acme-web/envcloak.toml sha256 abababababababababababababababababababababababababababababababab
   test keys of the same provider, proposed instead of live ones (EnvCloak never swaps them in: bind one, then run the command again):
     STRIPE_SECRET_KEY: the test key stripe/acme-test, not the live key stripe/acme-web
-      to bind it: run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`
+      to bind it: run `envcloak ref --manifest /src/acme-web/envcloak.toml STRIPE_SECRET_KEY=stripe/acme-test`
     OPENAI_API_KEY: the test key openai/acme-\\u{1b}[31mtest#api\\u{200b}key, not the live key openai/acme\\u{202e}-live
-      to bind it: run `envcloak ref OPENAI_API_KEY=openai/acme-\\u{1b}[31mtest#api\\u{200b}key`
+      to bind it: run `envcloak ref --manifest /src/acme-web/envcloak.toml OPENAI_API_KEY=openai/acme-\\u{1b}[31mtest#api\\u{200b}key`
   bindings (inject mode):
     OPENAI_API_KEY = openai/acme-web#value  (test key, first use: no project uses this item yet)
     STRIPE_SECRET_KEY = stripe/acme-web#value  (live key, live: not allowed by you, so this approval is refused unless you add --live STRIPE_SECRET_KEY)
@@ -718,7 +718,8 @@ Nothing is approved: no passphrase is asked for an approval that leaves a live k
 
 /// Gate 40, sentence 2 (SPEC §10b): the test item is proposed first.
 /// The rendering lists each proposal, with how to bind it (here the
-/// `envcloak ref` line, for bindings of `[env]`), before the bindings and
+/// `envcloak ref --manifest` line naming the request's manifest, for
+/// bindings of `[env]`), before the bindings and
 /// their ticks, every string escaped: a program answering in the daemon's
 /// place could send anything. The whole statement is compared
 /// ([`PROPOSED_SNAPSHOT`]); refused as it stands, it says that nothing is
@@ -788,14 +789,21 @@ fn the_refusal_names_a_test_key_only_for_an_unticked_binding() {
 /// which a profile, an env file or a `--ref` replaces, so following it
 /// asked for the live item again): `[env]` and a profile name the
 /// `envcloak ref` line, with `--profile` for a profile; an env file names
-/// its line; a `--ref` says to give another. That following each binds the
-/// test item is checked end to end in `crates/envcloak-cli/tests/live_guard.rs`.
+/// its line; a `--ref` says to give another. The `envcloak ref` line names
+/// the request's manifest (Codex, round 3: alone, it edits the manifest
+/// nearest the directory of the terminal that follows it, which need not
+/// be the project's, after `run --manifest` or in a person's own
+/// terminal). That following each binds the test item, from an unrelated
+/// directory too, is checked end to end in
+/// `crates/envcloak-cli/tests/live_guard.rs`.
 ///
-/// Mutation: every layer advised as `[env]` (`advice` answering `envcloak
-/// ref NAME=...` whatever the source): the profile, env file and `--ref`
-/// cases fail.
+/// Mutations: every layer advised as `[env]` (`advice` answering
+/// `envcloak ref NAME=...` whatever the source): the profile, env file and
+/// `--ref` cases fail; the manifest left out of the line: the `[env]` and
+/// profile cases fail.
 #[test]
 fn the_advice_follows_the_layer_the_live_binding_came_from() {
+    const M: &str = "/src/acme-web/envcloak.toml";
     let none = |_: &str| false;
     let with = |source| {
         from(
@@ -806,13 +814,15 @@ fn the_advice_follows_the_layer_the_live_binding_came_from() {
     let cases = [
         (
             BindingSource::Env,
-            "run `envcloak ref STRIPE_KEY=stripe/test#secret`",
+            "run `envcloak ref --manifest /src/acme-web/envcloak.toml \
+             STRIPE_KEY=stripe/test#secret`",
         ),
         (
             BindingSource::Profile {
                 profile: "dev".into(),
             },
-            "run `envcloak ref --profile dev STRIPE_KEY=stripe/test#secret`",
+            "run `envcloak ref --manifest /src/acme-web/envcloak.toml --profile dev \
+             STRIPE_KEY=stripe/test#secret`",
         ),
         (
             BindingSource::EnvFile { line: 7 },
@@ -825,7 +835,7 @@ fn the_advice_follows_the_layer_the_live_binding_came_from() {
     ];
     for (source, advice) in cases {
         let x = with(source);
-        assert_eq!(x.advice(&none), advice);
+        assert_eq!(x.advice(M, &none), advice);
         // The statement shows the same advice.
         let mut d = proposing(strings(&["./emit"]));
         d.proposals = vec![x];
@@ -833,6 +843,78 @@ fn the_advice_follows_the_layer_the_live_binding_came_from() {
         assert!(
             text.contains(&format!("      to bind it: {advice}\n")),
             "{text}"
+        );
+    }
+}
+
+/// The manifest in the `envcloak ref` line is one shell word: as it is
+/// when a shell takes every character as itself, else in single quotes,
+/// a quote in it closed, escaped and reopened, so a path with spaces, a
+/// quote or a shell's own characters, or one a program answering in the
+/// daemon's place chose (SPEC §1.1), is that one argument when the line
+/// is pasted and runs nothing. A path with a character the display
+/// escapes (a control or an invisible one) cannot be shown as the word
+/// it is: the line names the manifest, escaped, and says to run it in its
+/// directory. A `/bin/sh` reading each word back is the independent check
+/// that the quoting gives the path whole and runs nothing.
+///
+/// Mutation: the path put in the line as it is (`shell_word` answering
+/// `Some(s.to_owned())`): the space, quote and `$(...)` cases split or
+/// run, and this fails.
+#[test]
+fn the_manifest_in_the_line_is_one_shell_word() {
+    use envcloak_policy::shell_word;
+    let none = |_: &str| false;
+    let x = proposal("STRIPE_KEY", "stripe/live", "stripe/test", None);
+    assert_eq!(
+        shell_word("/src/acme-web/envcloak.toml").as_deref(),
+        Some("/src/acme-web/envcloak.toml")
+    );
+    let ran = std::env::temp_dir().join(format!("ecsw-{}", std::process::id()));
+    let hostile = [
+        "/src/my project/envcloak.toml".to_owned(),
+        "/src/it's/envcloak.toml".to_owned(),
+        "/src/a\\b/envcloak.toml".to_owned(),
+        format!("/src/$(touch {})/envcloak.toml", ran.display()),
+        "/src/`id`;*?[x]~/envcloak.toml".to_owned(),
+        "/src/''\"\"/envcloak.toml".to_owned(),
+    ];
+    for path in &hostile {
+        let word = shell_word(path).unwrap();
+        assert!(word.starts_with('\''), "{word}");
+        // Read back by a shell: the one argument, nothing run.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' {word}"))
+            .env_clear()
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{word}");
+        let mut expected = path.as_bytes().to_vec();
+        expected.push(b'\n');
+        assert_eq!(out.stdout, expected, "{word}");
+        let advice = x.advice(path, &none);
+        assert!(
+            advice.starts_with(&format!("run `envcloak ref --manifest {word} STRIPE_KEY=")),
+            "{advice}"
+        );
+    }
+    assert!(!ran.exists(), "a quoted path ran a command");
+    // Shown escaped, a control or an invisible character is not itself:
+    // the line names the manifest and says where to run it.
+    for path in [
+        "/src/a\nb/envcloak.toml",
+        "/src/a\u{202e}b/envcloak.toml",
+        "",
+    ] {
+        assert_eq!(shell_word(path), None, "{path:?}");
+        let advice = x.advice(path, &none);
+        assert_eq!(
+            advice,
+            format!(
+                "run `envcloak ref STRIPE_KEY=stripe/test` in the directory of the manifest {}",
+                envcloak_policy::escape_for_display(path)
+            )
         );
     }
 }
@@ -888,7 +970,7 @@ fn a_proposed_name_shaped_like_a_key_is_not_shown() {
             assert!(text.contains(HIDDEN), "{text}");
         }
         // The advice names no live slug; the rest is hidden there too.
-        let advice = x.advice(&value_shaped);
+        let advice = x.advice("/src/acme-web/envcloak.toml", &value_shaped);
         assert!(!advice.to_ascii_lowercase().contains(&token), "{advice}");
         // The control: not taken for a key, the name is shown.
         let shown = render_statement_with(&d, &ticking(&[]), &|_| false);

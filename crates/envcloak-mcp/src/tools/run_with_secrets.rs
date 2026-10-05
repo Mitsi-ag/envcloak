@@ -32,10 +32,13 @@
 //!    `approval_required` names the request the record names and says how
 //!    the person approves it, from a terminal of their own (T-15), and
 //!    names the test items the daemon proposed in place of live ones, with
-//!    how to bind each (SPEC §10b "Live-key guard"; from the record, at
-//!    most [`envcloak_client::run_status::MAX_PROPOSALS`] with a count of
-//!    the rest; a name shaped like a key or token hidden); the child's own
-//!    line, which names `envcloak approve`, is not passed on.
+//!    how to bind each through this server (SPEC §10b "Live-key guard":
+//!    `add_reference` with this call's `project_dir`, the project the run
+//!    used), from the record, at most
+//!    [`envcloak_client::run_status::MAX_PROPOSALS`] with a count of the
+//!    rest (the record leaves out a proposal with a name shaped like a key
+//!    or token, and counts it); the child's own line, which names
+//!    `envcloak approve`, is not passed on.
 //!    No record, or one that is not well formed, is `execution_unknown`:
 //!    the command may have run, and the result says so with the output.
 //!    Otherwise the command ran: the result is its exit code and its
@@ -376,7 +379,8 @@ fn not_started(
 /// daemon proposed in place of live ones (SPEC §10b "Live-key guard"): each
 /// with how to bind it ([`proposal_text`]: every name escaped, one shaped
 /// like a key or token hidden), and how many more it proposed than the
-/// record names. Empty when there are none.
+/// record names (past its cap, and any with a name shaped like a key,
+/// which the record leaves out). Empty when there are none.
 fn test_keys((proposals, left_out): (&[Proposal], u32)) -> String {
     if proposals.is_empty() && left_out == 0 {
         return String::new();
@@ -389,15 +393,43 @@ fn test_keys((proposals, left_out): (&[Proposal], u32)) -> String {
         out.push(' ');
         out.push_str(&proposal_text(
             x,
-            "call run_with_secrets again (add_reference binds a variable as `envcloak ref` does).",
+            &binding_advice(x),
+            "call run_with_secrets again.",
         ));
     }
     if left_out > 0 {
         out.push_str(&format!(
-            " It proposed {left_out} more; `envcloak run` in a shell names them all."
+            " It proposed {left_out} more, which this message does not name."
         ));
     }
     out
+}
+
+/// How the agent binds the test item `x` proposes, through this server:
+/// for a binding of the manifest, `add_reference` with this call's
+/// `project_dir`, which names the project the run used (`envcloak run`
+/// found its manifest from there, as `add_reference` does), so the edit
+/// lands in that project and no other; the run's own command line (a
+/// `--ref`, the `--env-file`), which `run_with_secrets` never passes, as
+/// [`Proposal::command_line_advice`] says. Every name escaped, one shaped
+/// like a key or token hidden.
+fn binding_advice(x: &Proposal) -> String {
+    use envcloak_client::render::looks_like_value;
+    use envcloak_policy::{BindingSource, shown_name};
+    if let Some(line) = x.command_line_advice(&looks_like_value) {
+        return line;
+    }
+    let profile = match &x.source {
+        BindingSource::Profile { profile } => {
+            format!(" and profile {}", shown_name(profile, &looks_like_value))
+        }
+        _ => String::new(),
+    };
+    format!(
+        "call add_reference with this call's project_dir, env_name {} and slug {}{profile}",
+        shown_name(&x.env_name, &looks_like_value),
+        x.shown_reference(&looks_like_value)
+    )
 }
 
 /// The command ran, and ended as `exit` says.
@@ -731,18 +763,24 @@ mod tests {
         assert!(v["message"].as_str().unwrap().contains("stopped the run"));
     }
 
-    /// Output past the caps keeps its ends, names what was left out, and
-    /// never shows part of a key-shaped word at a cut: the cut moves to a
-    /// byte that cannot be in one, and the masking sees whole words.
     /// The test keys a record names (SPEC §10b "Live-key guard"): the
-    /// `approval_required` message names each with how to bind it, and how
-    /// many more the record counts; a name shaped like a key or token
-    /// (generated canaries, each a valid slug, field or variable name) is
-    /// never in the answer, the words every metadata command prints in its
-    /// place are (Codex, round 2). The control: an ordinary name is shown.
+    /// `approval_required` message names each with how to bind it through
+    /// this server, `add_reference` with this call's `project_dir` (Codex,
+    /// round 3: `envcloak ref` run in a shell edits the manifest nearest
+    /// its directory, which need not be the project's), and how many more
+    /// the record counts. A proposal with a name shaped like a key or
+    /// token (generated canaries, each a valid slug or variable name) is
+    /// left out of the record and counted (Codex, round 3: the record
+    /// carried such names unmasked), so it is never in the answer; a record
+    /// that names one, written by hand, is no record, and the call says
+    /// the run's outcome is unknown. This server's own words hide such a
+    /// name too (Codex, round 2). The control: ordinary names are shown.
     ///
-    /// Mutation: the names passed through unmasked (`proposal_text`
-    /// escaping only): the canaries are in the answer and this fails.
+    /// Mutations: the names passed through unmasked (`proposal_text`
+    /// escaping only): `test_keys` shows the canaries and this fails; the
+    /// advice in `envcloak ref` words (`binding_advice` answering
+    /// `Proposal::advice`): the message names no `add_reference` and this
+    /// fails.
     #[test]
     fn the_test_keys_a_record_names_are_in_the_message_masked() {
         use envcloak_client::run_status::MAX_PROPOSALS;
@@ -763,21 +801,22 @@ mod tests {
             test_field: None,
             source,
         };
-        let mut proposals = vec![
-            x("STRIPE_SECRET_KEY", "stripe/acme-test", BindingSource::Env),
-            x(
-                "OTHER_KEY",
-                &format!("stripe/{token}"),
-                BindingSource::Profile {
-                    profile: "dev".to_owned(),
-                },
-            ),
+        let dev = || BindingSource::Profile {
+            profile: "dev".to_owned(),
+        };
+        let hostile = [
+            x("OTHER_KEY", &format!("stripe/{token}"), dev()),
             x(
                 &format!("K{}", token.to_ascii_uppercase()),
                 "stripe/acme-test",
                 BindingSource::Env,
             ),
         ];
+        let mut proposals = vec![
+            x("STRIPE_SECRET_KEY", "stripe/acme-test", BindingSource::Env),
+            x("DEV_KEY", "stripe/acme-test", dev()),
+        ];
+        proposals.extend(hostile.iter().cloned());
         proposals.extend(
             (0..MAX_PROPOSALS)
                 .map(|i| x(&format!("MORE_{i}"), "stripe/acme-test", BindingSource::Env)),
@@ -789,18 +828,48 @@ mod tests {
         assert_eq!(v["status"], "approval_required", "{v}");
         let m = v["message"].as_str().unwrap();
         assert!(!v.to_string().to_ascii_lowercase().contains(&token), "{v}");
-        assert!(m.contains(envcloak_client::render::HIDDEN), "{m}");
         assert!(
             m.contains(
                 "STRIPE_SECRET_KEY is bound to the live key stripe/acme-live: to use the test key \
-                 stripe/acme-test instead, run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`, \
-                 and call run_with_secrets again"
+                 stripe/acme-test instead, call add_reference with this call's project_dir, \
+                 env_name STRIPE_SECRET_KEY and slug stripe/acme-test, and call run_with_secrets \
+                 again."
             ),
             "{m}"
         );
-        // Of the 11 proposed, the record names 8 and counts 3.
-        assert!(m.contains("It proposed 3 more"), "{m}");
+        assert!(
+            m.contains(
+                "call add_reference with this call's project_dir, env_name DEV_KEY and slug \
+                 stripe/acme-test and profile dev, and call"
+            ),
+            "{m}"
+        );
+        assert!(!m.contains("envcloak ref"), "{m}");
+        // Of the 12 proposed, the record names 8 (the two key-shaped ones
+        // left out) and counts 4.
+        assert!(
+            m.contains("It proposed 4 more, which this message does not name."),
+            "{m}"
+        );
         assert!(!v.to_string().contains("envcloak approve"), "{v}");
+        // A record naming one, written by hand: no record.
+        let named = RunStatus::NotStarted {
+            token: "approval_required".into(),
+            request: Some(id),
+            proposals: hostile.to_vec(),
+            proposals_left_out: 0,
+        };
+        let v = outcome(&captured(Some(125), b"", b""), &report(&named), &c, 8);
+        assert_eq!(v["status"], "execution_unknown", "{v}");
+        assert!(!v.to_string().to_ascii_lowercase().contains(&token), "{v}");
+        // This server's own words hide such a name.
+        let words = test_keys((&hostile, 0));
+        assert!(!words.to_ascii_lowercase().contains(&token), "{words}");
+        assert_eq!(
+            words.matches(envcloak_client::render::HIDDEN).count(),
+            4,
+            "{words}"
+        );
         // None proposed: the message names no test key.
         let v = outcome(
             &captured(Some(125), b"", b""),
@@ -811,6 +880,9 @@ mod tests {
         assert!(!v["message"].as_str().unwrap().contains("test key"), "{v}");
     }
 
+    /// Output past the caps keeps its ends, names what was left out, and
+    /// never shows part of a key-shaped word at a cut: the cut moves to a
+    /// byte that cannot be in one, and the masking sees whole words.
     #[test]
     fn long_output_keeps_its_ends_and_masks_whole_words() {
         let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());

@@ -16,7 +16,11 @@
 //!   was started; nothing ran. Its token, and with `approval_required`
 //!   the request id and the test items the daemon proposed in place of
 //!   live ones (SPEC §10b "Live-key guard": the `approval_required` text
-//!   names them), at most [`MAX_PROPOSALS`] with a count of the rest.
+//!   names them), at most [`MAX_PROPOSALS`] with a count of the rest. The
+//!   record is not shown to anyone, so it does not hide a name as a
+//!   terminal does: it leaves out every proposal with a name shaped like a
+//!   key or token ([`proposal_shown_whole`]), and counts it with the
+//!   rest. The descriptor can be a regular file anyone reads later.
 //! - [`RunStatus::Ran`]: the command was started and followed to its end:
 //!   its exit code, or the signal that ended it or stopped the run.
 //! - [`RunStatus::Unknown`]: the command may have been started, and how it
@@ -31,7 +35,8 @@
 //! a record cut short (the run killed while writing it) is no record. It
 //! carries no value, no output and no free text: a token, an id, a number,
 //! and the proposals' names, each of the shape the daemon gives it
-//! ([`Proposal::well_formed`]). A reader takes only the exact bytes
+//! ([`Proposal::well_formed`]) and none shaped like a key or token. A
+//! reader takes only the exact bytes
 //! [`RunStatus::encode`] writes for a well-formed record; a missing record,
 //! a second one, one cut short, one too long, one of an unknown version,
 //! one written any other way (other spacing, field order or case) or any
@@ -41,6 +46,8 @@
 use std::io::{self, Write};
 
 use envcloak_policy::{PendingId, Proposal};
+
+use crate::render::proposal_shown_whole;
 use serde::{Deserialize, Serialize};
 
 /// The longest record without proposals, its newline included: one write
@@ -78,9 +85,11 @@ pub enum RunStatus {
         /// The pending request, for `approval_required`.
         request: Option<PendingId>,
         /// For `approval_required`: the test items the daemon proposed in
-        /// place of live ones, at most [`MAX_PROPOSALS`].
+        /// place of live ones, at most [`MAX_PROPOSALS`], none with a name
+        /// shaped like a key or token.
         proposals: Vec<Proposal>,
-        /// How many more it proposed than `proposals` names.
+        /// How many more it proposed than `proposals` names: those past
+        /// [`MAX_PROPOSALS`], and those with a name shaped like a key.
         proposals_left_out: u32,
     },
     /// The command was started and followed to its end.
@@ -143,14 +152,21 @@ impl RunStatus {
     }
 
     /// `approval_required` for request `id`, naming the first
-    /// [`MAX_PROPOSALS`] of `proposals` and counting the rest.
+    /// [`MAX_PROPOSALS`] of `proposals` whose every name is shown whole
+    /// ([`proposal_shown_whole`]) and counting the rest: the record goes to
+    /// a descriptor, maybe a file, where no name is hidden for it.
     pub fn approval_required(id: PendingId, proposals: &[Proposal]) -> RunStatus {
-        let named = proposals.len().min(MAX_PROPOSALS);
+        let named: Vec<Proposal> = proposals
+            .iter()
+            .filter(|x| proposal_shown_whole(x))
+            .take(MAX_PROPOSALS)
+            .cloned()
+            .collect();
         RunStatus::NotStarted {
             token: "approval_required".to_owned(),
             request: Some(id),
-            proposals: proposals[..named].to_vec(),
-            proposals_left_out: u32::try_from(proposals.len() - named).unwrap_or(u32::MAX),
+            proposals_left_out: u32::try_from(proposals.len() - named.len()).unwrap_or(u32::MAX),
+            proposals: named,
         }
     }
 
@@ -261,14 +277,15 @@ impl RunStatus {
                 if request.is_some() && token != "approval_required" {
                     return None;
                 }
-                // Proposals only with a request; at most MAX_PROPOSALS,
-                // counted beyond only when that many are named; each of
-                // the daemon's shapes, no variable twice.
+                // Proposals only with a request; at most MAX_PROPOSALS;
+                // each of the daemon's shapes with no name shaped like a
+                // key or token (the writer leaves such a one out and
+                // counts it), no variable twice.
                 if !no_proposals
                     && (request.is_none()
                         || w.proposals.len() > MAX_PROPOSALS
-                        || (w.proposals_left_out > 0 && w.proposals.len() < MAX_PROPOSALS)
                         || !w.proposals.iter().all(Proposal::well_formed)
+                        || !w.proposals.iter().all(proposal_shown_whole)
                         || w.proposals.iter().enumerate().any(|(i, x)| {
                             w.proposals[..i].iter().any(|y| y.env_name == x.env_name)
                         }))
@@ -418,9 +435,11 @@ mod tests {
     }
 
     /// The `n`th proposal, every name as long as its grammar allows, from
-    /// a profile of the longest name: the longest a record carries.
+    /// a profile of the longest name: the longest a record carries. Its
+    /// words are separated, as names' are, so none looks like a key (the
+    /// record leaves out a proposal whose name does).
     fn longest(n: usize) -> Proposal {
-        let name = format!("{}{n:03}", "A".repeat(125));
+        let name = format!("{}A{n:03}", "A_".repeat(62));
         let slug = |kind: &str| format!("{kind}/{}", "s".repeat(127 - kind.len()));
         Proposal {
             env_name: name,
@@ -437,8 +456,7 @@ mod tests {
     /// `MAX_PROPOSALS` named, of the longest names, fit `MAX_RECORD`, the
     /// rest counted; more are counted, never dropped unsaid. Only with
     /// `approval_required` and its request, each of the daemon's shapes,
-    /// no variable twice, and a count only past a full list: anything else
-    /// is no record.
+    /// no variable twice: anything else is no record.
     #[test]
     fn proposals_are_named_with_a_request_and_counted_past_the_cap() {
         let id = PendingId::generate();
@@ -485,8 +503,8 @@ mod tests {
                 "\"profile\":\"no such/name\"",
                 1,
             ),
-            // A count past a list that is not full.
-            at_end(",\"proposals_left_out\":1"),
+            // A count of 0, which is never written.
+            at_end(",\"proposals_left_out\":0"),
             // An unknown field in a proposal.
             text.replacen("\"source\":", "\"value\":\"x\",\"source\":", 1),
         ];
@@ -514,5 +532,96 @@ mod tests {
             1,
         );
         assert_eq!(RunStatus::decode(with.as_bytes()), None);
+    }
+
+    /// A slug no metadata command shows: a generated key-shaped token
+    /// (from run-time canaries, so no key-shaped literal is in the
+    /// source) under a provider's name.
+    fn key_shaped_slug() -> String {
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        let token: String = cs
+            .iter()
+            .flat_map(|c| c.value().to_vec())
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|b| char::from(b).to_ascii_lowercase())
+            .take(42)
+            .chain("x1y2z3".chars())
+            .collect();
+        format!("stripe/{token}")
+    }
+
+    /// The record goes to a descriptor, maybe a regular file, where no
+    /// name is hidden for it (Codex, round 3: the record carried the
+    /// daemon's names unmasked while the terminal and the MCP message hid
+    /// a key-shaped one). A proposal with any name shaped like a key or
+    /// token, each of its five, is left out and counted with the rest, and
+    /// the record holds no byte of it; a record that names one, written by
+    /// hand, is no record and is never written. The control: ordinary
+    /// names are named.
+    ///
+    /// Mutation: `approval_required` keeping every proposal (no
+    /// `proposal_shown_whole` filter): the token is in the record and
+    /// this fails.
+    #[test]
+    fn a_proposal_with_a_key_shaped_name_is_left_out_and_counted() {
+        let id = PendingId::generate();
+        let key = key_shaped_slug();
+        let token = key.strip_prefix("stripe/").unwrap().to_owned();
+        assert!(crate::render::looks_like_value(&key), "the control");
+        let ordinary = |n: usize| Proposal {
+            env_name: format!("KEY_{n}"),
+            live_slug: "stripe/acme-live".to_owned(),
+            test_slug: "stripe/acme-test".to_owned(),
+            test_field: None,
+            source: envcloak_policy::BindingSource::Profile {
+                profile: "dev".to_owned(),
+            },
+        };
+        let mut hostile = Vec::new();
+        for which in 0..5 {
+            let mut x = ordinary(10 + which);
+            match which {
+                0 => x.env_name = format!("K{}", token.to_ascii_uppercase()),
+                1 => x.live_slug.clone_from(&key),
+                2 => x.test_slug.clone_from(&key),
+                3 => x.test_field = Some(token.clone()),
+                _ => {
+                    x.source = envcloak_policy::BindingSource::Profile {
+                        profile: token.clone(),
+                    }
+                }
+            }
+            assert!(x.well_formed(), "{which}");
+            hostile.push(x);
+        }
+        let mut all = vec![ordinary(0)];
+        all.extend(hostile.iter().cloned());
+        all.push(ordinary(1));
+        let s = RunStatus::approval_required(id, &all);
+        assert_eq!(
+            s,
+            RunStatus::NotStarted {
+                token: "approval_required".into(),
+                request: Some(id),
+                proposals: vec![ordinary(0), ordinary(1)],
+                proposals_left_out: 5,
+            }
+        );
+        let mut out = Vec::new();
+        s.write_to(&mut out).unwrap();
+        let lower = String::from_utf8(out.clone()).unwrap().to_ascii_lowercase();
+        assert!(!lower.contains(&token), "{lower}");
+        assert_eq!(RunStatus::decode(&out), Some(s));
+        // Each, named in a record by hand: no record, never written.
+        for x in &hostile {
+            let named = RunStatus::NotStarted {
+                token: "approval_required".into(),
+                request: Some(id),
+                proposals: vec![x.clone()],
+                proposals_left_out: 0,
+            };
+            assert_eq!(RunStatus::decode(&named.encode()), None, "{x:?}");
+            assert!(named.write_to(&mut Vec::new()).is_err(), "{x:?}");
+        }
     }
 }

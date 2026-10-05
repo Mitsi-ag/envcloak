@@ -1,6 +1,11 @@
-//! `envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]` (SPEC §7:
-//! an agent that needs a key finds it with `envcloak ls` and references
-//! it here): binds a variable to an item in the nearest `envcloak.toml`.
+//! `envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest PATH]
+//! [--json]` (SPEC §7: an agent that needs a key finds it with `envcloak
+//! ls` and references it here): binds a variable to an item in the nearest
+//! `envcloak.toml`, or in the one `--manifest` names (an absolute path, as
+//! `envcloak run --manifest` takes it), which the approval statement's and
+//! `envcloak run`'s advice to bind a test key in a live one's place names,
+//! so that it edits that project from any directory (SPEC §10b "Live-key
+//! guard").
 //! The manifest holds names only, so this reads and writes no value. A
 //! slug does not say what its item is, and a reference to a login's field
 //! is never written (SPEC §6.8 "Login fields are typed", gate b18), so the
@@ -15,7 +20,7 @@
 //! binding written is a request for approval later, not an approval:
 //! `envcloak run` still asks for the new binding.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use envcloak_client::connect::connect;
@@ -24,23 +29,30 @@ use envcloak_client::manifest_edit::edit_manifest_ref;
 use envcloak_client::render::print;
 use envcloak_ipc::ClientError;
 use envcloak_ipc::view::{RefEditView, RefStatus};
-use envcloak_policy::{Binding, ProfileName, find_manifest};
+use envcloak_policy::{Binding, MANIFEST_NAME, ProfileName, find_manifest};
 
 use super::refuse_value_like;
 
-const USAGE_TEXT: &str = "envcloak ref NAME=<slug>[#field] [--profile NAME] [--json]";
+const USAGE_TEXT: &str = "envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest /absolute/path/envcloak.toml] \
+     [--json]";
+
+/// What a `--manifest` must be.
+const MANIFEST_PATH: &str = "--manifest needs the absolute path of an envcloak.toml";
 
 /// The parsed command line.
 #[derive(Debug, PartialEq, Eq)]
 struct RefArgs {
     binding: Binding,
     profile: Option<ProfileName>,
+    /// `--manifest`: an absolute path to a file named `envcloak.toml`.
+    manifest: Option<PathBuf>,
     json: bool,
 }
 
 fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
     let mut binding = None;
     let mut profile = None;
+    let mut manifest = None;
     let mut json = false;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
@@ -49,6 +61,17 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
             "--profile" if profile.is_none() => {
                 let p = *it.next().ok_or("--profile needs a name")?;
                 profile = Some(ProfileName::new(p).map_err(|_| "invalid profile name")?);
+            }
+            "--manifest" if manifest.is_none() => {
+                // The editor opens the file named `envcloak.toml` in this
+                // path's directory, through that directory, never through
+                // a symlink, and checks the rest; a path that is relative
+                // or names another file is refused here, unechoed.
+                let p = Path::new(*it.next().ok_or(MANIFEST_PATH)?);
+                if !p.is_absolute() || p.file_name().is_none_or(|n| n != MANIFEST_NAME) {
+                    return Err(MANIFEST_PATH);
+                }
+                manifest = Some(p.to_path_buf());
             }
             _ if arg.starts_with('-') => return Err("unknown or repeated option"),
             _ if binding.is_some() => return Err("ref takes one NAME=<slug>[#field]"),
@@ -59,6 +82,7 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
     Ok(RefArgs {
         binding: Binding::parse_arg(text).map_err(|_| "ref needs NAME=<slug>[#field]")?,
         profile,
+        manifest,
         json,
     })
 }
@@ -69,10 +93,14 @@ pub fn run(args: &[&str]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     // A value pasted as an argument is refused as one, before anything
-    // about its grammar is said.
+    // about its grammar is said. A `--manifest` path is a path, not a name
+    // in whose place a value gets pasted (a directory named like a hash is
+    // common), so it is not looked at.
     let pieces: Vec<&str> = args
         .iter()
-        .flat_map(|a| a.split(['=', '#']))
+        .enumerate()
+        .filter(|(i, _)| *i == 0 || args[i - 1] != "--manifest")
+        .flat_map(|(_, a)| a.split(['=', '#']))
         .filter(|p| !p.is_empty())
         .collect();
     if let Err(f) = refuse_value_like(&pieces) {
@@ -89,7 +117,11 @@ pub fn run(args: &[&str]) -> ExitCode {
 }
 
 fn edit(a: RefArgs) -> Result<ExitCode, Failure> {
-    let manifest = match find_manifest(Path::new(".")) {
+    let found = match a.manifest {
+        Some(m) => Ok(Some(m)),
+        None => find_manifest(Path::new(".")),
+    };
+    let manifest = match found {
         Ok(Some(p)) => p,
         Ok(None) => {
             return Err(Failure::new(
@@ -264,8 +296,27 @@ mod tests {
             &["A=b", "--profile", "Bad"],
             &["A=b", "--value", "x"],
             &["=b"],
+            // A `--manifest` that is relative, names another file, is
+            // missing or given twice.
+            &["A=b", "--manifest"],
+            &["A=b", "--manifest", "envcloak.toml"],
+            &["A=b", "--manifest", "./p/envcloak.toml"],
+            &["A=b", "--manifest", "/p/other.toml"],
+            &["A=b", "--manifest", "/p/"],
+            &["A=b", "--manifest", "/"],
+            &[
+                "A=b",
+                "--manifest",
+                "/p/envcloak.toml",
+                "--manifest",
+                "/q/envcloak.toml",
+            ],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");
         }
+        let a = parse(&["--manifest", "/p q/envcloak.toml", "A=openai/acme-web"]).unwrap();
+        assert_eq!(a.manifest, Some(PathBuf::from("/p q/envcloak.toml")));
+        assert_eq!(a.binding, binding("A=openai/acme-web"));
+        assert_eq!(parse(&["A=b"]).unwrap().manifest, None);
     }
 }

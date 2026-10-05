@@ -5,10 +5,10 @@
 //! passphrase, the refusal the daemon's own and audited, and approves it
 //! with the ticks; `envcloak run`'s `approval_required` line names the
 //! same provider's test item and how to bind it for the layer the live
-//! binding came from, waiting or not, and following that binds the test
-//! item; `envcloak items reclassify` tightens with no proof and loosens
-//! only with one. The daemon's side is in
-//! `crates/envcloak-daemon/tests/live_guard.rs`.
+//! binding came from, waiting or not, and following that, from any
+//! directory, binds the test item in the requested project; `envcloak
+//! items reclassify` tightens with no proof and loosens only with one.
+//! The daemon's side is in `crates/envcloak-daemon/tests/live_guard.rs`.
 //!
 //! The requesters are `envcloak run` without a terminal (an unknown
 //! subject) and `envcloak run` as the command of the fixture agent on a
@@ -344,14 +344,23 @@ fn quoted_after<'a>(line: &'a str, before: &str) -> &'a str {
 /// `--ref`, an env file and a profile replace, so following the line round
 /// 1 printed asked for the live item again). A `--ref` is replaced; the
 /// env file's line is set; a profile's binding is changed with `envcloak
-/// ref --profile`; `[env]`'s with `envcloak ref`. The control: the round-1
-/// line, followed for the `--ref` run, leaves the live item bound.
+/// ref --manifest <m> --profile`; `[env]`'s with `envcloak ref --manifest
+/// <m>`. The edits are followed from another project's directory, as a
+/// run with `--manifest` or a terminal elsewhere would (Codex, round 3:
+/// `envcloak ref` alone edits the manifest nearest the directory it runs
+/// in): the requested project changes and the other stays byte for byte.
+/// The controls: the round-1 line, followed for the `--ref` run, leaves
+/// the live item bound; the round-2 line, without the manifest, followed
+/// from the other project, edits that one and leaves the live item bound.
 ///
 /// Mutations: leave the proposals off the line (`proposed` answering
 /// nothing): the line names no test item and this fails; advise every
 /// layer as `[env]` (`Proposal::advice` answering `envcloak ref NAME=...`
 /// whatever the source): the `--ref` line differs, and following the
-/// env file's and the profile's still binds the live item.
+/// env file's and the profile's still binds the live item; leave the
+/// manifest out of the line (`envcloak ref NAME=...` for `[env]` and a
+/// profile): the line differs, and followed from the other project it
+/// edits that one.
 #[test]
 fn the_approval_required_line_names_the_test_item() {
     let mut f = Fixture::new();
@@ -375,13 +384,26 @@ fn the_approval_required_line_names_the_test_item() {
             .to_owned();
         (id, line)
     };
-    // `envcloak <args>` in the project, as the agent runs `envcloak ref`.
-    let in_project = |args: &[&str]| {
+    // `envcloak <args>` in `at`, as the agent runs `envcloak ref`.
+    let in_dir = |at: &Path, args: &[&str]| {
         let mut cmd = cli_command(&f.home, args, &[]);
-        cmd.current_dir(&dir);
+        cmd.current_dir(at);
         let out = finish_within(cmd, Duration::from_secs(60));
         f.swept(&out);
         assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+    };
+    let in_project = |args: &[&str]| in_dir(&dir, args);
+    // Another project, which binds the same live key: where a terminal
+    // that follows the line may be.
+    let other = project(&f.home, "acme-other", LIVE_MANIFEST);
+    let other_manifest = std::fs::read(other.join("envcloak.toml")).unwrap();
+    let elsewhere = |args: &[&str]| {
+        in_dir(&other, args);
+        assert_eq!(
+            std::fs::read(other.join("envcloak.toml")).unwrap(),
+            other_manifest,
+            "{args:?} edited another project"
+        );
     };
     let words = |cmd: &str| -> Vec<String> {
         let w: Vec<String> = cmd.split_whitespace().map(str::to_owned).collect();
@@ -483,17 +505,18 @@ fn the_approval_required_line_names_the_test_item() {
     assert_eq!(pending_slugs(&f, &id), ["stripe/acme-test"]);
     assert!(!line.contains("test key"), "{line}");
 
-    // A profile: `envcloak ref --profile`.
+    // A profile: `envcloak ref --manifest <m> --profile`, followed from
+    // the other project.
     let (id, line) = ask(&["--profile", "dev"]);
     assert!(
-        line.contains(
-            "instead, run `envcloak ref --profile dev STRIPE_SECRET_KEY=stripe/acme-test`, and \
-             run this again"
-        ),
+        line.contains(&format!(
+            "instead, run `envcloak ref --manifest {m} --profile dev \
+             STRIPE_SECRET_KEY=stripe/acme-test`, and run this again"
+        )),
         "{line}"
     );
     assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
-    in_project(
+    elsewhere(
         &words(quoted_after(&line, "instead, run `"))
             .iter()
             .map(String::as_str)
@@ -503,16 +526,27 @@ fn the_approval_required_line_names_the_test_item() {
     assert_eq!(pending_slugs(&f, &id), ["stripe/acme-test"]);
     assert!(!line.contains("test key"), "{line}");
 
-    // `[env]`: `envcloak ref`.
+    // `[env]`: `envcloak ref --manifest <m>`. The control first: round 2's
+    // line, without the manifest, followed from the other project, edits
+    // that one, and the requested project still binds the live item.
     let (id, line) = ask(&[]);
     assert!(
-        line.contains(
-            "instead, run `envcloak ref STRIPE_SECRET_KEY=stripe/acme-test`, and run this again"
-        ),
+        line.contains(&format!(
+            "instead, run `envcloak ref --manifest {m} STRIPE_SECRET_KEY=stripe/acme-test`, and \
+             run this again"
+        )),
         "{line}"
     );
     assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
-    in_project(
+    in_dir(&other, &["ref", "STRIPE_SECRET_KEY=stripe/acme-test"]);
+    assert_ne!(
+        std::fs::read(other.join("envcloak.toml")).unwrap(),
+        other_manifest
+    );
+    let (id, _) = ask(&[]);
+    assert_eq!(pending_slugs(&f, &id), ["stripe/acme-live"]);
+    std::fs::write(other.join("envcloak.toml"), &other_manifest).unwrap();
+    elsewhere(
         &words(quoted_after(&line, "instead, run `"))
             .iter()
             .map(String::as_str)

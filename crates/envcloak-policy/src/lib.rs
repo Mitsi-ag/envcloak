@@ -91,5 +91,5 @@ pub use statement::{
     BindingSummary, HIDDEN, PendingDescriptor, ProcessSummary, ProjectSummary, Proposal,
     RENDER_LIMIT, STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped,
     escape_for_display, live_guarded, proposals, proposed_for, render_statement,
-    render_statement_with, shown_name, statement_digest, unticked_live,
+    render_statement_with, shell_word, shown_name, statement_digest, unticked_live,
 };

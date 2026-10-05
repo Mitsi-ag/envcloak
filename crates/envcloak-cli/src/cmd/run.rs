@@ -108,7 +108,7 @@ use std::time::Duration;
 use envcloak_client::claims::claims;
 use envcloak_client::connect::{connect, run_paths};
 use envcloak_client::fail::{Failure, RUN_FAILURE, USAGE, refuse_if_traced, traced, usage};
-use envcloak_client::render::proposal_text;
+use envcloak_client::render::{looks_like_value, proposal_text};
 use envcloak_client::run_status::{Exit, RunStatus};
 use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
@@ -496,7 +496,7 @@ fn request(a: RunArgs) -> Result<Ended, Failure> {
                     "approval_required",
                     format!(
                         "request={id}: run \"envcloak approve {id}\" in a terminal you control{}",
-                        proposed(&answer.proposals)
+                        proposed(&answer.proposals, &params.manifest)
                     ),
                 ),
                 code: RUN_FAILURE,
@@ -593,7 +593,7 @@ fn wait_for(
         Notice::Pending(id) => eprintln!(
             "envcloak: approval_required: request={id}: run \"envcloak approve {id}\" in a \
              terminal you control{}; waiting up to {shown} for it",
-            proposed(&latest.borrow())
+            proposed(&latest.borrow(), &params.manifest)
         ),
         Notice::TooManyPending(e) => {
             let f = Failure::from(ClientError::Rpc(e));
@@ -639,15 +639,22 @@ fn wait_for(
 /// What the `approval_required` line adds for the test items the daemon
 /// proposes in place of live ones (SPEC §10b "Live-key guard"): for each,
 /// the variable, the live item, the test item and how to bind it for the
-/// layer the live binding came from
-/// ([`envcloak_client::render::proposal_text`]: names escaped, one shaped
-/// like a key or token hidden). The daemon never substitutes one. The
-/// client took only an answer whose names have the daemon's shapes
-/// (`RunAnswer::well_formed`).
-fn proposed(proposals: &[Proposal]) -> String {
+/// layer the live binding came from, an edit of the manifest naming
+/// `manifest`, the one this run sent (`Proposal::advice`: the line can be
+/// followed from any directory), and
+/// [`envcloak_client::render::proposal_text`]'s masking (names escaped,
+/// one shaped like a key or token hidden). The daemon never substitutes
+/// one. The client took only an answer whose names have the daemon's
+/// shapes (`RunAnswer::well_formed`).
+fn proposed(proposals: &[Proposal], manifest: &str) -> String {
     proposals
         .iter()
-        .map(|x| format!("; {}", proposal_text(x, "run this again")))
+        .map(|x| {
+            format!(
+                "; {}",
+                proposal_text(x, &x.advice(manifest, &looks_like_value), "run this again")
+            )
+        })
         .collect()
 }
 
@@ -912,13 +919,16 @@ mod tests {
         };
         let upper = format!("K{}", token.to_ascii_uppercase());
         let slug = format!("stripe/{token}");
-        let line = proposed(&[
-            x("STRIPE_SECRET_KEY", "stripe/live", "stripe/test", None),
-            x(&upper, "stripe/live", "stripe/test", None),
-            x("A_KEY", &slug, "stripe/test", None),
-            x("B_KEY", "stripe/live", &slug, None),
-            x("C_KEY", "stripe/live", "stripe/test", Some(&token)),
-        ]);
+        let line = proposed(
+            &[
+                x("STRIPE_SECRET_KEY", "stripe/live", "stripe/test", None),
+                x(&upper, "stripe/live", "stripe/test", None),
+                x("A_KEY", &slug, "stripe/test", None),
+                x("B_KEY", "stripe/live", &slug, None),
+                x("C_KEY", "stripe/live", "stripe/test", Some(&token)),
+            ],
+            "/p/acme/envcloak.toml",
+        );
         assert!(!line.to_ascii_lowercase().contains(&token), "{line}");
         assert_eq!(
             line.matches(envcloak_client::render::HIDDEN).count(),
@@ -933,7 +943,20 @@ mod tests {
             ),
             "{line}"
         );
-        assert_eq!(proposed(&[]), "");
+        assert_eq!(proposed(&[], "/p/acme/envcloak.toml"), "");
+        // A binding of the manifest: the edit names the manifest this run
+        // sent, as one shell word (Codex, round 3: `envcloak ref` alone
+        // edits the manifest nearest the directory it runs in).
+        let mut p = x("STRIPE_SECRET_KEY", "stripe/live", "stripe/test", None);
+        p.source = BindingSource::Profile {
+            profile: "dev".to_owned(),
+        };
+        assert_eq!(
+            proposed(&[p], "/p/my acme/envcloak.toml"),
+            "; STRIPE_SECRET_KEY is bound to the live key stripe/live: to use the test key \
+             stripe/test instead, run `envcloak ref --manifest '/p/my acme/envcloak.toml' \
+             --profile dev STRIPE_SECRET_KEY=stripe/test`, and run this again"
+        );
     }
 
     #[test]

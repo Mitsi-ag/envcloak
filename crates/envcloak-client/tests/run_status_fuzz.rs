@@ -174,7 +174,6 @@ fn valid(s: &RunStatus) -> bool {
                 && ((proposals.is_empty() && *proposals_left_out == 0)
                     || (request.is_some()
                         && proposals.len() <= MAX_PROPOSALS
-                        && (*proposals_left_out == 0 || proposals.len() == MAX_PROPOSALS)
                         && unique
                         && proposals.iter().all(proposal_ok)))
         }
@@ -356,9 +355,26 @@ fn known_list(text: &str) -> Option<Vec<Proposal>> {
     })
 }
 
+/// A slug shaped like a key: a generated token (run-time canaries, no
+/// key-shaped literal in the source) under a provider's name. A record
+/// never names one (Codex, round 3): its writer leaves the proposal out.
+fn key_shaped_slug() -> String {
+    let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+    let token: String = cs
+        .iter()
+        .flat_map(|c| c.value().to_vec())
+        .filter(u8::is_ascii_alphanumeric)
+        .map(|b| char::from(b).to_ascii_lowercase())
+        .take(42)
+        .chain("x1y2z3".chars())
+        .collect();
+    format!("stripe/{token}")
+}
+
 /// Malformed lists: empty (never written), a variable twice, a name of
-/// the wrong shape, an unknown layer, a profile of the wrong shape, line
-/// 0, an unknown field, more than the cap, and not a list.
+/// the wrong shape, a name shaped like a key, an unknown layer, a profile
+/// of the wrong shape, line 0, an unknown field, more than the cap, and
+/// not a list.
 fn bad_lists() -> Vec<String> {
     let json = |l: &[Proposal]| {
         let items: Vec<String> = l.iter().map(proposal_json).collect();
@@ -370,6 +386,8 @@ fn bad_lists() -> Vec<String> {
     slug[0].test_slug = "Stripe/Test".to_owned();
     let mut name = vec![good_proposal(0)];
     name[0].env_name = "1KEY".to_owned();
+    let mut key = vec![good_proposal(0), good_proposal(1)];
+    key[1].test_slug = key_shaped_slug();
     let mut profile = vec![good_proposal(1)];
     profile[0].source = BindingSource::Profile {
         profile: "Dev".to_owned(),
@@ -383,6 +401,7 @@ fn bad_lists() -> Vec<String> {
         json(&twice),
         json(&slug),
         json(&name),
+        json(&key),
         json(&profile),
         json(&line),
         json(&over),
@@ -538,10 +557,17 @@ fn valid_record() -> impl Strategy<Value = RunStatus> {
     prop_oneof![
         token.prop_map(|token| RunStatus::not_started(&token)),
         shown_id().prop_map(|id| RunStatus::approval_required(PendingId::parse(&id).unwrap(), &[])),
-        (shown_id(), 0usize..3, 0u32..3).prop_map(|(id, which, more)| {
+        (shown_id(), 0usize..3, 0u32..3, any::<bool>()).prop_map(|(id, which, more, key)| {
             let list = &good_lists()[which];
-            // A count only past a full list.
+            // Counted: the proposals past a full list, and one with a name
+            // shaped like a key, which the writer leaves out wherever it
+            // is in the daemon's list.
             let mut all = list.clone();
+            if key {
+                let mut x = good_proposal(MAX_PROPOSALS + 10);
+                x.test_slug = key_shaped_slug();
+                all.insert(0, x);
+            }
             if list.len() == MAX_PROPOSALS {
                 all.extend((0..more as usize).map(|i| good_proposal(MAX_PROPOSALS + i)));
             }
