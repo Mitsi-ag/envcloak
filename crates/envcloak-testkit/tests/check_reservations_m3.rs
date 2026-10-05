@@ -888,10 +888,13 @@ fn a_dotted_field_is_read_and_a_malformed_one_fails() {
 
 /// The M3 plan's code-owned paths (task M3-01): the macOS app, its build
 /// and signing scripts, and the pinned requirements, beside the two
-/// checks whose tables the M3 tasks take their rows from.
+/// checks whose tables the M3 tasks take their rows from, and the SPEC,
+/// whose edits the SPEC check leaves to a code owner's review for the
+/// paraphrases it misses (round three's verifier: no line named it).
 ///
-/// Mutation checked: the `/apps/macos/` line removed from
-/// .github/CODEOWNERS: this test fails.
+/// Mutations checked: the `/apps/macos/` line removed from
+/// .github/CODEOWNERS; separately the `/docs/SPEC.md` line removed: this
+/// test fails for each.
 #[test]
 fn codeowners_name_an_owner_for_the_m3_paths() {
     let text = std::fs::read_to_string(repo_root().join(".github/CODEOWNERS")).unwrap();
@@ -913,6 +916,7 @@ fn codeowners_name_an_owner_for_the_m3_paths() {
         "/scripts/check-reservations.py",
         "/scripts/check-reservations-baseline.txt",
         "/scripts/check-spec-decisions.py",
+        "/docs/SPEC.md",
     ] {
         assert!(
             owned.iter().any(|(p, owners)| *p == want && *owners > 0),
