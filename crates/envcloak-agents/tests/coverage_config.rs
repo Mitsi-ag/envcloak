@@ -77,11 +77,16 @@ impl Home {
     }
 
     fn read(&self, host: Host, extra: &[(&str, &str)]) -> ConfigSet {
+        self.read_in(host, &self.project, extra)
+    }
+
+    /// The configuration of a session whose working directory is `cwd`.
+    fn read_in(&self, host: Host, cwd: &Path, extra: &[(&str, &str)]) -> ConfigSet {
         let env = self.env(extra);
         let l = Locations::new(&env)
             .unwrap()
             .with_system_dirs(self.system.clone(), self.managed_prefs.clone());
-        ConfigSet::read(host, &l, &self.claude_managed, &self.project, &env)
+        ConfigSet::read(host, &l, &self.claude_managed, cwd, &env)
     }
 
     fn write(&self, p: &Path, text: &str) {
@@ -758,4 +763,487 @@ fn the_fingerprint_follows_what_a_result_depends_on() {
     std::fs::set_permissions(&h.envcloak, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert!(!unreadable.context.complete);
     assert_eq!(unreadable.fingerprint(&build), None);
+}
+
+/// Claude Code's registration of EnvCloak's server is part of the probe
+/// context (the verifier's and Codex's round-2 finding, F-132's residual:
+/// `.claude.json` was read for the server's presence alone, so a changed
+/// command, arguments or timeout left a result current): each change of
+/// the user-scope entry, of a local-scope entry or of the person's
+/// settings about the server there, of a `.mcp.json` from the working
+/// directory up, and an organization's `managed-mcp.json`, gives another
+/// fingerprint, the result kept for the first stale, and putting it back
+/// the first again, the result current, after a reload too. What Claude
+/// Code writes there for itself on every run (measured on 2.1.280: it
+/// creates the file in a fresh home, with its own state) changes nothing:
+/// the probe's own runs leave the context as it was (a whole-file digest,
+/// Codex cycle418's, would make every result stale after its first run).
+/// No value of the registration is kept.
+///
+/// Mutation checked: the registration left out of the context (the
+/// `cs.context.parts.push` in `read_claude` dropped): the command's change
+/// leaves the fingerprint as it was and this fails.
+#[test]
+fn claude_registration_changes_make_a_result_stale() {
+    use coverage::{Cache, Outcome, ProbeRecord, Probed, Sentinel, ServerObserved};
+    let h = Home::new();
+    h.claude_installed(json!({}));
+    let path = h.home.join(".claude.json");
+    let entry = json!({
+        "type": "stdio",
+        "command": "/fixture/program-a",
+        "args": ["mcp", "--host", "claude-code"],
+        "env": {"FIXTURE_ONLY": "fixture-environment-a"},
+        "timeout": 60000,
+    });
+    let file = |entry: &serde_json::Value, extra: serde_json::Value| {
+        let mut v = json!({"mcpServers": {"envcloak": entry.clone()}});
+        for (k, x) in extra.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        v.to_string()
+    };
+    h.write(&path, &file(&entry, json!({})));
+    let first = h.read(Host::ClaudeCode, &[]);
+    assert!(first.server.registered);
+    let digest = first.fingerprint(&h.envcloak).unwrap();
+    let cache_path = h.root.join("data").join("coverage.json");
+    let mut cache = Cache::default();
+    cache.put(ProbeRecord {
+        host: Host::ClaudeCode.id().to_owned(),
+        exe_sha256: "e".repeat(64),
+        version: "2.1.280".to_owned(),
+        config_digest: digest.clone(),
+        os: std::env::consts::OS.to_owned(),
+        surfaces: Vec::new(),
+        server: ServerObserved {
+            outcome: Outcome::Passed,
+            sentinel: Sentinel::Appeared,
+            control_ran: true,
+            allowed_write: true,
+            control_denied: true,
+        },
+        flags: Vec::new(),
+    });
+    cache.store(&cache_path).unwrap();
+    let current = || {
+        let fp = h
+            .read(Host::ClaudeCode, &[])
+            .fingerprint(&h.envcloak)
+            .unwrap_or_default();
+        matches!(
+            Cache::load(&cache_path).probed("claude-code", &"e".repeat(64), "2.1.280", &fp),
+            Probed::Current(_)
+        )
+    };
+    assert!(current(), "the context it was kept for");
+    // The entry's every part, the facts the same.
+    for (name, k, changed) in [
+        ("the command", "command", json!("/fixture/program-b")),
+        ("the arguments", "args", json!(["mcp"])),
+        (
+            "an environment value",
+            "env",
+            json!({"FIXTURE_ONLY": "fixture-environment-b"}),
+        ),
+        ("the timeout", "timeout", json!(1)),
+        ("the type", "type", json!("http")),
+    ] {
+        let mut e = entry.clone();
+        e[k] = changed;
+        h.write(&path, &file(&e, json!({})));
+        let mut after = h.read(Host::ClaudeCode, &[]);
+        assert!(!current(), "{name}: still current");
+        after.context = first.context.clone();
+        assert_eq!(after, first, "{name}: the facts changed");
+        h.write(&path, &file(&entry, json!({})));
+        assert!(current(), "{name} put back");
+    }
+    // Claude Code's own bookkeeping, as its runs write it: no change.
+    let cwd = std::fs::canonicalize(&h.project).unwrap();
+    h.write(
+        &path,
+        &file(
+            &entry,
+            json!({
+                "numStartups": 7,
+                "firstStartTime": "2026-10-05T00:00:00Z",
+                "projects": {cwd.to_string_lossy(): {"lastSessionId": "x", "allowedTools": []}},
+            }),
+        ),
+    );
+    assert!(current(), "Claude Code's own state moved the fingerprint");
+    // A local-scope entry and the person's settings about the server for
+    // the working directory, and for a folder above it.
+    for (name, part) in [
+        (
+            "a local-scope entry",
+            json!({"mcpServers": {"envcloak": {"command": "/x"}}}),
+        ),
+        (
+            "the server disabled",
+            json!({"disabledMcpServers": ["envcloak"]}),
+        ),
+        (
+            "project servers allowed",
+            json!({"enableAllProjectMcpServers": true}),
+        ),
+        (
+            "the project's server enabled",
+            json!({"enabledMcpjsonServers": ["envcloak"]}),
+        ),
+    ] {
+        for key in [cwd.clone(), cwd.parent().unwrap().to_path_buf()] {
+            h.write(
+                &path,
+                &file(
+                    &entry,
+                    json!({"projects": {key.to_string_lossy(): part.clone()}}),
+                ),
+            );
+            assert!(!current(), "{name} at {}: still current", key.display());
+            h.write(&path, &file(&entry, json!({})));
+            assert!(current(), "{name} taken out");
+        }
+    }
+    // Another project's entry: nothing to do with this directory.
+    h.write(
+        &path,
+        &file(
+            &entry,
+            json!({"projects": {"/elsewhere": {"mcpServers": {"envcloak": {"command": "/x"}}}}}),
+        ),
+    );
+    assert!(current(), "another directory's entry");
+    h.write(&path, &file(&entry, json!({})));
+    // A `.mcp.json` in the working directory and in a folder above it,
+    // and an organization's `managed-mcp.json`.
+    for mcp in [
+        h.project.join(".mcp.json"),
+        h.home.join(".mcp.json"),
+        h.claude_managed.join("managed-mcp.json"),
+    ] {
+        h.write(
+            &mcp,
+            r#"{"mcpServers": {"envcloak": {"command": "/fixture/y"}}}"#,
+        );
+        assert!(!current(), "{}: still current", mcp.display());
+        std::fs::remove_file(&mcp).unwrap();
+        assert!(current(), "{} taken out", mcp.display());
+    }
+    // No value of the registration is kept.
+    let kept = serde_json::to_string(&h.read(Host::ClaudeCode, &[]).context).unwrap();
+    for literal in ["/fixture/program-a", "fixture-environment-a"] {
+        assert!(!kept.contains(literal), "{literal}");
+    }
+}
+
+/// A registration only in a `.mcp.json` or a local-scope entry is a
+/// registration; a `.claude.json` that is there but cannot be read, or is
+/// not JSON, leaves the context incomplete (no result is current), and
+/// absent or holding nothing about EnvCloak, the same context.
+#[test]
+fn claude_registrations_are_found_in_every_scope() {
+    let h = Home::new();
+    h.claude_installed(json!({}));
+    let absent = h.read(Host::ClaudeCode, &[]);
+    assert!(!absent.server.registered);
+    let fp = absent.fingerprint(&h.envcloak).unwrap();
+    let path = h.home.join(".claude.json");
+    h.write(&path, r#"{"userID": "fixture", "projects": {}}"#);
+    assert_eq!(
+        h.read(Host::ClaudeCode, &[]).fingerprint(&h.envcloak),
+        Some(fp.clone())
+    );
+    let cwd = std::fs::canonicalize(&h.project).unwrap();
+    h.write(
+        &path,
+        &json!({"projects": {cwd.to_string_lossy(): {"mcpServers": {"envcloak": {"command": "/x"}}}}})
+            .to_string(),
+    );
+    assert!(h.read(Host::ClaudeCode, &[]).server.registered);
+    std::fs::remove_file(&path).unwrap();
+    h.write(
+        &h.project.join(".mcp.json"),
+        r#"{"mcpServers": {"envcloak": {"command": "/x"}}}"#,
+    );
+    assert!(h.read(Host::ClaudeCode, &[]).server.registered);
+    std::fs::remove_file(h.project.join(".mcp.json")).unwrap();
+    for (name, body) in [("not JSON", "{not json"), ("unreadable", "{}")] {
+        h.write(&path, body);
+        if name == "unreadable" {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let cs = h.read(Host::ClaudeCode, &[]);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!cs.context.complete, "{name}");
+        assert_eq!(cs.fingerprint(&h.envcloak), None, "{name}");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            h.read(Host::ClaudeCode, &[]).fingerprint(&h.envcloak),
+            Some(fp.clone()),
+            "{name}: taken out"
+        );
+    }
+}
+
+/// How Claude Code lets an agent call `run_with_secrets` follows the
+/// permission mode its settings give and the rules naming the tool, as
+/// the pinned 2.1.280 does (measured, `-p`): `bypassPermissions` runs it
+/// with no rule; a `deny` or an `ask` rule stops it in every mode;
+/// `default`, `manual`, `acceptEdits` and `dontAsk` run it with an
+/// `allow` rule only; `plan`, `auto`, an unknown mode, bypass switched off
+/// and an organization's `managed-mcp.json` are not known; the highest
+/// level that sets the mode decides (the verifier's round-2 finding:
+/// `defaultMode` was never read, and bypass read as needing approval).
+///
+/// Mutation checked: `defaultMode` not read (`mode[i] = Some(..)`
+/// dropped): bypass reads `Some(false)` and this fails.
+#[test]
+fn claude_code_approval_follows_its_permission_mode() {
+    const TOOL: &str = "mcp__envcloak__run_with_secrets";
+    let cases: Vec<(
+        &str,
+        serde_json::Value,
+        Option<serde_json::Value>,
+        Option<bool>,
+    )> = vec![
+        ("no setting", json!({}), None, Some(false)),
+        ("allowed", json!({"allow": [TOOL]}), None, Some(true)),
+        (
+            "bypass",
+            json!({"defaultMode": "bypassPermissions"}),
+            None,
+            Some(true),
+        ),
+        (
+            "bypass, denied",
+            json!({"defaultMode": "bypassPermissions", "deny": [TOOL]}),
+            None,
+            Some(false),
+        ),
+        (
+            "bypass, asked",
+            json!({"defaultMode": "bypassPermissions", "ask": ["mcp__envcloak__*"]}),
+            None,
+            Some(false),
+        ),
+        (
+            "allowed, asked",
+            json!({"allow": [TOOL], "ask": [TOOL]}),
+            None,
+            Some(false),
+        ),
+        (
+            "manual",
+            json!({"defaultMode": "manual"}),
+            None,
+            Some(false),
+        ),
+        (
+            "manual, allowed",
+            json!({"defaultMode": "manual", "allow": [TOOL]}),
+            None,
+            Some(true),
+        ),
+        (
+            "accept edits",
+            json!({"defaultMode": "acceptEdits"}),
+            None,
+            Some(false),
+        ),
+        (
+            "don't ask, allowed",
+            json!({"defaultMode": "dontAsk", "allow": ["mcp__envcloak"]}),
+            None,
+            Some(true),
+        ),
+        ("plan", json!({"defaultMode": "plan"}), None, None),
+        ("auto", json!({"defaultMode": "auto"}), None, None),
+        ("unknown", json!({"defaultMode": "someday"}), None, None),
+        (
+            "bypass switched off",
+            json!({"defaultMode": "bypassPermissions", "disableBypassPermissionsMode": "disable"}),
+            None,
+            None,
+        ),
+        (
+            "bypass for the user, default for the project",
+            json!({"defaultMode": "bypassPermissions"}),
+            Some(json!({"defaultMode": "default"})),
+            Some(false),
+        ),
+        (
+            "default for the user, bypass for the project",
+            json!({"defaultMode": "default"}),
+            Some(json!({"defaultMode": "bypassPermissions"})),
+            Some(true),
+        ),
+    ];
+    for (name, user, project, want) in cases {
+        let h = Home::new();
+        h.claude_installed(json!({"permissions": user}));
+        if let Some(p) = project {
+            h.write(
+                &h.project.join(".claude/settings.json"),
+                &json!({"permissions": p}).to_string(),
+            );
+        }
+        h.write(
+            &h.home.join(".claude.json"),
+            r#"{"mcpServers": {"envcloak": {"command": "/x/envcloak"}}}"#,
+        );
+        let cs = h.read(Host::ClaudeCode, &[]);
+        assert!(cs.server.registered, "{name}");
+        assert_eq!(cs.server.run_with_secrets_approved, want, "{name}");
+        // An organization's servers file: not known.
+        h.write(&h.claude_managed.join("managed-mcp.json"), "{}");
+        assert_eq!(
+            h.read(Host::ClaudeCode, &[])
+                .server
+                .run_with_secrets_approved,
+            None,
+            "{name}: managed-mcp.json"
+        );
+    }
+}
+
+/// Claude Code's settings are read for the working directory, as the
+/// pinned 2.1.280 reads them (measured): the project's settings there
+/// only, never a folder above it's; the local settings there and at the
+/// git root above it (Codex review of M2-09: the nearest manifest's
+/// directory was read instead).
+///
+/// Mutation checked: the git root's local settings not read (the
+/// `git_root` push dropped in `read_claude`): `disableAllHooks` there,
+/// for a session in a folder below, gives no token and this fails.
+#[test]
+fn claude_code_settings_are_read_for_the_working_directory() {
+    let off = r#"{"disableAllHooks": true}"#;
+    let h = Home::new();
+    h.claude_installed(json!({}));
+    let sub = h.project.join("sub");
+    std::fs::create_dir_all(sub.join(".claude")).unwrap();
+    std::fs::create_dir_all(h.project.join(".git")).unwrap();
+    let in_sub = || switched(&h.read_in(Host::ClaudeCode, &sub, &[]));
+    assert_eq!(in_sub(), []);
+    for (file, want) in [
+        (
+            sub.join(".claude/settings.json"),
+            vec![Reason::SwitchedOffProject],
+        ),
+        (
+            sub.join(".claude/settings.local.json"),
+            vec![Reason::SwitchedOffLocal],
+        ),
+        // The git root's local settings: read from below it.
+        (
+            h.project.join(".claude/settings.local.json"),
+            vec![Reason::SwitchedOffLocal],
+        ),
+        // A folder above's project settings: not read.
+        (h.project.join(".claude/settings.json"), vec![]),
+    ] {
+        h.write(&file, off);
+        assert_eq!(in_sub(), want, "{}", file.display());
+        std::fs::remove_file(&file).unwrap();
+    }
+    // With no git root, a folder above's local settings are not read.
+    std::fs::remove_dir(h.project.join(".git")).unwrap();
+    h.write(&h.project.join(".claude/settings.local.json"), off);
+    assert_eq!(in_sub(), []);
+}
+
+/// Codex runs the hooks of a trusted project's `.codex/hooks.json`, from
+/// the project root down (measured on 0.159.2): each is in the probe
+/// context, and a prompt hook there, or in the user's file, that is not
+/// EnvCloak's is said so; EnvCloak's own hooks alone are not (the
+/// control). Claude Code's settings likewise; and a deny rule for its
+/// file tools other than EnvCloak's `Read(**/.env*)`.
+///
+/// Mutation checked: the project hook files not read (`hook_files` left
+/// with the system file alone): the project's prompt hook gives no
+/// `foreign_prompt_hook` and this fails.
+#[test]
+fn hooks_and_rules_not_envcloaks_are_said_so() {
+    let other = json!({"hooks": {"UserPromptSubmit": [{"hooks": [
+        {"type": "command", "command": "/usr/bin/true"}
+    ]}]}})
+    .to_string();
+    let h = Home::new();
+    h.codex_installed();
+    let base = h.read(Host::Codex, &[]);
+    assert!(!base.foreign_prompt_hook);
+    let fp = base.fingerprint(&h.envcloak).unwrap();
+    for file in [
+        h.project.join(".codex/hooks.json"),
+        h.system.join("hooks.json"),
+    ] {
+        h.write(&file, &other);
+        let cs = h.read(Host::Codex, &[]);
+        assert!(cs.foreign_prompt_hook, "{}", file.display());
+        assert_ne!(
+            cs.fingerprint(&h.envcloak),
+            Some(fp.clone()),
+            "{}",
+            file.display()
+        );
+        assert_eq!(cs.hooks, base.hooks, "{}", file.display());
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            h.read(Host::Codex, &[]).fingerprint(&h.envcloak),
+            Some(fp.clone())
+        );
+    }
+    // In the user's own hook file, beside EnvCloak's.
+    let user = h.home.join(".codex/hooks.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&user).unwrap()).unwrap();
+    v["hooks"]["UserPromptSubmit"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"hooks": [{"type": "command", "command": "/usr/bin/true"}]}));
+    h.write(&user, &v.to_string());
+    assert!(h.read(Host::Codex, &[]).foreign_prompt_hook);
+    // Claude Code: EnvCloak's hooks and deny rule alone, then others.
+    let h = Home::new();
+    h.claude_installed(json!({}));
+    let cs = h.read(Host::ClaudeCode, &[]);
+    assert!(!cs.foreign_prompt_hook && !cs.foreign_read_deny && cs.read_deny);
+    h.write(&h.project.join(".claude/settings.local.json"), &other);
+    assert!(h.read(Host::ClaudeCode, &[]).foreign_prompt_hook);
+    std::fs::remove_file(h.project.join(".claude/settings.local.json")).unwrap();
+    for rule in ["Read(./.env)", "Read", "Read(//**/secrets/**)"] {
+        h.write(
+            &h.project.join(".claude/settings.json"),
+            &json!({"permissions": {"deny": [rule]}}).to_string(),
+        );
+        assert!(h.read(Host::ClaudeCode, &[]).foreign_read_deny, "{rule}");
+    }
+    h.write(
+        &h.project.join(".claude/settings.json"),
+        &json!({"permissions": {"deny": ["Bash(rm:*)", "WebFetch"]}}).to_string(),
+    );
+    assert!(!h.read(Host::ClaudeCode, &[]).foreign_read_deny);
+}
+
+/// A configuration file the host reads that is there but cannot be read
+/// leaves the context incomplete: what it holds could change unseen, so no
+/// result is current while it cannot be read (Codex cycle418).
+///
+/// Mutation checked: `Context::note` without `self.complete = false`: the
+/// unreadable settings file still gives a fingerprint and this fails.
+#[test]
+fn a_settings_file_that_cannot_be_read_leaves_no_fingerprint() {
+    let h = Home::new();
+    h.claude_installed(json!({}));
+    let fp = h.read(Host::ClaudeCode, &[]).fingerprint(&h.envcloak);
+    assert!(fp.is_some());
+    let settings = h.home.join(".claude/settings.json");
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let cs = h.read(Host::ClaudeCode, &[]);
+    std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!cs.context.complete);
+    assert_eq!(cs.fingerprint(&h.envcloak), None);
+    assert_eq!(h.read(Host::ClaudeCode, &[]).fingerprint(&h.envcloak), fp);
 }

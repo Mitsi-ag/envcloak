@@ -299,6 +299,10 @@ fn the_coverage_report_keeps_its_contract_over_the_whole_matrix() {
                             mcp: hooks[mask / 9],
                         },
                         read_deny: true,
+                        // What tells a refusal or a block as EnvCloak's in
+                        // a probe; no state rests on them.
+                        foreign_read_deny: false,
+                        foreign_prompt_hook: false,
                         server: ServerFacts::default(),
                         context: Default::default(),
                     };
