@@ -10,14 +10,15 @@
 //! - A probe's value is *kept out* only when no recorded request holds it
 //!   in any form ([`forms`]: as it is, base64 in both alphabets, padded or
 //!   not and at every alignment, hexadecimal, percent-encoded, JSON
-//!   `\u` escapes), whatever its path: a refused tunnel's forwarded
-//!   target and every header value are read as well as the bodies
-//!   ([`seen`]).
+//!   `\u` escapes), in any part of any request: its method, path and
+//!   query, every header's name and value, its body, and a refused
+//!   tunnel's forwarded target ([`seen`]).
 //! - A tool's result is the last tool result in the request that came
 //!   after the call ([`last_tool_output`]), the place a host puts what a
 //!   command printed or a hook's denial.
-//! - The host's stores are read by [`sweep`], which counts a needle found
-//!   only within what it read whole: a file it could not read, or past its
+//! - The host's stores are read by [`sweep`], which looks in every file's
+//!   contents and every entry's name, and counts a needle found only
+//!   within what it read whole: a file it could not read, or past its
 //!   caps, makes the sweep incomplete, which no probe counts as clean
 //!   (L-08).
 
@@ -89,13 +90,19 @@ pub fn reached(requests: &[Recorded], marker: &str) -> bool {
         .any(|r| accepted(r) && contains(&r.body, marker.as_bytes()))
 }
 
-/// Whether anything recorded holds any of `forms`: a body, a header value
-/// or a forwarded target, of any request, accepted or not.
+/// Whether anything recorded holds any of `forms`, in any part of any
+/// request, accepted or not: its method, path, query, header names and
+/// values, body and forwarded target (Codex review of M2-09: a value in a
+/// request's path or query went uncounted).
 pub fn seen(requests: &[Recorded], forms: &[Zeroizing<Vec<u8>>]) -> bool {
     requests.iter().any(|r| {
         forms.iter().any(|f| {
             contains(&r.body, f)
                 || contains(&r.forward, f)
+                || contains(r.method.as_bytes(), f)
+                || contains(r.path.as_bytes(), f)
+                || r.query.as_ref().is_some_and(|q| contains(q.as_bytes(), f))
+                || r.headers.iter().any(|h| contains(h.as_bytes(), f))
                 || r.values.iter().any(|v| contains(v, f))
         })
     })
@@ -188,12 +195,46 @@ pub fn denial(reason: crate::hook::Reason) -> String {
     format!("[envcloak:{}]", reason.name())
 }
 
+/// The refusal a host gives a call under one of EnvCloak's own host
+/// rules, recognised by its fixed text: Claude Code's for a deny rule
+/// (`Read(**/.env*)`), Codex's for a `forbidden` rule, which carries the
+/// rule's justification, EnvCloak's own text ([`codex_rule_refused`]).
+/// Names the source, or `None`.
+pub fn rule_refusal(host: crate::hook::Host, result: &str) -> Option<&'static str> {
+    use crate::hook::Host;
+    match host {
+        Host::ClaudeCode => result
+            .contains("denied by your permission settings")
+            .then_some("the host's own permission settings, under EnvCloak's deny rule"),
+        Host::Codex => codex_rule_refused(result)
+            .then_some("Codex's exec policy, under EnvCloak's forbidden rule"),
+    }
+}
+
+/// Whether `result` is Codex's refusal of a command under one of the
+/// `forbidden` rules EnvCloak writes: measured on the pinned 0.159.2 as
+/// ``exec_command failed: CreateProcess { message: "Rejected(\"`<shell>
+/// -lc '<command>'` rejected: <justification>\")" }``, the justification
+/// one of [`crate::hosts::codex::RULES`]'.
+pub fn codex_rule_refused(result: &str) -> bool {
+    codex_justifications().any(|j| result.contains(&format!("` rejected: {j}")))
+}
+
+/// The justifications of the rules EnvCloak writes for Codex.
+pub fn codex_justifications() -> impl Iterator<Item = &'static str> {
+    crate::hosts::codex::RULES.lines().filter_map(|l| {
+        l.trim()
+            .strip_prefix("justification = \"")?
+            .strip_suffix("\",")
+    })
+}
+
 /// What answered a probe call when EnvCloak's marker for it is not in
 /// the result the model got, named from a fixed list: the result itself
 /// is never printed, since it could hold fixture data (M2-08's refusal
 /// sources, Codex's cycle 321 review). The first text found names it.
 pub fn unmarked(result: &str) -> &'static str {
-    const SOURCES: [(&str, &str); 3] = [
+    const SOURCES: [(&str, &str); 4] = [
         (
             "[envcloak:",
             "EnvCloak's hook denied it, with another reason",
@@ -205,6 +246,10 @@ pub fn unmarked(result: &str) -> &'static str {
         (
             "would block or produce infinite output",
             "the host's device-file check refused it first, without EnvCloak's marker",
+        ),
+        (
+            "` rejected: ",
+            "the host's exec policy refused it first, without EnvCloak's marker",
         ),
     ];
     if result.is_empty() {
@@ -303,8 +348,9 @@ pub const SWEEP_FILES_CAP: usize = 100_000;
 
 /// Looks for each of `needles` (each a set of forms) in every regular
 /// file under `roots` (a root may be a file; with a name filter, only the
-/// files directly in it whose names hold the filter), never following a
-/// link. A root that is not there holds nothing.
+/// files directly in it whose names hold the filter), and in the name of
+/// every entry met there (a store can name a file by what it holds),
+/// never following a link. A root that is not there holds nothing.
 pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>>]]) -> Swept {
     let mut s = Swept {
         found: vec![false; needles.len()],
@@ -342,6 +388,14 @@ pub fn sweep(roots: &[(PathBuf, Option<String>)], needles: &[&[Zeroizing<Vec<u8>
                 continue;
             }
         };
+        if let Some(name) = p.file_name() {
+            use std::os::unix::ffi::OsStrExt as _;
+            for (i, forms) in needles.iter().enumerate() {
+                if !s.found[i] && forms.iter().any(|f| contains(name.as_bytes(), f)) {
+                    s.found[i] = true;
+                }
+            }
+        }
         if meta.is_dir() {
             match std::fs::read_dir(&p) {
                 Ok(rd) => {
@@ -470,6 +524,25 @@ mod tests {
         }
     }
 
+    /// Codex's refusal under EnvCloak's rules is recognised by the rules'
+    /// own justifications, as the pinned Codex gives it, and nothing else
+    /// is.
+    #[test]
+    fn codex_refusals_are_read_by_the_rules_justifications() {
+        assert_eq!(codex_justifications().count(), 4);
+        let measured = "exec_command failed: CreateProcess { message: \"Rejected(\\\"`/bin/zsh -lc \
+                        'cat .env'` rejected: It reads a .env file, whose values would reach the \
+                        model. Run the command that needs them as `envcloak run -- <command>`.\\\")\" }";
+        assert!(codex_rule_refused(measured), "{measured}");
+        for other in [
+            "exec_command failed: rejected: something else",
+            "Permission to read /p/.env has been denied by your permission settings.",
+            "",
+        ] {
+            assert!(!codex_rule_refused(other), "{other}");
+        }
+    }
+
     /// The receiver corpus (Codex cycle354): only an accepted request
     /// counts as a control reaching the model.
     #[test]
@@ -517,6 +590,37 @@ mod tests {
         assert!(!seen(&[rec(200, true, Some("messages"), b"nothing")], &f));
     }
 
+    /// A value is seen in every part of a request the model recorded, each
+    /// part a positive control of its own: its path, its query, a header's
+    /// name, its method (Codex review of M2-09: the path and query of a
+    /// request to the model's own endpoint went uncounted).
+    ///
+    /// Mutation checked: `seen` without the path and query (`r.path`,
+    /// `r.query` dropped): the first two cases are not seen and this
+    /// fails.
+    #[test]
+    fn a_value_is_seen_in_every_part_of_a_request() {
+        let v = b"ecpk0123456789abcdef0123456789abcdef";
+        let f = forms(v);
+        let text = String::from_utf8_lossy(v).into_owned();
+        let b64 = URL_SAFE_NO_PAD.encode(v);
+        type Put<'a> = Box<dyn Fn(&mut Recorded) + 'a>;
+        let parts: [Put<'_>; 6] = [
+            Box::new(|r| r.path = format!("/v1/messages/{text}")),
+            Box::new(|r| r.query = Some(format!("k={b64}"))),
+            Box::new(|r| r.headers = vec![format!("x-{text}")]),
+            Box::new(|r| r.method = text.clone()),
+            Box::new(|r| r.values = vec![Zeroizing::new(v.to_vec())]),
+            Box::new(|r| r.body = Zeroizing::new(v.to_vec())),
+        ];
+        for (i, put) in parts.iter().enumerate() {
+            let mut r = rec(200, true, Some("messages"), b"{}");
+            assert!(!seen(std::slice::from_ref(&r), &f), "{i}: before");
+            put(&mut r);
+            assert!(seen(&[r], &f), "part {i}");
+        }
+    }
+
     fn hexify(v: &[u8]) -> Vec<u8> {
         v.iter()
             .flat_map(|b| format!("{b:02X}").into_bytes())
@@ -561,6 +665,12 @@ mod tests {
         assert!(s.complete);
         let s = sweep(&[(a.clone(), Some(".backup".to_owned()))], &[&two, &one]);
         assert_eq!(s.found, [true, false]);
+        // A store that names a file by what it holds: found by its name.
+        let named = forms(b"ecp-named-0000-1111");
+        assert!(!sweep(&[(a.clone(), None)], &[&named]).found[0]);
+        std::fs::write(a.join("b").join("ecp-named-0000-1111.json"), b"{}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(sweep(&[(a.clone(), None)], &[&named]).found[0]);
         // A file it cannot read makes the sweep incomplete.
         let locked = a.join("b").join("locked");
         std::fs::write(&locked, b"x").unwrap_or_else(|e| panic!("{e}"));
