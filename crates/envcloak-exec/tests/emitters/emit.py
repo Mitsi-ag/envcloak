@@ -23,9 +23,14 @@ given; and payloads read from standard input and from fixture directories
 
 Usage:
   emit.py --names A,B [--pause-ms N] [--tail eof|malformed|sigterm]
-          [--whole-only] [--node PATH] [--php PATH] [--go PATH]
+          [--whole-only] [--merged] [--node PATH] [--php PATH] [--go PATH]
           [--stdin] [--fixtures DIR]...
           [--stop PATH --ended PATH --deadline SECONDS]
+
+With `--merged` (PTY mode, where standard output and standard error are one
+terminal), each payload is written whole and then split while the other
+stream waits, so the streams still alternate but a value's bytes are never
+interleaved with the other stream's on the one terminal.
 
 Every line it writes starts with a frame naming the payload, so the test
 can tell that each one went through. It never writes a value on its own
@@ -94,15 +99,24 @@ NODE = "const n = process.argv.slice(1); for (const x of n) process.stdout.write
 PHP = 'foreach (array_slice($argv, 1) as $x) { echo json_encode(getenv($x)), "\\0"; }'
 
 
-def emit(fd, payloads, pause):
+class NoLock:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def emit(fd, payloads, pause, lock):
     for name, p in payloads:
-        frame = ("<W|%s=" % name).encode()
-        os.write(fd, frame + p + b"\n")
-        os.write(fd, ("<B|%s=" % name).encode())
-        for i in range(len(p)):
-            os.write(fd, p[i : i + 1])
-            time.sleep(pause)
-        os.write(fd, b"\n")
+        with lock:
+            frame = ("<W|%s=" % name).encode()
+            os.write(fd, frame + p + b"\n")
+            os.write(fd, ("<B|%s=" % name).encode())
+            for i in range(len(p)):
+                os.write(fd, p[i : i + 1])
+                time.sleep(pause)
+            os.write(fd, b"\n")
 
 
 def record(path, how):
@@ -120,7 +134,7 @@ def main():
     fixtures, flags = [], set()
     while args:
         a = args.pop(0)
-        if a in ("--whole-only", "--stdin"):
+        if a in ("--whole-only", "--stdin", "--merged"):
             flags.add(a)
         elif a == "--fixtures":
             fixtures.append(args.pop(0))
@@ -153,8 +167,9 @@ def main():
         used.append("fixtures")
     os.write(2, ("SERIALIZERS %s PAYLOADS %d\n" % (",".join(used), len(payloads))).encode())
 
+    lock = threading.Lock() if "--merged" in flags else NoLock()
     threads = [
-        threading.Thread(target=emit, args=(fd, payloads[i::2], pause))
+        threading.Thread(target=emit, args=(fd, payloads[i::2], pause, lock))
         for i, fd in ((0, 1), (1, 2))
     ]
     for t in threads:
