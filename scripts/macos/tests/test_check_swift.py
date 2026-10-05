@@ -2,9 +2,13 @@
 """Tests for scripts/macos/check-swift.sh: a clean tree passes, and each
 refusal fixture (one change to that tree) fails with the rule it breaks,
 pinned to the changed file. Negative controls (code that looks close but
-is allowed: a child process's streams and working directory, an implicit
-`.error(...)` case, a descriptor in a variable, the temporary directory,
-a token enum's case forms, a struct with its own `rawValue`, the brand's
+is allowed: a child process's streams, working directory, arguments and
+environment being set, an implicit `.error(...)` case, a descriptor in a
+variable, `/dev/null`, the temporary directory, an NSException with a
+literal reason, a token enum's case forms, a struct with its own
+`rawValue`, a nested one inside an extension, a local named `rawValue`,
+SwiftUI's `extension ShapeStyle where Self == Color`, a button with an
+ordinary action on the default key, `onSubmit` that searches, the brand's
 icon group, an SDK framework) sit in the clean tree, so a rule that
 refuses too much fails here too.
 
@@ -95,6 +99,9 @@ struct View: SwiftUI.View {
                 .foregroundStyle(.secondary)
             Button("Open") {}
                 .keyboardShortcut(.defaultAction)
+            Button("Search") { search() }
+                .keyboardShortcut("f")
+            TextField("Find", text: .constant("")).onSubmit { search() }
             Divider().background(Color.clear)
         }
         .environment(\\.locale, Locale(identifier: "en_GB"))
@@ -114,8 +121,15 @@ public struct Client {
         p.standardOutput = Pipe()
         p.standardError = Pipe()
         p.currentDirectoryURL = URL(fileURLWithPath: "/")
+        p.arguments = ["status"]
+        p.environment = [:]
         return p
     }
+    // The null device is no one's stream.
+    public func discard() -> FileHandle? { FileHandle(forWritingAtPath: "/dev/null") }
+    public func stopped() -> NSException { NSException(name: .genericException, reason: "stopped", userInfo: nil) }
+    // The program name comes from the executable, not argv[0] (measured).
+    public func name() -> String { String(cString: getprogname()) }
     // A descriptor the client opened, not a standard stream.
     public func handle(_ fd: Int32) -> FileHandle { FileHandle(fileDescriptor: fd, closeOnDealloc: true) }
     // The temporary directory does not follow the environment (measured).
@@ -127,6 +141,11 @@ public struct Client {
 public enum Outcome { case ok, error(Int) }
 
 public struct Slug: RawRepresentable { public let rawValue: String; public init?(rawValue: String) { self.rawValue = rawValue } }
+
+extension Client {
+    public struct Name: RawRepresentable { public let rawValue: String; public init(rawValue: String) { self.rawValue = rawValue } }
+    func raw(_ s: Slug) -> String { let rawValue = s.rawValue; return rawValue }
+}
 
 public struct Box<T: LogToken> { let token: T }
 
@@ -156,6 +175,10 @@ public enum ECToken: String, CaseIterable, Sendable {
     case text
     public var color: Color { Color(rawValue, bundle: .module) }
     public var named: Color { Color("text", bundle: .module) }
+}
+
+extension ShapeStyle where Self == Color {
+    public static var ecText: Color { ECToken.text.color }
 }
 """,
     BRAND_SWIFT: """import SwiftUI
@@ -275,6 +298,11 @@ SWIFT_REFUSALS = [
     ("standard input by descriptor", "launch-input", KIT, append(KIT, "let h = FileHandle(fileDescriptor: 0)\n")),
     ("standard input read by descriptor", "launch-input", KIT, append(KIT, "func r(p: UnsafeMutableRawPointer) { _ = read(0, p, 1) }\n")),
     ("standard input by its name", "launch-input", KIT, append(KIT, "func r(p: UnsafeMutableRawPointer) { _ = read(STDIN_FILENO, p, 1) }\n")),
+    ("standard input by path", "launch-input", KIT, append(KIT, "let d = FileManager.default.contents(atPath: \"/dev/stdin\")\n")),
+    ("an inherited descriptor by path", "launch-input", KIT, append(KIT, "let d = FileManager.default.contents(atPath: \"/dev/fd/3\")\n")),
+    ("the launch arguments through sysctl", "launch-input", KIT, append(KIT, "let m: [Int32] = [CTL_KERN, KERN_PROCARGS2, getpid()]\n")),
+    ("the launch arguments through sysctlbyname", "launch-input", KIT, append(KIT, "func p(b: UnsafeMutableRawPointer, n: UnsafeMutablePointer<Int>) { _ = sysctlbyname(\"kern.procargs2\", b, n, nil, 0) }\n")),
+    ("a child's environment read back", "launch-input", KIT, append(KIT, "func e(p: Process) -> [String: String]? { p.environment }\n")),
     # launch inputs: home as Foundation finds it (CFFIXED_USER_HOME)
     ("NSHomeDirectory", "launch-input", KIT, append(KIT, "let h = NSHomeDirectory()\n")),
     ("NSHomeDirectoryForUser", "launch-input", KIT, append(KIT, "let h = NSHomeDirectoryForUser(\"x\")\n")),
@@ -308,6 +336,13 @@ SWIFT_REFUSALS = [
     ("approve on a key", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}", "            Button(\"Approve with Touch ID\") {}")),
     ("reveal on a key, title in the label", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}", "            Button { } label: { Text(\"Reveal\") }")),
     ("remove on a key press", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}\n                .keyboardShortcut(.defaultAction)", "            Button(\"Remove key\") {}\n                .padding(2)\n                .onKeyPress(.delete) { .handled }")),
+    ("approve on a key, named by its action", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}", "            Button(title) { approve() }")),
+    ("an icon button that reveals on a key", "gated-key", VIEW, replace(VIEW, "            Button(\"Open\") {}", "            Button(action: revealValue) { Image(systemName: \"eye\") }")),
+    ("approve on submit", "gated-key", VIEW, replace(VIEW, ".onSubmit { search() }", ".onSubmit { approveRequest() }")),
+    ("Return as an AppKit key equivalent", "gated-key", KIT, append(KIT, "import AppKit\nfunc b(x: NSButton) { x.keyEquivalent = \"\\r\" }\n")),
+    ("Return as a menu item's key equivalent", "gated-key", KIT, append(KIT, "import AppKit\nlet i = NSMenuItem(title: \"Go\", action: nil, keyEquivalent: \"\\u{0D}\")\n")),
+    ("zoom action", "a11y-action", VIEW, in_view(".accessibilityZoomAction { _ in }")),
+    ("an AppKit accessibility override", "a11y-action", KIT, append(KIT, "import AppKit\nfinal class B: NSButton { override func accessibilityPerformPress() -> Bool { true } }\n")),
     # log: other writers
     ("print", "log", KIT, append(KIT, "func p() { print(\"x\") }\n")),
     ("swift print", "log", KIT, append(KIT, "func p() { Swift.print(\"x\") }\n")),
@@ -327,6 +362,16 @@ SWIFT_REFUSALS = [
     ("a write to standard error by name", "log", KIT, append(KIT, "func p(b: UnsafeRawPointer) { _ = Darwin.write(STDERR_FILENO, b, 1) }\n")),
     ("C standard output", "log", KIT, append(KIT, "func p() { fflush(stdout) }\n")),
     ("C standard output, module-qualified", "log", KIT, append(KIT, "func p() { fflush(Darwin.stdout) }\n")),
+    ("standard error by a converted descriptor", "log", KIT, append(KIT, "let h = FileHandle(fileDescriptor: Int32(2))\n")),
+    ("standard error by path", "log", KIT, append(KIT, "let h = FileHandle(forWritingAtPath: \"/dev/stderr\")\n")),
+    ("standard output through a URL", "log", KIT, append(KIT, "func w(d: Data) throws { try d.write(to: URL(fileURLWithPath: \"/dev/stdout\")) }\n")),
+    ("fopen of standard error", "log", KIT, append(KIT, "let f = fopen(\"/dev/stderr\", \"w\")\n")),
+    ("descriptor 2 by path", "log", KIT, append(KIT, "let f = fopen(\"/dev/fd/2\", \"w\")\n")),
+    ("the terminal by path", "log", KIT, append(KIT, "let f = fopen(\"/dev/tty\", \"w\")\n")),
+    ("CFShow", "log", KIT, append(KIT, "func p(x: CFTypeRef) { CFShow(x) }\n")),
+    ("the system log facility", "log", KIT, append(KIT, "func p() { withVaList([]) { asl_vlog(nil, nil, 3, \"x\", $0) } }\n")),
+    ("an NSException reason", "log", KIT, append(KIT, "func x(s: String) -> NSException { NSException(name: .genericException, reason: s, userInfo: nil) }\n")),
+    ("raise with a format", "log", KIT, append(KIT, "func x(s: String) { withVaList([s]) { NSException.raise(.genericException, format: \"%@\", arguments: $0) } }\n")),
     ("print in an interpolation", "log", KIT, append(KIT, "let s = \"\\(print(\"x\"))\"\n")),
     # log: other log APIs
     ("os_log", "log", KIT, append(KIT, "import os\nfunc p(v: String) { os_log(\"x \\(v)\") }\n")),
@@ -367,6 +412,32 @@ SWIFT_REFUSALS = [
     ("an extension of LogToken", "log", KIT, append(KIT, "extension LogToken { var shown: String { rawValue } }\n")),
     ("a typealias for the token", "log", KIT, append(KIT, "typealias Word = LogToken\n")),
     ("dynamic member lookup", "log", KIT, append(KIT, "@dynamicMemberLookup struct Any2 { subscript(dynamicMember m: String) -> String { m } }\n")),
+    # Measured (Swift 6, Xcode 26.6): each of these made `.logToken` print
+    # run-time data before the rule took the members whatever the type.
+    ("rawValue from an extension of RawRepresentable", "log", VIEW, both(
+        append(KIT, "public enum Leak: String, LogToken { case a }\n"),
+        append(VIEW, "nonisolated(unsafe) var leaked = \"\"\nextension RawRepresentable where Self: LogToken { var rawValue: String { leaked } }\n"),
+    )),
+    ("rawValue from an extension pinned to one enum", "log", VIEW, both(
+        append(KIT, "public enum Leak: String, LogToken { case a }\n"),
+        append(VIEW, "nonisolated(unsafe) var leaked = \"\"\nextension RawRepresentable where Self == Leak { var rawValue: String { leaked } }\n"),
+    )),
+    ("rawValue through a typealias", "log", VIEW, both(
+        append(KIT, "public enum Leak: String, LogToken { case a }\n"),
+        append(VIEW, "nonisolated(unsafe) var leaked = \"\"\ntypealias Ev = Leak\nextension Ev { var rawValue: String { leaked } }\n"),
+    )),
+    ("init(rawValue:) in any extension", "log", KIT, append(KIT, "extension Outcome { init?(rawValue: String) { nil } }\n")),
+    ("an init in a token enum's extension through a typealias", "log", VIEW, both(
+        append(KIT, "public enum Leak: String, LogToken { case a }\n"),
+        append(VIEW, "typealias L = Leak\nextension L { init(x: Int) { self = .a } }\n"),
+    )),
+    ("an extension constrained to LogToken", "log", KIT, append(KIT, "extension Sendable where Self: LogToken { var shown: Int { 0 } }\n")),
+    ("a member in a token enum's extension", "log", KIT, append(KIT, "enum Leak: String, LogToken { case a }\nextension Leak { var shown: String { \"x\" } }\n")),
+    ("a tuple labelled logToken", "log", APP, append(APP, "func m(s: String) { ECLog.logger(.app).notice(\"\\((logToken: s, n: 0).logToken, privacy: .public)\") }\n")),
+    ("a parameter named logToken", "log", KIT, append(KIT, "func f(logToken: String) {}\n")),
+    ("a String of its own", "log", KIT, append(KIT, "struct String {}\n")),
+    ("a typealias named String", "log", KIT, append(KIT, "typealias String = Substring\n")),
+    ("a LogToken of its own", "log", VIEW, append(VIEW, "protocol LogToken {}\n")),
     # indirect calls
     ("silgen name", "indirect", KIT, append(KIT, "@_silgen_name(\"puts\") func say(_ s: UnsafePointer<CChar>) -> Int32\n")),
     ("extern", "indirect", KIT, append(KIT, "@_extern(c, \"getenv\") func look(_ n: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?\n")),

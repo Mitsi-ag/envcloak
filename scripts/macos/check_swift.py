@@ -29,10 +29,14 @@ Rules (the id is what a finding and an allowlist entry name):
                  system saves for the app (rule 1).
   launch-input   anything the starter of the app controls (docs/APP.md "The
                  app run by an agent"):
-                 - arguments and environment: `CommandLine`, `.arguments`,
-                   `.environment` (other than SwiftUI's `.environment(...)`
-                   modifier), `getenv`, `environ`, `_NSGetArgv`,
-                   `_NSGetArgc`, `_NSGetEnviron`, an `LSEnvironment` key;
+                 - arguments and environment: `CommandLine`, any
+                   `.arguments` or `.environment` (other than SwiftUI's
+                   `.environment(...)` modifier) that is not a child
+                   process's being set, `getenv`, `environ`, `_NSGetArgv`,
+                   `_NSGetArgc`, `_NSGetEnviron`, `KERN_PROCARGS`,
+                   `KERN_PROCARGS2`, `KERN_PROC_ARGS` and a
+                   `"kern.procargs..."` literal (sysctl), an
+                   `LSEnvironment` key;
                  - the defaults, whose argument domain launch arguments
                    (`-key value`) set: `UserDefaults`, `NSUserDefaults`,
                    `NSUserDefaultsController`, `@AppStorage`,
@@ -41,7 +45,10 @@ Rules (the id is what a finding and an allowlist entry name):
                  - the app's own standard input: `FileHandle.standardInput`
                    or any `.standardInput` that is not a child process's
                    being set, `stdin`, `__stdinp`, `STDIN_FILENO`,
-                   `readLine`, and a descriptor-0 handle or read;
+                   `readLine`, a descriptor-0 handle or read (the number
+                   also inside `Int32(...)` and the like), and a string
+                   literal naming `/dev/stdin` or `/dev/fd/N` (N other than
+                   1 and 2: a descriptor the starter may have passed in);
                  - the home directory as Foundation finds it, which follows
                    the environment's `CFFIXED_USER_HOME` (measured on macOS
                    26.4.1): `NSHomeDirectory`, `NSHomeDirectoryForUser`,
@@ -68,38 +75,58 @@ Rules (the id is what a finding and an allowlist entry name):
                  Apple event handlers, services providers, user activities
                  and the app delegate's open callbacks (rule 2).
   a11y-action    accessibility actions, which another program can perform
-                 (rule 2: none may approve, reveal or write).
-  gated-key      a keyboard shortcut on a button whose title starts with
-                 Approve, Reveal, Replace or Remove (rule 2).
+                 (rule 2: none may approve, reveal or write): SwiftUI's
+                 action, adjustable, scroll, zoom and quick actions, custom
+                 actions, `accessibilityActionNames` and AppKit's
+                 `accessibilityPerform...` overrides.
+  gated-key      (rule 2) a keyboard shortcut or key press on a button
+                 whose title starts with Approve, Reveal, Replace or
+                 Remove, or whose action names one (`approve()`,
+                 `revealValue`: a name that is the verb or starts with it
+                 and a capital); `onSubmit` or `onKeyPress` whose closure
+                 names one; Return as an AppKit `keyEquivalent`.
   log            the app logs only through `Logger` with `LogToken` words
                  (rule 3: a launch environment can make the log store
                  "private" arguments in the clear, docs/APP.md "Logging"):
                  - no other writer: `print`, `debugPrint`, `dump`, `NSLog`,
-                   the C stdio and err(3) writers, `syslog`, also when
-                   module-qualified (`Darwin.puts`); the app's own
-                   `FileHandle.standardError` and `.standardOutput` (any
-                   such member that is not a child's stream being set),
-                   `stderr`, `stdout`, `STDOUT_FILENO`, `STDERR_FILENO`,
-                   and a descriptor-1 or -2 handle or write;
+                   the C stdio and err(3) writers, `syslog`, `CFShow`,
+                   also when module-qualified (`Darwin.puts`); the app's
+                   own `FileHandle.standardError` and `.standardOutput`
+                   (any such member that is not a child's stream being
+                   set), `stderr`, `stdout`, `STDOUT_FILENO`,
+                   `STDERR_FILENO`, a descriptor-1 or -2 handle or write,
+                   and a string literal naming `/dev/stdout`,
+                   `/dev/stderr`, `/dev/fd/1`, `/dev/fd/2`, a terminal
+                   (`/dev/tty...`) or `/dev/console`;
                  - no other log API: `os_log`, `os_signpost`, `os_trace`,
-                   `os_activity` (any spelling), `OSLog`, `OSLogMessage`,
-                   `OSSignposter`, `OSSignpostID`, `OSLogStore`;
+                   `os_activity` (any spelling), the system log facility
+                   (`asl_...`), `OSLog`, `OSLogMessage`, `OSSignposter`,
+                   `OSSignpostID`, `OSLogStore`;
                  - a `Logger` call (a level method on a receiver) takes its
                    message as a string literal at the call, and each
                    interpolation in it is `\\(x.logToken)`;
                    `privacy: .public` only on such a token; `%{public}`
                    nowhere;
                  - `fatalError`, `precondition`, `preconditionFailure`,
-                   `assert` and `assertionFailure` (which write their
-                   message to standard error and the crash report) take a
-                   literal message with the same interpolation rule;
+                   `assert`, `assertionFailure` and an `NSException`'s
+                   `reason:` (which reach standard error and the crash
+                   report) take a literal message with the same
+                   interpolation rule; `raise(_:format:arguments:)` is
+                   refused;
                  - `LogToken`: only an `enum` whose raw type, written first,
                    is `String` and whose body holds only cases with literal
-                   raw values conforms; no extension of such an enum, and
-                   no extension of `LogToken`, declares `rawValue`, an
-                   `init` or anything else outside Log/LogToken.swift; only
-                   EnvCloakKit's Log/LogToken.swift declares `logToken`;
-                   no `@dynamicMemberLookup` type (whose `x.logToken` could
+                   raw values conforms. Measured (Swift 6): a `rawValue`
+                   from any extension the enum's conformances reach
+                   replaces the compiler's, so outside Log/LogToken.swift
+                   no extension of anything declares `rawValue` or
+                   `init(rawValue:)` at its top level, no extension is
+                   constrained to `LogToken`, no extension of a token enum
+                   (also through a `typealias`) or of `LogToken` declares
+                   anything; `logToken` appears only as `x.logToken` (never
+                   declared, used as a label, as in a tuple's
+                   `(logToken: s, ...).logToken`, or bound); no type or
+                   typealias is named `String` or `LogToken`; and no
+                   `@dynamicMemberLookup` type (whose `x.logToken` could
                    be any string).
   indirect       a call by a name the other rules cannot see:
                  `@_silgen_name`, `@_extern`, `dlopen`, `dlsym`,
@@ -147,12 +174,15 @@ Rules (the id is what a finding and an allowlist entry name):
   lex            a Swift file the lexer cannot read whole.
   allowlist      a malformed, unknown, missing or unused allowlist entry.
 
-Limits (what a review still looks for): the rules read names, so a
-`typealias` or a wrapper that renames a refused API (other than the ones
-above), a shadowing `String` type, Objective-C or C sources (none may be
-added: stray files fail only for Swift, so a review refuses them) and a
-path built at run time that starts with `~` and reaches
-`URL(fileURLWithPath:)` are not seen; key-literal reads text files only.
+Limits (what a review still looks for): the rules read names and
+literals, not types or values computed at run time, so these are not
+seen: a `typealias` or a wrapper that renames a refused API (other than
+the ones above); a path built at run time (one that starts with `~` and
+reaches `URL(fileURLWithPath:)`, or `"/dev/" + "stderr"`); a relative path,
+which resolves against the working directory the starter chose (the app
+uses absolute paths from `getpwuid_r` and its bundle); a gated button whose
+title is not a literal and whose action has another name (M3-12's review
+looks for them, with `onSubmit` handlers named otherwise).
 
 The brand's own Swift (assets/brand/motion/swiftui/EnvCloakMotion.swift,
 reached through a symlink in EnvCloakDesign) is product code and held to
@@ -241,7 +271,13 @@ A11Y_NAMES = {
     "AccessibilityActionKind",
     "accessibilityAdjustableAction",
     "accessibilityScrollAction",
+    "accessibilityZoomAction",
+    "accessibilityQuickAction",
+    "accessibilityActionNames",
 }
+# AppKit's action overrides (`accessibilityPerformPress()` and the rest, and
+# the informal protocol's `accessibilityPerformAction(_:)`).
+A11Y_PREFIXES = ("accessibilityPerform",)
 GATED_VERBS = ("approve", "reveal", "replace", "remove")
 PRINTERS = {
     "print",
@@ -274,6 +310,10 @@ PRINTERS = {
     "verrx",
     "syslog",
     "vsyslog",
+    "CFShow",
+    "CFShowStr",
+    "putc_unlocked",
+    "putchar_unlocked",
 }
 # Modules a writer can be qualified with (`Darwin.puts`): these, and every
 # module the file imports.
@@ -331,7 +371,7 @@ C_STREAM_READERS = {"stdin", "__stdinp", "STDIN_FILENO"}
 FD_CALLS = {"FileHandle", "write", "read", "pwrite", "pread", "writev", "readv", "fdopen", "dup", "dup2", "send", "recv"}
 LOG_LEVELS = {"debug", "info", "notice", "error", "warning", "fault", "critical", "trace", "log"}
 LOG_APIS = {"OSLog", "OSLogMessage", "OSSignposter", "OSSignpostID", "OSLogStore", "OSLogInterpolation"}
-LOG_API_PREFIXES = ("os_log", "_os_log", "os_signpost", "_os_signpost", "os_trace", "_os_trace", "os_activity", "_os_activity")
+LOG_API_PREFIXES = ("os_log", "_os_log", "os_signpost", "_os_signpost", "os_trace", "_os_trace", "os_activity", "_os_activity", "asl_")
 # Calls that write their message to standard error and the crash report,
 # with the index of the message among the unlabelled arguments.
 FAIL_CALLS = {"fatalError": 0, "preconditionFailure": 0, "assertionFailure": 0, "precondition": 1, "assert": 1}
@@ -344,6 +384,9 @@ LAUNCH_NAMES = {
     "_NSGetEnviron": "reads the environment",
     "_NSGetArgv": "reads the launch arguments",
     "_NSGetArgc": "reads the launch arguments",
+    "KERN_PROCARGS": "reads the launch arguments and environment through sysctl",
+    "KERN_PROCARGS2": "reads the launch arguments and environment through sysctl",
+    "KERN_PROC_ARGS": "reads the launch arguments through sysctl",
     # standard input
     "readLine": "reads the app's own standard input",
     # the defaults
@@ -498,11 +541,74 @@ MACHO_MAGIC = {
     b"\xbf\xba\xfe\xca",
 }
 
+# The app's own streams and descriptors reached by path: (pattern, rule,
+# what). `/dev/fd/N` for N other than 1 and 2 is a descriptor the starter
+# may have passed in.
+DEVICE_PATHS = (
+    (re.compile(r"/dev/(?:std(?:out|err)|fd/0*[12](?![0-9])|tty[A-Za-z0-9]*|console)"), "log", "the app's own output, error or terminal"),
+    (re.compile(r"/dev/(?:stdin|fd(?:$|/(?!0*[12](?![0-9]))))"), "launch-input", "the app's own standard input or a descriptor its starter passed in"),
+    (re.compile(r"^kern\.proc(?:args2?|\.args)"), "launch-input", "the launch arguments and environment, through sysctlbyname"),
+)
+# Source kinds that compile into the app (or generate code for it) as
+# something other than the Swift this check reads, and interface archives
+# that instantiate classes by name: refused anywhere under apps/macos.
+COMPILED_SUFFIXES = (
+    ".c",
+    ".cc",
+    ".cp",
+    ".cpp",
+    ".cxx",
+    ".c++",
+    ".m",
+    ".mm",
+    ".h",
+    ".hh",
+    ".hpp",
+    ".hxx",
+    ".h++",
+    ".inl",
+    ".ipp",
+    ".pch",
+    ".s",
+    ".asm",
+    ".modulemap",
+    ".metal",
+    ".cl",
+    ".y",
+    ".ym",
+    ".l",
+    ".lm",
+    ".r",
+    ".swiftinterface",
+    ".swiftmodule",
+    ".intentdefinition",
+    ".mlmodel",
+    ".mlpackage",
+    ".mlmodelc",
+    ".xcdatamodel",
+    ".xcdatamodeld",
+    ".xcmappingmodel",
+    ".storyboard",
+    ".xib",
+    ".nib",
+    ".rcproject",
+    ".reality",
+    ".playground",
+)
+# Names product code may not declare: a `String` of its own would stand in
+# for the raw type of every token enum in its module, and only the token
+# file declares the token.
+SHADOWED_TYPES = {"String", "LogToken"}
+# What a key equivalent must not be: Return (and Enter).
+RETURN_KEYS = {"\r", "\n", "\r\n", "\x03"}
+
 findings = []
-# Cross-file facts for the LogToken rule: enums that conform, and every
-# extension's (file, line, extended type's last name, body tokens).
+# Cross-file facts for the LogToken rule: enums that conform, every
+# extension's (file, line, extended type's last name, body tokens), and
+# every `typealias A = B` (A to B's last name).
 log_token_enums = set()
 extensions = []
+aliases = {}
 
 
 def find(rule, path, line, msg):
@@ -948,8 +1054,8 @@ def check_product_swift(rel, toks, brand):
         return not is_member(k) or receiver(k) == "module"
 
     def assigned_on_receiver(k):
-        """`x.member = ...`: a child process's stream or directory being
-        set, not the app's own being read."""
+        """`x.member = ...`: a child process's stream, directory, arguments
+        or environment being set, not the app's own being read."""
         a = at(k + 1)
         return is_member(k) and receiver(k) == "explicit" and a is not None and a.kind == "op" and a.text == "="
 
@@ -977,10 +1083,10 @@ def check_product_swift(rel, toks, brand):
                     find("launch-input", rel, t.line, "`%s(for:in:)` looks up a directory under the home Foundation finds" % name)
             if name in CWD_MEMBERS and not assigned_on_receiver(k):
                 find("launch-input", rel, t.line, "`%s` reads the working directory, which the starter sets" % name)
-            if name == "arguments" and is_member(k):
-                find("launch-input", rel, t.line, "`.arguments` (the app reads no launch argument)")
-            if name == "environment" and is_member(k) and not calls:
-                find("launch-input", rel, t.line, "`.environment` (the app reads no environment variable)")
+            if name == "arguments" and is_member(k) and not assigned_on_receiver(k):
+                find("launch-input", rel, t.line, "`.arguments` (the app reads no launch argument; only a child's may be set)")
+            if name == "environment" and is_member(k) and not calls and not assigned_on_receiver(k):
+                find("launch-input", rel, t.line, "`.environment` (the app reads no environment variable; only a child's may be set)")
             if name in C_STREAM_READERS and bare(k):
                 find("launch-input", rel, t.line, "`%s` reads the app's own standard input" % name)
             # rule 2
@@ -998,10 +1104,19 @@ def check_product_swift(rel, toks, brand):
                     hit = labels & OPEN_CALLBACK_LABELS
                     if hit:
                         find("side-door", rel, t.line, "an app delegate callback that opens input from outside (%s)" % ", ".join(sorted(hit)))
-            if name in A11Y_NAMES:
+            if name in A11Y_NAMES or name.startswith(A11Y_PREFIXES):
                 find("a11y-action", rel, t.line, "`%s`: another program can perform it" % name)
             if name == "Button" and after is not None and after.kind == "punct" and after.text in ("(", "{"):
                 check_gated_button(rel, flat, k)
+            if name in ("onSubmit", "onKeyPress") and is_member(k):
+                span = flat[k + 1 : closure_end(flat, k) + 1]
+                verb = gated_call(span)
+                if verb:
+                    find("gated-key", rel, t.line, "`%s` runs `%s` on a key press: these go through Touch ID, never a key alone" % (name, verb))
+            if name == "keyEquivalent":
+                nxt, val = at(k + 1), at(k + 2)
+                if nxt is not None and nxt.text in ("=", ":") and val is not None and val.kind == "str" and literal_value(val) in RETURN_KEYS:
+                    find("gated-key", rel, t.line, "Return as a key equivalent (Return never approves; design §1)")
             # rule 3: other writers
             if name in PRINTERS and calls and bare(k):
                 find("log", rel, t.line, "`%s` writes outside the unified log (use Logger with LogToken)" % name)
@@ -1023,11 +1138,19 @@ def check_product_swift(rel, toks, brand):
                 check_log_call(rel, flat, k + 1)
             if name in FAIL_CALLS and calls and bare(k):
                 check_fail_call(rel, flat, k + 1, FAIL_CALLS[name], name)
-            # rule 3: the token
-            if name == "logToken" and rel != LOG_TOKEN_FILE:
-                p = at(k - 1)
-                if p is not None and p.kind == "id" and p.text in ("var", "let", "func", "case", "subscript"):
-                    find("log", rel, t.line, "`logToken` is declared only in %s" % LOG_TOKEN_FILE)
+            exception_init = name == "init" and calls and is_member(k) and at(k - 2) is not None and at(k - 2).text == "NSException"
+            if (name == "NSException" and calls and bare(k)) or exception_init:
+                for label, expr in call_args(flat, k + 1):
+                    if label == "reason" and [x.text for x in unwrap(expr)] != ["nil"]:
+                        check_message(rel, expr, t.line, "an NSException reason, which reaches standard error and the crash report,")
+            if name == "raise" and calls and is_member(k):
+                if "format" in [label for label, _ in call_args(flat, k + 1)]:
+                    find("log", rel, t.line, "`raise(_:format:arguments:)` formats values into standard error and the crash report")
+            # rule 3: the token. Outside its file, `logToken` is only ever
+            # read as a member: never declared, used as a label (a tuple's
+            # `(logToken: s, ...).logToken` is any string) or bound.
+            if name == "logToken" and rel != LOG_TOKEN_FILE and not is_member(k):
+                find("log", rel, t.line, "`logToken` outside %s, other than as `x.logToken`" % LOG_TOKEN_FILE)
             if name in ("enum", "struct", "class", "actor", "extension", "protocol", "typealias") and not (at(k - 1) is not None and at(k - 1).text == "."):
                 check_declaration(rel, flat, k)
             # indirect calls
@@ -1064,6 +1187,9 @@ def check_product_swift(rel, toks, brand):
                 find("log", rel, t.line, "`%{public}` in a format string")
             if t.text.startswith("~"):
                 find("launch-input", rel, t.line, "a path that starts with `~`, which Foundation expands from CFFIXED_USER_HOME")
+            for pattern, rule, what in DEVICE_PATHS:
+                if pattern.search(t.text):
+                    find(rule, rel, t.line, "`%s` reaches %s by path" % (t.text, what))
             for inner in interpolations(t):
                 args = split_top(inner)
                 if len(args) > 1 and any(is_public_privacy(a) for a in args[1:]) and not is_log_token_expr(args[0]):
@@ -1123,11 +1249,17 @@ def check_fail_call(rel, flat, lp, index, name):
         check_message(rel, positional[index], flat[lp].line, "`%s`, whose message reaches standard error and the crash report," % name)
 
 
+# Conversions a descriptor number may be written in: `Int32(2)`.
+INT_CONVERSIONS = {"Int32", "CInt", "Int", "UInt32", "Int16", "numericCast"}
+
+
 def check_descriptor_call(rel, flat, k):
     args = call_args(flat, k + 1)
     if not args:
         return
     expr = unwrap(args[0][1])
+    while len(expr) >= 4 and expr[0].kind == "id" and expr[0].text in INT_CONVERSIONS and expr[1].text == "(" and matching(expr, 1) == len(expr) - 1:
+        expr = unwrap(expr[2:-1])
     if len(expr) == 1 and expr[0].kind == "num" and expr[0].text in ("0", "1", "2"):
         fd = expr[0].text
         if fd == "0":
@@ -1188,17 +1320,61 @@ def names_log_token(entry):
     return bool(ids) and ids[-1] == "LogToken"
 
 
+def top_level(body):
+    """The tokens of a declaration body outside any nested braces: its own
+    members, not what their bodies or nested types hold."""
+    out, depth = [], 0
+    for t in body:
+        if t.kind == "punct" and t.text == "{":
+            depth += 1
+        elif t.kind == "punct" and t.text == "}":
+            depth -= 1
+        elif depth == 0:
+            out.append(t)
+    return out
+
+
+def raw_value_members(body):
+    """`rawValue` declared (`var`, `let`, `func`, `subscript`, `case`) or an
+    `init(rawValue:)` at a body's top level, as (token, what)."""
+    found = []
+    top = top_level(body)
+    for j, t in enumerate(top):
+        if t.kind != "id":
+            continue
+        if t.text == "rawValue" and j > 0 and top[j - 1].kind == "id" and top[j - 1].text in ("var", "let", "func", "subscript", "case"):
+            found.append((t, "rawValue"))
+        if t.text == "init":
+            m = j + 1
+            while m < len(top) and top[m].kind == "op" and top[m].text in ("?", "!"):
+                m += 1
+            if m + 1 < len(top) and top[m].text == "(" and top[m + 1].kind == "id" and top[m + 1].text == "rawValue":
+                found.append((t, "init(rawValue:)"))
+    return found
+
+
 def check_declaration(rel, flat, k):
     kw = flat[k].text
     line = flat[k].line
     if kw == "typealias":
+        alias = flat[k + 1] if k + 1 < len(flat) else None
+        if alias is not None and alias.kind == "id" and alias.text in SHADOWED_TYPES and rel != LOG_TOKEN_FILE:
+            find("log", rel, line, "a typealias named `%s`, which would stand in for the real one" % alias.text)
         j = k + 1
+        target = []
+        seen_eq = False
         while j < len(flat) and flat[j].line == line:
             if flat[j].kind == "id" and flat[j].text == "LogToken":
                 if rel != LOG_TOKEN_FILE:
                     find("log", rel, line, "a typealias for LogToken")
                 return
+            if seen_eq and flat[j].kind == "id":
+                target.append(flat[j].text)
+            if flat[j].kind == "op" and flat[j].text == "=":
+                seen_eq = True
             j += 1
+        if alias is not None and alias.kind == "id" and target:
+            aliases[alias.text] = target[-1]
         return
     nxt = flat[k + 1] if k + 1 < len(flat) else None
     if nxt is None or nxt.kind != "id" or nxt.text in DECL_MODIFIED:
@@ -1206,12 +1382,24 @@ def check_declaration(rel, flat, k):
         return
     name, inherits, lbrace, generic = declaration(flat, k)
     simple = name[-1].text if name and name[-1].kind == "id" else None
+    if kw != "extension" and simple in SHADOWED_TYPES and rel != LOG_TOKEN_FILE:
+        find("log", rel, line, "a %s named `%s`, which would stand in for the real one" % (kw, simple))
     if kw == "extension":
         body = flat[lbrace + 1 : matching(flat, lbrace)] if lbrace is not None else []
         if rel != LOG_TOKEN_FILE:
             extensions.append((rel, line, simple, body))
             if simple == "LogToken":
                 find("log", rel, line, "an extension of LogToken outside %s" % LOG_TOKEN_FILE)
+            # Measured: a `rawValue` from any extension the enum's
+            # conformances reach (`extension RawRepresentable where Self:
+            # LogToken`, `where Self == E`, through a typealias) replaces the
+            # compiler's, so no extension declares one, whatever it extends.
+            for tok, what in raw_value_members(body):
+                find("log", rel, tok.line, "an extension declares `%s`, which can replace a token enum's words" % what)
+            end = lbrace if lbrace is not None else len(flat)
+            where = [x for x in flat[k:end] if x.kind == "id"]
+            if "where" in [x.text for x in where] and "LogToken" in [x.text for x in where[[x.text for x in where].index("where") :]]:
+                find("log", rel, line, "an extension constrained to LogToken outside %s" % LOG_TOKEN_FILE)
     if rel == LOG_TOKEN_FILE or not any(names_log_token(e) for e in inherits):
         return
     if kw != "enum":
@@ -1257,23 +1445,78 @@ def cases_only(body):
     return True
 
 
+def resolve(name):
+    seen = set()
+    while name in aliases and name not in seen:
+        seen.add(name)
+        name = aliases[name]
+    return name
+
+
 def check_log_token_extensions():
     for rel, line, simple, body in extensions:
+        simple = resolve(simple)
         if simple not in log_token_enums:
             continue
-        for j, t in enumerate(body):
-            declared = t.kind == "id" and t.text == "rawValue" and j > 0 and body[j - 1].kind == "id" and body[j - 1].text in ("var", "let", "func", "subscript")
-            if declared or (t.kind == "id" and t.text == "init"):
-                find("log", rel, t.line, "an extension of the LogToken enum `%s` declares `%s`, which would change its words" % (simple, t.text))
+        # An extension of a token enum may add a conformance; its body
+        # stays empty, so nothing beside the cases can change the words.
+        if body:
+            find("log", rel, body[0].line, "an extension of the LogToken enum `%s` declares something (only an empty extension, adding a conformance, is allowed)" % simple)
 
 
-def check_gated_button(rel, flat, k):
-    lp = k + 1
-    if flat[lp].text == "(":
-        end = matching(flat, lp)
-    else:
-        end = k
-    # Trailing closures: `{...}` and `label: {...}`.
+def literal_value(tok):
+    """A string literal's value, its escapes decoded (\\r, \\n, \\u{...})."""
+    out = []
+    text = tok.text
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text):
+            e = text[i + 1]
+            if e == "u" and text[i + 2 : i + 3] == "{":
+                close = text.find("}", i + 3)
+                if close > 0:
+                    try:
+                        out.append(chr(int(text[i + 3 : close], 16)))
+                    except ValueError:
+                        out.append(text[i : close + 1])
+                    i = close + 1
+                    continue
+            out.append({"r": "\r", "n": "\n", "t": "\t", "0": "\0"}.get(e, e))
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def gated_name(name):
+    """A name that says it approves, reveals, replaces or removes:
+    `approve`, `Reveal`, `removeKey`, `replaceValue`."""
+    for verb in GATED_VERBS:
+        if name in (verb, verb.capitalize()):
+            return True
+        for head in (verb, verb.capitalize()):
+            if name.startswith(head) and len(name) > len(head) and name[len(head)].isupper():
+                return True
+    return False
+
+
+def gated_call(span):
+    """The first name in a span of code that says it approves, reveals,
+    replaces or removes, or None."""
+    for t in span:
+        if t.kind == "id" and gated_name(t.text):
+            return t.text
+    return None
+
+
+def closure_end(flat, k):
+    """For a call or modifier named at flat[k]: the index of the last token
+    of its arguments and trailing closures (`{...}` and `label: {...}`)."""
+    end = k
+    if k + 1 < len(flat) and flat[k + 1].kind == "punct" and flat[k + 1].text == "(":
+        end = matching(flat, k + 1)
     j = end + 1
     while j < len(flat):
         t = flat[j]
@@ -1286,23 +1529,37 @@ def check_gated_button(rel, flat, k):
             j = end + 1
             continue
         break
-    span = flat[lp : end + 1]
+    return end
+
+
+def check_gated_button(rel, flat, k):
+    """A button is gated when its title (the first string literal in it)
+    starts with Approve, Reveal, Replace or Remove, or when its action names
+    one of them (`approve()`, `removeKey`)."""
+    end = closure_end(flat, k)
+    span = flat[k + 1 : end + 1]
     title = None
     for t in span:
         if t.kind == "str":
             title = t.text
             break
-    if title is None:
-        return
-    first = re.match(r"\s*([A-Za-z]+)", title)
-    if not first or first.group(1).lower() not in GATED_VERBS:
+    what = None
+    if title is not None:
+        first = re.match(r"\s*([A-Za-z]+)", title)
+        if first and first.group(1).lower() in GATED_VERBS:
+            what = '"%s" button' % title.strip()
+    if what is None:
+        verb = gated_call(span)
+        if verb:
+            what = "button that runs `%s`" % verb
+    if what is None:
         return
     # The modifier chain after the button.
     j = end + 1
     while j + 1 < len(flat) and flat[j].kind == "op" and flat[j].text == "." and flat[j + 1].kind == "id":
         name = flat[j + 1].text
         if name in ("keyboardShortcut", "onKeyPress"):
-            find("gated-key", rel, flat[j + 1].line, "`%s` on a \"%s\" button: these go through Touch ID, never a key alone" % (name, title.strip()))
+            find("gated-key", rel, flat[j + 1].line, "`%s` on a %s: these go through Touch ID, never a key alone" % (name, what))
             return
         j += 2
         if j < len(flat) and flat[j].kind == "punct" and flat[j].text == "(":
