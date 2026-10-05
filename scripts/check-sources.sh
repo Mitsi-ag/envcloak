@@ -37,14 +37,20 @@
 #    scripts/macos/check-swift.sh reads, or one of the two files the build
 #    generates for a package with resources (SwiftPM's
 #    resource_bundle_accessor.swift and Xcode's GeneratedAssetSymbols.swift,
-#    in the build's own DerivedSources/). So a file referenced from outside
-#    apps/macos, linked in from elsewhere or written by a build phase is
-#    refused, and check-swift.sh's rules hold for everything compiled into
-#    the app. Each list is a target's: one that ships (any whose name does
+#    in the build's own DerivedSources/). So a Swift file referenced from
+#    outside apps/macos, linked in from elsewhere or written by a build phase
+#    is refused. Each list is a target's: one that ships (any whose name does
 #    not end in `Tests`) may compile only files check-swift.sh holds to the
-#    product rules, so a test file compiled into the app is refused. The
-#    generated accessor's Debug-only environment override never ships:
-#    scripts/macos/sign-check.sh refuses an artifact that holds it.
+#    product rules, so a test file compiled into the app is refused. Every
+#    object the build linked (its *.LinkFileList files) must have been
+#    compiled from a Swift file in its target's list, or be another target's
+#    prelinked object or, in a test target, the host app's Debug dylib: an
+#    object compiled from C, Objective-C or assembly is refused, so
+#    check-swift.sh's rules hold for the Swift compiled into the app and
+#    nothing else is linked beside it. (check-swift.sh also refuses such
+#    sources in the tree.) The generated accessor's Debug-only environment
+#    override never ships: scripts/macos/sign-check.sh refuses an artifact
+#    that holds it.
 #    scripts/macos/check_compiled_swift.py does the comparison.
 #
 # Usage: scripts/check-sources.sh [workspace-root]
@@ -62,8 +68,30 @@ if [ "${1:-}" = "--swift" ]; then
   }
   derived="$(cd "$2" && pwd -P)"
   root="$(cd "${3:-$here/..}" && pwd -P)"
-  listed="$(mktemp "${TMPDIR:-/tmp}/check-sources-swift.XXXXXX")"
-  trap 'rm -f "$listed"' EXIT
+  # The listing is named <prefix>.<pid>.<random> and the exit trap removes
+  # every such name of this process, so it goes however the script stops;
+  # the four signals leave through that trap (bash runs no EXIT trap on
+  # SIGQUIT or SIGPIPE, measured with 3.2 and 5.3).
+  prefix="${TMPDIR:-/tmp}"
+  prefix="${prefix%/}/check-sources-swift"
+  trap 'rm -f "$prefix".$$.*' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  trap '' PIPE
+  listed=""
+  for _ in 1 2 3 4 5 6 7 8; do
+    candidate="$prefix.$$.$RANDOM$RANDOM"
+    if (set -C && : >"$candidate") 2>/dev/null; then
+      listed="$candidate"
+      break
+    fi
+  done
+  [ -n "$listed" ] || {
+    echo "check-sources: cannot make a listing named $prefix.$$.*" >&2
+    exit 1
+  }
   bash "$here/macos/check-swift.sh" --list-swift --root "$root" >"$listed"
   python3 "$here/macos/check_compiled_swift.py" "$derived" "$listed"
   exit 0
