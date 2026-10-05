@@ -21,6 +21,7 @@ Usage: python3 scripts/macos/tests/test_check_swift.py
 """
 
 import os
+import plistlib
 import random
 import re
 import shutil
@@ -481,6 +482,16 @@ OTHER_REFUSALS = [
     ("a runtime exception", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.cs.allow-jit</key>\n\t<true/>\n")),
     ("an entitlement no tier signs", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>com.apple.security.network.client</key>\n\t<true/>\n")),
     ("entitlements that do not parse", "entitlement", ENTITLEMENTS, replace(ENTITLEMENTS, "<dict>\n", "<dict>\n\t<key>open\n")),
+    # Property lists in every form plistlib reads, under any name.
+    ("a binary Info.plist", "side-door", "apps/macos/Support/Extra.plist", write_bytes("apps/macos/Support/Extra.plist", plistlib.dumps({"CFBundleURLTypes": []}, fmt=plistlib.FMT_BINARY))),
+    ("a UTF-16 Info.plist", "side-door", INFO, write_bytes(INFO, (PLIST % "\t<key>CFBundleURLTypes</key>\n\t<array/>\n").replace('encoding="UTF-8"', 'encoding="UTF-16"').encode("utf-16"))),
+    ("a key nested in a property list", "side-door", INFO, replace(INFO, "</dict>", "\t<key>Extra</key>\n\t<dict><key>NSServices</key><array/></dict>\n</dict>")),
+    ("an Info.plist under another name", "side-door", "apps/macos/Support/Extra-Info.xml", write("apps/macos/Support/Extra-Info.xml", PLIST % "\t<key>CFBundleURLTypes</key>\n\t<array/>\n")),
+    ("a binary entitlements file", "entitlement", ENTITLEMENTS, write_bytes(ENTITLEMENTS, plistlib.dumps({"com.apple.security.get-task-allow": True}, fmt=plistlib.FMT_BINARY))),
+    ("a property list that does not parse", "unreadable", INFO, replace(INFO, "<dict>\n", "<dict>\n\t<key>open\n")),
+    ("a binary property list that does not parse", "unreadable", "apps/macos/Support/Extra.plist", write_bytes("apps/macos/Support/Extra.plist", b"bplist00" + bytes(8))),
+    ("a settings file that is not text", "unreadable", XCCONFIG, write_bytes(XCCONFIG, b"SWIFT_VERSION = 6.0\0\n")),
+    ("a UTF-16 build setting", "linked-code", XCCONFIG, write_bytes(XCCONFIG, "OTHER_LDFLAGS = -lanalytics\n".encode("utf-16"))),
     # packages from outside the tree
     ("a remote package", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(url: "https://example.invalid/sdk.git", from: "1.0.0")')),
     ("a registry package", "remote-package", MANIFEST, replace(MANIFEST, '.package(path: "../EnvCloakDesign")', '.package(id: "example.sdk", from: "1.0.0")')),
@@ -496,6 +507,15 @@ OTHER_REFUSALS = [
     ("a linked library", "linked-code", MANIFEST, in_manifest('linkerSettings: [.linkedLibrary("analytics")]')),
     ("a linked framework", "linked-code", MANIFEST, in_manifest('linkerSettings: [.linkedFramework("Analytics")]')),
     ("a build plugin", "linked-code", MANIFEST, in_manifest('plugins: ["Gen"]')),
+    ("a macro target", "linked-code", MANIFEST, replace(MANIFEST, "targets: [", 'targets: [.macro(name: "Gen"), ')),
+    # Sources that compile into the app as something other than Swift.
+    ("a C file in a package", "linked-code", KIT.replace("Client.swift", "shim.c"), write(KIT.replace("Client.swift", "shim.c"), "int shim(void) { return 0; }\n")),
+    ("an Objective-C file in the app", "linked-code", "apps/macos/EnvCloak/App/Shim.m", write("apps/macos/EnvCloak/App/Shim.m", "#import <Foundation/Foundation.h>\n")),
+    ("a header", "linked-code", "apps/macos/EnvCloak/App/Shim.h", write("apps/macos/EnvCloak/App/Shim.h", "int shim(void);\n")),
+    ("a module map", "linked-code", "apps/macos/Packages/EnvCloakKit/Sources/CShim/include/module.modulemap", write("apps/macos/Packages/EnvCloakKit/Sources/CShim/include/module.modulemap", "module CShim {}\n")),
+    ("assembly", "linked-code", "apps/macos/EnvCloak/App/start.S", write("apps/macos/EnvCloak/App/start.S", ".text\n")),
+    ("a storyboard", "linked-code", "apps/macos/EnvCloak/App/Main.storyboard", write("apps/macos/EnvCloak/App/Main.storyboard", "<document/>\n")),
+    ("a data model", "linked-code", "apps/macos/EnvCloak/Model.xcdatamodeld/Model.xcdatamodel/contents", write("apps/macos/EnvCloak/Model.xcdatamodeld/Model.xcdatamodel/contents", "<model/>\n")),
     ("a script phase", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXShellScriptBuildPhase; shellScript = \"true\"; };")),
     ("a build rule", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXBuildRule; script = \"true\"; };")),
     ("a static library reference", "linked-code", PBXPROJ, in_pbxproj("EC09 = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libsdk.a; sourceTree = \"<group>\"; };")),
@@ -614,10 +634,13 @@ class CheckSwift(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
 
     def test_a_key_shaped_literal_fails_anywhere(self):
-        for rel in (TEST, INFO, "apps/macos/notes.md"):
+        for rel in (TEST, INFO, "apps/macos/notes.md", "apps/macos/blob.bin"):
             with self.subTest(file=rel):
                 tree = Tree(self.base)
-                if os.path.exists(os.path.join(tree.root, rel)):
+                if rel.endswith(".bin"):
+                    # A file that is not text is read byte for byte.
+                    tree.write_bytes(rel, b"\0\1" + key_shaped().encode() + b"\0")
+                elif os.path.exists(os.path.join(tree.root, rel)):
                     tree.apply(append(rel, "\n// %s\n" % key_shaped()))
                 else:
                     tree.write(rel, "%s\n" % key_shaped())
