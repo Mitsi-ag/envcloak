@@ -78,8 +78,10 @@ fn repeated_token_is_compared_once_with_every_occurrence() {
 
 #[test]
 fn stream_caps_and_malformed_input_never_report_complete() {
-    let mut budget = Budget::default();
-    budget.bytes = 31;
+    let budget = Budget {
+        bytes: 31,
+        ..Budget::default()
+    };
     let report = scan_reader(
         &mut Cursor::new(vec![b'z'; 100]),
         ConfigFormat::Raw,

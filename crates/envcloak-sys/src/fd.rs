@@ -232,6 +232,29 @@ pub fn inherit_on_spawn(cmd: &mut std::process::Command, fd: BorrowedFd<'_>) -> 
     Ok(())
 }
 
+/// Sets a child's working directory from an owned copy of an open directory.
+/// A path rename or descriptor reuse before spawn cannot redirect the child.
+///
+/// # Errors
+/// The descriptor cannot be copied. A non-directory is refused at spawn.
+pub fn chdir_on_spawn(cmd: &mut std::process::Command, dir: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let copy = inherited_fd(dir.as_raw_fd())?;
+    // SAFETY: the closure owns the copied descriptor until exec. fchdir is
+    // async-signal-safe, and last_os_error only reads errno. Nothing here
+    // allocates, locks, or changes the parent's working directory.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fchdir(copy.as_raw_fd()) < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,27 +500,4 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
     }
-}
-
-/// Sets a child's working directory from an owned copy of an open directory.
-/// A path rename or descriptor reuse before spawn cannot redirect the child.
-///
-/// # Errors
-/// The descriptor cannot be copied. A non-directory is refused at spawn.
-pub fn chdir_on_spawn(cmd: &mut std::process::Command, dir: &std::fs::File) -> io::Result<()> {
-    use std::os::unix::process::CommandExt;
-    let copy = inherited_fd(dir.as_raw_fd())?;
-    // SAFETY: the closure owns the copied descriptor until exec. fchdir is
-    // async-signal-safe, and last_os_error only reads errno. Nothing here
-    // allocates, locks, or changes the parent's working directory.
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::fchdir(copy.as_raw_fd()) < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-    Ok(())
 }
