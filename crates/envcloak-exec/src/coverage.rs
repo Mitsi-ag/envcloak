@@ -98,6 +98,21 @@ fn push_once(list: &mut Vec<Slug>, slug: &Slug) {
 /// is under 8 bytes, or 8 to 15 bytes with [`ShortPolicy::Refuse`]. No
 /// redactor is built then.
 pub fn build_redactor(labels: &[Label<'_>]) -> Result<(Redactor, CoverageReport), ExecError> {
+    build(labels, false)
+}
+
+/// [`build_redactor`] for PTY mode (`envcloak run --pty`): the redactor
+/// also matches the CR LF form of every value holding LF, which is what a
+/// terminal shows of it (the slave's line discipline writes each LF as CR
+/// LF, `ONLCR`; M2 plan D-19).
+///
+/// # Errors
+/// As [`build_redactor`].
+pub fn build_pty_redactor(labels: &[Label<'_>]) -> Result<(Redactor, CoverageReport), ExecError> {
+    build(labels, true)
+}
+
+fn build(labels: &[Label<'_>], crlf: bool) -> Result<(Redactor, CoverageReport), ExecError> {
     let mut report = CoverageReport::default();
     for l in labels {
         let len = l.value.len();
@@ -110,7 +125,9 @@ pub fn build_redactor(labels: &[Label<'_>]) -> Result<(Redactor, CoverageReport)
     if !report.refused_short.is_empty() {
         return Err(ExecError::ValueTooShort(report));
     }
-    let mut builder = RedactorBuilder::new().min_secret_len(MIN_VALUE_LEN);
+    let mut builder = RedactorBuilder::new()
+        .min_secret_len(MIN_VALUE_LEN)
+        .crlf_variants(crlf);
     let mut added: Vec<(&Slug, &SecretBytes)> = Vec::with_capacity(labels.len());
     for l in labels {
         // A value bound twice (two variables, one item) is added once.
@@ -241,6 +258,74 @@ mod tests {
             panic!("short values were taken");
         };
         assert_eq!(r.refused_short, vec![a, c]);
+    }
+
+    /// PTY mode's redactor keeps gate 9's policy (the same refusals and
+    /// warnings as pipe mode's) and also matches the CR LF form a terminal
+    /// shows of a value holding LF (`ONLCR`, D-19), whole and as the
+    /// stream sees it split at every byte; pipe mode's does not, since a
+    /// pipe never rewrites LF.
+    ///
+    /// Mutation checked: build PTY mode's redactor without the CR LF
+    /// variants: the CR LF form passes through and this fails.
+    #[test]
+    fn the_pty_redactor_keeps_the_short_value_policy_and_matches_the_crlf_form() {
+        let (a, b) = (slug("a/x"), slug("b/x"));
+        for (len, short) in [(7, ShortPolicy::Allow), (12, ShortPolicy::Refuse)] {
+            let v = value(len);
+            let labels = [Label {
+                slug: &a,
+                value: &v,
+                short,
+            }];
+            assert!(
+                matches!(
+                    build_pty_redactor(&labels),
+                    Err(ExecError::ValueTooShort(_))
+                ),
+                "{len} {short:?}"
+            );
+        }
+        // A value with LF in it: two lines of 20.
+        #[allow(clippy::disallowed_methods)] // Test: builds the fixture.
+        let lined: Vec<u8> = [value(20).expose_secret(), b"\n", value(20).expose_secret()].concat();
+        let crlf: Vec<u8> = lined
+            .iter()
+            .flat_map(|&c| if c == b'\n' { vec![b'\r', c] } else { vec![c] })
+            .collect();
+        let v = SecretBytes::from_vec(lined.clone());
+        let short = value(10);
+        let labels = [
+            Label {
+                slug: &a,
+                value: &v,
+                short: ShortPolicy::Refuse,
+            },
+            Label {
+                slug: &b,
+                value: &short,
+                short: ShortPolicy::Allow,
+            },
+        ];
+        let (pty, r) = build_pty_redactor(&labels).unwrap();
+        assert_eq!(r.warned_short, vec![b.clone()]);
+        assert_eq!(pty.redact(&lined), b"[envcloak:a/x]");
+        assert_eq!(pty.redact(&crlf), b"[envcloak:a/x]");
+        for cut in 1..crlf.len() {
+            let mut out = Vec::new();
+            let mut stream = pty.stream();
+            stream.push(&crlf[..cut], &mut out);
+            stream.flush_idle(&mut out);
+            stream.push(&crlf[cut..], &mut out);
+            stream.finish(&mut out);
+            assert_eq!(out, b"[envcloak:a/x]", "split at {cut}");
+        }
+        let (pipe, _) = build_redactor(&labels).unwrap();
+        assert_eq!(
+            pipe.redact(&crlf),
+            crlf,
+            "pipe mode matched a form it never sees"
+        );
     }
 
     /// A 10-byte value has too few whole base64 groups at one alignment,
