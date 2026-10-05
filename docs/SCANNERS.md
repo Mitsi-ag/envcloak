@@ -65,7 +65,10 @@ Git history is opt-in. An absolute `/usr/bin/git` runs `cat-file
 --batch-all-objects --batch` with a cleared environment, global/system config
 disabled, replacement objects disabled and fsmonitor disabled. The held root
 supplies the child's working directory. Bytes and objects are bounded, stderr
-is discarded, and an owned-child timeout closes a stalled read. Object ranges
+is discarded, and an owned-child deadline caps the whole Git subprocess at
+30 seconds, including time spent making progress. Larger histories may therefore
+be incomplete. Blobs, commits and annotated tags are scanned; recoverable token
+issues are retained while later objects are still read. Object ranges
 are distinct from file ranges and never authorize rewriting history. Git owns
 the interpretation of the repository's object database, including its linked
 object stores; this reader makes no working-tree filesystem-safety claim about
