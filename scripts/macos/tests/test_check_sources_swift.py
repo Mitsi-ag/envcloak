@@ -538,6 +538,20 @@ class Stopped(unittest.TestCase):
         self.assertIsNotNone(self.groups[-1].status, "the check was not reaped")
 
 
+def spellings(path):
+    """Every spelling of a directory a build's records may hold, longest
+    first: as given, its real path, and on macOS the real path under the
+    /tmp, /var and /etc links (a build started with /tmp/... records /tmp
+    paths, one given /private/tmp/... is the same directory)."""
+    real = os.path.realpath(path)
+    out = {path.rstrip("/"), real}
+    for alias in ("/tmp", "/var", "/etc"):
+        private = "/private" + alias
+        if real == private or real.startswith(private + "/"):
+            out.add(alias + real[len(private) :])
+    return sorted(out, key=len, reverse=True)
+
+
 class RealBuild(unittest.TestCase):
     """The build given with --derived-data; without it these are reported
     as skipped, never as passed. Each refusal changes one thing in an APFS
@@ -559,7 +573,7 @@ class RealBuild(unittest.TestCase):
         returns (the clone, the base path of the app target's records)."""
         dd = os.path.join(copy, "dd")
         subprocess.run(["/bin/cp", "-cR", REAL["derived"], dd], check=True)
-        olds = sorted({REAL["derived"].rstrip("/"), os.path.realpath(REAL["derived"])}, key=len, reverse=True)
+        olds = spellings(REAL["derived"])
         bases = []
         for dirpath, _, names in os.walk(os.path.join(dd, "Build", "Intermediates.noindex")):
             for n in names:
