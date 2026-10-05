@@ -9,9 +9,14 @@
 //!
 //! Codex reads files through its shell, so its file-read probe is a shell
 //! command. Its `forbidden` rules (`envcloak.rules`) refuse `printenv` and
-//! `cat .env` before any hook runs, without EnvCloak's marker: the probes
-//! use `env` and `cat -- .env`, which the rules' prefixes do not match and
-//! the hook denies, so what is measured is the hook.
+//! `cat .env`, without EnvCloak's marker, where EnvCloak's hook does not
+//! answer first (measured on 0.159.2: a running hook answers both with its
+//! marker; untrusted or taken out, the rules refuse them with their
+//! justification): the hook's cases are `env` and `cat -- .env`, which the
+//! rules' prefixes do not match and the hook denies, so what they measure
+//! is the hook whatever the rules do; `printenv` and `cat .env` are the
+//! rule's cases, which must be refused, by the rule or the hook. Claude
+//! Code's probes follow the same rule (`run`'s `file_read`).
 
 use std::ffi::OsString;
 

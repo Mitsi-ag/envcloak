@@ -214,11 +214,14 @@ fn every_surface_is_reported_once_whatever_was_probed() {
                 outcome: Outcome::Passed,
                 persisted: false,
                 why: Vec::new(),
+                skipped: Vec::new(),
             })
             .collect(),
         server: ServerObserved {
             outcome: Outcome::Passed,
             sentinel: Sentinel::Appeared,
+            control_ran: true,
+            allowed_write: true,
             control_denied: true,
         },
         flags: Vec::new(),

@@ -29,9 +29,12 @@
 //! - `unverified` otherwise, with its reason.
 //!
 //! The probe's results are kept per host binary (its SHA-256), version
-//! and configuration digest ([`ConfigSet::digest`]) in a cache
-//! ([`Cache`]), and recomputed at display: a result for anything else
-//! reads `unverified (changed_since_probe)`.
+//! and probe context ([`ConfigSet::fingerprint`]: the facts above, every
+//! configuration file the host reads by its SHA-256, the programs
+//! EnvCloak's hooks run and the `envcloak` build) in a cache ([`Cache`]),
+//! and recomputed at display: a result for anything else, or for a
+//! context that cannot be wholly identified, reads `unverified
+//! (changed_since_probe)`.
 //!
 //! EnvCloak's own MCP server gets a line of its own ([`ServerLine`]): how
 //! the host lets an agent call `run_with_secrets` (`listed`, `callable` or
@@ -391,6 +394,9 @@ pub struct SurfaceState {
     /// Sorted by token, each once.
     pub reasons: Vec<Reason>,
     pub probe: Outcome,
+    /// The cases of the probe that were not run ([`Case`]), sorted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<Case>,
 }
 
 impl SurfaceState {
@@ -401,7 +407,18 @@ impl SurfaceState {
             state,
             reasons: sorted(reasons),
             probe,
+            skipped: Vec::new(),
         }
+    }
+
+    /// The same, with the cases of its probe that were not run.
+    #[must_use]
+    pub fn with_skipped(mut self, cases: &[Case]) -> SurfaceState {
+        let mut c = cases.to_vec();
+        c.sort();
+        c.dedup();
+        self.skipped = c;
+        self
     }
 }
 
@@ -415,7 +432,9 @@ pub fn sorted(reasons: &[Reason]) -> Vec<Reason> {
 }
 
 impl fmt::Display for SurfaceState {
-    /// `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)`.
+    /// `degraded (fails_open_on_timeout, workspace_untrusted; probe=passed)`;
+    /// a case not run is named after the outcome: `...; probe=passed,
+    /// at_mention skipped)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (", self.state.name())?;
         for (i, r) in self.reasons.iter().enumerate() {
@@ -427,7 +446,11 @@ impl fmt::Display for SurfaceState {
         if !self.reasons.is_empty() {
             f.write_str("; ")?;
         }
-        write!(f, "probe={})", self.probe.name())
+        write!(f, "probe={}", self.probe.name())?;
+        for c in &self.skipped {
+            write!(f, ", {} skipped", c.name())?;
+        }
+        f.write_str(")")
     }
 }
 
@@ -460,6 +483,31 @@ impl Sentinel {
 }
 
 token_serde!(Sentinel, Sentinel::name, Sentinel::from_name);
+
+/// A case of a surface's probe that was not run, while the rest of the
+/// probe was: its outcome is the rest's, and the case is reported apart,
+/// never as passed (M2 plan M2-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Case {
+    /// Claude Code's file read: the `@README.md` and `@.env` mentions,
+    /// where the host does not expand `@` mentions under `-p` (M2-26's
+    /// interactive variant covers them).
+    AtMention,
+}
+
+impl Case {
+    pub fn name(self) -> &'static str {
+        match self {
+            Case::AtMention => "at_mention",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Case> {
+        [Case::AtMention].into_iter().find(|c| c.name() == name)
+    }
+}
+
+token_serde!(Case, Case::name, Case::from_name);
 
 /// The line for EnvCloak's own MCP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -563,6 +611,30 @@ impl Hooks {
     }
 }
 
+/// Which of EnvCloak's hooks are in a managed settings file, which
+/// `allowManagedHooksOnly` keeps: each hook apart, since a managed prompt
+/// hook keeps no file, shell or MCP hook (Codex review of M2-09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedHooks {
+    pub prompt: bool,
+    pub tools: bool,
+    pub mcp: bool,
+}
+
+impl ManagedHooks {
+    /// Whether the hook `surface` rests on is in a managed file (output
+    /// rests on none, so nothing managed-only stops it).
+    pub fn for_surface(&self, surface: Surface) -> bool {
+        match surface {
+            Surface::PromptToModel | Surface::Transcript => self.prompt,
+            Surface::FileRead | Surface::Shell => self.tools,
+            Surface::Mcp => self.mcp,
+            Surface::Output => true,
+        }
+    }
+}
+
 /// EnvCloak's MCP server as the host's configuration has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -574,11 +646,59 @@ pub struct ServerFacts {
     pub run_with_secrets_approved: Option<bool>,
 }
 
-/// The configuration facts that decide a host's coverage: value-free, so
-/// that their digest can key the probe cache and nothing a setting holds
-/// is kept. Each `off_*` is true when that level switches every hook off
-/// (or holds a file at that level that is not readable, whose switch is
-/// then not known: the conservative reading).
+/// How a configuration file was found when it was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileState {
+    Absent,
+    /// There, but not a regular file within the cap, or not readable.
+    Unreadable,
+    Read,
+}
+
+/// One configuration file the host reads, as the probe context keeps it:
+/// what it is to the host, where it is, how it was found, and the SHA-256
+/// of its bytes, never a byte of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileSeen {
+    pub role: String,
+    pub path: String,
+    pub state: FileState,
+    pub sha256: Option<String>,
+}
+
+/// A program one of EnvCloak's hooks runs: where it leads, and its
+/// SHA-256 (`None` when it is not there: the hook's state says so).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramSeen {
+    pub path: String,
+    pub sha256: Option<String>,
+}
+
+/// What a probe's result depends on beyond the facts above (Codex F-132:
+/// a hook's timeout, the program it runs, every other setting of the
+/// files the host reads): every configuration file the host reads, by its
+/// bytes' SHA-256, and every program EnvCloak's hooks run, by its
+/// SHA-256. Nothing a setting holds is kept.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Context {
+    pub files: Vec<FileSeen>,
+    pub programs: Vec<ProgramSeen>,
+    /// Everything a result depends on was identified: false when a program
+    /// a hook runs is there but cannot be read, or the hooks of EnvCloak's
+    /// Claude Code plugin cannot be found. A context not read is not
+    /// complete either.
+    pub complete: bool,
+}
+
+/// The configuration facts that decide a host's coverage, value-free:
+/// their fingerprint ([`ConfigSet::fingerprint`]) keys the probe cache.
+/// Each `off_*` is true when that level switches every hook off (or holds
+/// a file at that level that is not readable, or a layer EnvCloak cannot
+/// read, whose switch is then not known: the conservative reading).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigSet {
@@ -595,26 +715,49 @@ pub struct ConfigSet {
     pub config_dir_moved: bool,
     /// Codex: `AGENTS.override.md` is there.
     pub override_file: bool,
-    /// EnvCloak's hooks are in a managed settings file, which
-    /// `allowManagedHooksOnly` and `--safe-mode` keep.
-    pub hooks_managed: bool,
+    /// Which of EnvCloak's hooks are in a managed settings file, which
+    /// `allowManagedHooksOnly` keeps.
+    pub managed_hooks: ManagedHooks,
     pub hooks: Hooks,
     /// Claude Code: the deny rule `Read(**/.env*)`, which covers `@`
     /// mentions no hook sees.
     pub read_deny: bool,
     /// The host's shell runs in its sandbox by default (Claude Code's
-    /// `sandbox.enabled`; Codex unless `sandbox_mode` is
+    /// `sandbox.enabled`; Codex unless its effective `sandbox_mode` is
     /// `danger-full-access`).
     pub sandboxed_shell: bool,
     pub server: ServerFacts,
+    pub context: Context,
 }
 
+/// The version of what [`ConfigSet::fingerprint`] covers: when it changes,
+/// a result kept under the old one is no longer current.
+pub const CONTEXT_FORMAT: u32 = 1;
+
 impl ConfigSet {
-    /// The digest that keys the probe cache: SHA-256 of these facts, as
-    /// JSON. Any change in what decides coverage changes it.
-    pub fn digest(&self) -> String {
-        let bytes = serde_json::to_vec(self).unwrap_or_default();
-        hex(&Sha256::digest(&bytes))
+    /// The probe context's fingerprint, which keys the probe cache (its
+    /// configuration digest): the SHA-256 of [`CONTEXT_FORMAT`], these
+    /// facts, every configuration file's state and SHA-256 and every
+    /// program EnvCloak's hooks run ([`Context`]), and the SHA-256 of
+    /// `envcloak`, the build whose hook decisions and `envcloak run`
+    /// redaction the surfaces rest on (by where it leads). One routine for
+    /// both ends: what a probe's result is kept under (M2-28) and what
+    /// `agents status` looks it up by. `None` when the context is not
+    /// complete or `envcloak` cannot be read: no result is then current.
+    pub fn fingerprint(&self, envcloak: &Path) -> Option<String> {
+        if !self.context.complete {
+            return None;
+        }
+        let build = std::fs::canonicalize(envcloak)
+            .ok()
+            .and_then(|p| file_sha256(&p))?;
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "format": CONTEXT_FORMAT,
+            "facts": self,
+            "envcloak": build,
+        }))
+        .ok()?;
+        Some(hex(&Sha256::digest(&bytes)))
     }
 }
 
@@ -625,15 +768,20 @@ impl ConfigSet {
 /// `allow_managed_hooks_only` and `AGENTS.override.md`), the trust gates,
 /// and the timeout every hook fails open on. Pure: the same set always
 /// gives the same reasons, so M2-28 applies it to the person's files.
+/// `managed_only` is given when a hook a surface rests on is not in a
+/// managed file; [`degraders_for`] gives a surface's own.
 pub fn degraders(cs: &ConfigSet) -> Vec<Reason> {
     let mut out = BTreeSet::new();
     let host = Host::from_id(&cs.host);
+    let unmanaged = Surface::ALL
+        .into_iter()
+        .any(|s| s.hook_based() && !cs.managed_hooks.for_surface(s));
     for (on, r) in [
         (cs.off_user, Reason::SwitchedOffUser),
         (cs.off_project, Reason::SwitchedOffProject),
         (cs.off_local, Reason::SwitchedOffLocal),
         (cs.off_managed, Reason::SwitchedOffManaged),
-        (cs.managed_only && !cs.hooks_managed, Reason::ManagedOnly),
+        (cs.managed_only && unmanaged, Reason::ManagedOnly),
         (cs.config_dir_moved, Reason::ConfigDirMoved),
         (cs.override_file, Reason::OverrideFile),
     ] {
@@ -662,6 +810,16 @@ pub fn degraders(cs: &ConfigSet) -> Vec<Reason> {
     sorted(&out.into_iter().collect::<Vec<_>>())
 }
 
+/// The reasons that degrade `surface`: those of [`degraders`] that apply
+/// to it, `managed_only` only when the hook it rests on is not managed.
+pub fn degraders_for(cs: &ConfigSet, surface: Surface) -> Vec<Reason> {
+    degraders(cs)
+        .into_iter()
+        .filter(|r| r.degrades(surface))
+        .filter(|r| *r != Reason::ManagedOnly || !cs.managed_hooks.for_surface(surface))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Reading the configuration (read-only).
 
@@ -685,7 +843,7 @@ enum Read {
 fn read_capped(path: &Path, cap: u64) -> Option<Option<Zeroizing<Vec<u8>>>> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        Err(e) if not_there(&e) => return Some(None),
         Err(_) => return None,
     };
     if !meta.is_file() || meta.len() > cap {
@@ -700,16 +858,23 @@ fn read_capped(path: &Path, cap: u64) -> Option<Option<Zeroizing<Vec<u8>>>> {
     Some(Some(bytes))
 }
 
-fn read_json(path: &Path, cap: u64) -> Read {
-    match read_capped(path, cap) {
+fn not_there(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
+fn parse_json(got: Option<Option<Zeroizing<Vec<u8>>>>) -> Read {
+    match got {
         Some(None) => Read::Absent,
         None => Read::Unreadable,
         Some(Some(b)) => serde_json::from_slice(&b).map_or(Read::Unreadable, Read::Json),
     }
 }
 
-fn read_toml(path: &Path) -> Read {
-    match read_capped(path, MAX_SETTINGS) {
+fn parse_toml(got: Option<Option<Zeroizing<Vec<u8>>>>) -> Read {
+    match got {
         Some(None) => Read::Absent,
         None => Read::Unreadable,
         Some(Some(b)) => std::str::from_utf8(&b)
@@ -719,18 +884,96 @@ fn read_toml(path: &Path) -> Read {
     }
 }
 
-/// Whether the program a hook command starts (`<path> hook --host ...`,
-/// the path quoted for a shell or not) is an executable file.
-fn command_present(cmd: &str) -> bool {
+fn read_json(path: &Path, cap: u64) -> Read {
+    parse_json(read_capped(path, cap))
+}
+
+impl Context {
+    /// Keeps how `path` (a `role` to the host) was found: its state and
+    /// its bytes' SHA-256.
+    fn note(&mut self, role: &str, path: &Path, got: &Option<Option<Zeroizing<Vec<u8>>>>) {
+        let (state, sha256) = match got {
+            Some(None) => (FileState::Absent, None),
+            None => (FileState::Unreadable, None),
+            Some(Some(b)) => (FileState::Read, Some(hex(&Sha256::digest(b.as_slice())))),
+        };
+        self.files.push(FileSeen {
+            role: role.to_owned(),
+            path: path.to_string_lossy().into_owned(),
+            state,
+            sha256,
+        });
+    }
+
+    /// Reads `path` as JSON, keeping it in the context.
+    fn json(&mut self, role: &str, path: &Path, cap: u64) -> Read {
+        let got = read_capped(path, cap);
+        self.note(role, path, &got);
+        parse_json(got)
+    }
+
+    /// Reads `path` as TOML, keeping it in the context.
+    fn toml(&mut self, role: &str, path: &Path) -> Read {
+        let got = read_capped(path, MAX_SETTINGS);
+        self.note(role, path, &got);
+        parse_toml(got)
+    }
+
+    /// Keeps a file whose content EnvCloak does not read but whose
+    /// presence and bytes decide what the host does (a device profile, an
+    /// organization's settings): whether it is there, its SHA-256 when it
+    /// can be read. True when it is there, or cannot be looked at.
+    fn opaque(&mut self, role: &str, path: &Path) -> bool {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if not_there(&e) => false,
+            Err(_) => {
+                self.note(role, path, &None);
+                true
+            }
+            Ok(_) => {
+                let got = read_capped(path, MAX_SETTINGS);
+                self.note(role, path, &got);
+                true
+            }
+        }
+    }
+
+    /// Keeps the programs EnvCloak's hooks run, each by where it leads and
+    /// its SHA-256. One that is there but cannot be read leaves the
+    /// context incomplete.
+    fn programs(&mut self, mut paths: Vec<PathBuf>) {
+        paths.sort();
+        paths.dedup();
+        for p in paths {
+            let sha256 = match std::fs::canonicalize(&p) {
+                Ok(real) => match file_sha256(&real) {
+                    Some(s) => Some(s),
+                    None => {
+                        self.complete = false;
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
+            self.programs.push(ProgramSeen {
+                path: p.to_string_lossy().into_owned(),
+                sha256,
+            });
+        }
+    }
+}
+
+/// The program a hook command starts (`<path> hook --host ...`, the path
+/// quoted for a shell or not), when the command names one by an absolute
+/// path.
+fn command_program(cmd: &str) -> Option<PathBuf> {
     let exe = match cmd.strip_prefix('\'') {
         Some(rest) => {
             // `'...'` with `'\''` for each quote inside.
             let mut out = String::new();
             let mut rest = rest;
             loop {
-                let Some(end) = rest.find('\'') else {
-                    return false;
-                };
+                let end = rest.find('\'')?;
                 out.push_str(&rest[..end]);
                 rest = &rest[end + 1..];
                 if let Some(r) = rest.strip_prefix("\\''") {
@@ -742,20 +985,30 @@ fn command_present(cmd: &str) -> bool {
             }
             out
         }
-        None => match cmd.split_once(' ') {
-            Some((exe, _)) => exe.to_owned(),
-            None => return false,
-        },
+        None => cmd.split_once(' ')?.0.to_owned(),
     };
-    let p = Path::new(&exe);
-    p.is_absolute()
-        && std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    let p = PathBuf::from(exe);
+    p.is_absolute().then_some(p)
+}
+
+/// Whether the program a hook command starts is an executable file.
+fn command_present(cmd: &str) -> bool {
+    command_program(cmd).is_some_and(|p| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
 }
 
 /// EnvCloak's hook for `event` among `groups` (a host's list of hook
 /// groups for one event), for the tool matcher `matcher` (`None` for an
-/// event without one): its state.
-fn hook_in(groups: Option<&Value>, host: Host, event: Event, matcher: Option<&str>) -> HookState {
+/// event without one): its state. The programs its entries name are added
+/// to `programs`.
+fn hook_in(
+    groups: Option<&Value>,
+    host: Host,
+    event: Event,
+    matcher: Option<&str>,
+    programs: &mut Vec<PathBuf>,
+) -> HookState {
     let tail = format!(" hook --host {} --event {}", host.id(), event.name());
     let mut best = HookState::Missing;
     for group in groups.and_then(Value::as_array).into_iter().flatten() {
@@ -775,10 +1028,15 @@ fn hook_in(groups: Option<&Value>, host: Host, event: Event, matcher: Option<&st
             if !cmd.ends_with(&tail) {
                 continue;
             }
-            if command_present(cmd) {
-                return HookState::Present;
-            }
-            best = HookState::CommandMissing;
+            programs.extend(command_program(cmd));
+            best = either(
+                best,
+                if command_present(cmd) {
+                    HookState::Present
+                } else {
+                    HookState::CommandMissing
+                },
+            );
         }
     }
     best
@@ -795,7 +1053,13 @@ fn either(a: HookState, b: HookState) -> HookState {
     }
 }
 
-fn hooks_of(settings: &Value, host: Host, tool_matcher: &str, mcp_matcher: &str) -> Hooks {
+fn hooks_of(
+    settings: &Value,
+    host: Host,
+    tool_matcher: &str,
+    mcp_matcher: &str,
+    programs: &mut Vec<PathBuf>,
+) -> Hooks {
     let events = settings.get("hooks");
     let at = |e: Event| events.and_then(|h| h.get(e.name()));
     Hooks {
@@ -804,18 +1068,21 @@ fn hooks_of(settings: &Value, host: Host, tool_matcher: &str, mcp_matcher: &str)
             host,
             Event::UserPromptSubmit,
             None,
+            programs,
         ),
         tools: hook_in(
             at(Event::PreToolUse),
             host,
             Event::PreToolUse,
             Some(tool_matcher),
+            programs,
         ),
         mcp: hook_in(
             at(Event::PreToolUse),
             host,
             Event::PreToolUse,
             Some(mcp_matcher),
+            programs,
         ),
     }
 }
@@ -847,8 +1114,9 @@ impl ConfigSet {
     /// directory of the nearest manifest, or the working directory), from
     /// the files `locations` names and the system directories
     /// (`claude_managed` for Claude Code's managed settings), with `env`
-    /// for the switches a host reads from its environment. Read-only; no
-    /// value of a setting is kept.
+    /// for the switches a host reads from its environment (and `PATH`,
+    /// where the plugin's hooks find `envcloak`). Read-only; no value of a
+    /// setting is kept.
     pub fn read(
         host: Host,
         locations: &Locations,
@@ -859,6 +1127,10 @@ impl ConfigSet {
         let mut cs = ConfigSet {
             host: host.id().to_owned(),
             linux: !cfg!(target_os = "macos"),
+            context: Context {
+                complete: true,
+                ..Context::default()
+            },
             ..ConfigSet::default()
         };
         match host {
@@ -878,14 +1150,30 @@ fn read_claude(
 ) {
     cs.config_dir_moved = env("CLAUDE_CONFIG_DIR").is_some_and(|v| !v.is_empty());
     let mut managed = vec![managed_dir.join("managed-settings.json")];
-    if let Ok(rd) = std::fs::read_dir(managed_dir.join("managed-settings.d")) {
-        let mut more: Vec<PathBuf> = rd
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|e| e == "json"))
-            .collect();
-        more.sort();
-        managed.extend(more);
+    let drop_in = managed_dir.join("managed-settings.d");
+    match std::fs::read_dir(&drop_in) {
+        Ok(rd) => {
+            let mut more = Vec::new();
+            for e in rd {
+                match e {
+                    Ok(e) => more.push(e.path()),
+                    // A file there that cannot be listed may switch every
+                    // hook off: the conservative reading.
+                    Err(_) => {
+                        cs.off_managed = true;
+                        cs.context.note("claude_managed_dir", &drop_in, &None);
+                    }
+                }
+            }
+            more.retain(|p| p.extension().is_some_and(|e| e == "json"));
+            more.sort();
+            managed.extend(more);
+        }
+        Err(e) if not_there(&e) => {}
+        Err(_) => {
+            cs.off_managed = true;
+            cs.context.note("claude_managed_dir", &drop_in, &None);
+        }
     }
     let levels: [(&str, Vec<PathBuf>); 4] = [
         ("user", vec![l.claude_settings()]),
@@ -901,9 +1189,13 @@ fn read_claude(
     ];
     let mut sandbox: [Option<bool>; 4] = [None; 4];
     let mut plugin = false;
+    let mut programs = Vec::new();
     for (i, (level, files)) in levels.iter().enumerate() {
         for path in files {
-            let off = match read_json(path, MAX_SETTINGS) {
+            let off = match cs
+                .context
+                .json(&format!("claude_{level}"), path, MAX_SETTINGS)
+            {
                 Read::Absent => false,
                 // Claude Code does not read a file it cannot parse, so
                 // what it would set (EnvCloak's hooks, a switch) is not
@@ -915,9 +1207,12 @@ fn read_claude(
                         Host::ClaudeCode,
                         claude::TOOL_MATCHER,
                         claude::MCP_MATCHER,
+                        &mut programs,
                     );
-                    if *level == "managed" && h.prompt == HookState::Present {
-                        cs.hooks_managed = true;
+                    if *level == "managed" {
+                        cs.managed_hooks.prompt |= h.prompt == HookState::Present;
+                        cs.managed_hooks.tools |= h.tools == HookState::Present;
+                        cs.managed_hooks.mcp |= h.mcp == HookState::Present;
                     }
                     cs.hooks = merge_hooks(cs.hooks, h);
                     plugin |= claude::plugin_enabled(&v);
@@ -980,7 +1275,9 @@ fn read_claude(
             mcp: HookState::Present,
         };
         cs.server.registered = true;
+        plugin_context(&mut cs.context, l, env, &mut programs);
     }
+    cs.context.programs(programs);
     if let Read::Json(v) = read_json(l.claude_json(), MAX_CLAUDE_JSON) {
         if v.get(claude::MCP_SERVERS)
             .and_then(|s| s.get(claude::SERVER))
@@ -994,22 +1291,86 @@ fn read_claude(
     }
 }
 
-fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
-    cs.override_file = l.codex_instructions_override().exists();
-    // `[features] hooks = false`, by layer; `allow_managed_hooks_only` in
-    // any layer.
-    let off = |r: &Read| match r {
-        Read::Absent => false,
-        Read::Unreadable | Read::Json(_) => true,
-        Read::Toml(d) => {
-            d.get("features")
-                .and_then(|f| f.get("hooks"))
-                .and_then(toml_edit::Item::as_bool)
-                == Some(false)
+/// What EnvCloak's Claude Code plugin adds to the context: Claude Code's
+/// record of its installed plugins (`plugins/installed_plugins.json`),
+/// the hook file of each install of the `envcloak` plugin it names, and
+/// the `envcloak` those hooks find on `PATH`. Any of them not found leaves
+/// the context incomplete: a result kept for a plugin install is current
+/// only while all of them are known.
+fn plugin_context(
+    ctx: &mut Context,
+    l: &Locations,
+    env: &dyn Fn(&str) -> Option<OsString>,
+    programs: &mut Vec<PathBuf>,
+) {
+    let record = l
+        .claude_dir()
+        .join("plugins")
+        .join("installed_plugins.json");
+    let mut found = false;
+    if let Read::Json(v) = ctx.json("claude_plugins", &record, MAX_SETTINGS) {
+        let installs = v
+            .get("plugins")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| k.split('@').next() == Some("envcloak"))
+            .flat_map(|(_, e)| match e {
+                Value::Array(a) => a.clone(),
+                other => vec![other.clone()],
+            });
+        for install in installs {
+            let Some(dir) = install.get("installPath").and_then(Value::as_str) else {
+                ctx.complete = false;
+                continue;
+            };
+            let hooks = Path::new(dir).join("hooks").join("hooks.json");
+            match ctx.json("claude_plugin_hooks", &hooks, MAX_SETTINGS) {
+                Read::Json(_) => found = true,
+                _ => ctx.complete = false,
+            }
         }
-    };
-    let managed_only = |r: &Read| match r {
-        Read::Toml(d) => {
+    }
+    match env("PATH").and_then(|p| crate::detect::find_on_path("envcloak", &p)) {
+        Some(p) => programs.push(p),
+        None => ctx.complete = false,
+    }
+    if !found {
+        ctx.complete = false;
+    }
+}
+
+/// One of Codex's merged layers, as read.
+struct CodexLayer {
+    read: Read,
+}
+
+impl CodexLayer {
+    fn doc(&self) -> Option<&toml_edit::DocumentMut> {
+        match &self.read {
+            Read::Toml(d) => Some(d),
+            _ => None,
+        }
+    }
+
+    fn unreadable(&self) -> bool {
+        matches!(self.read, Read::Unreadable | Read::Json(_))
+    }
+
+    /// `[features] hooks = false` (or not readable: not known, so off).
+    fn hooks_off(&self) -> bool {
+        self.unreadable()
+            || self.doc().is_some_and(|d| {
+                d.get("features")
+                    .and_then(|f| f.get("hooks"))
+                    .and_then(toml_edit::Item::as_bool)
+                    == Some(false)
+            })
+    }
+
+    /// `allow_managed_hooks_only = true`, at the top or under `[hooks]`.
+    fn managed_only(&self) -> bool {
+        self.doc().is_some_and(|d| {
             d.get("allow_managed_hooks_only")
                 .and_then(toml_edit::Item::as_bool)
                 == Some(true)
@@ -1017,59 +1378,220 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
                     .and_then(|h| h.get("allow_managed_hooks_only"))
                     .and_then(toml_edit::Item::as_bool)
                     == Some(true)
-        }
-        _ => false,
+        })
+    }
+
+    fn sandbox_mode(&self) -> Option<String> {
+        self.doc()?
+            .get("sandbox_mode")
+            .and_then(toml_edit::Item::as_str)
+            .map(str::to_owned)
+    }
+
+    /// EnvCloak's server table, when this layer has one.
+    fn server(&self) -> Option<&toml_edit::Item> {
+        self.doc()?
+            .get("mcp_servers")
+            .and_then(|s| s.get(codex::SERVER))
+    }
+}
+
+/// What Codex's merge of `layers` (lowest first; tables merged key by
+/// key, any other value replaced by the higher layer's, pinned 0.159.2)
+/// gives for what coverage depends on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexMerged {
+    unreadable: bool,
+    sandbox_mode: Option<String>,
+    registered: bool,
+    /// The effective approval mode of `run_with_secrets`: its own setting,
+    /// else the server's default.
+    approval: Option<String>,
+}
+
+fn codex_merge(layers: &[&CodexLayer]) -> CodexMerged {
+    let mode =
+        |item: Option<&toml_edit::Item>| item.and_then(toml_edit::Item::as_str).map(str::to_owned);
+    let mut out = CodexMerged {
+        unreadable: false,
+        sandbox_mode: None,
+        registered: false,
+        approval: None,
     };
-    let user = read_toml(&l.codex_config());
-    cs.off_user = off(&user);
-    cs.managed_only |= managed_only(&user);
-    for path in [
-        l.codex_system_config(),
-        l.codex_managed_config(),
-        l.codex_requirements(),
-    ] {
-        let r = read_toml(&path);
-        cs.off_managed |= off(&r);
-        cs.managed_only |= managed_only(&r);
-    }
-    // Each folder from the project up, as Codex reads project layers: a
-    // `.codex` that is Codex's own directory is not a project layer.
-    let own = std::fs::canonicalize(l.codex_home()).ok();
-    let mut dir = Some(project);
-    while let Some(d) = dir {
-        let dot = d.join(".codex");
-        let is_own = own.is_some() && std::fs::canonicalize(&dot).ok() == own;
-        if !is_own {
-            let r = read_toml(&Locations::codex_project_config(d));
-            cs.off_project |= off(&r);
+    let (mut tool, mut default) = (None, None);
+    for layer in layers {
+        out.unreadable |= layer.unreadable();
+        if let Some(m) = layer.sandbox_mode() {
+            out.sandbox_mode = Some(m);
         }
-        dir = d.parent();
-    }
-    if let Read::Toml(d) = &user {
-        cs.sandboxed_shell =
-            d.get("sandbox_mode").and_then(toml_edit::Item::as_str) != Some("danger-full-access");
-        if let Some(server) = d.get("mcp_servers").and_then(|s| s.get(codex::SERVER)) {
-            cs.server.registered = true;
-            let mode = |item: Option<&toml_edit::Item>| {
-                item.and_then(toml_edit::Item::as_str).map(str::to_owned)
-            };
-            let tool = mode(
+        if let Some(server) = layer.server() {
+            out.registered = true;
+            if let Some(t) = mode(
                 server
                     .get("tools")
                     .and_then(|t| t.get("run_with_secrets"))
                     .and_then(|t| t.get("approval_mode")),
-            );
-            let default = mode(server.get("default_tools_approval_mode"));
-            // A per-tool setting wins over the server's default.
-            let effective = tool.or(default);
-            cs.server.run_with_secrets_approved = Some(effective.as_deref() == Some("approve"));
+            ) {
+                tool = Some(t);
+            }
+            if let Some(d) = mode(server.get("default_tools_approval_mode")) {
+                default = Some(d);
+            }
         }
-    } else {
-        cs.sandboxed_shell = true;
     }
-    if let Read::Json(v) = read_json(&l.codex_hooks(), MAX_SETTINGS) {
-        cs.hooks = hooks_of(&v, Host::Codex, "Bash", "mcp__.*");
+    out.approval = tool.or(default);
+    out
+}
+
+/// Codex's configuration as it merges it (Codex review of M2-09: the
+/// sandbox mode and the server's approvals were read from the user's file
+/// alone): lowest first, the system file, the user's `config.toml`, a
+/// profile file (`--profile`; which one a session names is not in any
+/// file, so each, and none, is read), each project's `.codex/config.toml`
+/// from the folders above the project down to it (Codex reads them only
+/// for a trusted project, which the merge reads both ways), and the
+/// legacy managed file on top; `requirements.toml` beside them. A macOS
+/// device profile and an organization's settings are layers EnvCloak
+/// cannot read (`codex_layers`): with either there, the hooks are taken
+/// as switched off by a managed layer, the shell as sandboxed and the
+/// server's approval as not known. Each switch is reported at every level
+/// that sets it; the sandbox and the approval are what every reading of
+/// the merge agrees on, the sandboxed shell when any reading has it, and
+/// the approval not known when the readings disagree.
+fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
+    cs.override_file = l.codex_instructions_override().exists();
+    let ctx = &mut cs.context;
+    let layer = |ctx: &mut Context, role: &str, path: &Path| CodexLayer {
+        read: ctx.toml(role, path),
+    };
+    let system = layer(ctx, "codex_system", &l.codex_system_config());
+    let user = layer(ctx, "codex_user", &l.codex_config());
+    let profiles: Vec<CodexLayer> = match l.codex_profile_configs() {
+        Ok(mut ps) => {
+            ps.sort();
+            ps.iter().map(|p| layer(ctx, "codex_profile", p)).collect()
+        }
+        Err(_) => {
+            ctx.note("codex_profiles", l.codex_home(), &None);
+            vec![CodexLayer {
+                read: Read::Unreadable,
+            }]
+        }
+    };
+    // Each folder from the project up, as Codex reads project layers: a
+    // `.codex` that is Codex's own directory is not a project layer.
+    let own = std::fs::canonicalize(l.codex_home()).ok();
+    let mut projects: Vec<CodexLayer> = Vec::new();
+    for d in project.ancestors() {
+        let dot = d.join(".codex");
+        let is_own = own.is_some() && std::fs::canonicalize(&dot).ok() == own;
+        if !is_own {
+            projects.push(layer(
+                ctx,
+                "codex_project",
+                &Locations::codex_project_config(d),
+            ));
+        }
     }
+    // Merged from the root down.
+    projects.reverse();
+    let managed = layer(ctx, "codex_managed", &l.codex_managed_config());
+    let requirements = layer(ctx, "codex_requirements", &l.codex_requirements());
+    // The layers EnvCloak cannot read.
+    let mut unseen = match l.codex_managed_preferences() {
+        Ok(ps) => {
+            let mut any = false;
+            for p in ps {
+                any |= ctx.opaque("codex_device_profile", &p);
+            }
+            any
+        }
+        Err(_) => {
+            ctx.note(
+                "codex_device_profiles",
+                Path::new("/Library/Managed Preferences"),
+                &None,
+            );
+            true
+        }
+    };
+    unseen |= ctx.opaque("codex_cloud", &l.codex_cloud_config_cache());
+    // Codex's rules, which decide what its shell runs before any hook.
+    let rules = l.codex_home().join("rules");
+    match std::fs::read_dir(&rules) {
+        Ok(rd) => {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for e in rd {
+                match e {
+                    Ok(e) => files.push(e.path()),
+                    Err(_) => ctx.note("codex_rules_dir", &rules, &None),
+                }
+            }
+            files.retain(|p| p.extension().is_some_and(|e| e == "rules"));
+            files.sort();
+            for f in files {
+                let got = read_capped(&f, MAX_SETTINGS);
+                ctx.note("codex_rules", &f, &got);
+            }
+        }
+        Err(e) if not_there(&e) => {}
+        Err(_) => ctx.note("codex_rules_dir", &rules, &None),
+    }
+    // The switches, at every level that sets one.
+    cs.off_user = user.hooks_off() || profiles.iter().any(CodexLayer::hooks_off);
+    cs.off_project = projects.iter().any(CodexLayer::hooks_off);
+    cs.off_managed =
+        unseen || system.hooks_off() || managed.hooks_off() || requirements.hooks_off();
+    cs.managed_only = [&system, &user, &managed, &requirements]
+        .into_iter()
+        .chain(profiles.iter())
+        .chain(projects.iter())
+        .any(CodexLayer::managed_only);
+    // The merge, each way a session can read it.
+    let mut readings = Vec::new();
+    let mut choices: Vec<Option<&CodexLayer>> = vec![None];
+    choices.extend(profiles.iter().map(Some));
+    for profile in &choices {
+        for with_projects in [false, true] {
+            let mut stack: Vec<&CodexLayer> = vec![&system, &user];
+            stack.extend(profile.iter().copied());
+            if with_projects {
+                stack.extend(projects.iter());
+            }
+            stack.push(&managed);
+            readings.push(codex_merge(&stack));
+        }
+    }
+    let restricted = requirements.doc().is_some_and(|d| {
+        d.get("allowed_sandbox_modes")
+            .and_then(toml_edit::Item::as_array)
+            .is_some_and(|a| !a.iter().any(|v| v.as_str() == Some("danger-full-access")))
+    });
+    cs.sandboxed_shell = unseen
+        || restricted
+        || requirements.unreadable()
+        || readings
+            .iter()
+            .any(|r| r.unreadable || r.sandbox_mode.as_deref() != Some("danger-full-access"));
+    cs.server.registered = readings.iter().any(|r| r.registered);
+    if cs.server.registered {
+        let first = readings.first().map(|r| r.approval.clone());
+        let agreed = readings
+            .iter()
+            .all(|r| Some(r.approval.clone()) == first && !r.unreadable);
+        cs.server.run_with_secrets_approved = match first {
+            Some(a) if agreed && !unseen => Some(a.as_deref() == Some("approve")),
+            _ => None,
+        };
+    }
+    let mut programs = Vec::new();
+    if let Read::Json(v) = cs
+        .context
+        .json("codex_hooks", &l.codex_hooks(), MAX_SETTINGS)
+    {
+        cs.hooks = hooks_of(&v, Host::Codex, "Bash", "mcp__.*", &mut programs);
+    }
+    cs.context.programs(programs);
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,17 +1610,44 @@ pub struct Observed {
     /// Why the probe was skipped, when it was (`probe_needs_terminal`).
     #[serde(default)]
     pub why: Vec<Reason>,
+    /// The cases of the probe that were not run, while the rest was.
+    #[serde(default)]
+    pub skipped: Vec<Case>,
 }
 
-/// What the sentinel probe found for EnvCloak's server.
+/// What the sentinel probe found for EnvCloak's server: its outcome and
+/// each piece of its evidence, kept so that the outcome shown is the one
+/// the evidence supports ([`ServerObserved::supported`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerObserved {
     pub outcome: Outcome,
     pub sentinel: Sentinel,
-    /// The control: the host's own shell was denied the same kind of
-    /// write.
+    /// The host's own shell ran the control: its marker, printed after
+    /// its writes, came back in the shell's result.
+    pub control_ran: bool,
+    /// The same shell made a write where its sandbox lets it (the
+    /// writer works).
+    pub allowed_write: bool,
+    /// And was denied the write beside the sentinel's.
     pub control_denied: bool,
+}
+
+impl ServerObserved {
+    /// The outcome the evidence supports: `passed` only when the shell
+    /// ran, wrote where it may, was denied where the sentinel is written,
+    /// and the sentinel appeared; else `failed` (a record that says passed
+    /// without its evidence reads failed).
+    pub fn supported(&self) -> Outcome {
+        let evidence = self.control_ran
+            && self.allowed_write
+            && self.control_denied
+            && self.sentinel == Sentinel::Appeared;
+        match self.outcome {
+            Outcome::Passed if !evidence => Outcome::Failed,
+            o => o,
+        }
+    }
 }
 
 /// A probe's results for one host, as the cache keeps them, with what
@@ -1124,8 +1673,14 @@ pub struct ProbeRecord {
 impl ProbeRecord {
     /// Whether this record is for the host binary, version and
     /// configuration given.
+    /// An identity not known (an empty SHA-256, version or digest: a
+    /// binary that could not be read, a context not complete) matches no
+    /// record, even one that holds the same empty value.
     pub fn is_for(&self, host: &str, exe_sha256: &str, version: &str, digest: &str) -> bool {
-        self.host == host
+        !exe_sha256.is_empty()
+            && !version.is_empty()
+            && !digest.is_empty()
+            && self.host == host
             && self.exe_sha256 == exe_sha256
             && self.version == version
             && self.config_digest == digest
@@ -1165,7 +1720,7 @@ pub fn assemble(host: Host, version: &str, cs: &ConfigSet, probed: Probed<'_>) -
         },
         reasons: vec![Reason::OutsideHostSandbox],
         probe: match probed {
-            Probed::Current(r) => r.server.outcome,
+            Probed::Current(r) => r.server.supported(),
             _ => Outcome::Skipped,
         },
         sentinel: match probed {
@@ -1193,18 +1748,23 @@ fn surface_state(
         .iter()
         .copied()
         .filter(|r| r.degrades(surface))
+        .filter(|r| *r != Reason::ManagedOnly || !cs.managed_hooks.for_surface(surface))
         .collect();
     // K-01: on Linux no pinned host's sandboxed shell reaches the daemon.
     let sandbox_blocks = surface == Surface::Shell && cs.linux && cs.sandboxed_shell;
     let hook = cs.hooks.for_surface(surface);
     let missing = matches!(hook, Some(HookState::Missing | HookState::CommandMissing));
-    let s = |state, reasons: &[Reason], probe| SurfaceState::new(surface, state, reasons, probe);
     let (outcome, observed) = match probed {
         Probed::Current(r) => match r.observed(surface) {
             Some(o) => (o.outcome, Some(o)),
             None => (Outcome::Skipped, None),
         },
         _ => (Outcome::Skipped, None),
+    };
+    // The cases its probe did not run go with whatever it reads.
+    let skipped = observed.map_or(&[][..], |o| o.skipped.as_slice());
+    let s = |state, reasons: &[Reason], probe| {
+        SurfaceState::new(surface, state, reasons, probe).with_skipped(skipped)
     };
     if sandbox_blocks {
         return s(State::Unsupported, &[Reason::SandboxBlocksSocket], outcome);
@@ -1308,8 +1868,10 @@ pub struct Cache {
     pub records: Vec<ProbeRecord>,
 }
 
-/// The cache's format.
-pub const CACHE_FORMAT: u32 = 1;
+/// The cache's format: 2 since a record keys the probe context's
+/// fingerprint and keeps the sentinel's evidence and the cases not run, so
+/// a record of format 1 is no record.
+pub const CACHE_FORMAT: u32 = 2;
 
 impl Cache {
     /// Where the cache is, in EnvCloak's data directory.
@@ -1452,11 +2014,14 @@ mod tests {
                     outcome: *o,
                     persisted: *p,
                     why: Vec::new(),
+                    skipped: Vec::new(),
                 })
                 .collect(),
             server: ServerObserved {
                 outcome: Outcome::Passed,
                 sentinel: Sentinel::Appeared,
+                control_ran: true,
+                allowed_write: true,
                 control_denied: true,
             },
             flags: Vec::new(),
@@ -1782,10 +2347,43 @@ mod tests {
         // Hooks kept in a managed file are not stopped by managed-only.
         let kept = ConfigSet {
             managed_only: true,
-            hooks_managed: true,
-            ..base
+            managed_hooks: ManagedHooks {
+                prompt: true,
+                tools: true,
+                mcp: true,
+            },
+            ..base.clone()
         };
         assert!(!degraders(&kept).contains(&Reason::ManagedOnly));
+        // Each hook apart: a managed prompt hook keeps the prompt guard
+        // and the transcript, never the file, shell or MCP hooks.
+        let prompt_only = ConfigSet {
+            managed_only: true,
+            managed_hooks: ManagedHooks {
+                prompt: true,
+                tools: false,
+                mcp: false,
+            },
+            ..base
+        };
+        let c = assemble(
+            Host::ClaudeCode,
+            "1.2.3",
+            &prompt_only,
+            Probed::Current(&record(Host::ClaudeCode, &all(Outcome::Passed))),
+        );
+        for surface in Surface::ALL {
+            let on = c
+                .surface(surface)
+                .is_some_and(|s| s.reasons.contains(&Reason::ManagedOnly));
+            let want = matches!(surface, Surface::FileRead | Surface::Shell | Surface::Mcp);
+            assert_eq!(on, want, "{surface:?}");
+            assert_eq!(
+                degraders_for(&prompt_only, surface).contains(&Reason::ManagedOnly),
+                want,
+                "{surface:?}"
+            );
+        }
     }
 
     #[test]
@@ -1865,20 +2463,139 @@ mod tests {
         std::fs::write(&path, b"{\"format\":1,\"records\":[{\"host\":1}]}")
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(Cache::load(&path), Cache::default());
-        std::fs::write(&path, b"{\"format\":2,\"records\":[]}").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&path, b"{\"format\":3,\"records\":[]}").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(Cache::load(&path), Cache::default());
+        // A record of format 1 (before the fingerprint and the sentinel's
+        // evidence) is no record.
+        let mut v = serde_json::to_value(&c).unwrap_or_default();
+        v["format"] = serde_json::json!(1);
+        std::fs::write(&path, v.to_string()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(Cache::load(&path), Cache::default());
     }
 
+    /// The fingerprint follows every fact, the context and the build, and
+    /// there is none for a context not wholly identified.
+    ///
+    /// Mutation checked: `fingerprint` without the `envcloak` build (its
+    /// `"envcloak"` member dropped): another build gives the same
+    /// fingerprint and this fails.
     #[test]
-    fn the_digest_follows_every_fact() {
-        let a = cs(Host::Codex);
+    fn the_fingerprint_follows_every_fact_the_context_and_the_build() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let build = dir.path().join("envcloak");
+        std::fs::write(&build, b"build one").unwrap_or_else(|e| panic!("{e}"));
+        let mut a = cs(Host::Codex);
+        a.context.complete = true;
+        let fp = |c: &ConfigSet| c.fingerprint(&build);
+        assert!(fp(&a).is_some());
+        assert_eq!(fp(&a), fp(&a.clone()));
         let mut b = a.clone();
-        assert_eq!(a.digest(), b.digest());
         b.hooks.prompt = HookState::CommandMissing;
-        assert_ne!(a.digest(), b.digest());
+        assert_ne!(fp(&a), fp(&b));
         let mut c = a.clone();
         c.server.run_with_secrets_approved = Some(true);
-        assert_ne!(a.digest(), c.digest());
+        assert_ne!(fp(&a), fp(&c));
+        let mut d = a.clone();
+        d.context.files.push(FileSeen {
+            role: "codex_user".to_owned(),
+            path: "/h/.codex/config.toml".to_owned(),
+            state: FileState::Read,
+            sha256: Some("0".repeat(64)),
+        });
+        let mut e = d.clone();
+        e.context.files[0].sha256 = Some("1".repeat(64));
+        assert_ne!(fp(&d), fp(&e));
+        let before = fp(&a);
+        std::fs::write(&build, b"build two").unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(before, fp(&a), "another build, the same fingerprint");
+        // Not complete, or no build to read: no fingerprint at all.
+        let mut f = a.clone();
+        f.context.complete = false;
+        assert_eq!(fp(&f), None);
+        assert_eq!(a.fingerprint(&dir.path().join("absent")), None);
+        assert_eq!(ConfigSet::default().fingerprint(&build), None);
+    }
+
+    /// An identity not known matches no record, even one holding the same
+    /// empty value (the verifier's finding: an unreadable host binary got
+    /// an empty SHA-256, which a record could share).
+    ///
+    /// Mutation checked: `is_for` without its empty-value refusal: a
+    /// record with an empty SHA-256 is current for an unreadable binary and
+    /// this fails.
+    #[test]
+    fn an_unknown_identity_matches_no_record() {
+        let mut r = record(Host::Codex, &all(Outcome::Passed));
+        r.exe_sha256 = String::new();
+        assert!(!r.is_for("codex", "", "1.2.3", "d"));
+        let mut c = Cache::default();
+        c.put(r);
+        assert!(matches!(c.probed("codex", "", "1.2.3", "d"), Probed::Stale));
+        let mut r = record(Host::Codex, &all(Outcome::Passed));
+        r.config_digest = String::new();
+        assert!(!r.is_for("codex", &"e".repeat(64), "1.2.3", ""));
+        let mut r = record(Host::Codex, &all(Outcome::Passed));
+        r.version = String::new();
+        assert!(!r.is_for("codex", &"e".repeat(64), "", "d"));
+        // The control: the same record with its identity is current.
+        let r = record(Host::Codex, &all(Outcome::Passed));
+        assert!(r.is_for("codex", &"e".repeat(64), "1.2.3", "d"));
+    }
+
+    /// The server line's outcome is what its evidence supports: a record
+    /// that says passed without the shell's run, its allowed write, its
+    /// denied write or the sentinel reads failed.
+    #[test]
+    fn a_server_pass_needs_all_its_evidence() {
+        let full = record(Host::Codex, &all(Outcome::Passed));
+        assert_eq!(full.server.supported(), Outcome::Passed);
+        for strip in 0..4 {
+            let mut r = full.clone();
+            match strip {
+                0 => r.server.control_ran = false,
+                1 => r.server.allowed_write = false,
+                2 => r.server.control_denied = false,
+                _ => r.server.sentinel = Sentinel::Absent,
+            }
+            let c = assemble(Host::Codex, "1.2.3", &cs(Host::Codex), Probed::Current(&r));
+            let line = c.envcloak_server.unwrap_or_else(|| panic!("no line"));
+            assert_eq!(line.probe, Outcome::Failed, "{strip}");
+        }
+        let mut r = full;
+        r.server.outcome = Outcome::Skipped;
+        r.server.control_ran = false;
+        assert_eq!(r.server.supported(), Outcome::Skipped);
+    }
+
+    /// A case its probe did not run is named with the surface, in the
+    /// report, `--json` and the cache, and never reads as passed.
+    #[test]
+    fn a_case_not_run_is_named_with_its_surface() {
+        let mut r = record(Host::ClaudeCode, &all(Outcome::Passed));
+        r.surfaces[2].skipped = vec![Case::AtMention];
+        let c = assemble(
+            Host::ClaudeCode,
+            "1.2.3",
+            &cs(Host::ClaudeCode),
+            Probed::Current(&r),
+        );
+        let file = c
+            .surface(Surface::FileRead)
+            .cloned()
+            .unwrap_or_else(|| panic!());
+        assert_eq!(
+            file.to_string(),
+            "degraded (fails_open_on_timeout, workspace_untrusted; probe=passed, at_mention skipped)"
+        );
+        let text = serde_json::to_string(&file).unwrap_or_default();
+        assert!(text.contains(r#""skipped":["at_mention"]"#), "{text}");
+        assert_eq!(serde_json::from_str::<SurfaceState>(&text).ok(), Some(file));
+        let back: ProbeRecord =
+            serde_json::from_str(&serde_json::to_string(&r).unwrap_or_default())
+                .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(back.surfaces[2].skipped, [Case::AtMention]);
+        // No other surface names it.
+        assert!(c.surfaces.iter().filter(|s| !s.skipped.is_empty()).count() == 1);
     }
 
     #[test]

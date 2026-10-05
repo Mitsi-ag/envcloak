@@ -24,6 +24,17 @@
 //!   denial without it; `"run"` the call is run;
 //! - `control`: `"run"` (the default) runs a benign call; `"fail"` answers
 //!   it with an error;
+//! - `rule`: `"on"` (the default) refuses a `Read` of an env file within
+//!   the working directory as Claude Code's `Read(**/.env*)` deny rule
+//!   does, before any hook, with the host's own words; `"off"` leaves it
+//!   to the hook;
+//! - `sandbox`: what a `Bash` call does when `--settings` turns the
+//!   sandbox on: `"deny"` (the default) lets a `touch` write within the
+//!   working directory only; `"open"` lets it write anywhere; `"closed"`
+//!   nowhere; `"dead"` runs nothing and answers as a sandbox that cannot
+//!   start does (Claude Code's inside a user namespace);
+//! - `server`: what EnvCloak's `run_with_secrets` does: `"outside"` (the
+//!   default) runs its argv, outside any sandbox; `"inside"` refuses it;
 //! - `exit`: the exit code once done (0 by default).
 //!
 //! Test support only: it holds nothing of value, and runs a command only
@@ -44,6 +55,9 @@ struct Mode {
     mention: String,
     tools: String,
     control_fails: bool,
+    rule: bool,
+    sandbox: String,
+    server_outside: bool,
     exit: i32,
 }
 
@@ -60,6 +74,9 @@ fn mode(home: &Path) -> Mode {
         mention: s("mention", "guarded"),
         tools: s("tools", "marker"),
         control_fails: s("control", "run") == "fail",
+        rule: s("rule", "on") == "on",
+        sandbox: s("sandbox", "deny"),
+        server_outside: s("server", "outside") == "outside",
         exit: v
             .get("exit")
             .and_then(Value::as_i64)
@@ -98,6 +115,13 @@ fn main() {
     };
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     let m = mode(&home);
+    // The Bash sandbox, as `--settings` turns it on.
+    let sandboxed = args
+        .iter()
+        .position(|a| a == "--settings")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|t| serde_json::from_str::<Value>(t).ok())
+        .is_some_and(|v| v["sandbox"]["enabled"] == json!(true));
     let transcript = home.join(".claude/projects/fake/session.jsonl");
     let keep = |text: &str| {
         let _ = std::fs::create_dir_all(transcript.parent().unwrap_or(&home));
@@ -142,6 +166,7 @@ fn main() {
         "Read",
         "mcp__ecprobe__echo",
         "mcp__ecprobe__read_file",
+        "mcp__envcloak__run_with_secrets",
     ]
     .iter()
     .map(|n| json!({"name": n, "input_schema": {"type": "object"}}))
@@ -175,7 +200,7 @@ fn main() {
         for c in calls {
             let name = c.get("name").and_then(Value::as_str).unwrap_or("");
             let input = c.get("input").cloned().unwrap_or(Value::Null);
-            let out = call(&m, name, &input);
+            let out = call(&m, sandboxed, name, &input);
             results.push(json!({
                 "type": "tool_result",
                 "tool_use_id": c.get("id").cloned().unwrap_or(Value::Null),
@@ -187,8 +212,57 @@ fn main() {
     std::process::exit(m.exit);
 }
 
+/// Whether `path` is within the working directory, both resolved.
+fn within_cwd(path: &str) -> bool {
+    let (Ok(p), Ok(cwd)) = (
+        std::fs::canonicalize(path),
+        std::env::current_dir().and_then(std::fs::canonicalize),
+    ) else {
+        return false;
+    };
+    p.starts_with(cwd)
+}
+
+/// A `Bash` call in the sandbox `m.sandbox` says: each `;`-separated
+/// command run in turn, a `touch` written only where the sandbox lets it.
+fn sandboxed_shell(m: &Mode, cmd: &str) -> String {
+    if m.sandbox == "dead" {
+        return "apply-seccomp: write /proc/self/uid_map: Operation not permitted".to_owned();
+    }
+    let mut out = String::new();
+    for part in cmd.split(';') {
+        let words: Vec<String> = part
+            .split_whitespace()
+            .map(|w| w.trim_matches('\'').to_owned())
+            .collect();
+        if words.first().map(String::as_str) == Some("touch") {
+            for target in &words[1..] {
+                let parent = Path::new(target)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let lets = match m.sandbox.as_str() {
+                    "open" => true,
+                    "closed" => false,
+                    _ => within_cwd(&parent),
+                };
+                if lets {
+                    let _ = std::fs::write(target, b"");
+                } else {
+                    out.push_str(&format!("touch: {target}: Operation not permitted\n"));
+                }
+            }
+            continue;
+        }
+        if let Ok(o) = Command::new("/bin/sh").args(["-c", part]).output() {
+            out.push_str(&String::from_utf8_lossy(&o.stdout));
+        }
+    }
+    out
+}
+
 /// What a tool call returns.
-fn call(m: &Mode, name: &str, input: &Value) -> String {
+fn call(m: &Mode, sandboxed: bool, name: &str, input: &Value) -> String {
     let s = |k: &str| {
         input
             .get(k)
@@ -221,9 +295,17 @@ fn call(m: &Mode, name: &str, input: &Value) -> String {
             let cmd = s("command");
             if matches!(cmd.trim(), "printenv" | "env") {
                 guarded("env_dump", &|| shell(&cmd))
+            } else if sandboxed {
+                control(&|| sandboxed_shell(m, &cmd))
             } else {
                 control(&|| shell(&cmd))
             }
+        }
+        "Read" if m.rule && env_file(&s("file_path")) && within_cwd(&s("file_path")) => {
+            format!(
+                "Permission to read {} has been denied by your permission settings.",
+                s("file_path")
+            )
         }
         "Read" | "mcp__ecprobe__read_file" => {
             let p = if name == "Read" {
@@ -235,6 +317,26 @@ fn call(m: &Mode, name: &str, input: &Value) -> String {
                 guarded("env_file", &|| read(&p))
             } else {
                 control(&|| read(&p))
+            }
+        }
+        "mcp__envcloak__run_with_secrets" => {
+            if !m.server_outside {
+                return "Error: the server refused the call".to_owned();
+            }
+            let argv: Vec<String> = input
+                .get("argv")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|w| w.as_str().map(str::to_owned))
+                .collect();
+            match argv.split_first() {
+                Some((exe, rest)) => Command::new(exe)
+                    .args(rest)
+                    .status()
+                    .map(|st| format!("exit {}", st.code().unwrap_or(-1)))
+                    .unwrap_or_else(|_| "Error: it did not start".to_owned()),
+                None => "Error: no argv".to_owned(),
             }
         }
         "mcp__ecprobe__echo" => control(&|| format!("{}{}", s("text"), s("more"))),

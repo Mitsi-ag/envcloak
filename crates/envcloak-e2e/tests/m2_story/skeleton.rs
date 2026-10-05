@@ -1464,6 +1464,47 @@ fn ci_runs_the_sandboxed_cases_outside_a_user_namespace_as_required_steps() {
     }
 }
 
+/// The coverage probes' sentinels run again outside a user namespace on
+/// Linux (M2-09; the verifier's finding: Claude Code's sandboxed shell
+/// cannot start inside CI's user namespace, so the matrix's Linux server
+/// line rests on this step): a required step of `agents-e2e`, on Linux,
+/// on every run, naming both sentinel tests and failing unless they ran.
+///
+/// Mutation checked: the step's `--user` namespace kept (`unshare --user
+/// --map-root-user --net --`): this fails.
+#[test]
+fn ci_runs_the_probe_sentinels_outside_a_user_namespace() {
+    let ci = ci_file();
+    let jobs = ci_jobs(&ci);
+    let body = ci_job(&jobs, "agents-e2e");
+    let steps = ci_steps(body, "Probe sentinels outside a user namespace");
+    assert_eq!(steps.len(), 1, "agents-e2e: no single sentinel step");
+    let step = steps[0];
+    assert_eq!(
+        yaml_value(step, 8, "if"),
+        Some("${{ !cancelled() && runner.os == 'Linux' }}"),
+        "the sentinel step does not run on every Linux run"
+    );
+    for needed in ["unshare --net --", "--test probes", "set -o pipefail"] {
+        assert!(step.contains(needed), "the sentinel step lacks {needed:?}");
+    }
+    assert!(
+        !step.contains("--user") && !step.contains("continue-on-error"),
+        "the sentinel step is not a required run outside a user namespace"
+    );
+    let names = exact_names(step);
+    for name in [
+        "claude_code_sentinel_is_what_its_probe_observes",
+        "codex_sentinel_is_what_its_probe_observes",
+    ] {
+        assert!(
+            names.contains(&name),
+            "the sentinel step does not run {name}"
+        );
+    }
+    assert_ran_all(step, names.len(), "agents-e2e");
+}
+
 /// Every step of every job that runs tests by name with `--exact`, the
 /// open-network positive controls included (verifier, low: those ran
 /// `the_network_is_what_ci_says` unguarded, so a renamed test would run
@@ -1699,8 +1740,8 @@ fn exact_names(step: &str) -> Vec<&str> {
 fn target_tests(target: &str) -> Vec<String> {
     match target {
         "m2_story" => story_tests(),
-        "agent_hosts" => {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/agent_hosts.rs");
+        "agent_hosts" | "probes" => {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/{target}.rs"));
             test_fns(&std::fs::read_to_string(path).unwrap(), "")
         }
         other => panic!("ci.yml runs --exact tests of {other}, which no check here lists"),

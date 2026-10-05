@@ -35,7 +35,7 @@ use super::{
     Check, HostFlags, ProbeHome, ProbeHost, ProbeReport, RunSummary, ServerProbe, SurfaceProbe,
     claude, codex,
 };
-use crate::coverage::{Outcome, Reason, Sentinel, Surface};
+use crate::coverage::{Case, Outcome, Reason, Sentinel, Surface};
 use crate::hook::{Host, Reason as Denied};
 use crate::hosts::shell_quote;
 use crate::locations::Locations;
@@ -68,6 +68,8 @@ pub fn run_surfaces(
         server: ServerProbe {
             outcome: Outcome::Skipped,
             sentinel: Sentinel::NotRun,
+            control_ran: false,
+            allowed_write: false,
             control_denied: false,
             checks: Vec::new(),
         },
@@ -90,7 +92,7 @@ pub fn run_surfaces(
         flags,
         runs: Vec::new(),
     };
-    let fixtures = Fixtures::write(&home.project);
+    let fixtures = Fixtures::write(&home.project, &home.root);
     let Ok(fx) = fixtures else {
         // No control could be set up: every probe fails through it.
         for s in Surface::ALL.into_iter().filter(|s| want(*s)) {
@@ -139,6 +141,7 @@ fn skipped(surface: Surface, outcome: Outcome, why: &[Reason]) -> SurfaceProbe {
         checks: Vec::new(),
         persisted: false,
         why: why.to_vec(),
+        skipped: Vec::new(),
     }
 }
 
@@ -154,6 +157,7 @@ fn failed(surface: Surface, why: &'static str) -> SurfaceProbe {
         }],
         persisted: false,
         why: Vec::new(),
+        skipped: Vec::new(),
     }
 }
 
@@ -179,25 +183,44 @@ fn surface(surface: Surface, checks: Vec<Check>) -> SurfaceProbe {
         checks,
         persisted: false,
         why: Vec::new(),
+        skipped: Vec::new(),
     }
 }
 
-/// The files a probe writes into its project: `README.md` holding a
-/// marker (the read control), and `.env` holding another (what must never
-/// reach the model); and a third marker for the host's environment (the
-/// shell probe's).
+/// The files a probe writes: in its project, `README.md` holding a marker
+/// (the read control) and `.env` holding another (what must never reach
+/// the model); the same `.env` in a folder of the probe's own beside the
+/// project ([`ELSEWHERE`]), outside the session's working directory; and a
+/// third marker for the host's environment (the shell probe's).
 struct Fixtures {
     readme: String,
     env_file: Zeroizing<String>,
     env_var: Zeroizing<String>,
+    /// The folder outside the project holding the other `.env`, resolved.
+    elsewhere: PathBuf,
 }
 
+/// The folder of the probe's own, in its root, that holds a `.env`
+/// outside the session's working directory.
+const ELSEWHERE: &str = "ecprobe-elsewhere";
+
 impl Fixtures {
-    fn write(project: &Path) -> std::io::Result<Fixtures> {
+    fn write(project: &Path, root: &Path) -> std::io::Result<Fixtures> {
+        let elsewhere = root.join(ELSEWHERE);
+        match std::fs::DirBuilder::new().mode(0o700).create(&elsewhere) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !std::fs::symlink_metadata(&elsewhere)?.is_dir() {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
         let fx = Fixtures {
             readme: marker("readme")?,
             env_file: Zeroizing::new(marker("envfile")?),
             env_var: Zeroizing::new(marker("envvar")?),
+            elsewhere: std::fs::canonicalize(&elsewhere)?,
         };
         write_file(
             &project.join("README.md"),
@@ -205,6 +228,7 @@ impl Fixtures {
         )?;
         let env = Zeroizing::new(format!("ECPROBE_FIXTURE={}\n", fx.env_file.as_str()));
         write_file(&project.join(".env"), env.as_bytes())?;
+        write_file(&fx.elsewhere.join(".env"), env.as_bytes())?;
         Ok(fx)
     }
 }
@@ -524,18 +548,25 @@ impl Prober<'_, '_> {
             .collect()
     }
 
-    /// File read: a control read, a read of `.env` that must be denied
-    /// with EnvCloak's marker, and (Claude Code) the `@` mentions.
+    /// File read: a control read; the hook's case, a read of a `.env`
+    /// that must be denied with EnvCloak's marker; the rule's case, the
+    /// read EnvCloak's own host rule covers, which must be refused; and
+    /// (Claude Code) the `@` mentions.
     ///
-    /// Claude Code's `Read` names the files by the project's resolved
-    /// path, the one the host's working directory is. Claude Code checks
-    /// its deny rules against that before any hook runs, so the resolved
-    /// path is refused by the `Read(**/.env*)` rule first, without
-    /// EnvCloak's marker, while a path spelled through a link (on macOS
-    /// `/tmp` is one, to `/private/tmp`) passes that check, reaches
-    /// EnvCloak's hook first and meets the rule only after it (measured on
-    /// 2.1.280). The probe makes the call as a session shown the project
-    /// would.
+    /// The hook's case is a call EnvCloak's installed host rules leave to
+    /// the hook, so the marker can only be the hook's and a hook taken out
+    /// fails it; the call a rule covers is the rule's case, refused by the
+    /// rule or the hook. One rule for both hosts (the verifier's finding:
+    /// the two probes treated a refusal by EnvCloak's own rule two ways).
+    /// Claude Code checks its deny rules before any hook, and
+    /// `Read(**/.env*)` matches within the session's working directory
+    /// (measured on 2.1.280: the project's `.env`, named by the resolved
+    /// path the working directory is, is refused by the rule; a `.env`
+    /// outside it reaches EnvCloak's hook), so its hook's case reads the
+    /// `.env` in a folder beside the project ([`ELSEWHERE`]), and its
+    /// rule's case the project's. Codex's `forbidden` rules match `cat
+    /// .env` by its prefix: its hook's case is `cat -- .env`, its rule's
+    /// case `cat .env`.
     fn file_read(&mut self, fx: &Fixtures) -> SurfaceProbe {
         let Ok(project) = std::fs::canonicalize(&self.home.project) else {
             return failed(
@@ -543,21 +574,24 @@ impl Prober<'_, '_> {
                 "the probe's project could not be resolved",
             );
         };
-        let (control_step, probe_step) = if self.claude() {
-            (
+        let steps = if self.claude() {
+            [
                 claude::read_step(&project.join("README.md")),
+                claude::read_step(&fx.elsewhere.join(".env")),
                 claude::read_step(&project.join(".env")),
-            )
+            ]
         } else {
-            (
+            [
                 json!({"shell": "cat README.md"}),
                 json!({"shell": "cat -- .env"}),
-            )
+                json!({"shell": "cat .env"}),
+            ]
         };
+        let [control, hook, rule] = steps;
         let mut spec = self.spec(
             "file read",
-            json!({"steps": [control_step, probe_step, {"say": "done"}]}),
-            "Read the project's README and its .env file.".to_owned(),
+            json!({"steps": [control, hook, rule, {"say": "done"}]}),
+            "Read the project's README and the .env files.".to_owned(),
         );
         if self.claude() {
             spec.probe = claude::permissions(&["Bash", "Read"]);
@@ -565,19 +599,34 @@ impl Prober<'_, '_> {
         let r = self.run(&spec);
         let env_forms = forms(fx.env_file.as_bytes());
         let mut checks = denial_checks(&r, &fx.readme, Denied::EnvFile, &env_forms);
+        checks.push(rule_check(&r, 3, self.host.host));
         drop(r);
+        let mut skipped = Vec::new();
         if self.claude() {
-            checks.extend(self.mentions(fx, &env_forms));
+            let (more, not_run) = self.mentions(fx, &env_forms);
+            checks.extend(more);
+            skipped.extend(not_run);
         }
-        surface(Surface::FileRead, checks)
+        let mut out = surface(Surface::FileRead, checks);
+        out.skipped = skipped;
+        out
     }
 
     /// Claude Code's `@` mentions: `@README.md` (whose content must
     /// arrive) and `@.env` (whose content must not), each prompt carrying a
-    /// marker of its own that must arrive.
-    fn mentions(&mut self, fx: &Fixtures, env_forms: &[Zeroizing<Vec<u8>>]) -> Vec<Check> {
+    /// marker of its own that must arrive. Where the host does not expand
+    /// `@` mentions under `-p`, the case is not run: it is returned apart
+    /// ([`Case::AtMention`]), never as a check that passed.
+    fn mentions(
+        &mut self,
+        fx: &Fixtures,
+        env_forms: &[Zeroizing<Vec<u8>>],
+    ) -> (Vec<Check>, Option<Case>) {
         let (Ok(m1), Ok(m2)) = (marker("mention"), marker("mention")) else {
-            return vec![check("mentions", true, false, "no random bytes")];
+            return (
+                vec![check("mentions", true, false, "no random bytes")],
+                None,
+            );
         };
         let script = json!({"steps": [{"say": "done"}]});
         let spec = self.spec(
@@ -590,23 +639,21 @@ impl Prober<'_, '_> {
         let expanded = arrived && reached(&a.requests, &fx.readme);
         drop(a);
         if !arrived {
-            return vec![check(
-                "an @README.md mention reaches the model",
-                true,
-                false,
-                "the control mention did not reach the model",
-            )];
+            return (
+                vec![check(
+                    "an @README.md mention reaches the model",
+                    true,
+                    false,
+                    "the control mention did not reach the model",
+                )],
+                None,
+            );
         }
         if !expanded {
             // A host that does not expand `@` mentions under `-p` leaves
-            // that case to M2-26's interactive variant: skipped here, which
-            // fails nothing and claims nothing.
-            return vec![check(
-                "the @ mention cases are skipped: the host does not expand them under -p",
-                true,
-                true,
-                "",
-            )];
+            // that case to M2-26's interactive variant: not run here, and
+            // said so with the surface, never counted as passed.
+            return (Vec::new(), Some(Case::AtMention));
         }
         let spec = self.spec(
             "mention probe",
@@ -616,44 +663,54 @@ impl Prober<'_, '_> {
         let b = self.run(&spec);
         let arrived = b.usable() && reached(&b.requests, &m2);
         let leaked = seen(&b.requests, env_forms);
-        vec![
-            check(
-                "an @README.md mention's content reaches the model",
-                true,
-                true,
-                "",
-            ),
-            check(
-                "an @.env mention reaches the model as a prompt",
-                true,
-                arrived,
-                "the @.env prompt did not reach the model",
-            ),
-            check(
-                "the @.env file's content never does",
-                false,
-                !leaked,
-                "the @.env file's content reached the model",
-            ),
-        ]
+        (
+            vec![
+                check(
+                    "an @README.md mention's content reaches the model",
+                    true,
+                    true,
+                    "",
+                ),
+                check(
+                    "an @.env mention reaches the model as a prompt",
+                    true,
+                    arrived,
+                    "the @.env prompt did not reach the model",
+                ),
+                check(
+                    "the @.env file's content never does",
+                    false,
+                    !leaked,
+                    "the @.env file's content reached the model",
+                ),
+            ],
+            None,
+        )
     }
 
     /// Shell: a printed marker must reach the model; printing the
     /// environment must be denied with EnvCloak's marker, and a variable
-    /// of the host's environment never reach it.
+    /// of the host's environment never reach it. As for the file read
+    /// ([`Self::file_read`]), the hook's case is a call EnvCloak's host
+    /// rules leave to the hook (Codex's `forbidden` rules match `printenv`,
+    /// so Codex's is `env`), and Codex's rule's case, `printenv`, must be
+    /// refused; Claude Code has no host rule for the shell.
     fn shell(&mut self, fx: &Fixtures) -> SurfaceProbe {
         let Ok(ctl) = marker("shell") else {
             return failed(Surface::Shell, "no random bytes");
         };
         let (a, b) = halves(&ctl);
-        let dump = if self.claude() { "printenv" } else { "env" };
+        let mut steps = vec![json!({"shell": format!("printf '%s%s\\n' '{a}' '{b}'")})];
+        if self.claude() {
+            steps.push(json!({"shell": "printenv"}));
+        } else {
+            steps.push(json!({"shell": "env"}));
+            steps.push(json!({"shell": "printenv"}));
+        }
+        steps.push(json!({"say": "done"}));
         let mut spec = self.spec(
             "shell",
-            json!({"steps": [
-                {"shell": format!("printf '%s%s\\n' '{a}' '{b}'")},
-                {"shell": dump},
-                {"say": "done"},
-            ]}),
+            json!({ "steps": steps }),
             "Print a marker, then the environment.".to_owned(),
         );
         if self.claude() {
@@ -662,10 +719,11 @@ impl Prober<'_, '_> {
         spec.env = vec![(ENV_NAME.into(), fx.env_var.as_str().into())];
         let r = self.run(&spec);
         let env_forms = forms(fx.env_var.as_bytes());
-        surface(
-            Surface::Shell,
-            denial_checks(&r, &ctl, Denied::EnvDump, &env_forms),
-        )
+        let mut checks = denial_checks(&r, &ctl, Denied::EnvDump, &env_forms);
+        if !self.claude() {
+            checks.push(rule_check(&r, 3, self.host.host));
+        }
+        surface(Surface::Shell, checks)
     }
 
     /// MCP: the fixture server's `echo` must answer; its `read_file` of
@@ -785,12 +843,22 @@ impl Prober<'_, '_> {
         )
     }
 
-    /// EnvCloak's server: the host's own shell is denied a write in the
-    /// probe home, and a command `run_with_secrets` starts makes it.
+    /// EnvCloak's server: the host's own shell, in its sandbox, makes a
+    /// write in the project (where the sandbox lets it) and is denied one
+    /// beside the sentinel's in the probe home, then prints a marker,
+    /// which must come back in its result: the witness that the shell ran
+    /// (Codex F-133: without it a shell that never ran, refused by a hook
+    /// or by a sandbox that cannot start, read as a denied write). Then a
+    /// command `run_with_secrets` starts makes the sentinel's write. Each
+    /// is a check of its own and kept with the result, so the outcome
+    /// shown is the one the evidence supports
+    /// (`coverage::ServerObserved::supported`).
     fn sentinel(&mut self) -> ServerProbe {
         let mut out = ServerProbe {
             outcome: Outcome::Skipped,
             sentinel: Sentinel::NotRun,
+            control_ran: false,
+            allowed_write: false,
             control_denied: false,
             checks: Vec::new(),
         };
@@ -807,12 +875,14 @@ impl Prober<'_, '_> {
             out.outcome = Outcome::Failed;
             return out;
         }
-        let control = dir.join("shell");
+        let denied = dir.join("shell");
+        let allowed = self.home.project.join(format!("{nonce}-ok"));
         let sentinel = dir.join("mcp");
         let (a, b) = halves(&ran);
         let shell = format!(
-            "touch {}; printf '%s%s\\n' '{a}' '{b}'",
-            shell_quote(&control.to_string_lossy())
+            "touch {}; touch {}; printf '%s%s\\n' '{a}' '{b}'",
+            shell_quote(&denied.to_string_lossy()),
+            shell_quote(&allowed.to_string_lossy())
         );
         let input = json!({
             "project_dir": project.to_string_lossy(),
@@ -839,8 +909,11 @@ impl Prober<'_, '_> {
         spec.approve = true;
         let r = self.run(&spec);
         let usable = r.usable();
+        out.control_ran = usable && contains(r.after(1).as_bytes(), ran.as_bytes());
         drop(r);
-        out.control_denied = !control.exists();
+        out.allowed_write = out.control_ran && allowed.exists();
+        out.control_denied = out.allowed_write && !denied.exists();
+        let _ = std::fs::remove_file(&allowed);
         let appeared = sentinel.exists();
         out.sentinel = if appeared {
             Sentinel::Appeared
@@ -855,10 +928,22 @@ impl Prober<'_, '_> {
                 "the host's run did not finish cleanly",
             ),
             check(
-                "the host's own shell is denied the write",
+                "the host's own shell ran the control",
+                true,
+                out.control_ran,
+                "the shell's marker did not come back: the control did not run",
+            ),
+            check(
+                "the host's own shell wrote where its sandbox lets it",
+                true,
+                out.allowed_write,
+                "the shell's write in the project is not there: no denial can be told apart",
+            ),
+            check(
+                "the host's own shell is denied the write beside the sentinel's",
                 true,
                 out.control_denied,
-                "the host's sandbox let its shell write there",
+                "the host's sandbox let its shell write there, or the shell did not run",
             ),
             check(
                 "a command run_with_secrets started made the write",
@@ -873,6 +958,30 @@ impl Prober<'_, '_> {
             Outcome::Failed
         };
         out
+    }
+}
+
+/// The rule's case of a probe ([`Prober::file_read`]): the call of step
+/// `n - 1`, one EnvCloak's own host rule covers, is refused, by that rule
+/// (the host's refusal under it, named from a fixed list:
+/// [`controls::rule_refusal`]) or by EnvCloak's hook (its marker).
+/// What refused it is named in the check's `why` either way, from the
+/// fixed list.
+fn rule_check(r: &HostRun, n: usize, host: Host) -> Check {
+    let name = "the call EnvCloak's host rule covers is refused";
+    let result = r.after(n);
+    let by = if !r.usable() {
+        Err("no refusal of the call EnvCloak's host rule covers reached the model")
+    } else if contains(result.as_bytes(), b"[envcloak:") {
+        Ok("EnvCloak's hook, with its marker")
+    } else {
+        controls::rule_refusal(host, &result).ok_or_else(|| unmarked(&result))
+    };
+    Check {
+        name,
+        control: false,
+        passed: by.is_ok(),
+        why: by.unwrap_or_else(|why| why),
     }
 }
 
@@ -1005,6 +1114,25 @@ mod tests {
             deny(Host::Codex, "Bash", json!({"command": "cat -- .env"})),
             Decision::Deny(Denied::EnvFile)
         );
+        // The rule's cases: what EnvCloak's host rules cover, which the
+        // hook denies too, so the case passes whichever answers first.
+        assert_eq!(
+            deny(Host::Codex, "Bash", json!({"command": "cat .env"})),
+            Decision::Deny(Denied::EnvFile)
+        );
+        assert_eq!(
+            deny(Host::Codex, "Bash", json!({"command": "printenv"})),
+            Decision::Deny(Denied::EnvDump)
+        );
+        // Claude Code's hook case: a `.env` outside the working directory.
+        assert_eq!(
+            deny(
+                Host::ClaudeCode,
+                "Read",
+                json!({"file_path": "/q/ecprobe-elsewhere/.env"})
+            ),
+            Decision::Deny(Denied::EnvFile)
+        );
         assert_eq!(
             deny(Host::Codex, "Bash", json!({"command": "cat README.md"})),
             Decision::Allow
@@ -1022,6 +1150,91 @@ mod tests {
             Decision::Allow
         );
         let _ = Event::ALL;
+    }
+
+    /// The rule's case passes on a refusal the host gives under EnvCloak's
+    /// own rule, or on EnvCloak's marker, and on nothing else: a generic
+    /// denial, no result, a run that did not finish.
+    ///
+    /// Mutation checked: `rule_check` passing whatever the result
+    /// (`passed: true`): the generic denial passes and this fails.
+    #[test]
+    fn a_rule_case_needs_a_known_refusal() {
+        let req = |n: usize, out: &str| {
+            let body = json!({"messages": [
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "a",
+                  "content": out}]},
+            ]});
+            Recorded {
+                seq: n as u64,
+                at_ms: 0,
+                method: "POST".to_owned(),
+                path: "/v1/messages".to_owned(),
+                query: None,
+                headers: Vec::new(),
+                values: Vec::new(),
+                forward: Zeroizing::new(Vec::new()),
+                status: 200,
+                answered: true,
+                api: Some("messages".to_owned()),
+                pick: Some(format!("step {n}")),
+                body: Zeroizing::new(body.to_string().into_bytes()),
+            }
+        };
+        let run = |out: &str, exit: Option<i32>| HostRun {
+            requests: vec![req(3, out)],
+            clean: true,
+            exit,
+            timed_out: false,
+            approved: None,
+        };
+        for (host, out, exit, passed) in [
+            (
+                Host::ClaudeCode,
+                "Permission to read /p/.env has been denied by your permission settings.",
+                Some(0),
+                true,
+            ),
+            (
+                Host::ClaudeCode,
+                "[envcloak:env_file] stopped",
+                Some(0),
+                true,
+            ),
+            (
+                Host::Codex,
+                "exec_command failed: CreateProcess { message: \"Rejected(\\\"`/bin/zsh -lc \
+                 printenv` rejected: It prints environment variables, which can hold keys. Run a \
+                 command that needs a key as `envcloak run -- <command>`, and use `envcloak ls` \
+                 to see which keys exist.\\\")\" }",
+                Some(0),
+                true,
+            ),
+            (
+                Host::Codex,
+                "exec_command failed: rejected: by a rule of the person's own",
+                Some(0),
+                false,
+            ),
+            (Host::ClaudeCode, "Permission denied", Some(0), false),
+            (
+                Host::Codex,
+                "Permission to read /p/.env has been denied by your permission settings.",
+                Some(0),
+                false,
+            ),
+            (Host::ClaudeCode, "", Some(0), false),
+            (
+                Host::ClaudeCode,
+                "[envcloak:env_file] stopped",
+                Some(1),
+                false,
+            ),
+        ] {
+            let c = rule_check(&run(out, exit), 3, host);
+            assert_eq!(c.passed, passed, "{host:?} {out:?} {exit:?}: {c:?}");
+            assert!(!c.why.is_empty());
+        }
     }
 
     #[test]

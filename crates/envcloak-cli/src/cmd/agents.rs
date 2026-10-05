@@ -20,12 +20,17 @@
 //!   tokens and its probe outcome, failed probes first, and EnvCloak's
 //!   own MCP server line (`outside_host_sandbox`, with the sentinel
 //!   probe's evidence). States rest on the probe results kept for this
-//!   host binary (its SHA-256), version and configuration digest
-//!   (`<data>/agents/coverage.json`), recomputed here from the person's
-//!   real configuration, read-only: a result for anything else reads
+//!   host binary (its SHA-256), version and probe context (the
+//!   fingerprint of the configuration facts, every configuration file the
+//!   host reads, the programs EnvCloak's hooks run and this `envcloak`
+//!   build; `<data>/agents/coverage.json`), recomputed here from the
+//!   person's real configuration, read-only: a result for anything else,
+//!   or when the binary or the context cannot be wholly identified, reads
 //!   `unverified (changed_since_probe)`, none at all `unverified
 //!   (not_probed)`, and only a passed probe that nothing degrades reads
-//!   `active`. Exit 0 once the report is printed. Before it, a double
+//!   `active`. A host told only by the name of an executable on `PATH`
+//!   (Copilot CLI, OpenCode, Goose) is said to be not identified
+//!   (`identified_by`). Exit 0 once the report is printed. Before it, a double
 //!   install is refused (exit 1, `double_install`): EnvCloak's Claude
 //!   Code plugin enabled (in the user's settings, or the working
 //!   directory's project or local settings) while EnvCloak's own hooks
@@ -182,6 +187,11 @@ struct Row {
     /// `current`, `changed_since_probe` or `not_probed`: what the states
     /// rest on.
     probed: &'static str,
+    /// How the host was told: `version` (its version line, read the way
+    /// the catalog reads the host's), or `executable_name` (an executable
+    /// of that name on `PATH`, which another program can have: the
+    /// verifier's finding, `goose` is also a database migration tool).
+    identified_by: &'static str,
     coverage: Coverage,
 }
 
@@ -228,11 +238,15 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
                     tier: 1,
                     exe: detect::find_on_path(detect::exe_name(host), &path),
                     probed: "not_probed",
+                    identified_by: "executable_name",
                     coverage: c,
                 });
                 continue;
             }
         };
+        // A binary that cannot be read, or a context not wholly identified
+        // (`ConfigSet::fingerprint`), is an identity no record matches:
+        // an empty value never does (`ProbeRecord::is_for`).
         let sha = std::fs::canonicalize(&d.exe)
             .ok()
             .and_then(|p| coverage::file_sha256(&p))
@@ -244,7 +258,11 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
             &project,
             &env,
         );
-        let probed = cache.probed(host.id(), &sha, &d.version, &cs.digest());
+        let fingerprint = std::env::current_exe()
+            .ok()
+            .and_then(|me| cs.fingerprint(&me))
+            .unwrap_or_default();
+        let probed = cache.probed(host.id(), &sha, &d.version, &fingerprint);
         let word = match probed {
             Probed::Current(_) => "current",
             Probed::Stale => "changed_since_probe",
@@ -255,6 +273,7 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
             tier: 1,
             exe: Some(d.exe.clone()),
             probed: word,
+            identified_by: "version",
             coverage: coverage::assemble(host, &d.version, &cs, probed),
         });
     }
@@ -270,6 +289,7 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
             tier: 2,
             exe: Some(found),
             probed: "not_probed",
+            identified_by: "executable_name",
             coverage: Coverage {
                 agent: id.to_owned(),
                 version: None,
@@ -304,6 +324,7 @@ fn print_coverage(rows: &[Row], json: bool) {
                 v["tier"] = json!(r.tier);
                 v["exe"] = json!(r.exe.as_ref().map(|p| shown(&home, p)));
                 v["probed"] = json!(r.probed);
+                v["identified_by"] = json!(r.identified_by);
                 v
             })
             .collect();
@@ -321,9 +342,20 @@ fn print_coverage(rows: &[Row], json: bool) {
         .max()
         .unwrap_or(0);
     for r in rows {
+        let exe = r
+            .exe
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| escape_for_display(&n.to_string_lossy()))
+            .unwrap_or_default();
         match &r.coverage.version {
             Some(v) => println!("{} {}", r.name, escape_for_display(v)),
-            None => println!("{} (version not read)", r.name),
+            None if r.tier == 1 => println!("{} (version not read)", r.name),
+            None => println!(
+                "{} (not identified: an executable named {exe} is on PATH, which may be another \
+                 program)",
+                r.name
+            ),
         }
         for s in &r.coverage.surfaces {
             println!("  {:width$}  {s}", s.surface.shown());
