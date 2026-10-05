@@ -68,5 +68,13 @@
 # code owner's review from the first file.
 /apps/macos/                                 @Mitsi-ag
 /scripts/macos/                              @Mitsi-ag
+# What the app compiles and ships from outside apps/macos (task M3-02): the
+# brand's motion file (linked into EnvCloakDesign), icon and menu bar
+# template; and the two scripts that decide whether the app's Swift checks
+# cover what was compiled (check-sources.sh --swift) and whether the
+# macos-app job runs on a pull request (ci-paths.py).
+/assets/brand/                               @Mitsi-ag
+/scripts/check-sources.sh                    @Mitsi-ag
+/scripts/ci-paths.py                         @Mitsi-ag
 /crates/envcloak-sys/src/peer_code.rs        @Mitsi-ag
 /crates/envcloak-sys/src/peer_code/          @Mitsi-ag

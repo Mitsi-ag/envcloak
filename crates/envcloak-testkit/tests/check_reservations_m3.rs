@@ -895,9 +895,15 @@ fn a_dotted_field_is_read_and_a_malformed_one_fails() {
 /// whose edits the SPEC check leaves to a code owner's review for the
 /// paraphrases it misses (round three's verifier: no line named it).
 ///
+/// Task M3-02 adds what the app compiles and ships from outside
+/// apps/macos (the brand's motion file, icon and menu template, under
+/// /assets/brand/) and the two scripts that decide whether the app's Swift
+/// checks cover what was compiled and whether its CI job runs
+/// (check-sources.sh, ci-paths.py).
+///
 /// Mutations checked: the `/apps/macos/` line removed from
-/// .github/CODEOWNERS; separately the `/docs/SPEC.md` line removed: this
-/// test fails for each.
+/// .github/CODEOWNERS; separately the `/docs/SPEC.md` line removed; and
+/// the `/assets/brand/` line removed: this test fails for each.
 #[test]
 fn codeowners_name_an_owner_for_the_m3_paths() {
     let text = std::fs::read_to_string(repo_root().join(".github/CODEOWNERS")).unwrap();
@@ -920,6 +926,9 @@ fn codeowners_name_an_owner_for_the_m3_paths() {
         "/scripts/check-reservations-baseline.txt",
         "/scripts/check-spec-decisions.py",
         "/docs/SPEC.md",
+        "/assets/brand/",
+        "/scripts/check-sources.sh",
+        "/scripts/ci-paths.py",
     ] {
         assert!(
             owned.iter().any(|(p, owners)| *p == want && *owners > 0),
