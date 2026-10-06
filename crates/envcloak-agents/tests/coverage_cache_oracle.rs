@@ -117,6 +117,7 @@ fn producer(host: Host, step: usize, outcome: Outcome) -> ProbeReport {
         flags: vec![format!("fixture-context-{step}")],
         exe_sha256: "a".repeat(64),
         config_digest: "b".repeat(64),
+        config_shape: "c".repeat(64),
     }
 }
 fn host(n: usize) -> Host {

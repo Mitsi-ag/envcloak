@@ -294,6 +294,11 @@ pub struct ProbeReport {
     /// environment, with the `envcloak` the probe ran), read before and
     /// after: empty when it could not be read whole or changed meanwhile.
     pub config_digest: String,
+    /// The probe context's shape (`coverage::ConfigSet::shape`, relative
+    /// to the probe's `HOME`), read before and after: what a result
+    /// measured in a probe home can be compared with the person's
+    /// configuration by (M2-28). Empty as `config_digest` is.
+    pub config_shape: String,
 }
 
 impl ProbeReport {

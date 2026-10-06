@@ -57,8 +57,11 @@
 //!   published for. A result is kept (`<data>/agents/coverage.json`) only
 //!   under the identity it measured: the binary the person's `PATH` leads
 //!   to and the person's configuration, unchanged while the probe ran, with
-//!   their hooks running this `envcloak`; otherwise the report says why it
-//!   was not kept. Exit 0 once the report is printed; 1 with
+//!   their hooks running this `envcloak` and their configuration of the
+//!   probe home's shape (`ConfigSet::shape`: EnvCloak's entries as written,
+//!   the facts the probes act out, the stores); otherwise the report says
+//!   why it was not kept. Each host is asked its version in a probe home of
+//!   its own too, never with the person's `HOME`. Exit 0 once the report is printed; 1 with
 //!   `probe_unavailable` when a host's probe could not be set up (the
 //!   programs it needs are not beside this `envcloak`, or its probe home,
 //!   daemon, vault or install could not be made), after the report.
@@ -186,7 +189,7 @@ fn run_status(args: &[&str]) -> ExitCode {
     if let Some(text) = double_install() {
         return Failure::new("double_install", text).report(FAILURE);
     }
-    match coverage_report() {
+    match coverage_report(&|host, path| detect::detect(host, path, &env)) {
         Ok(rows) => {
             print_coverage(&rows, json);
             ExitCode::SUCCESS
@@ -300,6 +303,15 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
         .filter_map(|m| env(m).map(|v| (OsString::from(m), v)))
         .collect();
     let person_socket = envcloak_ipc::RunPaths::for_user().ok().map(|p| p.socket);
+    // The hosts are asked their versions in a probe home of their own, as
+    // they are probed (Codex review of M2-28): a host, or a launcher in
+    // its place, that reads or writes its home as it answers reaches
+    // nothing of the person's, nor their working directory.
+    let version_home =
+        probe::home::ProbeHome::create_in(Path::new(probe::home::TMP), person_socket.as_deref())
+            .map_err(|e| unavailable(e.message()))?;
+    let mut version_env = version_home.env();
+    version_env.push(("PATH".into(), path.clone()));
     let hosts: Vec<Host> = if a.hosts.is_empty() {
         install::TIER_1.to_vec()
     } else {
@@ -318,7 +330,7 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
     let mut kept_any = false;
     let mut cache = Cache::load(&cache_path);
     for host in hosts {
-        let d = match detect::detect(host, &path, &env) {
+        let d = match detect::detect_with(host, &path, &version_env) {
             Ok(d) => d,
             Err(DetectError::NotFound) if a.hosts.is_empty() => continue,
             Err(e) => {
@@ -356,6 +368,7 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
         let run = probe::local::probe_host(&host_exe, &opts);
         let after_set = read(host);
         let after = after_set.fingerprint(&me);
+        let shape = after_set.shape(locations.home(), &me);
         let (run, kept) = match run {
             Ok(r) => {
                 let person = probe::local::PersonIdentity {
@@ -364,6 +377,7 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
                     after: after.as_deref(),
                     programs: &after_set.context.programs,
                     envcloak_sha256: &me_sha,
+                    shape: shape.as_deref(),
                 };
                 let kept = match probe::local::keep_record(&r, &person) {
                     Ok(record) => {
@@ -391,7 +405,16 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
             }
         }
     }
-    let rows = coverage_report()?;
+    let rows = coverage_report(&|host, path| detect::detect_with(host, path, &version_env));
+    // Its own, emptied whatever was said: nothing of it is the person's.
+    let removed = version_home.remove().is_ok();
+    let rows = rows?;
+    if !removed {
+        return Err(unavailable(
+            "the probe home the hosts were asked their versions in could not be removed; the \
+             next run removes it",
+        ));
+    }
     print_probes(&done, &swept, &rows, a.json);
     if done.iter().any(|h| h.run.is_err()) {
         return Err(unavailable(
@@ -610,7 +633,11 @@ struct Row {
 
 /// The report: each tier-1 host found on `PATH`, then each host whose
 /// documentation leaves a surface no contract.
-fn coverage_report() -> Result<Vec<Row>, Failure> {
+/// How a host's version is asked: [`detect::detect`] for `status`,
+/// [`detect::detect_with`] a probe home's environment for `status --probe`.
+type Detector<'a> = dyn Fn(Host, &std::ffi::OsStr) -> Result<detect::Detected, DetectError> + 'a;
+
+fn coverage_report(detect: &Detector<'_>) -> Result<Vec<Row>, Failure> {
     let locations = Locations::from_env().map_err(|_| {
         Failure::new(
             "no_home",
@@ -633,7 +660,7 @@ fn coverage_report() -> Result<Vec<Row>, Failure> {
     let cwd = working_dir()?;
     let mut rows = Vec::new();
     for host in install::TIER_1 {
-        let detected = detect::detect(host, &path, &env);
+        let detected = detect(host, &path);
         let d = match detected {
             Ok(d) => d,
             Err(DetectError::NotFound) => continue,

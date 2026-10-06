@@ -33,6 +33,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use envcloak_policy::PendingId;
@@ -43,6 +44,8 @@ use super::local::ProbeDaemon;
 pub const APPROVE_LIMIT: Duration = Duration::from_secs(120);
 /// How long to wait between two looks at the pending requests.
 const POLL: Duration = Duration::from_millis(250);
+/// How long the output of a finished `envcloak approve` is read for.
+pub const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Why an approval was not given. Value-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,7 +54,8 @@ pub enum ApproveError {
     NoVault,
     /// `envcloak approve` could not be started.
     Spawn,
-    /// It did not finish within its limit, and was stopped.
+    /// It did not finish within its limit or the host run's, or the run
+    /// ended first, and it was stopped.
     TimedOut,
     /// It exited with this code: the daemon refused the approval (a proof
     /// refused, the request gone), or the command refused it first.
@@ -73,7 +77,13 @@ impl ApproveError {
 /// Approves request `id` of the probe daemon, once (see the module
 /// documentation): `envcloak` is the `envcloak` to run, `markers` the
 /// agent markers of this process's environment, which the command gets
-/// too.
+/// too. It is given until `deadline` (the host run's) or [`APPROVE_LIMIT`],
+/// whichever comes first, and is stopped once `stop` is set (the host's run
+/// ended): a command past either is killed while it is this process's own
+/// unreaped child (D-34), then reaped, and its output is read for at most
+/// [`DRAIN_GRACE`] more (a process it left holding its output does not hold
+/// this one). A child whose state cannot be read is taken as running, and
+/// is killed before it is waited for (Codex cycle488 F144).
 ///
 /// # Errors
 /// See [`ApproveError`].
@@ -82,6 +92,8 @@ pub fn approve_pending(
     id: &PendingId,
     envcloak: &Path,
     markers: &[(OsString, OsString)],
+    deadline: Instant,
+    stop: &AtomicBool,
 ) -> Result<(), ApproveError> {
     let pass = daemon.passphrase().ok_or(ApproveError::NoVault)?;
     let (read, write) = envcloak_sys::pipe_cloexec().map_err(|_| ApproveError::Spawn)?;
@@ -107,12 +119,40 @@ pub fn approve_pending(
     // only read side, so the pipe ends for it once the passphrase is in.
     drop(cmd);
     drop(read);
-    let mut child = spawned.map_err(|_| ApproveError::Spawn)?;
+    let child = spawned.map_err(|_| ApproveError::Spawn)?;
     let mut write = std::fs::File::from(write);
     let written = write
         .write_all(pass.as_bytes())
         .and_then(|()| write.write_all(b"\n"));
     drop(write);
+    let (stopped, status) = await_child(child, approval_end(deadline), stop);
+    if stopped {
+        return Err(ApproveError::TimedOut);
+    }
+    match status {
+        Ok(s) if s.success() && written.is_ok() => Ok(()),
+        Ok(s) => Err(ApproveError::Refused(s.code().unwrap_or(-1))),
+        Err(_) => Err(ApproveError::Spawn),
+    }
+}
+
+/// When an approval started now must end: the host run's `deadline`, or
+/// [`APPROVE_LIMIT`] from now, whichever comes first.
+fn approval_end(deadline: Instant) -> Instant {
+    deadline.min(Instant::now() + APPROVE_LIMIT)
+}
+
+/// Waits for `child` (its standard output and error piped) until `end` or
+/// until `stop` is set, reading and dropping its output; one still running
+/// then, or whose state cannot be read, is killed while it is this
+/// process's own unreaped child (D-34). Reaps it, and reads its output for
+/// at most [`DRAIN_GRACE`] more. Returns whether it was stopped, and its
+/// status.
+fn await_child(
+    mut child: std::process::Child,
+    end: Instant,
+    stop: &AtomicBool,
+) -> (bool, std::io::Result<std::process::ExitStatus>) {
     let drains: Vec<_> = [
         child
             .stdout
@@ -124,32 +164,38 @@ pub fn approve_pending(
             .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
     ]
     .into_iter()
-    .map(|s| std::thread::spawn(move || drain(s)))
+    .map(|s| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drain(s);
+            let _ = tx.send(());
+        });
+        rx
+    })
     .collect();
     let pid = i32::try_from(child.id()).unwrap_or(0);
-    let end = Instant::now() + APPROVE_LIMIT;
-    let mut timed_out = false;
-    while !envcloak_sys::has_exited(pid).unwrap_or(true) {
-        if Instant::now() > end {
-            timed_out = true;
-            // Still this process's own unreaped child (D-34).
-            let _ = child.kill();
-            break;
+    let mut stopped = false;
+    loop {
+        match envcloak_sys::has_exited(pid) {
+            Ok(true) => break,
+            Ok(false) if Instant::now() < end && !stop.load(Ordering::SeqCst) => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // Past its time, told to stop, or its state not known: still
+            // this process's own unreaped child, so the signal is its.
+            _ => {
+                stopped = true;
+                let _ = child.kill();
+                break;
+            }
         }
-        std::thread::sleep(Duration::from_millis(20));
     }
     let status = child.wait();
+    let grace = Instant::now() + DRAIN_GRACE;
     for d in drains {
-        let _ = d.join();
+        let _ = d.recv_timeout(grace.saturating_duration_since(Instant::now()));
     }
-    if timed_out {
-        return Err(ApproveError::TimedOut);
-    }
-    match status {
-        Ok(s) if s.success() && written.is_ok() => Ok(()),
-        Ok(s) => Err(ApproveError::Refused(s.code().unwrap_or(-1))),
-        Err(_) => Err(ApproveError::Spawn),
-    }
+    (stopped, status)
 }
 
 /// Reads what a stream says to its end, and drops it.
@@ -216,7 +262,14 @@ impl super::Approver for ProbeApprover<'_> {
                 .and_then(|l| l.requests.into_iter().next())
                 .and_then(|r| PendingId::parse(&r.request));
             if let Some(id) = first {
-                return match approve_pending(self.daemon, &id, &self.envcloak, &self.markers) {
+                return match approve_pending(
+                    self.daemon,
+                    &id,
+                    &self.envcloak,
+                    &self.markers,
+                    deadline,
+                    stop,
+                ) {
                     Ok(()) => {
                         self.given.fetch_add(1, Ordering::SeqCst);
                         Ok(())
@@ -227,5 +280,69 @@ impl super::Approver for ProbeApprover<'_> {
             std::thread::sleep(POLL);
         }
         Err("no request was pending".to_owned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sh(script: &str) -> std::process::Child {
+        Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// An approval command is held to the host run's deadline and its stop,
+    /// not to its own limit alone, and a process it leaves holding its
+    /// output does not hold the wait (Codex cycle488 F144). Mutations
+    /// checked: the deadline left out of `approval_end` (`APPROVE_LIMIT`
+    /// alone: its end is then two minutes on); the stop flag not looked at
+    /// (the second case waits for its deadline); the output drains joined
+    /// without a bound (the third case waits for the left process, 30 s).
+    #[test]
+    fn an_approval_is_held_to_the_runs_deadline_and_stop() {
+        let soon = Instant::now() + Duration::from_millis(500);
+        assert!(approval_end(soon) <= soon);
+        let later = Instant::now() + Duration::from_secs(3600);
+        assert!(approval_end(later) <= Instant::now() + APPROVE_LIMIT);
+        let t = Instant::now();
+        let (stopped, _) = await_child(
+            sh("sleep 30"),
+            Instant::now() + Duration::from_millis(500),
+            &AtomicBool::new(false),
+        );
+        assert!(stopped);
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+
+        let t = Instant::now();
+        let stop = AtomicBool::new(false);
+        let (stopped, _) = std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(300));
+                stop.store(true, Ordering::SeqCst);
+            });
+            await_child(
+                sh("sleep 30"),
+                Instant::now() + Duration::from_secs(60),
+                &stop,
+            )
+        });
+        assert!(stopped);
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+
+        let t = Instant::now();
+        let (stopped, status) = await_child(
+            sh("sleep 30 & echo done; exit 3"),
+            Instant::now() + Duration::from_secs(60),
+            &AtomicBool::new(false),
+        );
+        assert!(!stopped);
+        assert_eq!(status.ok().and_then(|s| s.code()), Some(3));
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
     }
 }
