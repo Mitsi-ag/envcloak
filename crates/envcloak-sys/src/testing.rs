@@ -842,19 +842,10 @@ pub fn signal_this_thread(sig: i32) -> io::Result<()> {
     Ok(())
 }
 
-/// Test support only: `kill(target, sig)` as the system call returns it (0,
-/// or -1 with `errno` set), for a harness that signals itself, its own
-/// group, or a child it started and has not reaped, as the kernel
-/// behaviour it measures needs. EnvCloak's own code signals only through
-/// an owned handle ([`crate::OwnedChild`], M2 plan D-34; `clippy.toml`
-/// bans `libc::kill` elsewhere); this is not built without the `testing`
-/// feature, which only tests enable.
-pub fn kill_raw(target: i32, sig: i32) -> libc::c_int {
-    match crate::owned::kill_number(target, sig) {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
-}
+/// Test support only: `kill(target, sig)` as the system call returns it
+/// ([`crate::owned::kill_raw`], kept beside the one `kill` call so this
+/// file names no numeric signal call).
+pub use crate::owned::kill_raw;
 
 /// Does what the installed [`crate::SignalRelay`]'s handler does with a
 /// signal that finds the relay's pipe full (review F-71): keeps `sig`,
