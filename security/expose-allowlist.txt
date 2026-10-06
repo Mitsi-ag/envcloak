@@ -38,3 +38,4 @@ crates/envcloak-scan/src/agent_config.rs     # config bindings and envFile paths
 crates/envcloak-scan/src/json.rs             # bounded duplicate-key fingerprints; string decoding stays in wiping buffers
 crates/envcloak-scan/tests/profiles.rs       # independent Bash oracle digests synthetic fixtures only
 crates/envcloak-scan/tests/scanner_probe.rs  # deliberate positive-control copy of synthetic allocator fixtures
+crates/envcloak-scan/tests/transcript_oracle.rs # hashes synthetic candidate values for the independent range oracle
