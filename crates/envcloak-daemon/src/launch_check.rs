@@ -668,12 +668,75 @@ fn recheck(rec: &FileIdentity, part: Part) -> Result<File, CheckError> {
     Ok(f)
 }
 
+/// A record may predate stricter declaration or interpreter policy. Check
+/// both its original declaration and its prepared argv/environment, then
+/// require its cached class, entry and strength to agree. Nothing here
+/// resolves PATH or reads a shebang again: the recorded images stay fixed.
+fn stored_policy_matches(l: &RegisteredLaunch) -> bool {
+    if check_declaration(&l.declaration).is_err()
+        || l.env
+            .vars
+            .iter()
+            .any(|(name, _)| envcloak_policy::managed::is_code_selecting(name))
+    {
+        return false;
+    }
+    let declaration_class = match classify_argv(&l.declaration.argv) {
+        Ok(class) => class,
+        Err(_) => return false,
+    };
+    let class_matches = match declaration_class {
+        ArgvClass::Program => matches!(l.class, LaunchClass::Native | LaunchClass::Script),
+        ArgvClass::Interpreter { .. } => l.class == LaunchClass::Script,
+        ArgvClass::PackageRunner { .. } => l.class == LaunchClass::PackageRunner,
+    };
+    if !class_matches {
+        return false;
+    }
+    let Ok(argv) = l
+        .argv
+        .iter()
+        .map(|a| String::from_utf8(a.clone()))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return false;
+    };
+    let canonical = Path::new(std::ffi::OsStr::from_bytes(&l.executable.path));
+    let canonical_name = canonical.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let Ok(class) = refuse_disguised(&argv, canonical_name) else {
+        return false;
+    };
+    let entry_at = |at: usize| {
+        l.entry
+            .as_ref()
+            .is_some_and(|e| argv.get(at).is_some_and(|a| a.as_bytes() == e.path))
+    };
+    let at_rest = l.strength == BindingStrength::CheckedAtRest;
+    match class {
+        ArgvClass::Program if l.class == LaunchClass::Native => l.entry.is_none(),
+        ArgvClass::Program => at_rest && entry_at(1),
+        ArgvClass::Interpreter { entry } => {
+            l.class != LaunchClass::Native && at_rest && entry_at(entry)
+        }
+        ArgvClass::PackageRunner { .. } => {
+            l.class == LaunchClass::PackageRunner && at_rest && l.entry.is_none()
+        }
+    }
+}
+
 /// Checks `l` before its values are released (see the module
 /// documentation).
 ///
 /// # Errors
 /// [`CheckError`].
 pub(crate) fn check(l: &RegisteredLaunch) -> Result<CheckedLaunch, CheckError> {
+    if !stored_policy_matches(l) {
+        return Err(CheckError::Changed {
+            part: Part::Executable,
+            old: meta_of(&l.executable),
+            new: None,
+        });
+    }
     let file = recheck(&l.executable, Part::Executable)?;
     // The executable runs itself, never through a `#!` line the kernel
     // would read again: registration ran a `#!` file through its checked
@@ -813,6 +876,195 @@ mod tests {
             env: Vec::new(),
             path_env: Some("/usr/bin:/bin".to_owned()),
         }
+    }
+
+    /// Mutation: trust the sealed declaration under yesterday's policy.
+    #[test]
+    fn stored_declarations_obey_current_policy() {
+        let home = tempfile::Builder::new()
+            .prefix("ecl")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let base = resolve(&decl(&["true"]), home.path(), vec![], [21; 16], 1).unwrap();
+        assert!(check(&base).is_ok());
+        let entry = home.path().join("entry");
+        script(&entry, "#!/bin/sh\nexit 0\n");
+        for (name, option) in [
+            ("php", "-f/selected.php"),
+            ("python3", "-Xpresite=observer"),
+            ("python3", "-Wignore::observer.Notice"),
+        ] {
+            let interpreter = home.path().join(name);
+            std::fs::copy(
+                Path::new(std::ffi::OsStr::from_bytes(&base.executable.path)),
+                &interpreter,
+            )
+            .unwrap();
+            let mut old = base.clone();
+            old.class = LaunchClass::Script;
+            old.strength = BindingStrength::CheckedAtRest;
+            old.entry = Some(file_identity(&entry).unwrap());
+            old.executable = file_identity(&interpreter).unwrap();
+            old.declaration.argv = vec![
+                interpreter.to_str().unwrap().into(),
+                option.into(),
+                entry.to_str().unwrap().into(),
+            ];
+            old.argv = old
+                .declaration
+                .argv
+                .iter()
+                .map(|a| a.as_bytes().to_vec())
+                .collect();
+            assert!(
+                matches!(check(&old), Err(CheckError::Changed { .. })),
+                "{name} {option}"
+            );
+        }
+        for name in [
+            "PYTHON_PRESITE",
+            "PYTHONWARNINGS",
+            "NpM_cOnFiG_sCrIpT_ShElL",
+        ] {
+            let mut old = base.clone();
+            old.declaration.env.push((name.into(), "observer".into()));
+            old.env.vars = old.declaration.env.clone();
+            assert!(
+                matches!(check(&old), Err(CheckError::Changed { .. })),
+                "{name}"
+            );
+        }
+        // The recorded executable remains authoritative. The launch check
+        // must not look a bare command up again on a changed PATH.
+        let mut retained = base;
+        retained.declaration.path_env = Some("/no-such-recorded-path".into());
+        retained.env.path_env = b"/no-such-recorded-path".to_vec();
+        assert!(check(&retained).is_ok());
+    }
+
+    /// Mutation: reuse an old native class after a name becomes an interpreter.
+    #[test]
+    fn stored_native_classes_cannot_outlive_interpreter_policy() {
+        let home = tempfile::Builder::new()
+            .prefix("ecl")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let base = resolve(&decl(&["true"]), home.path(), vec![], [22; 16], 1).unwrap();
+        let entry = home.path().join("entry");
+        std::fs::write(&entry, "entry\n").unwrap();
+        assert!(check(&base).is_ok());
+        for name in [
+            "python3.12-intel64",
+            "pythonw3",
+            "graalpy",
+            "micropython",
+            "truffleruby",
+            "php-cgi",
+            "php8.4-fpm",
+        ] {
+            let mut old = base.clone();
+            old.declaration.argv = vec![name.into(), entry.to_str().unwrap().into()];
+            old.argv = old
+                .declaration
+                .argv
+                .iter()
+                .map(|a| a.as_bytes().to_vec())
+                .collect();
+            // Earlier classifiers kept this native, with no entry identity;
+            // its file argument made it checked_at_rest, still unchecked.
+            old.strength = BindingStrength::CheckedAtRest;
+            assert!(
+                matches!(check(&old), Err(CheckError::Changed { .. })),
+                "{name}"
+            );
+        }
+    }
+
+    /// Mutation: validate only the original declaration, ignoring derived argv/env.
+    #[test]
+    fn stored_effective_arguments_and_entries_obey_current_policy() {
+        let home = tempfile::Builder::new()
+            .prefix("ecl")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let entry = home.path().join("entry");
+        script(&entry, "#!/bin/sh\nexit 0\n");
+        let base = resolve(
+            &decl(&[entry.to_str().unwrap()]),
+            home.path(),
+            vec![],
+            [23; 16],
+            1,
+        )
+        .unwrap();
+        assert!(check(&base).is_ok());
+        for (name, option) in [
+            ("php", "-f/selected.php"),
+            ("python3", "-Xpresite=observer"),
+        ] {
+            let interpreter = home.path().join(name);
+            std::fs::copy(
+                Path::new(std::ffi::OsStr::from_bytes(&base.executable.path)),
+                &interpreter,
+            )
+            .unwrap();
+            let legacy_entry = home.path().join(format!("{name}-entry"));
+            script(
+                &legacy_entry,
+                &format!("#!{} {option}\nentry\n", interpreter.display()),
+            );
+            let mut old = base.clone();
+            old.declaration = decl(&[legacy_entry.to_str().unwrap()]);
+            old.executable = file_identity(&interpreter).unwrap();
+            old.entry = Some(file_identity(&legacy_entry).unwrap());
+            old.argv = [
+                interpreter.to_str().unwrap(),
+                option,
+                legacy_entry.to_str().unwrap(),
+            ]
+            .iter()
+            .map(|a| a.as_bytes().to_vec())
+            .collect();
+            assert!(
+                matches!(check(&old), Err(CheckError::Changed { .. })),
+                "{name} {option}"
+            );
+        }
+        let mut old = base.clone();
+        old.env
+            .vars
+            .push(("PYTHONWARNINGS".into(), "ignore::observer.Notice".into()));
+        assert!(matches!(check(&old), Err(CheckError::Changed { .. })));
+        let mut old = base.clone();
+        old.argv[1] = b"/different-entry".to_vec();
+        assert!(matches!(check(&old), Err(CheckError::Changed { .. })));
+        let mut old = base;
+        old.strength = BindingStrength::Bound;
+        assert!(matches!(check(&old), Err(CheckError::Changed { .. })));
+        // A shebang may name a native program unknown to the interpreter
+        // table; without an option its checked entry is argv[1].
+        let cat = home.path().join("cat-entry");
+        script(&cat, "#!/bin/cat\nentry\n");
+        let cat = resolve(
+            &decl(&[cat.to_str().unwrap()]),
+            home.path(),
+            vec![],
+            [24; 16],
+            1,
+        )
+        .unwrap();
+        assert!(check(&cat).is_ok());
+        let package = home.path().join("npx");
+        script(&package, "#!/bin/sh\nexit 0\n");
+        let package = resolve(
+            &decl(&[package.to_str().unwrap(), "-y", "fixture"]),
+            home.path(),
+            vec![],
+            [25; 16],
+            1,
+        )
+        .unwrap();
+        assert!(check(&package).is_ok());
     }
 
     /// A bare name is found on the declared PATH, once, and the record
