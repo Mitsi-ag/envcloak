@@ -264,18 +264,7 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
     let me = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(|_| Failure::new("io", "the path of this envcloak could not be read"))?;
-    let dir = me
-        .parent()
-        .ok_or_else(|| Failure::new("io", "the path of this envcloak could not be read"))?;
-    let envcloakd = dir.join("envcloakd");
-    let model = dir.join("envcloak-probe-model");
-    if !envcloakd.is_file() || !model.is_file() {
-        return Err(unavailable(
-            "the probes need envcloakd and envcloak-probe-model installed beside this envcloak; \
-             nothing was probed",
-        ));
-    }
-    let mcp = Some(dir.join("envcloak-probe-mcp")).filter(|p| p.is_file());
+    let programs = probe::local::locate_programs(&me).map_err(unavailable)?;
     let me_sha = coverage::file_sha256(&me).unwrap_or_default();
     // Probe homes earlier runs left (a run killed before it removed its
     // own), whose runs have ended.
@@ -346,17 +335,31 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
                 continue;
             }
         };
+        // A system or managed configuration the host loads whatever its
+        // home: not probed (Codex review of M2-28).
+        if !probe::local::inherited_configuration(host, &locations, &coverage::claude_managed_dir())
+            .is_empty()
+        {
+            done.push(HostProbe {
+                host,
+                version: Some(d.version),
+                run: Err(probe::local::LocalError::Inherited.message()),
+                kept: Err("the host was not probed"),
+            });
+            continue;
+        }
         let before = read(host).fingerprint(&me);
         let opts = probe::local::LocalOptions {
             envcloak: me.clone(),
-            envcloakd: envcloakd.clone(),
-            model_exe: model.clone(),
-            mcp_fixture: mcp.clone(),
+            envcloakd: programs.envcloakd.clone(),
+            model_exe: programs.model.clone(),
+            mcp_fixture: Some(programs.mcp.clone()),
             path: probe_path(&d.exe, &me, &path),
             markers: markers.clone(),
             claims: claims.clone(),
             tmp: PathBuf::from(probe::home::TMP),
             person_socket: person_socket.clone(),
+            person_data: data_dir.clone(),
             run_limit: probe::local::RUN_LIMIT,
         };
         let host_exe = probe::ProbeHost {

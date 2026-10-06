@@ -52,7 +52,8 @@ mod statement;
 
 pub use agents::{
     AGENTS_DIR, AgentCatalog, AgentLabel, CatalogError, CatalogErrorKind, CatalogProblem,
-    CatalogSource, LOADER_ENV_PREFIXES, MAX_CATALOG_FILE, MAX_EXTENSION_FILES, MatchBasis,
+    CatalogSource, ExtensionFiles, LOADER_ENV_PREFIXES, MAX_CATALOG_FILE, MAX_EXTENSION_FILES,
+    MatchBasis,
 };
 pub use bind::{BindError, BindErrorKind, BoundBinding, bind_items};
 pub use effective::{EffectivePolicy, SubjectKind, VaultProjectPolicy, effective_policy};
