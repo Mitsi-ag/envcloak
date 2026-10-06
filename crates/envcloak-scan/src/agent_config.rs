@@ -401,6 +401,10 @@ pub fn scan_config_sources_with_budget(
                 report.issue(root.path().join(rel), "env_file_outside_root");
                 continue;
             }
+            if attempted.len() >= budget.files && !attempted.contains(&root.path().join(&path)) {
+                report.issue(root.path().join(rel), "file_budget");
+                break;
+            }
             if !admit_file(root.path().join(&path), budget, &mut attempted, report) {
                 continue;
             }

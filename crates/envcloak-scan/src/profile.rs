@@ -387,6 +387,10 @@ fn visit(
             report.issue(rel, "source_outside_root");
             continue;
         }
+        if seen.len() >= 64 && !seen.contains_key(&path) {
+            report.issue(rel, "too_many_files");
+            break;
+        }
         visit(root, &path, shell, depth + 1, false, seen, report);
     }
 }

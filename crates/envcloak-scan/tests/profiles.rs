@@ -314,3 +314,26 @@ fn missing_optional_profile_is_reported_when_explicitly_sourced() {
         1
     );
 }
+
+#[test]
+fn exhausted_profile_budget_keeps_diagnostics_bounded() {
+    let d = fixture();
+    let body = (0..5000)
+        .map(|n| format!("source missing{n}\n"))
+        .collect::<String>();
+    std::fs::write(d.path().join(".zshrc"), body).unwrap();
+    let report = scan_profiles(&open_root(d.path()).unwrap()).unwrap();
+    assert!(!report.complete());
+    assert!(
+        report.issues.len() <= 71,
+        "diagnostics grew after exhaustion"
+    );
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.reason == "not_found")
+            .count(),
+        63
+    );
+}
