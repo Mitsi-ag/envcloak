@@ -38,7 +38,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -830,6 +830,24 @@ fn start_on(
     argv: &[OsString],
     env: &[(&str, &OsStr)],
 ) -> Child {
+    start_on_with_stderr(
+        launcher,
+        case,
+        outer,
+        argv,
+        env,
+        Stdio::from(outer.slave.try_clone().unwrap()),
+    )
+}
+
+fn start_on_with_stderr(
+    launcher: &str,
+    case: &Case,
+    outer: &Outer,
+    argv: &[OsString],
+    env: &[(&str, &OsStr)],
+    stderr: Stdio,
+) -> Child {
     let mut cmd = Command::new(python3());
     case.home.apply(&mut cmd);
     let slave = || Stdio::from(outer.slave.try_clone().unwrap());
@@ -840,7 +858,7 @@ fn start_on(
         .current_dir(case.dir.path())
         .stdin(slave())
         .stdout(slave())
-        .stderr(slave());
+        .stderr(stderr);
     cmd.spawn().unwrap()
 }
 
@@ -1179,10 +1197,12 @@ printf '!\n'"#;
     case.assert_clean(&outer.seen);
 }
 
-/// Python's termios and the kernel are independent oracles: each inherited
-/// translation is enabled on the outer terminal, and the plain command
+/// The kernel is the independent oracle: each inherited translation is
+/// enabled on the outer terminal, and the plain command
 /// records its actual byte rewrite. Through the runner only OPOST/ONLCR
 /// remain, and a value containing tabs, CR, LF, lowercase and EOT is masked.
+/// Platform constants come from libc: Apple's Python omits OXTABS/ONOEOT.
+/// A flag the kernel refuses is named; an entirely skipped gate fails.
 fn inherited_output_translations_are_cleared_before_redaction() {
     let case = Case::new();
     let value = format!("\rline{:x}\tcol\rnext\x04end\n", case.seed);
@@ -1192,11 +1212,23 @@ fn inherited_output_translations_are_cleared_before_redaction() {
     std::fs::write(&value_file, value.as_bytes()).unwrap();
     let launcher = case.script(
         "translations.py",
-        r"import os, sys, termios
+        r"import errno, os, sys, termios
+name, flags = sys.argv[1], int(sys.argv[2])
+def unsupported(reason):
+    print('FLAG_UNSUPPORTED %s: %s' % (name, reason), file=sys.stderr, flush=True)
+    sys.exit(77)
 settings = termios.tcgetattr(0)
-settings[1] = termios.OPOST | termios.ONLCR | getattr(termios, sys.argv[1])
-termios.tcsetattr(0, termios.TCSANOW, settings)
-os.execv(sys.argv[2], sys.argv[2:])",
+settings[1] = flags
+try:
+    termios.tcsetattr(0, termios.TCSANOW, settings)
+except termios.error as error:
+    if error.args[0] in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP):
+        unsupported('tcsetattr rejected output flags: %s' % (error,))
+    raise
+actual = termios.tcgetattr(0)[1]
+if actual != flags:
+    unsupported('tcgetattr returned %d instead of requested %d' % (actual, flags))
+os.execv(sys.argv[3], sys.argv[3:])",
     );
     let emitter = case.script(
         "output.py",
@@ -1210,29 +1242,83 @@ else:
 os.write(1, value)",
     );
     let python = python3();
+    let capture = |argv: &[OsString]| {
+        let mut outer = Outer::new(24, 80);
+        // A failed session leader can revoke the PTY before its traceback
+        // is read. Keep stderr independently, without a pipe that can fill.
+        let mut errors = tempfile::tempfile().unwrap();
+        let mut child = Running {
+            child: start_on_with_stderr(
+                LEAD,
+                &case,
+                &outer,
+                argv,
+                &[],
+                Stdio::from(errors.try_clone().unwrap()),
+            ),
+        };
+        let status = outer.wait_exit(&mut child.child, DEADLINE);
+        let stdout_len = outer.seen.len();
+        errors.rewind().unwrap();
+        errors.read_to_end(&mut outer.seen).unwrap();
+        (outer, status, stdout_len)
+    };
     #[cfg(target_os = "macos")]
-    let flags = ["OXTABS", "ONOEOT", "OCRNL", "ONOCR", "ONLRET"];
+    let flags = [
+        ("OXTABS", libc::OXTABS),
+        ("ONOEOT", libc::ONOEOT),
+        ("OCRNL", libc::OCRNL),
+        ("ONOCR", libc::ONOCR),
+        ("ONLRET", libc::ONLRET),
+    ];
     #[cfg(target_os = "linux")]
-    let flags = ["TAB3", "OLCUC", "OCRNL", "ONOCR", "ONLRET"];
-    for flag in flags {
-        let mut plain = Outer::new(24, 80);
+    let flags = [
+        ("TAB3", libc::TAB3),
+        ("OLCUC", libc::OLCUC),
+        ("OCRNL", libc::OCRNL),
+        ("ONOCR", libc::ONOCR),
+        ("ONLRET", libc::ONLRET),
+    ];
+    let mut exercised = 0;
+    for (flag, bit) in flags {
+        let oflags = (libc::OPOST | libc::ONLCR | bit).to_string();
         let argv = vec![
             python.clone().into_os_string(),
             launcher.clone().into_os_string(),
             flag.into(),
+            oflags.clone().into(),
             python.clone().into_os_string(),
             emitter.clone().into_os_string(),
             value_file.clone().into_os_string(),
         ];
-        let mut child = Running {
-            child: lead(&case, &plain, &argv, &[]),
-        };
-        assert_eq!(plain.wait_exit(&mut child.child, DEADLINE).code(), Some(0));
+        let (plain, status, stdout_len) = capture(&argv);
+        if status.code() == Some(77)
+            && stdout_len == 0
+            && plain
+                .seen
+                .starts_with(format!("FLAG_UNSUPPORTED {flag}: ").as_bytes())
+        {
+            println!("PTY output flag {flag}: skipped: {}", plain.text().trim());
+            continue;
+        }
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{flag}: plain launcher failed; PTY output and stderr:\n{}",
+            plain.text()
+        );
+        assert_eq!(
+            stdout_len,
+            plain.seen.len(),
+            "{flag}: plain launcher wrote stderr:\n{}",
+            plain.text()
+        );
         if flag != "ONLRET" {
             assert_ne!(
                 plain.seen,
                 crlf(value.as_bytes()),
-                "{flag}: kernel control did not rewrite output"
+                "{flag}: kernel control did not rewrite output:\n{}",
+                plain.text()
             );
         }
         let file_arg = format!("TEST_VALUE:{}", value_file.display());
@@ -1245,23 +1331,39 @@ os.write(1, value)",
             python.clone().into_os_string(),
             launcher.clone().into_os_string(),
             flag.into(),
+            oflags.into(),
         ];
         argv.extend(runner);
-        let mut outer = Outer::new(24, 80);
-        let mut run = Running {
-            child: lead(&case, &outer, &argv, &[]),
-        };
-        assert_eq!(outer.wait_exit(&mut run.child, DEADLINE).code(), Some(0));
+        let (outer, status, stdout_len) = capture(&argv);
+        assert_eq!(
+            status.code(),
+            Some(0),
+            "{flag}: relay launcher failed; PTY output and stderr:\n{}",
+            outer.text()
+        );
+        assert_eq!(
+            stdout_len,
+            outer.seen.len(),
+            "{flag}: relay launcher wrote stderr:\n{}",
+            outer.text()
+        );
         let expected = format!(
             "FLAGS={}\r\n[envcloak:fixture0/t]",
             libc::OPOST | libc::ONLCR
         );
         assert!(
             outer.seen == expected.as_bytes(),
-            "{flag}: unexpected output flags or value not redacted"
+            "{flag}: unexpected output flags or value not redacted:\n{}",
+            outer.text()
         );
         assert_no_canary(&outer.seen, std::slice::from_ref(&canary));
+        exercised += 1;
+        println!("PTY output flag {flag}: kernel control and redaction passed");
     }
+    assert!(
+        exercised > 0,
+        "no supported PTY output flags were exercised"
+    );
 }
 
 /// Canonical input: a typed line is echoed by the command's terminal and
