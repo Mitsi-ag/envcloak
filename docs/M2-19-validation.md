@@ -1,8 +1,10 @@
 # M2-19 validation receipt
 
-This receipt covers the six open findings from the second review and verifier,
+The original receipt below covers the six open findings from the second review and verifier,
 on branch `m2/m2-19`. All six are fixed; none is rejected or deferred. The
 task's existing PTY implementation and acceptance tests are retained.
+The subsequent review's three findings and fresh platform checks are recorded
+in the final section, which supersedes the original platform-verification status.
 
 ## Scope and requirements
 
@@ -126,3 +128,81 @@ output flags, cutoff behavior, and signal routing need that run. The existing
 D-35 narrowing of SIGTERM/SIGHUP on kernels before 6.9 remains documented and
 tested conditionally; it is an intentional platform contract, not a newly
 waived gate. Cross-platform acceptance of R-M2-89 remains conditional on CI.
+
+## Subsequent review: post-loss output, discard wiping, and CLI receipts
+
+The verifier reported the full macOS and Ubuntu CI run at `bfb0cab` green,
+including the native relay and real-shell tests. Its three remaining findings
+are all addressed, including the optional real-CLI receipt check. None was
+rejected. The existing scope and requirement mapping above is retained:
+gates 8 (PTY), 9, 13, 14 and 23; R-M2-03, R-M2-07 through R-M2-14,
+R-M2-79, R-M2-89 and T-12. CR-4 now also has real-CLI signal receipts.
+
+The class sweep searched all 33 files changed by the task from review base
+`8a4df098`, including the new e2e manifest change, product code, tests,
+fixtures, CLI and documentation. Search receipts remain in the ignored
+`.collab/m2-19/review3/*-sweep.txt` files.
+
+| Bug class | Instances swept and coverage |
+| --- | --- |
+| A post-transition redaction assertion satisfied only by earlier output | Swept `read_master`, idle flush, `master_ended`, `cut`, final flush, monitor loss before and after an exit report, descendant drains and pipe-mode drains. Existing exit/EOF/cutoff gates retain their values and redaction assertions. The new Linux loss gate pauses only after `lost` is set, then lets a HUP-ignoring writer emit three numbered values with hostile bytes. Its write receipt precedes draining, and the test requires all three redacted lines, exit 125, one `pty_monitor_lost`, restored terminal settings and the clean-canary sweep. macOS revokes the slave on hangup, so its existing native hangup gate remains the applicable check. |
+| Sensitive input or stale cursors retained when pending input is discarded | Swept every `drop_keys` caller: exit report, monitor loss, absent master, completed or failed write, and `end_input`; also the read and partial-write paths and final `Zeroizing` cleanup. All discard callers use the same tested helper. Unsent, partially sent, empty, exhausted and short buffers are checked before RAII cleanup, then the allocation is reused and checked again. NUL, ESC, invalid UTF-8 and incomplete multibyte bytes are included. Both cursors must reset. Other prepared exec strings and CLI receive buffers retain their existing wiping paths and tests. |
+| Acceptance receipts that substitute a library runner for the product entrypoint | Swept the direct/nested four-signal relay cases, Linux forced narrowing, sys forwarding routes, CLI `RunSpec::pty` construction and real-shell e2e paths. An owning parent now sends all four external signals to the actual `envcloak run --pty`, both directly and under a nested shell. Exact job and shell counters are required; the kernel support probe selects D-35's documented Linux narrowing. Existing lower-level receipts still cover forced narrowing. |
+
+| Commit | Mutation and observed result |
+| --- | --- |
+| `09040c02` | `E-passthrough-after-loss`: pass raw bytes through once `lost` is set. The new native Linux numbered-line gate fails. `H-omit-discard-wipe`: remove the wipe; the discard test fails on retained bytes. `H-omit-discard-cursors`: retain both cursors; the same test fails on stale state. Restored gates pass. |
+| `a399c8c0` | `direct-group-only`: replace foreground-job forwarding with a signal to the monitor's direct command group, then rebuild the real CLI. Direct receipts pass; the nested SIGINT receipt fails because the job got none. Rebuilding the restored CLI makes both receipt cases pass. |
+
+These failures reached their intended assertions, with Cargo exit 101, rather
+than failing to compile or start. The runners restored every mutation in a
+`finally` path and rebuilt the CLI before restored checks. Cycle410's
+delivery/trace oracle informed the causal post-loss barrier and numbered
+receipts; cycle416's bounded I/O and owned-child guidance informed the
+fixtures. Those research records are independent design checks, not claimed
+as runtime results for this revision.
+
+Fresh local checks passed on macOS 26.4.1 arm64, Rust 1.98.1:
+
+- `cargo fmt --all --check` and
+  `RUSTFLAGS="-D warnings" cargo clippy --offline --workspace --all-targets`.
+- Full detached `envcloak-exec` suite: 100 tests, including 33 unit tests,
+  31 native PTY relay cases, 5 PTY spawn cases, 30 pipe cases and the
+  allocator test.
+- Full detached `envcloak-e2e` suite: 130 tests, including both real-shell
+  PTY cases. Direct and nested CLI signal receipts both give job
+  `[1, 1, 1, 1]` and shell `[0, 0, 0, 0]`.
+- `check-unsafe.sh`, `check-expose-lint.sh` (6/6 canary reports),
+  `check-unsafe-lint.sh` (9/9), `check-reservations.py`,
+  `check-spec-decisions.py`, `check-crate-graph.py` and `check-sources.sh`.
+
+Linux checks ran offline in a local container on kernel
+`6.12.72-linuxkit`, Rust 1.99.0 and Python 3.12.3. The image was built from
+the cached `ec-m2-17-build` and `rust:1-slim` images; its id is
+`sha256:6f988e26cb5eeccd75a61236f858dbedbf3d2c7ea4fd455fb479bc542c4e5c52`.
+The new post-loss gate passes, fails under raw passthrough, and passes again
+after restoration. Both real-CLI PTY tests also pass there, with direct and
+nested job `[1, 1, 1, 1]` and shell `[0, 0, 0, 0]` receipts.
+An additional host-control run enables the existing group-signal refusal
+seam by default and makes the test's support probe report that refusal.
+The real CLI then gives nested job `[1, 1, 0, 0]` and shell
+`[0, 0, 1, 1]`, while direct delivery remains `[1, 1, 1, 1]`.
+This exercises the new assertion's older-kernel branch on the current
+kernel without adding any permanent test flag to the CLI. The temporary
+control was restored, the binaries rebuilt and both CLI tests passed again
+with all four signals reaching the nested job.
+
+The detached macOS runner and Linux container use isolated short `/tmp`
+HOME/XDG directories and cleared environments. Every Cargo build uses three
+jobs and incremental compilation off. The host target is
+`/Volumes/KeenShiftDev/tmp/envcloak-target/C`; Linux artifacts are isolated
+under its `linux19` subdirectory, mounted at that same target path inside
+the container. Tests use `--no-fail-fast -- --test-threads 3`. No workspace
+test command was run. Logs and results are under `.collab/m2-19/review3/`:
+`exec-mutations.json`, `cli-mutation.json`, `positive.json`, `final.json`
+and `linux-narrowing.json`, with their per-check logs.
+
+No scope or review fix is deferred. The D-35 narrowing on Linux before 6.9
+remains the intentional platform contract. Fresh GitHub CI for these commits
+belongs to the driver under plan section 6 and the no-push instruction;
+the verifier's green `bfb0cab` CI is prior evidence, not a run of these commits.
