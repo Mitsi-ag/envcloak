@@ -142,7 +142,8 @@ fn profile_count_fish_literals_and_ambiguous_context_are_conservative() {
     }
     std::fs::write(d.path().join(".profile"), body).unwrap();
     let report = scan_profiles(&open_root(d.path()).unwrap()).unwrap();
-    assert_eq!(report.files, 64);
+    // Five absent conventional profiles consumed attempts before .profile.
+    assert_eq!(report.files, 59);
     assert!(report.issues.iter().any(|i| i.reason == "too_many_files"));
     let parsed = parse_profile(
         &SecretBytes::copy_from(b"set -x A 'literal value'\nset -x B $OTHER\nset -x C one two\n"),
@@ -272,4 +273,44 @@ fn tilde_source_permission_does_not_allow_other_unsupported_syntax() {
                 .any(|i| i.reason == "source_not_literal")
         );
     }
+}
+
+#[test]
+fn failed_profile_includes_consume_the_file_budget() {
+    let d = fixture();
+    let mut body = String::new();
+    for n in 0..70 {
+        body.push_str(&format!("source missing{n}\n"));
+    }
+    body.push_str("source reached\n");
+    std::fs::write(d.path().join(".zshrc"), body).unwrap();
+    std::fs::write(d.path().join("reached"), b"A=fixtureZpastFailedIncludes\n").unwrap();
+    let report = scan_profiles(&open_root(d.path()).unwrap()).unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "too_many_files"));
+    assert!(report.findings.is_empty());
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.reason == "not_found")
+            .count(),
+        63
+    );
+}
+
+#[test]
+fn missing_optional_profile_is_reported_when_explicitly_sourced() {
+    let d = fixture();
+    std::fs::write(d.path().join(".profile"), b"source .zshrc\nsource .zshrc\n").unwrap();
+    let report = scan_profiles(&open_root(d.path()).unwrap()).unwrap();
+    assert!(!report.complete());
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.reason == "not_found")
+            .count(),
+        1
+    );
 }

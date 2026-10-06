@@ -206,3 +206,68 @@ fn binding_named_env_file_is_not_an_include_directive() {
         }));
     }
 }
+
+#[test]
+fn failed_envfile_includes_share_one_attempt_budget() {
+    let d = dir();
+    let mut servers = serde_json::Map::new();
+    for n in 0..70 {
+        servers.insert(
+            format!("s{n:02}"),
+            serde_json::json!({"envFile":format!("missing{n}")}),
+        );
+    }
+    servers.insert("z".into(), serde_json::json!({"envFile":"reached"}));
+    std::fs::write(d.path().join("reached"), b"A=fixtureZpastFailedIncludes\n").unwrap();
+    let path = d.path().join("mcp.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({"mcpServers":servers})).unwrap(),
+    )
+    .unwrap();
+    let report = scan_config_sources_with_budget(
+        &[source(path)],
+        Budget {
+            files: 64,
+            ..Budget::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "file_budget"));
+    assert!(report.findings.is_empty());
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.reason == "not_found")
+            .count(),
+        63
+    );
+}
+
+#[test]
+fn repeated_envfile_paths_are_read_once() {
+    let d = dir();
+    let path = d.path().join("mcp.json");
+    let servers = (0..70)
+        .map(|n| (format!("s{n:02}"), serde_json::json!({"envFile":"shared"})))
+        .collect::<serde_json::Map<_, _>>();
+    std::fs::write(d.path().join("shared"), b"A=fixtureZsharedIncludeValue\n").unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({"mcpServers":servers})).unwrap(),
+    )
+    .unwrap();
+    let report = scan_config_sources_with_budget(
+        &[source(path)],
+        Budget {
+            files: 2,
+            ..Budget::default()
+        },
+    )
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert_eq!(report.files, 2);
+    assert_eq!(report.findings.len(), 1);
+}

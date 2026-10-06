@@ -312,9 +312,9 @@ pub fn scan_config_sources_with_budget(
     budget: Budget,
 ) -> Result<ScanReport, ScanError> {
     let mut report = ScanReport::default();
+    let mut attempted = std::collections::HashSet::new();
     crate::sources::walk_sources(sources, budget, &mut report, |root, rel, source, report| {
-        if report.files >= budget.files as u64 {
-            report.issue(root.path().join(rel), "file_budget");
+        if !admit_file(root.path().join(rel), budget, &mut attempted, report) {
             return;
         }
         let remaining = budget.bytes.saturating_sub(report.bytes);
@@ -401,8 +401,7 @@ pub fn scan_config_sources_with_budget(
                 report.issue(root.path().join(rel), "env_file_outside_root");
                 continue;
             }
-            if report.files >= budget.files as u64 {
-                report.issue(root.path().join(path), "file_budget");
+            if !admit_file(root.path().join(&path), budget, &mut attempted, report) {
                 continue;
             }
             let remain = budget.bytes.saturating_sub(report.bytes);
@@ -457,4 +456,23 @@ pub fn scan_config_sources_with_budget(
         }
     });
     Ok(report)
+}
+
+// Charge every distinct attempted file, including failures, before opening it.
+// Shared by catalog configs and their envFile includes for the whole run.
+fn admit_file(
+    path: std::path::PathBuf,
+    budget: Budget,
+    attempted: &mut std::collections::HashSet<std::path::PathBuf>,
+    report: &mut ScanReport,
+) -> bool {
+    if attempted.contains(&path) {
+        return false;
+    }
+    if attempted.len() >= budget.files {
+        report.issue(path, "file_budget");
+        return false;
+    }
+    attempted.insert(path);
+    true
 }

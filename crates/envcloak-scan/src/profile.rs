@@ -4,7 +4,7 @@ use crate::candidates::{Disposition, Found, ScanReport, Source};
 use crate::{MAX_DOTENV, ScanError, ScanRoot, read_capped};
 use envcloak_core::{SecretBuf, SecretBytes};
 use secrecy::ExposeSecret;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,7 +287,7 @@ fn source_path(raw: &[u8]) -> Option<Include> {
 
 pub fn scan_profiles(root: &ScanRoot) -> Result<ScanReport, ScanError> {
     let mut report = ScanReport::default();
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     for name in PROFILES {
         visit(
             root,
@@ -311,32 +311,36 @@ fn visit(
     shell: Shell,
     depth: usize,
     optional: bool,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut HashMap<PathBuf, Option<crate::ScanErrorKind>>,
     report: &mut ScanReport,
 ) {
     if depth > 4 {
         report.issue(rel, "too_deep");
         return;
     }
-    if seen.contains(rel) {
+    if let Some(failure) = seen.get(rel) {
+        if let Some(kind) = failure.filter(|_| !optional) {
+            report.issue(rel, kind.token());
+        }
         return;
     }
     if seen.len() >= 64 {
         report.issue(rel, "too_many_files");
         return;
     }
+    seen.insert(rel.to_path_buf(), None);
     // Missing conventional profiles are not an incomplete scan. A missing
     // explicit source is. Unsafe existing profiles are always reported.
     let (bytes, stamp) = match read_capped(root, rel, MAX_DOTENV) {
         Ok(x) => x,
         Err(e) => {
+            seen.insert(rel.to_path_buf(), Some(e.kind));
             if !optional || e.kind != crate::ScanErrorKind::NotFound {
                 report.issue(rel, e.kind.token());
             }
             return;
         }
     };
-    seen.insert(rel.to_path_buf());
     #[allow(clippy::disallowed_methods)]
     let (mut part, includes) = parse(bytes.expose_secret(), shell);
     part.files = 1;
@@ -384,5 +388,52 @@ fn visit(
             continue;
         }
         visit(root, &path, shell, depth + 1, false, seen, report);
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::*;
+
+    #[test]
+    fn failed_profile_read_is_not_retried_in_same_run() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        let root = crate::open_root(d.path()).expect("root");
+        let mut seen = HashMap::new();
+        let mut report = ScanReport::default();
+        visit(
+            &root,
+            Path::new("missing"),
+            Shell::Posix,
+            0,
+            false,
+            &mut seen,
+            &mut report,
+        );
+        std::fs::write(d.path().join("missing"), b"A=fixtureZlaterCreatedValue\n").expect("write");
+        visit(
+            &root,
+            Path::new("missing"),
+            Shell::Posix,
+            0,
+            false,
+            &mut seen,
+            &mut report,
+        );
+        assert!(report.findings.is_empty());
+        assert!(!report.complete());
+        // A fresh scan recomputes state and can read the new file.
+        let mut fresh = ScanReport::default();
+        visit(
+            &root,
+            Path::new("missing"),
+            Shell::Posix,
+            0,
+            false,
+            &mut HashMap::new(),
+            &mut fresh,
+        );
+        assert!(fresh.complete());
+        assert_eq!(fresh.findings.len(), 1);
     }
 }
