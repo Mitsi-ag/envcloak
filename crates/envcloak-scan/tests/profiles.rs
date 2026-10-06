@@ -40,7 +40,10 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
     assert!(output.status.success(), "oracle failed");
     assert!(output.stderr.is_empty());
     let cases: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    for case in cases.as_array().unwrap() {
+    let cases = cases.as_array().unwrap();
+    assert_eq!(cases.len(), 76, "Bash oracle corpus is incomplete");
+    let mut policies = [0usize; 3];
+    for case in cases {
         let bytes = SecretBytes::from_vec(
             std::fs::read(dir.path().join(case["source_file"].as_str().unwrap())).unwrap(),
         );
@@ -51,6 +54,7 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
             .find(|f| f.name.ct_eq(b"EC_ORACLE_A"));
         let template = case["proposed_policy"] == "template_name_only";
         if template {
+            policies[1] += 1;
             assert!(
                 a.is_some_and(|f| f.disposition == Disposition::Template && f.value.is_none()),
                 "template {}",
@@ -61,11 +65,14 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
             .unwrap()
             .starts_with("manual_")
         {
+            policies[2] += 1;
             assert!(!result.complete(), "manual {}", case["name"]);
             assert!(a.is_some_and(|f| f.disposition == Disposition::Manual
                 && f.value.is_none()
                 && !f.single_complete_line));
         } else {
+            assert_eq!(case["proposed_policy"], "literal_candidate");
+            policies[0] += 1;
             let f = a.expect("supported assignment must be found");
             assert_eq!(f.disposition, Disposition::Literal, "{}", case["name"]);
             let v = f.value.as_ref().unwrap();
@@ -92,6 +99,9 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
                 case["name"]
             );
         }
+    }
+    for (policy, count) in ["literal", "template", "manual"].into_iter().zip(policies) {
+        assert!(count > 0, "Bash oracle omitted the {policy} policy class");
     }
 }
 
