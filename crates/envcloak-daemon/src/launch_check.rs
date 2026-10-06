@@ -345,31 +345,37 @@ fn through_shebang(
     Ok((interp, argv, file_identity(canonical)?))
 }
 
-/// Whether an argument of a native launch names an existing regular file
-/// (absolute, or relative to the working directory `cwd`), itself or as
-/// the value of an `--option=value`: a program given a file may run what
-/// it holds (a script, a plug-in, a configuration that loads one), which
-/// nothing binds. Such a launch is `checked_at_rest`.
-fn names_a_file(args: &[String], cwd: &Path) -> bool {
+/// Whether an argument or a declared variable's value of a native launch
+/// may name a file: a program given a file may run what it holds (a
+/// script, a plug-in, a configuration that loads one), which nothing
+/// binds. Such a launch is `checked_at_rest`. Looked at: each argument
+/// whole, the value of an `--option=value` or `-o=value`, the value glued
+/// to a short option (`-c/srv/x.conf`, any letter of a cluster), and each
+/// variable's value. Any of them that holds a `/` or starts with `~` is
+/// taken for a path whether or not the file exists yet (one created after
+/// registration loads all the same); any other that names an entry of the
+/// working directory `cwd` now, of any type, is one too.
+fn names_a_file(args: &[String], values: &[&str], cwd: &Path) -> bool {
+    let path_like = |c: &str| {
+        !c.is_empty()
+            && (c.contains('/')
+                || c.starts_with('~')
+                || std::fs::symlink_metadata(cwd.join(c)).is_ok())
+    };
     args.iter().any(|a| {
-        let candidates = [
-            Some(a.as_str()),
-            a.strip_prefix('-')
-                .and_then(|o| o.split_once('='))
-                .map(|(_, v)| v),
-        ];
-        candidates.into_iter().flatten().any(|c| {
-            if c.is_empty() || c.starts_with('-') {
-                return false;
+        let mut candidates = vec![a.as_str()];
+        if let Some(o) = a.strip_prefix('-') {
+            if let Some((_, v)) = o.split_once('=') {
+                candidates.push(v);
             }
-            let p = if c.starts_with('/') {
-                PathBuf::from(c)
-            } else {
-                cwd.join(c)
-            };
-            std::fs::metadata(p).is_ok_and(|m| m.is_file())
-        })
-    })
+            if !o.starts_with('-') {
+                candidates.extend(o.char_indices().skip(1).map(|(i, _)| &o[i..]));
+            }
+        }
+        candidates
+            .into_iter()
+            .any(|c| !c.starts_with('-') && path_like(c))
+    }) || values.iter().any(|v| path_like(v))
 }
 
 /// Resolves `decl` into the registered launch `launch_id` at `revision`
@@ -454,7 +460,13 @@ pub(crate) fn resolve(
     let dir = open_dir(&cwd_canonical)?;
     let dm = dir.metadata().map_err(|_| ResolveError::NotFound)?;
     let strength = match class {
-        LaunchClass::Native if names_a_file(&argv[1..], &cwd_canonical) => {
+        LaunchClass::Native
+            if names_a_file(
+                &argv[1..],
+                &decl.env.iter().map(|(_, v)| v.as_str()).collect::<Vec<_>>(),
+                &cwd_canonical,
+            ) =>
+        {
             BindingStrength::CheckedAtRest
         }
         LaunchClass::Native => native_strength(&file, &executable.digest)?,
@@ -971,13 +983,17 @@ mod tests {
     }
 
     /// A native program given a file (an argument, an `--option=value`,
-    /// absolute or relative to its working directory) may run what the
-    /// file holds: `checked_at_rest`, never `bound`. The positive control:
-    /// the same program with no file argument is `bound`.
+    /// a value glued to a short option, a declared variable's value;
+    /// absolute, relative to its working directory or under `~`; there now
+    /// or created later) may run what the file holds: `checked_at_rest`,
+    /// never `bound`. The positive controls: the same program with a port
+    /// and a plain variable is `bound`.
     ///
-    /// Mutation checked: the file arguments not looked at (the previous
+    /// Mutations checked: the file arguments not looked at (the previous
     /// strength rule): the launch given a script file is `bound`, and this
-    /// fails.
+    /// fails; only existing files counted (the round-4 rule): `--config
+    /// /later.conf` is `bound`, and this fails; the glued short value not
+    /// looked at: `-c/later.conf` is `bound`, and this fails.
     #[test]
     fn a_native_program_given_a_file_is_checked_at_rest() {
         let dir = tempfile::tempdir().unwrap();
@@ -986,18 +1002,88 @@ mod tests {
         std::fs::copy("/bin/ls", &prog).unwrap();
         let file = dir.join("plugin.conf");
         std::fs::write(&file, "x\n").unwrap();
+        std::fs::create_dir(dir.join("plugins")).unwrap();
+        let later = dir.join("later.conf");
         let p = prog.to_str().unwrap();
-        let bound = resolve(&decl(&[p, "--port", "1"]), &dir, vec![], [13; 16], 1).unwrap();
+        let mut plain = decl(&[p, "--port", "1", "-v"]);
+        plain.env.push(("MODE".into(), "dev".into()));
+        let bound = resolve(&plain, &dir, vec![], [13; 16], 1).unwrap();
         assert_eq!(bound.class, LaunchClass::Native);
         assert_eq!(bound.strength, BindingStrength::Bound);
         let conf = format!("--config={}", file.display());
+        let glued = format!("-c{}", later.display());
+        let glued_cluster = format!("-vc{}", later.display());
+        let glued_relative = "-cplugin.conf";
+        let short_eq = format!("-c={}", later.display());
         for argv in [
             vec![p, file.to_str().unwrap()],
             vec![p, conf.as_str()],
             vec![p, "plugin.conf"],
+            vec![p, "--plugins", "plugins"],
+            vec![p, "--config", later.to_str().unwrap()],
+            vec![p, glued.as_str()],
+            vec![p, glued_cluster.as_str()],
+            vec![p, glued_relative],
+            vec![p, short_eq.as_str()],
+            vec![p, "--config=~/later.conf"],
+            vec![p, "conf.d/later.conf"],
         ] {
+            assert!(!later.exists());
             let l = resolve(&decl(&argv), &dir, vec![], [14; 16], 1).unwrap();
             assert_eq!(l.strength, BindingStrength::CheckedAtRest, "{argv:?}");
+        }
+        for value in [later.to_str().unwrap(), "plugin.conf", "~/x.conf"] {
+            let mut d = decl(&[p, "--port", "1"]);
+            d.env.push(("SERVER_CONFIG".into(), value.to_owned()));
+            let l = resolve(&d, &dir, vec![], [15; 16], 1).unwrap();
+            assert_eq!(l.strength, BindingStrength::CheckedAtRest, "{value}");
+        }
+    }
+
+    /// A native interpreter installed under an ABI-flagged name
+    /// (`python3.14t`, `python3.13d`) runs as a `script` launch: its entry
+    /// file is identified and named by its canonical path, the receipt's
+    /// strength is `checked_at_rest`, and a code-loading option is refused
+    /// at registration. A link named as a program to it is refused.
+    ///
+    /// Mutation checked: the interpreter match without the ABI flags (the
+    /// previous one): `python3.14t` is a native program, `bound` with no
+    /// entry, and this fails.
+    #[test]
+    fn an_abi_flagged_interpreter_is_a_script_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let tools = dir.join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        let s_py = dir.join("s.py");
+        std::fs::write(&s_py, "1\n").unwrap();
+        for name in ["python3.14t", "python3.13d"] {
+            let interp = tools.join(name);
+            std::fs::copy("/bin/ls", &interp).unwrap();
+            let mut d = decl(&[name, s_py.to_str().unwrap()]);
+            d.path_env = Some(tools.to_str().unwrap().to_owned());
+            let l = resolve(&d, &dir, vec![], [16; 16], 1).unwrap();
+            assert_eq!(l.class, LaunchClass::Script, "{name}");
+            assert_eq!(l.strength, BindingStrength::CheckedAtRest, "{name}");
+            assert_eq!(
+                l.entry.as_ref().unwrap().path,
+                s_py.as_os_str().as_bytes(),
+                "{name}"
+            );
+            let mut loads = decl(&[name, "-c", "import x"]);
+            loads.path_env = d.path_env.clone();
+            assert_eq!(
+                resolve(&loads, &dir, vec![], [17; 16], 1).unwrap_err(),
+                ResolveError::Decl(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+                "{name}"
+            );
+            let link = tools.join(format!("server-{name}"));
+            std::os::unix::fs::symlink(&interp, &link).unwrap();
+            assert_eq!(
+                resolve(&decl(&[link.to_str().unwrap()]), &dir, vec![], [18; 16], 1).unwrap_err(),
+                ResolveError::Decl(DeclError::Disguised),
+                "{name}"
+            );
         }
     }
 

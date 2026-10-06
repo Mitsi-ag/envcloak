@@ -2,10 +2,14 @@
 //! tests (M2 plan task M2-27). It reports what it is and what it got,
 //! never a value: digests and names only.
 //!
-//! Usage: `ec-launch-fixture [--marker <path>] [--linger <secs>] [--var <NAME>]...`
+//! Usage: `ec-launch-fixture [--marker <path> | --marker-here] [--linger <secs>] [--var <NAME>]...`
 //!
 //! Its first act is to write `ran` to the marker file, so a test can tell
 //! whether any of it ran (a suspended start that was refused never does).
+//! `--marker-here` names `fixture-ran` in its working directory: a launch
+//! registered with a path among its arguments is `checked_at_rest` (a
+//! program given a file may run what it holds), so a test of a `bound`
+//! launch names no path.
 //! Then, for each line on standard input:
 //!
 //! - `report`: one JSON line on standard output: its pid and parent pid;
@@ -99,6 +103,7 @@ fn main() {
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("--marker") => marker = args.next(),
+            Some("--marker-here") => marker = Some("fixture-ran".into()),
             Some("--linger") => {
                 linger = args
                     .next()
