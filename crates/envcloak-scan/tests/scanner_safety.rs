@@ -245,3 +245,36 @@ fn oversized_json_backup_is_refused_before_its_contents_are_read() {
     assert!(report.issues.iter().any(|i| i.reason == "too_large"));
     assert_eq!(report.bytes, 0);
 }
+
+#[test]
+fn malformed_jsonl_fallback_keeps_offsets_and_stops_on_refusal() {
+    let value = b"fixtureZdamagedJsonLine";
+    let first = b"{}\n{\"text\":\"fixtureZdamagedJsonLine\",BROKEN}\n";
+    let bytes = [
+        first.as_slice(),
+        b"{\"text\":\"fixtureZsecondDamagedLine\",BROKEN}\n",
+    ]
+    .concat();
+    let start = bytes.windows(value.len()).position(|p| p == value).unwrap() as u64;
+    let mut found = false;
+    let report = envcloak_scan::transcript::scan_reader(
+        &mut std::io::Cursor::new(&bytes),
+        ConfigFormat::Jsonl,
+        Default::default(),
+        Budget::default(),
+        &mut |c| {
+            if c.value.ct_eq(value) {
+                found = true;
+                assert_eq!(c.occurrence.range, start..start + value.len() as u64);
+                return false;
+            }
+            true
+        },
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert!(found);
+    assert!(report.issues.iter().any(|i| i.reason == "invalid_json"));
+    assert_eq!(report.bytes, bytes.len() as u64);
+    assert_eq!(report.not_scanned, 1);
+}

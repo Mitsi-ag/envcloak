@@ -37,7 +37,7 @@ fn different_readers_on_one_leaf_preserve_each_interpretation() {
     .unwrap();
     assert!(report.complete());
     assert!(found, "raw scan suppressed JSON decoding");
-    assert_eq!(report.files, 2);
+    assert_eq!(report.files, 1);
 
     let yaml = source(path, ConfigFormat::Yaml, SourceKind::McpConfig);
     let report = scan_config_sources(&[yaml, json]).unwrap();
@@ -176,4 +176,64 @@ fn empty_catalog_directories_consume_the_file_budget() {
     assert!(!report.complete());
     assert!(!read);
     assert!(report.issues.iter().any(|i| i.reason == "file_budget"));
+}
+
+#[test]
+fn overlapping_readers_count_each_physical_occurrence_once() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let path = d.path().join("store");
+    let value = b"fixtureZsamePhysicalValue";
+    std::fs::write(&path, br#"{"text":"fixtureZsamePhysicalValue"}"#).unwrap();
+    for formats in [
+        [ConfigFormat::Raw, ConfigFormat::Json],
+        [ConfigFormat::Json, ConfigFormat::Raw],
+    ] {
+        let sources = formats.map(|format| source(path.clone(), format, SourceKind::Transcript));
+        for counted in [false, true] {
+            let mut candidates = if counted {
+                envcloak_scan::candidates::Candidates::counted(Budget::for_counts())
+            } else {
+                envcloak_scan::candidates::Candidates::new(Budget::default())
+            }
+            .unwrap();
+            let report =
+                scan_transcript_sources(&sources, Budget::default(), &mut |c| candidates.insert(c))
+                    .unwrap();
+            assert!(report.complete());
+            assert!(!candidates.limited());
+            let found = candidates
+                .entries()
+                .iter()
+                .find(|c| c.value.ct_eq(value))
+                .unwrap();
+            if counted {
+                assert_eq!(found.counts.values().sum::<u64>(), 1);
+                assert!(found.occurrences.is_empty());
+            } else {
+                assert_eq!(found.occurrences.len(), 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn incompatible_structured_readers_are_visibly_partial() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let path = d.path().join("store");
+    std::fs::write(&path, b"{\n\"text\":\"fixtureZstructuredConflict\"\n}\n").unwrap();
+    for formats in [
+        [ConfigFormat::Json, ConfigFormat::Jsonl],
+        [ConfigFormat::Jsonl, ConfigFormat::Json],
+    ] {
+        let sources = formats.map(|format| source(path.clone(), format, SourceKind::Transcript));
+        let report = scan_transcript_sources(&sources, Budget::default(), &mut |_| true).unwrap();
+        assert!(!report.complete());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.reason == "conflicting_formats")
+        );
+        assert_eq!(report.files, 1);
+    }
 }

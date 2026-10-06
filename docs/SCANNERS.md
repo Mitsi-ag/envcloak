@@ -87,7 +87,11 @@ while still scanning adjacent UTF-8 text.
 
 Whole JSON sources, including host backups, decode as documents within the
 1 MiB config cap. Malformed documents get a raw fallback and an `invalid_json`
-issue, so fallback never reports complete. JSONL keeps its per-line behavior.
+issue, so fallback never reports complete. JSONL falls back to raw readings on
+a damaged line with the same visible issue. Structured transcript descriptors
+take precedence over overlapping raw coverage, so each physical leaf is read
+once. Conflicting JSON and JSONL descriptors report partial coverage. JSON
+readers scan strings; this does not promise raw readings of numeric JSON scalars.
 Assignment and query readings are bounded by words and URL fragments while
 retaining internal punctuation. Equals-run lookahead is linear; overlapping
 password lookahead has a linear work allowance and reports `reading_budget`

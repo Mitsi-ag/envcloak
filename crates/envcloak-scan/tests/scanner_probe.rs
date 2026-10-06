@@ -103,7 +103,7 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
                         expected.is_some(),
                         "transcript candidate eligibility"
                     );
-                    if expected.is_none() {
+                    if *valid && expected.is_none() {
                         assert_eq!(emitted, 0);
                     }
                     drop(report);
