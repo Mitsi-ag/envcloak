@@ -1,8 +1,9 @@
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 
-# Legacy compatibility only in envcloak-signin/src/totp.rs. The canary in
-# tests/sha1_canary.rs proves that normal workspace code cannot use it.
+# Legacy compatibility only in envcloak-signin/src/totp.rs. The canary
+# checks compiler refusals; check-totp-lint.sh also enforces the source
+# boundary independently of secret-exposure exceptions.
 disallowed-types = [
   { path = "sha1::Sha1", reason = "SHA-1 is confined to RFC 6238 in envcloak-signin/src/totp.rs", allow-invalid = true },
   { path = "sha1::block_api::Sha1Core", reason = "SHA-1 is confined to RFC 6238 in envcloak-signin/src/totp.rs", allow-invalid = true },
