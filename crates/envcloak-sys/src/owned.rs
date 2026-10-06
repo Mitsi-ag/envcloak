@@ -631,6 +631,21 @@ impl KillOps for SysKill {
     }
 }
 
+/// Test support only: `kill(target, sig)` as the system call returns it (0,
+/// or -1 with `errno` set), for a harness that signals itself, its own
+/// group, or a child it started and has not reaped, as the kernel
+/// behaviour it measures needs. EnvCloak's own code signals only through
+/// an owned handle ([`crate::OwnedChild`], M2 plan D-34; `clippy.toml`
+/// bans `libc::kill` elsewhere); this is not built without the `testing`
+/// feature, which only tests enable.
+#[cfg(feature = "testing")]
+pub fn kill_raw(target: i32, sig: i32) -> libc::c_int {
+    match crate::owned::kill_number(target, sig) {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
 /// `kill(target, sig)`: the one call of `libc::kill` EnvCloak makes
 /// (`clippy.toml` bans it elsewhere). Its callers are [`kill_owned`],
 /// after its checks, and the M1 runner's [`crate::signal_process`] and

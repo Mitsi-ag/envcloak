@@ -1012,6 +1012,93 @@ fn signal_calls_are_allowed_only_on_the_signal_list() {
     assert_fails(&t, "crates/envcloak-sys/src/owned.rs");
 }
 
+/// Review of M2-27: the two lists share clippy's lint, so a file on the
+/// exposure list alone may allow it, and the lint alone would let that
+/// file signal by number. The names are checked on the signal list's own:
+/// outside it no file may call, name or import libc's or nix's `kill` or
+/// `killpg`, `kill_number`, `signal_process` or `signal_group`, whether it
+/// allows the lint (a file on the exposure list) or the call sits under a
+/// configuration clippy does not lint (`cfg(target_arch = "x86")`), or it
+/// is renamed by an import. The positive controls: an owned handle's
+/// method (`.signal_group(`), a trait method's definition, and a name
+/// that merely holds the word (`skill`, `killer`) pass; envcloak-sys's
+/// re-export of its own wrappers passes; the listed file calls freely.
+///
+/// Mutation checked: the signal names left to the lint (no name check, as
+/// before): the exposure-listed file's call by number passes, and this
+/// fails.
+#[test]
+fn a_file_on_the_exposure_list_alone_may_not_signal_by_number() {
+    let dm = disallowed_lint();
+    let secret = |body: &str| format!("#[allow({})]\npub fn open() {{}}\n{body}", exposure_lint());
+    for (rel, text, want) in [
+        (
+            "crates/envcloak-core/src/secret.rs",
+            secret(&format!(
+                "#[allow({dm})]\npub fn stop(p: i32) {{ let _ = envcloak_sys::signal_process(p, 9); }}\n"
+            )),
+            "crates/envcloak-core/src/secret.rs:4: names a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/secret.rs",
+            secret("pub fn stop(p: i32) { unsafe { libc::kill(p, 9); } }\n"),
+            "crates/envcloak-core/src/secret.rs:3: names a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/x86.rs",
+            "#[cfg(target_arch = \"x86\")]\npub fn stop(p: i32) { let _ = envcloak_sys::signal_group(p, 9); }\n".to_owned(),
+            "crates/envcloak-core/src/x86.rs:2: names a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/alias.rs",
+            "use libc::{\n    getpid,\n    kill as end,\n};\n".to_owned(),
+            "crates/envcloak-core/src/alias.rs:1: imports a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/alias.rs",
+            "use envcloak_sys::signal_process as s;\npub fn stop(p: i32) { let _ = s(p, 9); }\n".to_owned(),
+            "crates/envcloak-core/src/alias.rs:1: imports a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/glob.rs",
+            "use nix::sys::signal::*;\n".to_owned(),
+            "crates/envcloak-core/src/glob.rs:1: imports a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/nix.rs",
+            "pub fn stop(p: Pid) { let _ = nix::sys::signal::killpg(p, None); }\n".to_owned(),
+            "crates/envcloak-core/src/nix.rs:1: names a numeric signal call",
+        ),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), rel, &text);
+        assert_fails(&t, want);
+    }
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/fine.rs",
+        "pub trait Ops { fn signal_group(&self, sig: i32); }\npub fn stop(h: &dyn Ops, skill: i32) {\n    h\n        .signal_group(9);\n    let killer = skill;\n    let _ = killer;\n}\n",
+    );
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/lib.rs",
+        &format!(
+            "#![allow({})]\npub use child::{{has_exited, signal_group, signal_process}};\n",
+            unsafe_lint()
+        ),
+    );
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/owned.rs",
+        &format!(
+            "#[allow({dm})]\npub fn kill_number(p: i32) {{ unsafe {{ libc::kill(p, 9); }} }}\n"
+        ),
+    );
+    assert_passes(&t);
+}
+
 #[test]
 fn stale_allowlist_entries_fail() {
     let t = clean_tree();

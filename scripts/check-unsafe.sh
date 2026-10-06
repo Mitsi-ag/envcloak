@@ -24,7 +24,10 @@
 #    entries must exist), and those files may not declare out-of-line
 #    modules that would inherit an allow, or macros that could carry a call
 #    into another file. A file on the signal list alone still may not name
-#    expose_secret (below): the two lists share the lint, never the names.
+#    expose_secret (below), and a file on the exposure list alone may not
+#    name a numeric signal call (libc or nix kill and killpg, kill_number,
+#    signal_process, signal_group) or import one: the two lists share the
+#    lint, never the names.
 #    Nothing may allow `warnings`, `clippy::all` or `clippy::style`.
 #    Clippy lints only the configurations CI compiles, so a call under
 #    another target's cfg (`#[cfg(target_arch = "x86")]`) needs no allow
@@ -622,6 +625,38 @@ END {
         report(q, "names expose_secret or ExposeSecret but is not listed in " allowlist " (clippy lints only the configurations CI compiles; this check covers every cfg)")
     }
   }
+  # The signal names, the same way and on their own list (M2 plan D-34):
+  # a file on the exposure list alone may allow the shared lint, so the
+  # lint alone cannot keep it from signalling by number. Outside the
+  # signal list nothing may name libc or nix kill or killpg, the numeric
+  # wrappers kill_number, signal_process and signal_group (a call, a
+  # path or an import; a method of an owned handle, `.signal_group(`,
+  # and a definition, `fn signal_group`, are fine), or import any of them
+  # or a glob of the modules that hold them, in any cfg.
+  if (!signal_listed && !canary) {
+    n = split(text, tlines, "\n")
+    for (q = 1; q <= n; q++) {
+      t = tlines[q]
+      gsub(/fn[ \t]+signal_(process|group)/, "", t)
+      if (t ~ /(^|[^A-Za-z0-9_])(killpg|kill_number)([^A-Za-z0-9_]|$)/ ||
+          t ~ /(^|[^A-Za-z0-9_])(libc|signal)[ \t]*::[ \t]*kill([^A-Za-z0-9_]|$)/ ||
+          t ~ /(^|[^A-Za-z0-9_])(envcloak_sys|child)[ \t]*::[ \t]*signal_(process|group)([^A-Za-z0-9_]|$)/ ||
+          t ~ /(^|[^A-Za-z0-9_.])signal_(process|group)[ \t]*\(/)
+        report(q, "names a numeric signal call but is not listed in " signal_allowlist " (signal through envcloak_sys::owned::OwnedChild; this check covers every cfg)")
+    }
+    pos = 1
+    while (match(substr(text, pos), /use[ \t\n]+[^;]*;/)) {
+      s = pos + RSTART - 1
+      stmt = substr(text, s, RLENGTH)
+      pos = s + RLENGTH
+      if (s > 1 && ident(substr(text, s - 1, 1))) continue
+      if (stmt !~ /(^|[^A-Za-z0-9_])(libc|nix|envcloak_sys|child|owned|signal)([^A-Za-z0-9_]|$)/) continue
+      # envcloak-sys re-exports its own wrappers by name, calling nothing.
+      if (FILENAME == "crates/envcloak-sys/src/lib.rs" && stmt ~ /^use[ \t]+child[ \t]*::[ \t]*[{]/) continue
+      if (stmt ~ /(^|[^A-Za-z0-9_])(kill|killpg|kill_number|signal_process|signal_group)([^A-Za-z0-9_]|$)/ || stmt ~ /::[ \t\n]*[*]/)
+        report(line_of(s), "imports a numeric signal call but is not listed in " signal_allowlist)
+    }
+  }
   n = split(masked, lines, "\n")
   for (q = 1; q <= n; q++) {
     if (!in_sys && lines[q] ~ /(^|[^A-Za-z0-9_])unsafe_code([^A-Za-z0-9_]|$)/)
@@ -645,8 +680,10 @@ while IFS= read -r file; do
     listed=1
   fi
   may_allow="$listed"
+  signal_listed=0
   if printf '%s\n' "$signal_allowed" | grep -qxF "$file"; then
     may_allow=1
+    signal_listed=1
   fi
   canary=0
   if [ "$file" = security/lint-canary/src/lib.rs ]; then
@@ -655,7 +692,7 @@ while IFS= read -r file; do
   while IFS= read -r msg; do
     fail "$file:$msg"
   done < <(LC_ALL=C awk -v in_sys="$in_sys" -v allowlisted="$listed" -v allowlist="$allowlist" \
-    -v may_allow="$may_allow" -v signal_allowlist="$signal_allowlist" \
+    -v may_allow="$may_allow" -v signal_listed="$signal_listed" -v signal_allowlist="$signal_allowlist" \
     -v canary="$canary" "$rust_lints_awk" "$file")
 done < <(rust_files)
 
