@@ -25,38 +25,52 @@ use std::process::ExitCode;
 
 use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, USAGE, usage};
-use envcloak_client::manifest_edit::edit_manifest_ref;
+use envcloak_client::manifest_edit::{EditError, edit_manifest_ref, unset_manifest_ref};
 use envcloak_client::render::print;
 use envcloak_ipc::ClientError;
-use envcloak_ipc::view::{RefEditView, RefStatus};
-use envcloak_policy::{Binding, MANIFEST_NAME, ProfileName, find_manifest};
+use envcloak_ipc::view::{RefEditView, RefStatus, RefUnsetView};
+use envcloak_policy::{Binding, EnvName, MANIFEST_NAME, ProfileName, find_manifest};
 
 use super::refuse_value_like;
 
-const USAGE_TEXT: &str = "envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest /absolute/path/envcloak.toml] \
+const USAGE_TEXT: &str = "envcloak ref (NAME=<slug>[#field] | --unset NAME) [--profile NAME] [--manifest /absolute/path/envcloak.toml] \
      [--json]";
 
 /// What a `--manifest` must be.
 const MANIFEST_PATH: &str = "--manifest needs the absolute path of an envcloak.toml";
 
 /// The parsed command line.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 struct RefArgs {
-    binding: Binding,
+    binding: Option<Binding>,
+    unset: Option<EnvName>,
     profile: Option<ProfileName>,
     /// `--manifest`: an absolute path to a file named `envcloak.toml`.
     manifest: Option<PathBuf>,
     json: bool,
 }
 
+impl core::fmt::Debug for RefArgs {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RefArgs { .. }")
+    }
+}
+
 fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
     let mut binding = None;
+    let mut unset = None;
     let mut profile = None;
     let mut manifest = None;
     let mut json = false;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
         match arg {
+            "--unset" if unset.is_none() => {
+                unset = Some(
+                    EnvName::new(it.next().ok_or("--unset needs a name")?)
+                        .map_err(|_| "invalid variable name")?,
+                );
+            }
             "--json" if !json => json = true,
             "--profile" if profile.is_none() => {
                 let p = *it.next().ok_or("--profile needs a name")?;
@@ -78,9 +92,15 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
             _ => binding = Some(arg),
         }
     }
-    let text = binding.ok_or("ref needs NAME=<slug>[#field]")?;
+    if binding.is_some() == unset.is_some() {
+        return Err("ref needs one binding or --unset NAME");
+    }
     Ok(RefArgs {
-        binding: Binding::parse_arg(text).map_err(|_| "ref needs NAME=<slug>[#field]")?,
+        binding: binding
+            .map(Binding::parse_arg)
+            .transpose()
+            .map_err(|_| "ref needs NAME=<slug>[#field]")?,
+        unset,
         profile,
         manifest,
         json,
@@ -136,18 +156,39 @@ fn edit(a: RefArgs) -> Result<ExitCode, Failure> {
             ));
         }
     };
+    if let Some(name) = a.unset {
+        let reference = match unset_manifest_ref(&manifest, &name, a.profile.as_ref()) {
+            Ok(r) => r,
+            Err(EditError::BindingAbsent) => {
+                return Ok(Failure::from(EditError::BindingAbsent).report(1));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        print(
+            &RefUnsetView {
+                profile: a.profile.map(|p| p.as_str().to_owned()),
+                env_name: name.as_str().to_owned(),
+                reference: reference.to_string(),
+            },
+            a.json,
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let binding = a
+        .binding
+        .ok_or_else(|| Failure::new("manifest_invalid", "no binding was selected"))?;
     // What the reference names, from the daemon, before anything is
     // written: a login's field is never bound (SPEC §6.8), and a binding
     // the daemon did not check is not written either.
-    let text = format!("{}={}", a.binding.env_name, a.binding.reference);
+    let text = format!("{}={}", binding.env_name, binding.reference);
     let status = check(text)?;
     writable(status)?;
-    let e = edit_manifest_ref(&manifest, &a.binding, a.profile.as_ref())?;
+    let e = edit_manifest_ref(&manifest, &binding, a.profile.as_ref())?;
     let view = RefEditView {
         manifest: manifest.to_string_lossy().into_owned(),
         profile: a.profile.map(|p| p.as_str().to_owned()),
-        env_name: a.binding.env_name.as_str().to_owned(),
-        reference: a.binding.reference.to_string(),
+        env_name: binding.env_name.as_str().to_owned(),
+        reference: binding.reference.to_string(),
         change: e.change,
         previous: e.previous.map(|r| r.to_string()),
         resolves: status,
@@ -286,7 +327,7 @@ mod tests {
     #[test]
     fn arguments_are_one_binding_and_names() {
         let a = parse(&["OPENAI_API_KEY=openai/acme-web", "--profile", "short"]).unwrap();
-        assert_eq!(a.binding, binding("OPENAI_API_KEY=openai/acme-web"));
+        assert_eq!(a.binding, Some(binding("OPENAI_API_KEY=openai/acme-web")));
         assert_eq!(a.profile, Some(ProfileName::new("short").unwrap()));
         for bad in [
             &[][..],
@@ -316,7 +357,7 @@ mod tests {
         }
         let a = parse(&["--manifest", "/p q/envcloak.toml", "A=openai/acme-web"]).unwrap();
         assert_eq!(a.manifest, Some(PathBuf::from("/p q/envcloak.toml")));
-        assert_eq!(a.binding, binding("A=openai/acme-web"));
+        assert_eq!(a.binding, Some(binding("A=openai/acme-web")));
         assert_eq!(parse(&["A=b"]).unwrap().manifest, None);
     }
 }

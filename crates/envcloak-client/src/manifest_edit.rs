@@ -10,7 +10,7 @@
 //! 1. the manifest is opened through its directory's descriptor, never
 //!    through a symlink, and must be a regular file of this user with no
 //!    other hard link, at most 64 KiB, that parses; its device, inode,
-//!    size and modification time are noted;
+//!    size, modification time and change time are noted;
 //! 2. the new text must parse too, to the old manifest with the binding
 //!    set and nothing else changed: every other binding, in `[env]` and in
 //!    each profile, stays. A variable named like a profile in `[env]` is
@@ -33,7 +33,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use envcloak_ipc::view::RefChange;
-use envcloak_policy::{Binding, MANIFEST_NAME, Manifest, ProfileName, Reference, parse_manifest};
+use envcloak_policy::{
+    Binding, EnvName, MANIFEST_NAME, Manifest, ProfileName, Reference, parse_manifest,
+};
 use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::fail::Failure;
@@ -61,6 +63,8 @@ pub enum EditError {
     ProfileClash,
     /// `[env]` has a profile with the variable's name.
     NameIsProfile,
+    /// The selected table does not bind this name.
+    BindingAbsent,
     /// The manifest has another hard link.
     HardLinked,
     /// The new manifest would differ from the old one in more than the
@@ -78,6 +82,10 @@ impl From<EditError> for Failure {
     fn from(e: EditError) -> Self {
         let invalid = |m: &'static str| Failure::new("manifest_invalid", m);
         match e {
+            EditError::BindingAbsent => Failure::new(
+                "binding_absent",
+                "the selected table does not bind that name; nothing was changed",
+            ),
             EditError::Manifest(m) => Failure::new(
                 "manifest_invalid",
                 format!("envcloak.toml: {m}; nothing was changed"),
@@ -107,7 +115,7 @@ impl From<EditError> for Failure {
             EditError::TooLarge => invalid("the manifest would be larger than 64 KiB"),
             EditError::Io(_) => Failure::new(
                 "io",
-                "envcloak.toml could not be read or written; nothing was changed",
+                "envcloak.toml could not be read or durably written; inspect the file before retrying",
             ),
         }
     }
@@ -126,6 +134,8 @@ struct Stamp {
     size: u64,
     mtime: i64,
     mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
 }
 
 impl Stamp {
@@ -136,6 +146,8 @@ impl Stamp {
             size: m.size(),
             mtime: m.mtime(),
             mtime_nsec: m.mtime_nsec(),
+            ctime: m.ctime(),
+            ctime_nsec: m.ctime_nsec(),
         }
     }
 }
@@ -309,6 +321,151 @@ fn edit_with(
     profile: Option<&ProfileName>,
     before_replace: impl FnOnce(),
 ) -> Result<RefEdit, EditError> {
+    edit_document(
+        path,
+        |old, text| {
+            let (new_text, edit) = edited_text(text, binding, profile)?;
+            if let Some(text) = &new_text {
+                check_edit(old, text, binding, profile)?;
+            }
+            Ok((new_text, edit))
+        },
+        before_replace,
+    )
+}
+
+/// Removes only the selected binding's source bytes. The returned
+/// reference is metadata for undo. An absent binding never writes.
+pub fn unset_manifest_ref(
+    path: &Path,
+    name: &EnvName,
+    profile: Option<&ProfileName>,
+) -> Result<Reference, EditError> {
+    unset_with(path, name, profile, || {})
+}
+
+fn unset_with(
+    path: &Path,
+    name: &EnvName,
+    profile: Option<&ProfileName>,
+    before_replace: impl FnOnce(),
+) -> Result<Reference, EditError> {
+    edit_document(
+        path,
+        |old, text| {
+            let mut expected = old.clone();
+            let list = match profile {
+                None => &mut expected.env,
+                Some(p) => expected
+                    .profiles
+                    .get_mut(p)
+                    .ok_or(EditError::BindingAbsent)?,
+            };
+            let index = list
+                .iter()
+                .position(|b| &b.env_name == name)
+                .ok_or(EditError::BindingAbsent)?;
+            let removed = list.remove(index).reference;
+            let new_text = removed_text(text, name, profile)?;
+            let new = parse_manifest(new_text.as_bytes()).map_err(EditError::Manifest)?;
+            // Removing the only dotted binding also removes its implicit
+            // profile table. An explicit empty profile is kept byte for byte.
+            if let Some(p) = profile {
+                if expected.profiles.get(p).is_some_and(Vec::is_empty)
+                    && !new.profiles.contains_key(p)
+                {
+                    expected.profiles.remove(p);
+                }
+            }
+            expected.sha256 = new.sha256;
+            if expected != new {
+                return Err(EditError::OthersChanged);
+            }
+            Ok((Some(new_text), removed))
+        },
+        before_replace,
+    )
+}
+
+/// Uses the TOML parser's original spans, never a serialization: CRLF,
+/// dotted keys, comments and quoting outside the binding remain exact.
+fn removed_text(
+    text: &str,
+    name: &EnvName,
+    profile: Option<&ProfileName>,
+) -> Result<String, EditError> {
+    let doc = toml_edit::Document::parse(text)
+        .map_err(|_| EditError::Manifest(envcloak_policy::ManifestErrorKind::Syntax.into()))?;
+    let env = doc.as_table().get("env").ok_or(EditError::BindingAbsent)?;
+    let selected = match profile {
+        None => env,
+        Some(p) => env.get(p.as_str()).ok_or(EditError::BindingAbsent)?,
+    };
+    let table = selected.as_table_like().ok_or(EditError::BindingAbsent)?;
+    let (key, item) = table
+        .get_key_value(name.as_str())
+        .ok_or(EditError::BindingAbsent)?;
+    let key = key.span().ok_or(EditError::OthersChanged)?;
+    let value = item.span().ok_or(EditError::OthersChanged)?;
+    let mut ranges = Vec::new();
+    if let Some(inline) = selected.as_inline_table() {
+        // Gaps between parsed members hold whitespace, comments and a
+        // separator. Commas inside a comment or value are not separators.
+        let span = inline.span().ok_or(EditError::OthersChanged)?;
+        ranges.push(key.start..value.end);
+        let next_key = table
+            .iter()
+            .filter_map(|(name, _)| table.get_key_value(name)?.0.span())
+            .filter(|s| s.start > value.end)
+            .map(|s| s.start)
+            .min()
+            .unwrap_or(span.end - 1);
+        if let Some(comma) = separator(&text[value.end..next_key]) {
+            ranges.push(value.end + comma..value.end + comma + 1);
+        } else if let Some(previous_end) = table
+            .iter()
+            .filter_map(|(_, item)| item.span())
+            .filter(|s| s.end < key.start)
+            .map(|s| s.end)
+            .max()
+        {
+            let comma =
+                separator(&text[previous_end..key.start]).ok_or(EditError::OthersChanged)?;
+            ranges.push(previous_end + comma..previous_end + comma + 1);
+        }
+    } else {
+        let start = text[..key.start].rfind('\n').map_or(0, |i| i + 1);
+        let end = text[value.end..]
+            .find('\n')
+            .map_or(text.len(), |i| value.end + i + 1);
+        ranges.push(start..end);
+    }
+    ranges.sort_unstable_by_key(|a| std::cmp::Reverse(a.start));
+    let mut out = text.to_owned();
+    for range in ranges {
+        out.replace_range(range, "");
+    }
+    Ok(out)
+}
+
+fn separator(gap: &str) -> Option<usize> {
+    let mut comment = false;
+    for (i, byte) in gap.bytes().enumerate() {
+        match byte {
+            b'\n' => comment = false,
+            b'#' => comment = true,
+            b',' if !comment => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn edit_document<T>(
+    path: &Path,
+    edit: impl FnOnce(&Manifest, &str) -> Result<(Option<String>, T), EditError>,
+    before_replace: impl FnOnce(),
+) -> Result<T, EditError> {
     let parent = path
         .parent()
         .ok_or(EditError::Io(std::io::ErrorKind::NotFound))?;
@@ -336,17 +493,13 @@ fn edit_with(
     let old = parse_manifest(&bytes).map_err(EditError::Manifest)?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| EditError::Manifest(envcloak_policy::ManifestErrorKind::NotUtf8.into()))?;
-    let (new_text, edit) = edited_text(text, binding, profile)?;
+    let (new_text, edit) = edit(&old, text)?;
     let Some(new_text) = new_text else {
         return Ok(edit);
     };
     if new_text.len() > Manifest::MAX_LEN {
         return Err(EditError::TooLarge);
     }
-    // The new manifest must parse, with the binding where it was put and
-    // everything else as it was.
-    check_edit(&old, &new_text, binding, profile)?;
-
     let temp = temp_path(&dir_path);
     let result = write_and_replace(
         &dir,
@@ -419,6 +572,82 @@ fn write_and_replace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unset_preserves_policy_and_refuses_concurrent_same_size_edit() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = manifest_in(d.path(), COMMENTED);
+        let name = envcloak_policy::EnvName::new("OPENAI_API_KEY").unwrap();
+        let before = std::fs::metadata(&p).unwrap();
+        let theirs = COMMENTED.replace("approve", "deny   ");
+        let result = unset_with(&p, &name, None, || {
+            std::fs::write(&p, &theirs).unwrap();
+            File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
+                .unwrap();
+        });
+        assert_eq!(result.unwrap_err(), EditError::Changed);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), theirs);
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn unset_absent_profile_or_hard_link_changes_nothing() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = manifest_in(d.path(), COMMENTED);
+        for (name, profile) in [
+            ("MISSING", None),
+            ("short", None),
+            ("OPENAI_API_KEY", Some("missing")),
+        ] {
+            let before = Stamp::of(&std::fs::metadata(&p).unwrap());
+            let profile = profile.map(|s| ProfileName::new(s).unwrap());
+            assert_eq!(
+                unset_manifest_ref(
+                    &p,
+                    &envcloak_policy::EnvName::new(name).unwrap(),
+                    profile.as_ref()
+                ),
+                Err(EditError::BindingAbsent)
+            );
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), COMMENTED);
+            assert_eq!(Stamp::of(&std::fs::metadata(&p).unwrap()), before);
+        }
+        std::fs::hard_link(&p, d.path().join("other")).unwrap();
+        assert_eq!(
+            unset_manifest_ref(
+                &p,
+                &envcloak_policy::EnvName::new("OPENAI_API_KEY").unwrap(),
+                None
+            ),
+            Err(EditError::HardLinked)
+        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), COMMENTED);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+        #[test]
+        fn unset_hostile_text_never_panics_or_changes_unrelated_semantics(text in proptest::prop_oneof![
+            ".{0,2048}",
+            proptest::strategy::Strategy::prop_map("[A-Za-z0-9 é\t]{0,128}", |comment| format!("# {comment}\n[env]\nREMOVE='ordinary'\nKEEP='kept'\n[policy]\nagents='deny'\n"))
+        ]) {
+            let name = EnvName::new("REMOVE").unwrap();
+            if let Ok(old) = parse_manifest(text.as_bytes()) {
+                if old.env.iter().any(|b| b.env_name == name) {
+                    let new_text = removed_text(&text, &name, None).unwrap();
+                    let new = parse_manifest(new_text.as_bytes()).unwrap();
+                    let mut expected = old;
+                    expected.env.retain(|b| b.env_name != name);
+                    expected.sha256 = new.sha256;
+                    proptest::prop_assert_eq!(new, expected);
+                }
+            }
+        }
+    }
 
     const COMMENTED: &str = "# The acme-web project. Names only; no values here.
 [project]

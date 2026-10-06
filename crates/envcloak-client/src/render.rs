@@ -1368,6 +1368,16 @@ impl Render for RecoveryConfirmedView {
     }
 }
 
+impl Render for envcloak_ipc::view::RefUnsetView {
+    fn human(&self) -> String {
+        let place = self
+            .profile
+            .as_deref()
+            .map_or_else(|| "[env]".to_owned(), |p| format!("[env.{}]", shown(p)));
+        format!("Removed {} from {place}.\n", shown(&self.env_name))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

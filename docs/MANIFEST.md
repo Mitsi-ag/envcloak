@@ -119,13 +119,21 @@ A `--env-file` is a dotenv-style file of at most 1 MiB. It can hold real values,
 
 The edit keeps the rest of the file as it was: comments, order, spacing and quoting stay, a new binding goes at the end of its table, and a replaced one keeps its comment. Setting a binding that is there already (in either form) writes nothing. The write is atomic:
 
-1. The manifest is opened as the daemon opens it (above): through its directory's descriptor, never through a symlink, a regular file of this user of at most 64 KiB. It must have no other hard link (a rename would split the two names, and the other would keep the old bindings), and it must parse; its device, inode, size and modification time are noted.
+1. The manifest is opened as the daemon opens it (above): through its directory's descriptor, never through a symlink, a regular file of this user of at most 64 KiB. It must have no other hard link (a rename would split the two names, and the other would keep the old bindings), and it must parse; its device, inode, size, modification time and change time are noted.
 2. The new text must parse too, to the old manifest with the binding set and nothing else changed: every other binding, in `[env]` and in each profile, the project name and the policy stay as they were. A variable named like a profile (`envcloak ref short=...` when `[env.short]` exists) is refused, since it would replace the profile's table.
 3. It is written to `.envcloak.toml.<hex>.tmp` beside the manifest (`O_EXCL`, mode 0600, then the manifest's own mode) and flushed.
 4. The manifest is looked at again. When it changed (another program wrote it) or the directory's path names another directory, the new file is removed and nothing is replaced (`manifest_changed`).
 5. The new file is renamed over the manifest, and the directory flushed.
 
 A crash leaves the old manifest or the new one, never part of either. A name or reference shaped like a key or token is refused before anything is read (`value_on_argv`): values are never taken on the command line (SPEC §15.2 gate 13).
+
+## Removing a binding
+
+`envcloak ref --unset NAME [--profile P] [--manifest /absolute/path/envcloak.toml] [--json]` removes the binding from `[env]`, or only from the named profile's own table. It needs no daemon: it removes a reference and reads no value. An unbound name, an absent profile, or a profile name used as a variable exits 1 with `binding_absent`, empty stdout and no file change.
+
+For a binding on its own line, only that assignment and its trailing comment and newline are removed. All other bytes remain, including leading comments, CRLF, quoted keys, dotted keys and `[policy]`. In an inline `env` table, only the member and one comma separator are removed. The editor validates that every other binding and policy is unchanged, then uses the same atomic write and stamp checks as adding a binding. Symlinks and hard links are refused. Names shaped like values are refused without echoing them.
+
+On success, `--json` returns exactly `{profile, env_name, reference}`; `profile` is null for `[env]`. These are the removed reference's metadata for the app's undo action. An undo that needs the original formatting also keeps the original manifest bytes; this receipt alone does not encode comments or spacing.
 
 ## Checking a project: `envcloak check`
 
