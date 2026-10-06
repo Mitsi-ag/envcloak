@@ -9,6 +9,90 @@ use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::os::unix::fs::PermissionsExt;
+
+fn bundle() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("ec-codex-transcript-oracle-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .unwrap()
+}
+
+fn oracle() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles/transcript_ranges.py")
+}
+
+fn generate(root: &std::path::Path) -> std::process::Output {
+    std::process::Command::new("/usr/bin/python3")
+        .arg("-I")
+        .arg(oracle())
+        .arg(root)
+        .env_clear()
+        .env("HOME", root)
+        .output()
+        .unwrap()
+}
+
+fn failure_reason(stderr: &[u8]) -> &'static str {
+    match stderr {
+        b"oracle_failed:bundle_location\n" => "bundle_location",
+        b"oracle_failed:bundle_name\n" => "bundle_name",
+        b"oracle_failed:bundle_owner\n" => "bundle_owner",
+        b"oracle_failed:bundle_mode\n" => "bundle_mode",
+        b"oracle_failed:bundle_nonempty\n" => "bundle_nonempty",
+        b"oracle_failed:bundle_marker\n" => "bundle_marker",
+        b"oracle_failed:internal\n" => "internal",
+        _ => "oracle_failed",
+    }
+}
+
+#[test]
+fn range_oracle_failures_report_only_fixed_codes() {
+    let dir = bundle();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = generate(dir.path());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr == b"oracle_failed:bundle_mode\n",
+        "mode refusal did not return its fixed reason"
+    );
+    assert_eq!(failure_reason(&output.stderr), "bundle_mode");
+
+    let output = std::process::Command::new("/usr/bin/python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+import runpy, sys
+code = runpy.run_path(sys.argv[1])["failure_code"]
+marker = "".join(("fixtureZ", "privateDiagnostic"))
+for error in [ValueError("bundle_mode"), ValueError(marker),
+              ValueError("bundle_mode", marker), OSError(marker),
+              AssertionError(marker)]:
+    print(code(error))
+"#,
+        ])
+        .arg(oracle())
+        .env_clear()
+        .env("HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "reason-code probe failed");
+    assert!(
+        output.stderr.is_empty(),
+        "reason-code probe wrote diagnostics"
+    );
+    assert!(
+        output.stdout == b"bundle_mode\ninternal\ninternal\ninternal\ninternal\n",
+        "reason-code probe returned non-static diagnostics"
+    );
+    assert_eq!(
+        failure_reason(b"oracle_failed:fixtureZprivateDiagnostic\n"),
+        "oracle_failed"
+    );
+}
 
 type Spans = BTreeSet<(u64, u64, String, String)>;
 struct Chunked<R> {
@@ -24,22 +108,13 @@ impl<R: Read> Read for Chunked<R> {
 
 #[test]
 fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
-    let d = tempfile::Builder::new()
-        .prefix("ec-codex-transcript-oracle-")
-        .tempdir_in("/tmp")
-        .unwrap();
-    let output = std::process::Command::new("/usr/bin/python3")
-        .arg("-I")
-        .arg(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("tests/oracles/transcript_ranges.py"),
-        )
-        .arg(d.path())
-        .env_clear()
-        .env("HOME", d.path())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "range oracle generation failed");
+    let d = bundle();
+    let output = generate(d.path());
+    assert!(
+        output.status.success(),
+        "range oracle generation failed: {}",
+        failure_reason(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     let counts: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(counts["cases"], 37);
