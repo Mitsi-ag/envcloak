@@ -13,8 +13,9 @@
 //!
 //! **The methods.** `managed.register`, `managed.unregister` and
 //! `managed.update` take a passphrase proof, only from a caller that may
-//! give one (a terminal subject with no agent by any evidence,
-//! [`crate::requests::refuse_unless_prover`]); the declaration is resolved
+//! give one (a terminal subject with no agent by any evidence, sharing no
+//! session or terminal with a waiting agent's request,
+//! [`crate::requests::refuse_unless_prover_beside_pending`]); the declaration is resolved
 //! before the proof, so a refused one costs no Argon2id run. Each change
 //! is audited `managed_register` with counts and digest prefixes, never an
 //! argument, a variable's value or a path inside the launch. No method
@@ -63,7 +64,10 @@ use envcloak_sys::PeerIdentity;
 use crate::audit::{AuditEvent, ManagedCounts};
 use crate::clock::now_of;
 use crate::launch_check::{self, CheckError, CheckedLaunch, ResolveError};
-use crate::requests::{evidence, manifest_error, refuse_unless_prover, subject_summary};
+use crate::requests::{
+    evidence, manifest_error, proof_refusal_beside_pending, refuse_unless_prover_beside_pending,
+    requester_terminal_in, subject_summary,
+};
 use crate::server::{Shared, locked, refuse_if_traced};
 use crate::state::{State, vault_reason};
 
@@ -298,6 +302,8 @@ fn prove<'s>(
     shared: &'s Shared,
     peer: &PeerIdentity,
     who: &SubjectSummary,
+    caller: &SubjectEvidence,
+    method: &'static str,
     pass: envcloak_core::SecretBytes,
 ) -> Result<std::sync::MutexGuard<'s, State>, RpcError> {
     let _gate = locked(&shared.proof_gate);
@@ -319,6 +325,17 @@ fn prove<'s>(
         Ok(()) => {
             s.limiter().succeeded();
             back?;
+            // A waiting agent's request that shares this caller's terminal,
+            // made while the passphrase was read, refuses it as one made
+            // before did ([`refuse_unless_prover_beside_pending`]).
+            if let Some(r) = requester_terminal_in(&mut s, caller, &now) {
+                s.audit(AuditEvent::ProofRefused {
+                    pid: peer.pid,
+                    method,
+                    reason: r.token(),
+                });
+                return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+            }
             Ok(s)
         }
         Err(e) if e.kind() == VaultErrorKind::Crypto(CryptoErrorKind::Unlock) => {
@@ -376,19 +393,35 @@ fn resolve_refused(
 }
 
 /// Gate 13 in the daemon, behind the client's own refusal: a declaration
-/// whose argument or variable value looks like a key is refused
-/// `invalid_params` (`key_shaped`) and audited, before anything of it
-/// is resolved or stored. A key in a launch would sit in the record, on
-/// the server's argv (where `ps` shows it) and in the receipt; it belongs
-/// in the vault, bound by the managed manifest.
+/// whose argument, variable value, working directory or `PATH` looks like
+/// a key is refused `invalid_params` (`key_shaped`) and audited, before
+/// anything of it is resolved or stored. A key in a launch would sit in
+/// the record, on the server's argv (where `ps` shows it) and in the
+/// receipt; it belongs in the vault, bound by the managed manifest.
 fn refuse_key_shaped(
     shared: &Shared,
     peer: &PeerIdentity,
     who: &SubjectSummary,
     d: &LaunchDecl,
 ) -> Result<(), RpcError> {
-    let shaped = |v: &str| crate::items::looks_like_value(shared, v);
-    if d.argv.iter().any(|a| shaped(a)) || d.env.iter().any(|(_, v)| shaped(v)) {
+    let texts = d
+        .argv
+        .iter()
+        .chain(d.env.iter().map(|(_, v)| v))
+        .chain(d.cwd.iter())
+        .chain(d.path_env.iter());
+    refuse_key_shaped_texts(shared, peer, who, texts.map(String::as_str))
+}
+
+/// [`refuse_key_shaped`] for any texts of a declaration (a bridged
+/// server's origin and header names too).
+fn refuse_key_shaped_texts<'t>(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    who: &SubjectSummary,
+    mut texts: impl Iterator<Item = &'t str>,
+) -> Result<(), RpcError> {
+    if texts.any(|t| crate::items::looks_like_value(shared, t)) {
         shared.audit(AuditEvent::ManagedRegistered {
             pid: peer.pid,
             subject: who.clone(),
@@ -411,7 +444,7 @@ pub fn register(
     refuse_if_traced()?;
     let pass = p.passphrase.into_inner();
     let caller = evidence(shared, peer, &p.claims)?;
-    refuse_unless_prover(shared, peer, &caller, "managed.register")?;
+    refuse_unless_prover_beside_pending(shared, peer, &caller, "managed.register")?;
     if !valid_name(&p.name) {
         return Err(RpcError::new(ErrorKind::InvalidParams));
     }
@@ -459,6 +492,12 @@ pub fn register(
             origin,
             header_names,
         } => {
+            refuse_key_shaped_texts(
+                shared,
+                peer,
+                &who,
+                std::iter::once(origin.as_str()).chain(header_names.iter().map(String::as_str)),
+            )?;
             if !valid_origin(origin) {
                 return Err(RpcError::new(ErrorKind::InvalidParams));
             }
@@ -511,7 +550,7 @@ pub fn register(
     // A test stops here, after the resolution and before the proof and
     // the commit.
     envcloak_sys::pause_point("managed.register_resolved");
-    let mut s = prove(shared, peer, &who, pass)?;
+    let mut s = prove(shared, peer, &who, &caller, "managed.register", pass)?;
     let vault = s.unlocked_mut()?;
     // The launch id and revision are taken from the record of this name as
     // it is now, under the lock the commit holds: a registration or an
@@ -586,7 +625,7 @@ pub fn unregister(
     refuse_if_traced()?;
     let pass = p.passphrase.into_inner();
     let caller = evidence(shared, peer, &p.claims)?;
-    refuse_unless_prover(shared, peer, &caller, "managed.unregister")?;
+    refuse_unless_prover_beside_pending(shared, peer, &caller, "managed.unregister")?;
     let who = subject_summary(peer, &caller);
     let found = |vault: &Vault| -> Result<Option<(PolicyId, ManagedServer)>, RpcError> {
         Ok(records(vault)?
@@ -599,7 +638,7 @@ pub fn unregister(
             return Ok(ManagedUnregisteredView { removed: false });
         }
     }
-    let mut s = prove(shared, peer, &who, pass)?;
+    let mut s = prove(shared, peer, &who, &caller, "managed.unregister", pass)?;
     let vault = s.unlocked_mut()?;
     let Some((id, record)) = found(vault)? else {
         return Ok(ManagedUnregisteredView { removed: false });
@@ -706,7 +745,7 @@ pub fn update_plan(
     let caller = evidence(shared, peer, &p.claims)?;
     // The `pending.list` rule: nothing for a caller whose proof would be
     // refused, and no reason why.
-    if caller.proof_refusal().is_some() {
+    if proof_refusal_beside_pending(shared, &caller).is_some() {
         return Ok(ManagedUpdatePlanView { statement: None });
     }
     let who = subject_summary(peer, &caller);
@@ -744,7 +783,7 @@ pub fn update(
     let digest =
         crate::requests::digest_of(&p.digest).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &p.claims)?;
-    refuse_unless_prover(shared, peer, &caller, "managed.update")?;
+    refuse_unless_prover_beside_pending(shared, peer, &caller, "managed.update")?;
     let who = subject_summary(peer, &caller);
     // The plan made again: anything changed since the statement was shown
     // is another digest.
@@ -758,7 +797,7 @@ pub fn update(
     if plan.digest() != digest {
         return Err(RpcError::new(ErrorKind::StatementMismatch));
     }
-    let mut s = prove(shared, peer, &who, pass)?;
+    let mut s = prove(shared, peer, &who, &caller, "managed.update", pass)?;
     let vault = s.unlocked_mut()?;
     // The record must still be the one planned from.
     match by_launch(vault, &launch)? {

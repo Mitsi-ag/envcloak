@@ -156,6 +156,63 @@ pub(crate) fn refuse_unless_prover(
     }
 }
 
+/// Why `caller` may not give a proof that answers no pending request of
+/// its own (a managed server's registration, update or removal, M2-27),
+/// or `None` when it may: every refusal of
+/// [`SubjectEvidence::proof_refusal`], and
+/// [`envcloak_policy::ProofRefusal::RequesterTerminal`] when it shares a
+/// session or a terminal with any waiting request's requester that is not
+/// a terminal subject ([`SubjectEvidence::approval_refusal`], the
+/// `pending.list` rule). A process on an agent's terminal, the agent
+/// recognised only by its markers (F-70), is a terminal subject by its
+/// own chain; what is typed there may be the agent's, so no proof is
+/// read there while that agent waits.
+pub(crate) fn proof_refusal_beside_pending(
+    shared: &Shared,
+    caller: &SubjectEvidence,
+) -> Option<envcloak_policy::ProofRefusal> {
+    caller.proof_refusal().or_else(|| {
+        let mut s = locked(&shared.state);
+        let now = now_of(&shared.clocks);
+        requester_terminal_in(&mut s, caller, &now)
+    })
+}
+
+/// [`proof_refusal_beside_pending`]'s test of the waiting requests, under
+/// the state lock `s` the caller holds: checked again once the proof is
+/// verified, so a request made while the passphrase was read is seen.
+pub(crate) fn requester_terminal_in(
+    s: &mut crate::state::State,
+    caller: &SubjectEvidence,
+    now: &envcloak_policy::Now,
+) -> Option<envcloak_policy::ProofRefusal> {
+    s.grants()
+        .pending_all(now)
+        .find_map(|p| caller.approval_refusal(&p.request.subject, &alive))
+}
+
+/// [`refuse_unless_prover`] for a proof that answers no pending request
+/// of its own ([`proof_refusal_beside_pending`]): refused `proof_refused`
+/// with the reason, and audited.
+pub(crate) fn refuse_unless_prover_beside_pending(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    evidence: &SubjectEvidence,
+    method: &'static str,
+) -> Result<(), RpcError> {
+    match proof_refusal_beside_pending(shared, evidence) {
+        None => Ok(()),
+        Some(r) => {
+            shared.audit(AuditEvent::ProofRefused {
+                pid: peer.pid,
+                method,
+                reason: r.token(),
+            });
+            Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()))
+        }
+    }
+}
+
 /// Refuses `approver` for pending request `id` when it shares a session
 /// or a terminal with the requester's chain up to its root or its nearest
 /// agent, for a requester that is not a terminal subject
