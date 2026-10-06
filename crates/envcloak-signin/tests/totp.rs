@@ -122,3 +122,21 @@ fn invalid_parameters_cannot_reach_arithmetic() {
     }
     assert!(TotpParams::new(Algorithm::Sha512, 8, 0).is_err());
 }
+
+#[test]
+fn accepted_periods_have_an_eligible_instant_and_bounded_wait() {
+    for period in (0..=301).chain([3600, u64::MAX]) {
+        let result = TotpParams::new(Algorithm::Sha1, 6, period);
+        assert_eq!(result.is_ok(), (4..=300).contains(&period));
+        if let Ok(params) = result {
+            let p = params.period();
+            // After any start, a fresh eligible step is at most 300 s away.
+            for start in 0..2 * period {
+                let first_fresh = (start / period + 1) * period;
+                assert!(first_fresh - start <= 300);
+                assert!(!too_late_in_step(first_fresh, p));
+                assert!(!refused_after_start(start, p).contains(&step_at(first_fresh, p)));
+            }
+        }
+    }
+}

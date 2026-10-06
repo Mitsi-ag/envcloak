@@ -3,7 +3,7 @@ use crate::totp::TotpParams;
 use envcloak_core::SecretBytes;
 use std::fmt;
 
-pub const MAX_URI_BYTES: usize = 4096;
+pub const MAX_URI_BYTES: usize = 4000;
 pub const MAX_SEED_BYTES: usize = 512;
 pub const MAX_LABEL_BYTES: usize = 256;
 
