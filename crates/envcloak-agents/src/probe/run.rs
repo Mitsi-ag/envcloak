@@ -16,7 +16,6 @@
 
 use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -579,11 +578,18 @@ impl Prober<'_, '_> {
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0);
-        let Ok(mut child) = cmd.spawn() else {
+            .stderr(Stdio::piped());
+        // A session of its own on a terminal of its own (M2-28): nothing it
+        // or its commands do shares a session or a terminal with the
+        // approver's, so its requests can be approved (T9-3), and its
+        // process group is its pid's.
+        let Ok(session) = HostSession::spawn(cmd) else {
             return out;
         };
+        let HostSession {
+            mut child,
+            terminal,
+        } = session;
         drop(args);
         let readers = [
             drain(child.stdout.take(), spec.watch.clone()),
@@ -615,6 +621,8 @@ impl Prober<'_, '_> {
             // is still its own (D-34). What is left there goes now.
             let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
             let status = child.wait().ok();
+            // The session's terminal goes with it.
+            drop(terminal);
             stop.store(true, Ordering::SeqCst);
             let approved = approval.map(|h| h.join().unwrap_or(false));
             (timed_out, status, approved)
@@ -1434,6 +1442,51 @@ fn denial_checks(
             "what the call reads reached the model",
         ),
     ]
+}
+
+/// A program started in a session of its own, on a pseudo-terminal of its
+/// own that is the session's controlling terminal (M2-28): the agent host a
+/// probe runs. Its standard streams are as its command sets them; the
+/// terminal is the session's only, so nothing the program or its commands
+/// do shares a session or a terminal with this process or with any
+/// approver this process starts (SPEC §10b, T9-3), and the session leads a
+/// process group whose number is the program's pid, which stays its own
+/// while it is unreaped (D-34).
+pub struct HostSession {
+    pub child: std::process::Child,
+    /// The terminal's master side, which only this process holds
+    /// (close-on-exec): dropping it hangs the session up.
+    pub terminal: std::os::fd::OwnedFd,
+}
+
+impl std::fmt::Debug for HostSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostSession")
+            .field("pid", &self.child.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HostSession {
+    /// Starts `cmd` in a new session on a new pseudo-terminal.
+    ///
+    /// # Errors
+    /// When no pseudo-terminal can be opened, or the program cannot be
+    /// started, or cannot make its session.
+    pub fn spawn(mut cmd: Command) -> std::io::Result<HostSession> {
+        use std::os::fd::AsFd as _;
+        let pty = envcloak_sys::pty::open_pty(None, None)?;
+        envcloak_sys::new_session_on_spawn(&mut cmd, Some(pty.slave.as_fd()))?;
+        let child = cmd.spawn()?;
+        // `cmd` holds a copy of the slave side until it goes: the session's
+        // terminal is then open in no process of this one.
+        drop(cmd);
+        drop(pty.slave);
+        Ok(HostSession {
+            child,
+            terminal: pty.master,
+        })
+    }
 }
 
 /// Reads a pipe to its end on a thread of its own, dropping what it reads
