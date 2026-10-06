@@ -32,6 +32,8 @@ crates/envcloak-signin/src/totp.rs           # RFC 6238 reads a seed into HMAC; 
 crates/envcloak-signin/src/otpauth.rs        # enrollment parsed in place and decoded into wiping buffers; only typed parameters and SecretBytes leave
 
 crates/envcloak-scan/src/profile.rs          # parses bounded profile literals in place; never executes a profile
+crates/envcloak-scan/src/aws.rs              # bounded AWS INI keys copied into wiping values, no command execution
+crates/envcloak-scan/src/first_run.rs        # retained assignment spans copied to wiping output, validated slugs only in comments
 crates/envcloak-scan/src/candidates.rs       # per-run keyed candidate hashes, never persisted or reported
 crates/envcloak-scan/src/transcript.rs       # streamed candidate extraction into wiping buffers and raw ranges
 crates/envcloak-scan/src/agent_config.rs     # config bindings and envFile paths read only inside approved roots
