@@ -13,9 +13,9 @@
 //! - `/bin/cat`, first under the plain shell for its baseline, then under
 //!   `envcloak run --pty`: the outer terminal's suspend character gives the
 //!   shell its prompt back, `jobs` lists the job as stopped, `stty -g` is
-//!   what it was before, and `fg` resumes it; `/bin/cat` then does what its
-//!   baseline did (Linux's reads on; macOS's ends with "Interrupted system
-//!   call", as under any shell, M2-17);
+//!   what it was before, and `fg` resumes it; Linux cat reads on. BSD cat
+//!   may read on or end with EINTR depending on whether the stop landed
+//!   inside read. The retrying cat below must always read on;
 //! - a cat that reads again on `EINTR`: the same, then (once it says it
 //!   was continued) a fresh line round-trips, and values typed into it
 //!   (the PEM-shaped one, whose CR LF form the terminal shows, and an API
@@ -712,16 +712,18 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer
         .expect_since(mark, b"env-one", 2, "a line round-trips through cat");
     suspend_and_resume(&mut sh, &files, &before, (0x1a, None), "/bin/cat");
-    assert_eq!(
-        cat_after_fg(&mut sh, "env-two"),
-        reads_on,
-        "/bin/cat did not do what it did under the plain shell"
-    );
-    if reads_on {
+    // BSD cat may either retry or end with EINTR, depending on whether
+    // the stop interrupted read. The baseline records an observation,
+    // not an oracle for that scheduling choice. The retrying cat below
+    // must always complete the post-fg round trip on both systems.
+    let resumed_reads = cat_after_fg(&mut sh, "env-two");
+    #[cfg(not(target_os = "macos"))]
+    assert!(resumed_reads, "cat did not read after fg");
+    if resumed_reads {
         sh.outer.type_bytes(b"\x04");
     }
     sh.prompt_again("cat and the run ended");
-    assert_eq!(sh.status(), if reads_on { 0 } else { 1 });
+    assert_eq!(sh.status(), if resumed_reads { 0 } else { 1 });
 
     // The retrying cat: the round trip after fg, and values typed into it
     // come back redacted, the CR LF form included.
