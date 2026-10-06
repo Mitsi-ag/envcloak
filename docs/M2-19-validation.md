@@ -3,8 +3,8 @@
 The original receipt below covers the six open findings from the second review and verifier,
 on branch `m2/m2-19`. All six are fixed; none is rejected or deferred. The
 task's existing PTY implementation and acceptance tests are retained.
-The subsequent review's three findings and fresh platform checks are recorded
-in the final section, which supersedes the original platform-verification status.
+Later review findings and fresh platform checks are recorded below. The newest
+review log and validation supersede the earlier platform-verification status.
 
 ## Scope and requirements
 
@@ -206,3 +206,99 @@ No scope or review fix is deferred. The D-35 narrowing on Linux before 6.9
 remains the intentional platform contract. Fresh GitHub CI for these commits
 belongs to the driver under plan section 6 and the no-push instruction;
 the verifier's green `bfb0cab` CI is prior evidence, not a run of these commits.
+
+## Final review log
+
+- **Plan deviation, M2-19 interface:** `RunSpec::pty(argv, injected, redactor, OuterTerminal)` replaces the planned `winsize` argument; the owned outer terminal supplies current dimensions at startup, SIGWINCH and resume instead of retaining a size snapshot.
+- **M2-28 follow-up, shared temporary-directory observations:** `probe_local.rs::probe_homes` scans machine-wide `/tmp/ecp*` state. Give each test a private root and count only its descendants. Sweep all three callers: `the_probe_runs_beside_the_persons_daemon_and_touches_nothing_of_theirs`, `a_version_outside_the_table_is_not_qualified`, and `the_probe_home_is_cleaned_after_kill_9`. Add a concurrent unrelated-root control that cannot affect the count, and retain a positive control proving that a probe created under the owned root is found. This is tracked here, with no M2-28 code change, as the verifier requested; the plan's task ownership and section 6 disjoint-lane rule keep that implementation with M2-28.
+- **Main integration:** merge `36f2c89f` incorporates all 59 missing commits through `origin/main` `689c55aa` without conflicts. The verifier's green PR and full runs on `0f8d7d89` predate this merge. Fresh GitHub CI on the merged head remains the driver's pre-merge gate under section 6 and the no-push instruction.
+
+The stop-order finding was a temporal-oracle gap: the stopped state at the
+outer shell's prompt did not prove that the command was stopped when the
+terminal was restored. The outside-SIGTSTP case now pauses inside
+`TerminalGuard::restore`, immediately after the successful `tcsetattr`,
+and reads the command's kernel state there. It first observes the ticker
+running, then requires stopped state and the restored terminal settings at
+the barrier, releases the CLI, and retains the prompt, `jobs`, `stty -g`,
+`fg`, resumed ticker and final-exit checks. The pid is read only; the owning
+parent still supplies every signal.
+
+The sweep searched all 33 task files against the merged main baseline. Its
+stop-order checks cover both relay restore call sites, outside-SIGTSTP
+dispatch, the monitor's stop report, `command_stopped`, raw-mode reentry,
+resume, monitor-loss restoration and final/panic restoration. A barrier in
+the terminal primitive observes an early direct guard restore as well as
+one through `Suspension::restore_terminal`. Final and panic restoration
+have different requirements and retain their existing gates.
+
+The documentation sweep corrects claims that turn a scheduling-dependent
+observation into a promise: RUN.md's suspension paragraph and the e2e
+`cat_after_fg` comment now explicitly allow either ordinary BSD-cat
+outcome; its nearby comment says "read on", not "retry", because BSD cat
+does not retry EINTR. The sys topology cases and foundation paragraph
+already accept both outcomes independently. The strict Python retrying
+fixture still requires a fresh round trip. RUN.md's pipe prompt table also
+had stale "fastest of five" wording; it now describes the existing gate's
+pre-emission acknowledgement and all-five-samples requirement. Cycle512's
+independent outcome-policy review supports that distinction; the runtime
+checks remain the native tests, not that source-only review.
+
+The other swept classes are unrecorded interface deviations (the sole PTY
+constructor and all its call sites, with startup/resize/resume measurements),
+shared host state in tests (no machine-wide temporary-directory count in
+M2-19's files; the three M2-28 callers are tracked above), and stale
+integration evidence (the branch now contains the fetched main baseline).
+Search receipts are in `.collab/m2-19/review4/*-sweep.txt`.
+
+The actual-restore gate and wording corrections are committed in `d9ea98cc`.
+Mutation `restore-before-stop` inserts a direct guard restore into the relay's
+SIGTSTP dispatch, before asking the monitor to stop: the real-CLI gate fails
+at the restore point with kernel state `S+`, even though the later normal
+stop would still satisfy the old prompt-time assertion. Mutation
+`barrier-before-tcsetattr` moves the witness before the settings change and
+fails the independent settings comparison. Both tests reached the named
+assertion with Cargo exit 101. Both sources were restored, the CLI rebuilt,
+and the gate passed with state `T` and restored settings on macOS. The
+unchanged native sys topology and retrying-cat cases supply the documented
+ordinary-cat and mandatory-round-trip evidence.
+
+The Linux real-CLI gate also passes on the merged tree, observing stopped
+state `Tl` and restored settings at the barrier. Both PTY e2e cases pass
+there, with direct and nested signal receipts unchanged. The ancestry
+check `git merge-base --is-ancestor 689c55aa HEAD` passes; the same check
+against the pre-merge `0f8d7d89` control fails, showing it detects the
+reviewed integration gap.
+
+Commit `f5e9afde` also bounds the restore observation to 30 seconds from the
+stop request, before the barrier's 60-second automatic release. An expired
+barrier cannot let a later stop turn an early restore into a passing
+observation. Control `expired-restore-witness` makes that deadline already
+expired and fails the intended assertion with Cargo exit 101. Restoring the
+deadline passes the full detached e2e suite and strict Clippy.
+
+Final local validation on the merged tree:
+
+- `cargo fmt --all --check` and
+  `RUSTFLAGS="-D warnings" cargo clippy --offline --workspace --all-targets`.
+- Full detached `envcloak-sys` suite, including 14 PTY, 5 signal and 9
+  topology cases; its two existing documentation examples remain ignored.
+- Full detached `envcloak-exec` suite: 100 tests.
+- Full detached `envcloak-e2e` suite: 133 tests, rerun after the expiry guard.
+- Linux real-CLI PTY tests: both pass again with the expiry guard, observing
+  stopped state `Tl` at the restore barrier.
+- `scripts/check-unsafe.sh`, `scripts/check-expose-lint.sh`,
+  `scripts/check-unsafe-lint.sh`, `scripts/check-reservations.py`,
+  `scripts/check-spec-decisions.py`, `scripts/check-crate-graph.py` and
+  `scripts/check-sources.sh`.
+
+The host and offline Linux container are the same as the preceding review
+round. Builds retain target directory C, incremental compilation off and
+three jobs; all test commands use `--no-fail-fast -- --test-threads 3`,
+detached and with private short HOME/XDG directories. No workspace test
+command was run. Logs, mutation receipts and final statuses are in
+`.collab/m2-19/review4/`, especially `mutations.json`, `main-ancestry.json`,
+`final.json`, `linux-focused.json` and `expiry.json`.
+
+M2-19's scope, requirement ids and gates listed above remain covered. The
+only follow-up implementation belongs to M2-28, explicitly tracked above;
+fresh merged-head GitHub CI remains with the driver. No finding is rejected.
