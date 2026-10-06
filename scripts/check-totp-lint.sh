@@ -29,7 +29,7 @@ for line in result.stdout.splitlines():
     except ValueError:
         continue
     message = row.get('message') or {}
-    if (message.get('code') or {}).get('code') != 'clippy::disallowed_types':
+    if (message.get('code') or {}).get('code') not in ('clippy::disallowed_types', 'clippy::disallowed_methods'):
         continue
     for span in message.get('spans', []):
         if span.get('is_primary') and span.get('file_name', '').endswith('tests/sha1_canary.rs'):

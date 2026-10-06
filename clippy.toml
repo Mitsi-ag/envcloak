@@ -14,6 +14,7 @@ disallowed-types = [
 # the list. `allow-invalid` keeps crates that do not depend on `secrecy`
 # from warning that the path does not resolve.
 disallowed-methods = [
+  { path = "sha1::block_api::compress", reason = "SHA-1 is confined to RFC 6238 in envcloak-signin/src/totp.rs", allow-invalid = true },
   { path = "secrecy::ExposeSecret::expose_secret", reason = "opens a secret; allowed only in files listed in security/expose-allowlist.txt", allow-invalid = true },
   { path = "secrecy::ExposeSecretMut::expose_secret_mut", reason = "opens a secret; allowed only in files listed in security/expose-allowlist.txt", allow-invalid = true },
 ]
