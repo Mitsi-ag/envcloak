@@ -393,8 +393,13 @@ fn spawn_anchor(
     })
     .map_err(|_| ())?;
     // The started process must be the anchor's image before any of it
-    // runs: the kernel's cdhash, read while it is suspended.
-    let pid = i32::try_from(child.id()).map_err(|_| ())?;
+    // runs: the kernel's cdhash, read while it is suspended. Every way out
+    // but the resumed runner kills it through its handle first: nothing
+    // stays suspended, or unreaped, behind a refusal.
+    let Ok(pid) = i32::try_from(child.id()) else {
+        let _ = child.kill_and_reap();
+        return Err(());
+    };
     let sig = envcloak_sys::proc_info(pid)
         .ok()
         .and_then(|p| p.exe)
@@ -407,7 +412,12 @@ fn spawn_anchor(
         let _ = child.kill_and_reap();
         return Err(());
     }
-    child.resume().map_err(|_| ())?;
+    // A test makes the resumption fail here.
+    let resumed = envcloak_sys::fail_point("launch.anchor_resume").and_then(|()| child.resume());
+    if resumed.is_err() {
+        let _ = child.kill_and_reap();
+        return Err(());
+    }
     Ok(child)
 }
 
@@ -437,7 +447,16 @@ impl Started {
             Some(expected) => confirm_spawn(&control, &child, &expected),
         };
         drop(control);
-        reap_later(child);
+        match &outcome {
+            // The runner never asked, or was never answered: it holds the
+            // values, and its client was told the launch failed. It goes.
+            Err(e) if e.kind == ErrorKind::RunnerUnavailable => {
+                let _ = child.kill_and_reap();
+            }
+            // Confirmed, or refused (the runner kills its server and
+            // exits on its own).
+            _ => reap_later(child),
+        }
         outcome
     }
 
