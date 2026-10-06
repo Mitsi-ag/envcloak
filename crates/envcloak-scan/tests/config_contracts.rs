@@ -393,3 +393,40 @@ fn repeated_config_interpretations_share_diagnostic_identity() {
     assert_eq!(report.issues.len(), 1);
     assert_eq!(report.issues[0].reason, "unsupported_format");
 }
+
+#[test]
+fn discovery_and_includes_consume_one_attempt_budget() {
+    for prior in ["missing_parent/file.json", "missing.json", "empty"] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::create_dir(d.path().join("empty")).unwrap();
+        let config = d.path().join("config.json");
+        std::fs::write(&config, br#"{"mcpServers":{"s":{"envFile":"values.env"}}}"#).unwrap();
+        std::fs::write(d.path().join("values.env"), b"A=fixtureZcombinedBudget\n").unwrap();
+        let sources = [source(d.path().join(prior)), source(config)];
+        for files in [2, 3] {
+            let report = scan_config_sources_with_budget(
+                &sources,
+                Budget {
+                    files,
+                    ..Budget::default()
+                },
+            )
+            .unwrap();
+            let found = report.findings.iter().any(|f| {
+                f.value
+                    .as_ref()
+                    .is_some_and(|v| v.ct_eq(b"fixtureZcombinedBudget"))
+            });
+            assert_eq!(
+                found,
+                files == 3,
+                "discovery and includes used separate budgets: {prior}"
+            );
+            assert_eq!(report.complete(), files == 3);
+            assert_eq!(
+                report.issues.iter().any(|i| i.reason == "file_budget"),
+                files == 2
+            );
+        }
+    }
+}

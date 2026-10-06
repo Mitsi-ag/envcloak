@@ -135,3 +135,159 @@ fn displaced_foreign_save_is_reported_without_cleanup() {
     assert!(envcloak_testkit::find(format!("{report:?}").as_bytes(), &cs).is_empty());
     assert!(!envcloak_testkit::find(save, &cs).is_empty());
 }
+
+#[test]
+fn included_envfile_leftovers_are_reported_even_when_target_is_missing() {
+    use envcloak_scan::{agent_config::scan_config_sources_with_budget, candidates::Budget};
+    for format in [ConfigFormat::Json, ConfigFormat::Toml] {
+        for present in [false, true] {
+            let d = tempfile::tempdir_in("/tmp").unwrap();
+            let values = d.path().join("nested");
+            std::fs::create_dir(&values).unwrap();
+            if present {
+                std::fs::write(values.join("values.env"), b"A=fixtureZincludedOriginal\n").unwrap();
+            }
+            let config = if format == ConfigFormat::Json {
+                br#"{"mcpServers":{"s":{"envFile":"nested/values.env"}}}"#.as_slice()
+            } else {
+                b"[mcp_servers.s]\nenvFile = 'nested/values.env'\n"
+            };
+            std::fs::write(d.path().join("config"), config).unwrap();
+            let mut descriptor = source(d.path(), "config");
+            descriptor.format = format;
+            for kind in ["new", "swap"] {
+                let name = format!(".values.env.envcloak-{kind}-ab.tmp");
+                std::fs::write(values.join(name), b"fixtureZretainedIncludeContents").unwrap();
+            }
+            // Only the approved target's siblings count, not unrelated names.
+            std::fs::write(values.join(".other.envcloak-new-ab.tmp"), b"unrelated").unwrap();
+            let report = scan_config_sources(&[descriptor.clone()]).unwrap();
+            assert_eq!(
+                report.leftovers.len(),
+                2,
+                "included-file leftovers were omitted"
+            );
+            assert!(!report.complete());
+            assert!(
+                report
+                    .leftovers
+                    .iter()
+                    .all(|l| l.inspection == "possible_leftover")
+            );
+            assert!(report.findings.iter().all(|f| {
+                f.value
+                    .as_ref()
+                    .is_none_or(|v| !v.ct_eq(b"fixtureZretainedIncludeContents"))
+            }));
+            assert!(!format!("{report:?}").contains("fixtureZretainedIncludeContents"));
+            for leftover in report.leftovers {
+                assert_eq!(
+                    std::fs::read(leftover.source.path).unwrap(),
+                    b"fixtureZretainedIncludeContents"
+                );
+            }
+            let limited = scan_config_sources_with_budget(
+                &[descriptor],
+                Budget {
+                    files: 3,
+                    ..Budget::default()
+                },
+            )
+            .unwrap();
+            assert!(!limited.complete());
+            assert!(limited.issues.iter().any(|i| i.reason == "file_budget"));
+            assert_eq!(
+                limited.leftovers.len(),
+                1,
+                "include sibling discovery escaped the shared budget"
+            );
+        }
+    }
+}
+
+#[test]
+fn explicit_leftover_sources_and_includes_remain_metadata_only() {
+    for include in [false, true] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let name = ".values.env.envcloak-swap-ab.tmp";
+        let bytes = if include {
+            b"A=fixtureZdirectLeftoverRead\n".as_slice()
+        } else {
+            br#"{"env":{"A":"fixtureZdirectLeftoverRead"}}"#
+        };
+        std::fs::write(d.path().join(name), bytes).unwrap();
+        let descriptor = if include {
+            let config = serde_json::json!({"mcpServers":{"s":{"envFile":name}}});
+            std::fs::write(
+                d.path().join("config.json"),
+                serde_json::to_vec(&config).unwrap(),
+            )
+            .unwrap();
+            source(d.path(), "config.json")
+        } else {
+            source(d.path(), name)
+        };
+        let report = scan_config_sources(&[descriptor]).unwrap();
+        assert_eq!(
+            report.leftovers.len(),
+            1,
+            "direct leftover target was read as ordinary content"
+        );
+        assert!(report.findings.is_empty());
+        assert!(!report.complete());
+        assert_eq!(std::fs::read(d.path().join(name)).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn included_leftover_symlinks_are_reported_without_following() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::write(
+        d.path().join("config.json"),
+        br#"{"mcpServers":{"s":{"envFile":"missing.env"}}}"#,
+    )
+    .unwrap();
+    let target = d.path().join("target");
+    std::fs::write(&target, b"fixtureZoutsideLeftoverValue").unwrap();
+    let name = d.path().join(".missing.env.envcloak-new-ab.tmp");
+    std::os::unix::fs::symlink(&target, &name).unwrap();
+    let report = scan_config_sources(&[source(d.path(), "config.json")]).unwrap();
+    assert_eq!(report.leftovers.len(), 1);
+    assert_eq!(report.leftovers[0].inspection, "symlink");
+    assert!(report.findings.is_empty());
+    assert!(!report.complete());
+    assert!(name.is_symlink());
+}
+
+#[test]
+fn include_leftover_discovery_reuses_reported_metadata() {
+    use envcloak_scan::{agent_config::scan_config_sources_with_budget, candidates::Budget};
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let retained = ".values.env.envcloak-new-ab.tmp";
+    std::fs::write(d.path().join(retained), b"retained").unwrap();
+    std::fs::write(
+        d.path().join("values.env"),
+        b"A=fixtureZdeduplicatedMetadata\n",
+    )
+    .unwrap();
+    std::fs::write(
+        d.path().join("config.json"),
+        br#"{"mcpServers":{"s":{"envFile":"values.env"}}}"#,
+    )
+    .unwrap();
+    let report = scan_config_sources_with_budget(
+        &[source(d.path(), retained), source(d.path(), "config.json")],
+        Budget {
+            files: 3,
+            ..Budget::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.leftovers.len(), 1);
+    assert_eq!(report.findings.len(), 1);
+    assert!(!report.complete());
+    assert!(
+        !report.issues.iter().any(|i| i.reason == "file_budget"),
+        "same leftover was charged twice"
+    );
+}

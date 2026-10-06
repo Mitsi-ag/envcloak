@@ -606,7 +606,7 @@ pub fn scan_transcript_sources(
         &ordered,
         budget,
         &mut report,
-        |root, rel, source, opened, report| {
+        |root, rel, source, opened, _attempts, report| {
             let path = root.path().join(rel);
             let format = crate::sources::effective_format(rel, source.format);
             if let Some(previous) = scanned.get(&path) {
@@ -728,7 +728,7 @@ mod device_tests {
             &[source],
             Budget::default(),
             &mut report,
-            |root, rel, source, opened, report| {
+            |root, rel, source, opened, _attempts, report| {
                 // The callback is a deterministic barrier after discovery's
                 // open. Reopening this path must fail, while the held file
                 // remains readable and its original stamp must be retained.
