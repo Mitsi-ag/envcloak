@@ -2167,8 +2167,9 @@ try:
     while termios.tcgetattr(0)[3] & (termios.ICANON | termios.ECHO | termios.ISIG):
         assert time.monotonic() < end, 'foreground job never took raw mode'
     os.write(1, b'FOREGROUND\n')
-    assert p.wait(timeout=max(0.1, end-time.monotonic())) == 0
+    status = p.wait(timeout=max(0.1, end-time.monotonic()))
     reaped = True
+    assert status == 0
     os.tcsetpgrp(0, parent)
     os.write(1, b'CHECK-SETTINGS\n')
     # Like a shell reading the next stty command, consume pending input.
