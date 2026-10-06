@@ -111,6 +111,54 @@ fn git(dir: &std::path::Path, args: &[&str]) {
         .unwrap();
     assert!(o.status.success(), "git fixture preparation");
 }
+
+#[test]
+fn damaged_partial_clone_never_uses_its_transport() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let id = object(dir.path(), "blob", b"fixtureZpartialCloneValue");
+    let loose = dir
+        .path()
+        .join(".git/objects")
+        .join(&id[..2])
+        .join(&id[2..]);
+    std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(loose, b"damaged loose object").unwrap();
+
+    // The remote is local and its transport only records an attempt. No
+    // network service or external repository participates in this gate.
+    let remote = dir.path().join("remote");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "-q"]);
+    let uploadpack = dir.path().join("record-fetch");
+    let marker = dir.path().join("record-fetch.marker");
+    std::fs::write(&uploadpack, b"#!/bin/sh\n: > \"$0.marker\"\nexit 1\n").unwrap();
+    std::fs::set_permissions(&uploadpack, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (key, value) in [
+        ("core.repositoryFormatVersion", "1"),
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.url", remote.to_str().unwrap()),
+        ("remote.origin.uploadpack", uploadpack.to_str().unwrap()),
+        // The scanner must override even an explicit repository allowance.
+        ("protocol.allow", "always"),
+        ("protocol.file.allow", "always"),
+    ] {
+        git(dir.path(), &["config", key, value]);
+    }
+
+    let report = scan_git_history(
+        &open_root(dir.path()).unwrap(),
+        Budget::default(),
+        &mut |_| panic!("damaged object emitted a candidate"),
+    )
+    .unwrap();
+    assert!(!marker.exists(), "history scan invoked a remote transport");
+    assert!(!report.complete(), "damaged history reported complete");
+}
+
 #[test]
 fn deleted_history_is_found_and_limits_are_partial() {
     if std::env::var_os("EC_GIT_CHILD").is_some() {

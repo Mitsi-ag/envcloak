@@ -61,6 +61,11 @@ pub fn scan_git_history(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        // Partial clones may fetch missing or corrupt objects while reading.
+        // The protocol guard also covers Git versions without lazy-fetch opt-out.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        // An empty allowlist overrides repository protocol.<name>.allow too.
+        .env("GIT_ALLOW_PROTOCOL", "")
         .args(["--git-dir", git_dir, "--work-tree", "."])
         .env("LC_ALL", "C")
         .args([
@@ -68,6 +73,8 @@ pub fn scan_git_history(
             "--no-replace-objects",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            "protocol.allow=never",
             "cat-file",
             "--batch-all-objects",
             "--batch",
