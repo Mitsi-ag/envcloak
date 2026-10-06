@@ -12,7 +12,10 @@ use serde_json::json;
 
 #[test]
 fn swift_cross_language_vectors() {
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let explicit = std::env::var_os("ENVCLOAK_SWIFT_VECTORS");
     let directory = explicit
         .as_deref()
