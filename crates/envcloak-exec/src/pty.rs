@@ -161,8 +161,7 @@ enum End {
     /// The command exited with this status (its output read to the end or
     /// to the cutoff).
     Exited(ExitStatus),
-    /// A signal caught after the exit (or the monitor's loss) stopped the
-    /// run.
+    /// A signal caught after the reported exit stopped the run.
     Stopped(i32),
     /// The monitor's channel ended before it reported an exit.
     MonitorLost,
@@ -268,11 +267,15 @@ fn after_the_boundary(
             }
         }
     }
+    late_result(result, late)
+}
+
+fn late_result(
+    result: Result<ChildExit, ExecError>,
+    late: Option<i32>,
+) -> Result<ChildExit, ExecError> {
     match (result, late) {
-        (
-            Ok(ChildExit::Code(_) | ChildExit::Signal(_)) | Err(ExecError::MonitorLost),
-            Some(sig),
-        ) => Ok(ChildExit::Stopped(sig)),
+        (Ok(ChildExit::Code(_) | ChildExit::Signal(_)), Some(sig)) => Ok(ChildExit::Stopped(sig)),
         (result, _) => result,
     }
 }
@@ -343,7 +346,7 @@ impl Relay<'_, '_> {
     fn relay(&mut self) -> Result<End, ExecError> {
         loop {
             if let Some(sig) = self.stopped_by {
-                return Ok(End::Stopped(sig));
+                return Ok(signal_end(self.lost, sig));
             }
             if let Some(kind) = self.broken {
                 return Err(ExecError::TerminalLost(kind));
@@ -668,20 +671,17 @@ impl Relay<'_, '_> {
     /// Writes waiting keys to the master side as far as it takes them, and
     /// wipes them once written.
     fn write_keys(&mut self) {
-        while self.keys_at < self.keys_len {
-            let Some(mut m) = self.master.as_ref() else {
-                return self.drop_keys();
-            };
-            let rest = self
-                .keys
-                .get(self.keys_at..self.keys_len)
-                .unwrap_or_default();
-            match m.write(rest) {
-                Ok(0) => return self.drop_keys(),
-                Ok(n) => self.keys_at = self.keys_at.saturating_add(n).min(self.keys_len),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                Err(_) => return self.drop_keys(),
+        let Some(mut master) = self.master.as_ref() else {
+            return self.drop_keys();
+        };
+        if let Err(e) = write_keys_to(
+            &mut master,
+            &mut self.keys,
+            &mut self.keys_at,
+            self.keys_len,
+        ) {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return;
             }
         }
         self.drop_keys();
@@ -818,5 +818,103 @@ impl Suspension for Relay<'_, '_> {
         self.input_open = false;
         self.raw_wanted = false;
         self.drop_keys();
+    }
+}
+
+/// A signal ends the drain, keeping a monitor loss distinct from an exit.
+fn signal_end(lost: bool, sig: i32) -> End {
+    if lost {
+        End::MonitorLost
+    } else {
+        End::Stopped(sig)
+    }
+}
+
+/// Writes as far as the sink takes input, retaining only unsent bytes.
+fn write_keys_to(
+    writer: &mut impl Write,
+    keys: &mut [u8],
+    at: &mut usize,
+    len: usize,
+) -> io::Result<()> {
+    while *at < len {
+        match writer.write(keys.get(*at..len).unwrap_or_default()) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                let end = at.saturating_add(n).min(len);
+                if let Some(sent) = keys.get_mut(*at..end) {
+                    sent.zeroize();
+                }
+                *at = end;
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_partial_input_write_wipes_only_sent_bytes_before_backpressure() {
+        struct Partial(Vec<u8>);
+        impl Write for Partial {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    self.0.extend_from_slice(&bytes[..2]);
+                    Ok(2)
+                } else {
+                    Err(io::ErrorKind::WouldBlock.into())
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let original = [0x61, 0xff, 0, 0x1b, 0xe2, 0x82];
+        let mut keys = original;
+        let mut at = 0;
+        let mut sink = Partial(Vec::new());
+        let err = write_keys_to(&mut sink, &mut keys, &mut at, original.len()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(sink.0, original[..2]);
+        assert_eq!(at, 2);
+        assert_eq!(&keys[..2], &[0, 0]);
+        assert_eq!(&keys[2..], &original[2..]);
+        let mut rest = Vec::new();
+        write_keys_to(&mut rest, &mut keys, &mut at, original.len()).unwrap();
+        assert_eq!(rest, original[2..]);
+        assert_eq!(keys, [0; 6]);
+    }
+
+    #[test]
+    fn monitor_loss_survives_each_signal_during_the_drain() {
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+            assert!(matches!(signal_end(true, sig), End::MonitorLost));
+            assert!(matches!(signal_end(false, sig), End::Stopped(s) if s == sig));
+        }
+    }
+
+    #[test]
+    fn monitor_loss_survives_each_signal_at_the_result_boundary() {
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGTERM, libc::SIGHUP] {
+            assert!(matches!(
+                late_result(Err(ExecError::MonitorLost), Some(sig)),
+                Err(ExecError::MonitorLost)
+            ));
+            assert!(
+                matches!(late_result(Ok(ChildExit::Code(3)), Some(sig)), Ok(ChildExit::Stopped(s)) if s == sig)
+            );
+            assert!(matches!(
+                late_result(
+                    Err(ExecError::TerminalLost(io::ErrorKind::Other)),
+                    Some(sig)
+                ),
+                Err(ExecError::TerminalLost(_))
+            ));
+        }
     }
 }
