@@ -614,7 +614,8 @@ impl TerminalGuard {
         set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0)
     }
 
-    /// Reads the terminal's settings again and keeps them as the saved
+    /// Waits until this job owns the foreground, then reads the terminal's
+    /// settings again and keeps them as the saved
     /// ones, for after a stop: the person's shell had the terminal
     /// meanwhile, and may have changed it (`stty susp ^X`, `stty -echo`).
     /// Every later restore, the panic hook's included, puts these back, and
@@ -630,6 +631,27 @@ impl TerminalGuard {
     /// When the settings cannot be read, or the guard is not registered
     /// (never once it lives); nothing changes then.
     pub fn refresh(&mut self) -> io::Result<TerminalSettings> {
+        // A background SIGCONT can leave the shell's line editor here.
+        // It may have ISIG on, so testing is_raw alone cannot identify it.
+        // Never capture settings until the shell gives this job the tty.
+        loop {
+            // SAFETY: these calls only read the terminal's foreground
+            // group and this process's group. Neither number is signalled.
+            let foreground = unsafe { libc::tcgetpgrp(self.fd.as_raw_fd()) };
+            if foreground < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if foreground == 0 {
+                return Err(io::ErrorKind::NotConnected.into());
+            }
+            // SAFETY: getpgrp reads this process's own group.
+            if foreground == unsafe { libc::getpgrp() } {
+                break;
+            }
+            // SIGTSTP to our own job only. A background continue stops
+            // again; fg returns here after transferring the terminal.
+            crate::stop_own_job()?;
+        }
         let before = self.saved;
         let now = TerminalSettings(get(self.fd.as_raw_fd())?);
         if now.is_raw() {
