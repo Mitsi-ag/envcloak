@@ -852,6 +852,18 @@ pub struct Installed {
     /// EnvCloak's server registrations, and the person's settings about
     /// it beside them.
     pub servers: BTreeSet<String>,
+    /// What else in the configuration may decide a probe's control or its
+    /// probe (Codex review of M2-28: a Codex rule that forbids the
+    /// harmless shell control changed the fingerprint but not the shape,
+    /// so a fresh install's pass was credited to a configuration where the
+    /// control would fail): every hook entry that is not EnvCloak's, at
+    /// every level and in every hook file or layer; Claude Code's `deny`
+    /// and `ask` permission rules other than EnvCloak's own `Read` rule;
+    /// every Codex rules file, by name and SHA-256 (EnvCloak's own
+    /// included, which this build writes the same everywhere). A probe
+    /// home holds only what this build installs, so a configuration with
+    /// any of these has another shape and is not credited with its result.
+    pub foreign: BTreeSet<String>,
 }
 
 impl Installed {
@@ -860,8 +872,9 @@ impl Installed {
     }
 }
 
-/// The version of what [`ConfigSet::shape`] covers.
-pub const SHAPE_FORMAT: u32 = 1;
+/// The version of what [`ConfigSet::shape`] covers: 2 since it holds
+/// [`Installed::foreign`].
+pub const SHAPE_FORMAT: u32 = 2;
 
 /// The version of what [`ConfigSet::fingerprint`] covers: when it changes,
 /// a result kept under the old one is no longer current. 2 since the
@@ -957,6 +970,7 @@ impl ConfigSet {
             "server": self.server,
             "installed_hooks": self.installed.hooks,
             "installed_servers": self.installed.servers,
+            "foreign": self.installed.foreign,
             "programs": programs,
             "stores": stores,
             "envcloak": build,
@@ -1001,8 +1015,9 @@ fn under_home(path: &Path, home: &Path) -> Option<PathBuf> {
 
 /// EnvCloak's hook entries in `settings` (a host's settings or hook file,
 /// read at `level`), each with its event and its group's matcher, into
-/// `out` ([`Installed::hooks`]).
-fn installed_hooks(settings: &Value, host: Host, level: &str, out: &mut BTreeSet<String>) {
+/// `out`'s [`Installed::hooks`], and every other hook entry into its
+/// [`Installed::foreign`].
+fn installed_hooks(settings: &Value, host: Host, level: &str, out: &mut Installed) {
     let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
         return;
     };
@@ -1020,17 +1035,20 @@ fn installed_hooks(settings: &Value, host: Host, level: &str, out: &mut BTreeSet
                     .get("command")
                     .and_then(Value::as_str)
                     .is_some_and(|c| c.ends_with(&tail));
-                if ours {
-                    Installed::add(
-                        out,
-                        &serde_json::json!({
-                            "level": level,
-                            "event": event,
-                            "matcher": matcher,
-                            "hook": h,
-                        }),
-                    );
-                }
+                let set = if ours {
+                    &mut out.hooks
+                } else {
+                    &mut out.foreign
+                };
+                Installed::add(
+                    set,
+                    &serde_json::json!({
+                        "level": level,
+                        "event": event,
+                        "matcher": matcher,
+                        "hook": h,
+                    }),
+                );
             }
         }
     }
@@ -1828,7 +1846,7 @@ fn read_claude(
                 // known: switched off at that level, conservatively.
                 Read::Unreadable | Read::Toml(_) => true,
                 Read::Json(v) => {
-                    installed_hooks(&v, Host::ClaudeCode, level, &mut cs.installed.hooks);
+                    installed_hooks(&v, Host::ClaudeCode, level, &mut cs.installed);
                     let h = hooks_of(
                         &v,
                         Host::ClaudeCode,
@@ -1861,6 +1879,18 @@ fn read_claude(
                             .filter_map(Value::as_str)
                             .collect::<Vec<&str>>()
                     };
+                    for (kind, r) in list("deny")
+                        .into_iter()
+                        .map(|r| ("deny", r))
+                        .chain(list("ask").into_iter().map(|r| ("ask", r)))
+                    {
+                        if r != claude::READ_DENY || kind != "deny" {
+                            Installed::add(
+                                &mut cs.installed.foreign,
+                                &serde_json::json!({ "level": level, kind: r }),
+                            );
+                        }
+                    }
                     for r in list("deny") {
                         if r == claude::READ_DENY {
                             cs.read_deny = true;
@@ -2427,7 +2457,19 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
             files.sort();
             for f in files {
                 let got = read_capped(&f, MAX_SETTINGS);
+                let digest = match &got {
+                    Some(Some(b)) => hex(&Sha256::digest(b.as_slice())),
+                    Some(None) => "absent".to_owned(),
+                    None => "unreadable".to_owned(),
+                };
                 ctx.note("codex_rules", &f, &got);
+                Installed::add(
+                    &mut cs.installed.foreign,
+                    &serde_json::json!({
+                        "codex_rules": f.file_name().map(|n| n.to_string_lossy().into_owned()),
+                        "sha256": digest,
+                    }),
+                );
             }
         }
         Err(e) if not_there(&e) => {}
@@ -2507,7 +2549,7 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
         .json("codex_hooks", &l.codex_hooks(), MAX_SETTINGS)
     {
         Read::Json(v) => {
-            installed_hooks(&v, Host::Codex, "user", &mut cs.installed.hooks);
+            installed_hooks(&v, Host::Codex, "user", &mut cs.installed);
             cs.hooks = hooks_of(&v, Host::Codex, "Bash", "mcp__.*", &mut programs);
             cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Codex);
         }
@@ -2518,7 +2560,10 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
     }
     for (role, file) in hook_files {
         match cs.context.json(role, &file, MAX_SETTINGS) {
-            Read::Json(v) => cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Codex),
+            Read::Json(v) => {
+                cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Codex);
+                installed_hooks(&v, Host::Codex, role, &mut cs.installed);
+            }
             Read::Absent => {}
             _ => cs.foreign_prompt_hook = true,
         }
@@ -2534,6 +2579,17 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
             .chain(projects.iter())
     };
     cs.foreign_prompt_hook |= unseen || layers().any(CodexLayer::prompt_hook);
+    // Every hook written inline in a layer, for the shape.
+    for layer in layers() {
+        if let Some(h) = layer.doc().and_then(|d| d.get("hooks")) {
+            installed_hooks(
+                &serde_json::json!({ "hooks": toml_json(h) }),
+                Host::Codex,
+                "codex_layer",
+                &mut cs.installed,
+            );
+        }
+    }
     cs.context.programs(programs);
     // The stores (Codex's round-3 review: those a layer other than the
     // user's moved were never swept): the catalog's, where the environment
@@ -3632,9 +3688,14 @@ mod tests {
     /// server registration that differs in what a host acts on gives
     /// another (Codex review of M2-28: a probe home's result was credited
     /// to a configuration with another hook timeout or another server
-    /// named `envcloak`). Mutations checked: the hook entries left out of
-    /// the shape (the timeout case then has the same shape and this
-    /// fails); the server registrations left out (the command cases).
+    /// named `envcloak`), and so does anything else that may decide a
+    /// probe's control: a Codex rule added, changed or removed, another
+    /// hook in a hook file or inline in a layer, a Claude Code deny or ask
+    /// rule (Codex review of M2-28, round 3). Mutations checked: the hook
+    /// entries left out of the shape (the timeout case then has the same
+    /// shape and this fails); the server registrations left out (the
+    /// command cases); `Installed::foreign` left out of the shape (the
+    /// rule, hook and permission cases).
     #[test]
     fn the_shape_follows_envcloaks_entries_not_the_home() {
         use serde_json::json;
@@ -3747,6 +3808,132 @@ mod tests {
             &[(".codex/config.toml", codex("/elsewhere/server"))],
         );
         assert_ne!(x, z, "Codex: another server named envcloak");
+
+        // Codex's rules (Codex review of M2-28: a rule that forbids the
+        // shell control left the shape as it was): added, changed and
+        // removed, each another shape; EnvCloak's own rules file as this
+        // build writes it, the same in every home.
+        fn rules(config: &str, files: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+            let mut v = vec![(".codex/config.toml", config.to_owned())];
+            for (name, body) in files {
+                v.push((name, (*body).to_owned()));
+            }
+            v
+        }
+        let config = codex(&ours);
+        let rules = |files: &[(&'static str, &str)]| rules(&config, files);
+        let ours_rules =
+            "prefix_rule(pattern = [\"envcloak\", \"reveal\"], decision = \"forbidden\")\n";
+        let base = shape(
+            "r0",
+            Host::Codex,
+            &rules(&[(".codex/rules/envcloak.rules", ours_rules)]),
+        );
+        let base_elsewhere = shape(
+            "r0-elsewhere",
+            Host::Codex,
+            &rules(&[(".codex/rules/envcloak.rules", ours_rules)]),
+        );
+        assert_eq!(base, base_elsewhere, "Codex: EnvCloak's rules alike");
+        assert_ne!(base, x, "Codex: EnvCloak's rules file is part of it");
+        let forbid = "prefix_rule(pattern = [\"printf\"], decision = \"forbidden\")\n";
+        let added = shape(
+            "r1",
+            Host::Codex,
+            &rules(&[
+                (".codex/rules/envcloak.rules", ours_rules),
+                (".codex/rules/default.rules", forbid),
+            ]),
+        );
+        assert_ne!(base, added, "Codex: a rule added");
+        let changed = shape(
+            "r2",
+            Host::Codex,
+            &rules(&[
+                (".codex/rules/envcloak.rules", ours_rules),
+                (
+                    ".codex/rules/default.rules",
+                    "prefix_rule(pattern = [\"env\"], decision = \"forbidden\")\n",
+                ),
+            ]),
+        );
+        assert_ne!(added, changed, "Codex: a rule changed");
+        let removed = shape("r3", Host::Codex, &rules(&[]));
+        assert_ne!(base, removed, "Codex: a rules file removed");
+
+        // Another hook of the person's, in Codex's hook file or inline in
+        // a layer; a deny or ask rule of Claude Code's other than
+        // EnvCloak's: each another shape.
+        let other_hook = json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/usr/local/bin/guard"}]}]}})
+        .to_string();
+        let foreign_file = shape(
+            "h1",
+            Host::Codex,
+            &[
+                (".codex/config.toml", codex(&ours)),
+                (".codex/hooks.json", other_hook),
+            ],
+        );
+        assert_ne!(x, foreign_file, "Codex: another hook in hooks.json");
+        let inline = shape(
+            "h2",
+            Host::Codex,
+            &[(
+                ".codex/config.toml",
+                format!(
+                    "{}[[hooks.PreToolUse]]\nmatcher = \"Bash\"\n[[hooks.PreToolUse.hooks]]\n\
+                     type = \"command\"\ncommand = \"/usr/local/bin/guard\"\n",
+                    codex(&ours)
+                ),
+            )],
+        );
+        assert_ne!(x, inline, "Codex: another hook inline in config.toml");
+        for (case, extra) in [
+            ("a Bash deny", json!({"deny": ["Bash(printf:*)"]})),
+            ("an ask", json!({"ask": ["Bash"]})),
+        ] {
+            let other = shape(
+                case,
+                Host::ClaudeCode,
+                &[
+                    (
+                        ".claude/settings.json",
+                        settings(10, &[("permissions", extra)]),
+                    ),
+                    (".claude.json", server(&ours)),
+                ],
+            );
+            assert_ne!(a, other, "Claude Code: {case}");
+        }
+        let allow = shape(
+            "an allow",
+            Host::ClaudeCode,
+            &[
+                (
+                    ".claude/settings.json",
+                    settings(10, &[("permissions", json!({"allow": ["Bash"]}))]),
+                ),
+                (".claude.json", server(&ours)),
+            ],
+        );
+        assert_eq!(a, allow, "Claude Code: an allow rule decides no control");
+        let mut with_other = json!({"hooks": {"UserPromptSubmit": [{"hooks": [{
+            "type": "command",
+            "command": format!("{quoted} hook --host claude-code --event UserPromptSubmit"),
+            "timeout": 10,
+        }]}], "PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/usr/local/bin/guard"}]}]}});
+        with_other["model"] = json!("x");
+        let foreign_claude = shape(
+            "h3",
+            Host::ClaudeCode,
+            &[
+                (".claude/settings.json", with_other.to_string()),
+                (".claude.json", server(&ours)),
+            ],
+        );
+        assert_ne!(a, foreign_claude, "Claude Code: another PreToolUse hook");
     }
 
     #[test]
