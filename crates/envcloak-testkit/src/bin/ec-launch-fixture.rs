@@ -19,6 +19,18 @@
 //!   from `/dev/null`) as a child, and reports its exit code and the start
 //!   of its standard error as one JSON line: what a command a managed
 //!   server starts is told;
+//! - `echo <NAME>`: the value of variable `NAME` printed, on one line of
+//!   standard output and one of standard error, raw, as base64 and as hex,
+//!   and raw again written in two pieces with a pause between: what a
+//!   server that prints its key does, for the runner's redactor to catch
+//!   (a test whose runner did not redact finds the key in its client's
+//!   output);
+//! - `orphan`: starts `/bin/sleep 60` as a child in the server's process
+//!   group (holding its environment, with no standard stream), answers
+//!   `{"child": <pid>}` and exits at once: a server that leaves a
+//!   descendant behind;
+//! - `flood`: writes 4 MiB of filler lines to standard output: more than
+//!   any pipe holds, for a client that does not read;
 //! - anything else: ignored.
 //!
 //! At the end of its input it exits 0, or with `--linger`, that many seconds
@@ -61,6 +73,22 @@ fn cdhash() -> Option<String> {
         .signature?
         .cdhash
         .map(|h| hex(&h))
+}
+
+/// Writes `v` to `to` as `echo` does: raw, base64, hex, and raw again in
+/// two pieces with a pause between, on one line.
+fn echo(to: &mut impl Write, v: &[u8]) -> std::io::Result<()> {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(v);
+    write!(to, "raw {} ", String::from_utf8_lossy(v))?;
+    write!(to, "b64 {b64} hex {} split ", hex(v))?;
+    let (a, b) = v.split_at(v.len() / 2);
+    to.write_all(a)?;
+    to.flush()?;
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    to.write_all(b)?;
+    to.write_all(b" end\n")?;
+    to.flush()
 }
 
 fn main() {
@@ -113,6 +141,43 @@ fn main() {
             {
                 break;
             }
+            continue;
+        }
+        if let Some(name) = line.trim().strip_prefix("echo ") {
+            let v = std::env::var_os(name).unwrap_or_default();
+            let v = v.as_bytes();
+            let mut err = std::io::stderr();
+            let ok = echo(&mut out, v).and_then(|()| echo(&mut err, v));
+            if ok.is_err() {
+                break;
+            }
+            continue;
+        }
+        if line.trim() == "orphan" {
+            use std::process::Stdio;
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let answer =
+                serde_json::json!({"child": child.as_ref().ok().map(std::process::Child::id)});
+            let _ = writeln!(out, "{answer}").and_then(|()| out.flush());
+            std::process::exit(0);
+        }
+        if line.trim() == "flood" {
+            let filler = [b'x'; 1023];
+            for _ in 0..4096 {
+                if out
+                    .write_all(&filler)
+                    .and_then(|()| out.write_all(b"\n"))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            let _ = out.flush();
             continue;
         }
         if line.trim() != "report" {

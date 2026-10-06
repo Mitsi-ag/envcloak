@@ -177,16 +177,24 @@ fn helper_request(input: &Value) -> Value {
     let (server_in, to_server) = envcloak_sys::pipe_cloexec().unwrap();
     let (from_server, server_out) = envcloak_sys::pipe_cloexec().unwrap();
     let (life_read, life_write) = envcloak_sys::pipe_cloexec().unwrap();
+    // With `stderr`, the server's standard error too, read to its end once
+    // the rest is done.
+    let (from_errors, errors) = if input["stderr"].as_bool().unwrap_or(false) {
+        let (r, w) = envcloak_sys::pipe_cloexec().unwrap();
+        (Some(r), Some(w))
+    } else {
+        (None, None)
+    };
     let fds = envcloak_ipc::ClientFds {
         stdin: server_in,
         stdout: server_out,
-        stderr: None,
+        stderr: errors,
         lifeline: life_read,
     };
     let p = envcloak_ipc::proto::RunRequestParams {
         manifest: input["manifest"].as_str().unwrap_or("").to_owned(),
-        profile: None,
-        refs: Vec::new(),
+        profile: input["profile"].as_str().map(str::to_owned),
+        refs: serde_json::from_value(input["refs"].clone()).unwrap_or_default(),
         env_file: None,
         argv: vec!["mcp-bridge".to_owned()],
         claims: Vec::new(),
@@ -245,6 +253,40 @@ fn helper_request(input: &Value) -> Value {
         }
         ask(&mut to, &mut from, &input["send_after"], &mut replies);
     }
+    if input["stall"].as_bool().unwrap_or(false) {
+        // A client that stops reading: the server floods its output, and
+        // the client ends its lifeline only, its output's reading end held
+        // and never read. How long its runner takes to go.
+        let runner = replies
+            .first()
+            .and_then(Value::as_str)
+            .and_then(|l| serde_json::from_str::<Value>(l.trim()).ok())
+            .and_then(|r| r["ppid"].as_i64())
+            .and_then(|p| i32::try_from(p).ok());
+        let _ = writeln!(to, "flood").and_then(|()| to.flush());
+        std::thread::sleep(Duration::from_millis(500));
+        let t = Instant::now();
+        drop(life_write);
+        // The daemon reaps its runner as soon as it exits.
+        let gone = |pid: i32| envcloak_sys::proc_info(pid).is_err();
+        out["runner_gone_ms"] = match runner {
+            Some(pid) => {
+                while !gone(pid) && t.elapsed() < Duration::from_secs(20) {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if gone(pid) {
+                    json!(u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+                } else {
+                    Value::Null
+                }
+            }
+            None => Value::Null,
+        };
+        out["replies"] = Value::from(replies);
+        drop(to);
+        drop(from);
+        return out;
+    }
     if input["lifeline_only"].as_bool().unwrap_or(false) {
         let t = Instant::now();
         drop(life_write);
@@ -267,6 +309,19 @@ fn helper_request(input: &Value) -> Value {
         drop(life_write);
     }
     out["replies"] = Value::from(replies);
+    if let Some(e) = from_errors {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut all = Vec::new();
+            let _ = std::fs::File::from(e).read_to_end(&mut all);
+            let _ = tx.send(all);
+        });
+        out["stderr"] = rx
+            .recv_timeout(Duration::from_secs(30))
+            .map_or(Value::Null, |b| {
+                Value::from(String::from_utf8_lossy(&b).into_owned())
+            });
+    }
     if let Some(c) = control {
         out["control_len"] = json!(std::hint::black_box(&c).len());
     }
@@ -297,15 +352,25 @@ pub fn helper_main() {
 // --------------------------------------------------------- the world
 
 /// Whether this run uses `ENVCLOAK_E2E_BIN_DIR`'s binaries (CI's release
-/// job), which hold no test hook: these tests read the daemon's test trace
-/// and stop it at test barriers, so they say they were skipped there. The
-/// test job runs them on the test build, on both systems.
+/// job), which hold no test hook. Only a test that stops the daemon at a
+/// test barrier (`ENVCLOAK_TEST_PAUSE`) or makes a step fail
+/// (`ENVCLOAK_TEST_FAIL`) asks this, and says it was skipped there; every
+/// other managed test, the spike's precondition and its permanent controls
+/// among them, runs on the shipped binaries too, reading only what a
+/// release build shows (answers, the person's `pending` list, sweeps).
 pub fn release_run(test: &str) -> bool {
     let release = std::env::var_os("ENVCLOAK_E2E_BIN_DIR").is_some();
     if release {
         eprintln!("{test}: skipped on the release binaries: it needs the test build's hooks");
     }
     release
+}
+
+/// A helper the person runs in the background ([`World::person_background`]).
+pub struct Background {
+    thread: std::thread::JoinHandle<(envcloak_e2e::Person, Option<i32>)>,
+    output: PathBuf,
+    what: String,
 }
 
 /// One test's world: the harness, the managed project, the fixture.
@@ -471,6 +536,36 @@ impl World {
         self.read_out(&o, &format!("the person's {action}"))
     }
 
+    /// As [`World::person`], on a thread of its own, returning at once:
+    /// [`World::person_done`] takes its result.
+    pub fn person_background(&mut self, action: &str, mut input: Value) -> Background {
+        let pass = self.h.secret_file(labels::VAULT_PASSPHRASE, true);
+        input["passphrase_file"] = json!(pass.to_str().unwrap());
+        let (i, o) = self.io_paths();
+        std::fs::write(&i, input.to_string()).unwrap();
+        let argv = Self::helper_argv(action, &i, &o);
+        let person = self.h.person();
+        let home = self.h.home.home();
+        let thread = std::thread::spawn(move || {
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let ran = person.run_argv(&home, &argv, &[], Duration::from_secs(120));
+            (person, ran.map(|r| r.code))
+        });
+        Background {
+            thread,
+            output: o,
+            what: format!("the person's {action}"),
+        }
+    }
+
+    /// The result of a [`World::person_background`] run, swept.
+    pub fn person_done(&mut self, b: Background) -> Value {
+        let (person, code) = b.thread.join().unwrap();
+        self.h.keep_person(&person);
+        assert_eq!(code, Some(0), "{} did not finish", b.what);
+        self.read_out(&b.output, &b.what)
+    }
+
     /// The agent runs the helper's `action`, in its home directory (not
     /// the managed project's).
     pub fn agent(&mut self, action: &str, input: &Value) -> Value {
@@ -613,6 +708,22 @@ impl World {
             .join("\n")
     }
 
+    /// Whether the daemon is the test build, whose test trace counts what
+    /// it released ([`World::released`]).
+    pub fn traced(&self) -> bool {
+        self.h.test_build()
+    }
+
+    /// Asserts the daemons released values to a client `client` times and
+    /// to a runner `runner` times, where the test build's trace counts
+    /// them; a release build's daemon keeps no such count, and its tests
+    /// rest on the sweeps alone.
+    pub fn assert_released(&self, client: usize, runner: usize, when: &str) {
+        if self.traced() {
+            assert_eq!(self.released(), (client, runner), "{when}");
+        }
+    }
+
     /// How often the daemons' logs say values went to a client, and to a
     /// runner.
     pub fn released(&self) -> (usize, usize) {
@@ -625,9 +736,27 @@ impl World {
         )
     }
 
-    /// How many requests the daemons' audit lines say were left pending.
-    pub fn pending_count(&self) -> usize {
-        self.logs().matches("decision=pending").count()
+    /// How many requests were left pending: on the test build, as the
+    /// daemons' audit trace says (every one ever made); on a release
+    /// build, as the person's `envcloak pending --json` lists them now.
+    /// Either way, a request that made none leaves it unchanged.
+    pub fn pending_count(&mut self) -> usize {
+        if self.traced() {
+            return self.logs().matches("decision=pending").count();
+        }
+        let home = self.h.home.home();
+        let listed = self.h.human(&home, &["pending", "--json"], &[], &[]);
+        assert_eq!(listed.code, 0, "{}", listed.all());
+        let listed: Value = serde_json::from_str(&listed.out()).unwrap();
+        listed["requests"].as_array().map_or(0, Vec::len)
+    }
+
+    /// Waits for the test build's trace to show `text`; a release build
+    /// has no trace, and the caller's other checks stand alone there.
+    pub fn expect_trace(&mut self, text: &str) {
+        if self.traced() {
+            self.h.expect_log(text, Duration::from_secs(10));
+        }
     }
 }
 

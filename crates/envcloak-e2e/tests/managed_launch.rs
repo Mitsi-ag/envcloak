@@ -97,9 +97,6 @@ fn other_commands_refused(w: &mut World, when: &str) {
 /// project's): `envcloak run` gets a pending request and this fails.
 #[test]
 fn every_other_command_is_refused_before_a_pending_request() {
-    if managed_common::release_run("every_other_command_is_refused_before_a_pending_request") {
-        return;
-    }
     let mut w = World::new(&[]);
     let (launch, _) = w.register_fixture();
     other_commands_refused(&mut w, "no grant");
@@ -172,9 +169,6 @@ fn tamper_policies(w: &World, flip: bool) {
 /// than `vault_tampered`, and this fails. (Either layer alone refuses.)
 #[test]
 fn a_tampered_record_refuses_every_request() {
-    if managed_common::release_run("a_tampered_record_refuses_every_request") {
-        return;
-    }
     for flip in [true, false] {
         let how = if flip {
             "a flipped bit"
@@ -247,9 +241,6 @@ fn a_tampered_record_refuses_every_request() {
 /// fails.
 #[test]
 fn managed_audit_entries_hold_counts_and_digests_only() {
-    if managed_common::release_run("managed_audit_entries_hold_counts_and_digests_only") {
-        return;
-    }
     let mut w = World::new(&[]);
     let mode = format!("ec-mode-{:016x}", envcloak_testkit::fresh_seed());
     let argv = w.fixture_argv();
@@ -393,10 +384,9 @@ fn refused_changed(w: &mut World, launch: &str, part: &str) {
     assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
     assert_eq!(w.pending_count(), pending, "a pending request exists");
     assert_eq!(w.released(), released, "something was released");
-    w.h.expect_log(
-        &format!("managed launch refused reason=managed_launch_changed part={part}"),
-        Duration::from_secs(10),
-    );
+    w.expect_trace(&format!(
+        "managed launch refused reason=managed_launch_changed part={part}"
+    ));
 }
 
 /// F-72, D-33: the registered launch's executable replaced at the same
@@ -421,9 +411,6 @@ fn refused_changed(w: &mut World, launch: &str, part: &str) {
 /// fails.
 #[test]
 fn a_changed_launch_is_refused_before_any_pending_request() {
-    if managed_common::release_run("a_changed_launch_is_refused_before_any_pending_request") {
-        return;
-    }
     let mut w = World::new(&[]);
     let work = w.project.join("work");
     std::fs::create_dir(&work).unwrap();
@@ -484,9 +471,6 @@ fn a_changed_launch_is_refused_before_any_pending_request() {
 /// rather than the declared one: the decoy is registered, and this fails.
 #[test]
 fn a_bare_name_runs_the_registered_executable() {
-    if managed_common::release_run("a_bare_name_runs_the_registered_executable") {
-        return;
-    }
     let decoys = tempfile::Builder::new()
         .prefix("ecd")
         .tempdir_in("/tmp")
@@ -528,9 +512,6 @@ fn a_bare_name_runs_the_registered_executable() {
 /// code-selecting variables reach the server and this fails.
 #[test]
 fn the_server_gets_only_the_launch_environment() {
-    if managed_common::release_run("the_server_gets_only_the_launch_environment") {
-        return;
-    }
     let mut w = World::new(&[
         ("LD_PRELOAD", "/nonexistent/ec-preload.so"),
         ("NODE_OPTIONS", "--require /nonexistent/ec.js"),
@@ -574,9 +555,6 @@ fn the_server_gets_only_the_launch_environment() {
 /// `NODE_OPTIONS` declaration is registered and this fails.
 #[test]
 fn code_selecting_declarations_are_refused_at_registration() {
-    if managed_common::release_run("code_selecting_declarations_are_refused_at_registration") {
-        return;
-    }
     let mut w = World::new(&[]);
     let argv = w.fixture_argv();
     for (decl, reason) in [
@@ -617,7 +595,8 @@ fn code_selecting_declarations_are_refused_at_registration() {
 }
 
 /// Gate 23 for registration (T9-3, F-70): `managed.register` from an
-/// agent's process, and from a process without a terminal, is refused
+/// agent's process (on the agent's pipes, and on a terminal the agent
+/// opened for it), and from a process without a terminal, is refused
 /// `proof_refused` before the passphrase is checked; a wrong passphrase
 /// is `wrong_passphrase`; the person on a terminal of their own registers
 /// (the positive control).
@@ -626,9 +605,6 @@ fn code_selecting_declarations_are_refused_at_registration() {
 /// registration succeeds and this fails.
 #[test]
 fn registration_needs_a_terminal_proof() {
-    if managed_common::release_run("registration_needs_a_terminal_proof") {
-        return;
-    }
     let mut w = World::new(&[]);
     let pass =
         w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
@@ -643,6 +619,23 @@ fn registration_needs_a_terminal_proof() {
     // No terminal: started by the test itself.
     let no_terminal = w.no_terminal("register", &input);
     assert_eq!(error_of(&no_terminal), "proof_refused", "{no_terminal}");
+    // On a terminal of its own that the agent opened (Python's
+    // `pty.spawn`): its session, not the person's.
+    let (i, o) = w.io_paths();
+    std::fs::write(&i, input.to_string()).unwrap();
+    let argv = World::helper_argv("register", &i, &o);
+    let quoted: Vec<String> = argv.iter().map(|a| envcloak_e2e::quoted(a)).collect();
+    let line = format!(
+        "{} -c {} {}",
+        envcloak_e2e::quoted(envcloak_e2e::python3().to_str().unwrap()),
+        envcloak_e2e::quoted("import pty, sys; pty.spawn(sys.argv[1:])"),
+        quoted.join(" ")
+    );
+    let home = w.h.home.home();
+    let ran = w.h.agent_line(&home, &line);
+    assert!(ran.status.success(), "{}", text(&ran));
+    let on_pty = w.read_out(&o, "the agent's registration on a terminal of its own");
+    assert_eq!(error_of(&on_pty), "proof_refused", "{on_pty}");
     // A wrong passphrase, from the person.
     let wrong = w.h.files().join("wrong");
     std::fs::write(
@@ -682,9 +675,6 @@ fn registration_needs_a_terminal_proof() {
 /// request after the update is started at once, and this fails.
 #[test]
 fn an_update_comes_from_the_stored_declaration() {
-    if managed_common::release_run("an_update_comes_from_the_stored_declaration") {
-        return;
-    }
     let mut w = World::new(&[]);
     let argv = w.fixture_argv();
     let reg = w.register(json!({"argv": argv, "env": [["MODE", "dev"]]}));
@@ -771,9 +761,6 @@ fn an_update_comes_from_the_stored_declaration() {
 /// request is pending, and this fails.
 #[test]
 fn an_edited_origin_is_refused_until_registered_again() {
-    if managed_common::release_run("an_edited_origin_is_refused_until_registered_again") {
-        return;
-    }
     let mut w = World::new(&[]);
     let origin = "https://api.example.test";
     let edited = "https://api.example.test:8443";
@@ -841,9 +828,6 @@ fn an_edited_origin_is_refused_until_registered_again() {
 /// starts, and this fails.
 #[test]
 fn launch_classes_and_their_receipts() {
-    if managed_common::release_run("launch_classes_and_their_receipts") {
-        return;
-    }
     let mut w = World::new(&[]);
     // A script, through an interpreter.
     let script = w.project.join("server.sh");
@@ -883,10 +867,7 @@ fn launch_classes_and_their_receipts() {
     drop(f);
     let answer = w.request(&launch);
     assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
-    w.h.expect_log(
-        "managed launch refused reason=managed_launch_changed part=entry_file",
-        Duration::from_secs(10),
-    );
+    w.expect_trace("managed launch refused reason=managed_launch_changed part=entry_file");
     // A package runner: a stand-in `npx` on the declared PATH.
     let tools = w.project.join("tools");
     std::fs::create_dir(&tools).unwrap();
@@ -1010,10 +991,10 @@ fn held_world(site: &str) -> (World, tempfile::TempDir) {
 /// the daemon's check, before the runner starts): on Linux, an in-place
 /// rewrite of the original and a rename-over each made after the final
 /// sealed-copy check, the launch runs the approved image (its digest),
-/// never the replacement; on macOS, a rename-over at the barrier fails
-/// the suspended child's code directory hash check: the child is killed
-/// before it resumes (its start marker never appears) and the client is
-/// answered `managed_launch_changed`.
+/// never the replacement; on macOS, an in-place rewrite and a rename-over
+/// at the barrier each fail the suspended child's code directory hash
+/// check: the child is killed before it resumes (its start marker never
+/// appears) and the client is answered `managed_launch_changed`.
 ///
 /// Mutations checked: Linux, the source path reopened instead of the
 /// prepared copy (the rename-over's build runs, and this fails); macOS,
@@ -1051,6 +1032,18 @@ fn the_approved_image_runs_whatever_happens_at_the_barrier() {
         assert!(started(&answer), "{answer}");
         assert_eq!(reported_identity(&report(&answer)), receipt_identity(&reg));
     } else {
+        // Rewritten in place (the same file, another build's bytes), then
+        // the original's bytes put back in place for the next case, which
+        // the daemon's own check, before the barrier, reads.
+        let answer = at_barrier(&mut w, &launch, (&release, &held), site, &|w| {
+            rewrite_in_place(&w.fixture, &other);
+        });
+        assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
+        assert!(
+            !appears(&w.marker, Duration::from_secs(2)),
+            "the refused child ran"
+        );
+        rewrite_in_place(&w.fixture, &original);
         let answer = at_barrier(&mut w, &launch, (&release, &held), site, &rename_over);
         assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
         assert!(
@@ -1136,4 +1129,449 @@ fn a_source_changed_while_copied_never_runs() {
     } else {
         assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
     }
+}
+
+// ------------------------------------------------- removal and races
+
+/// Gate 23 for removal (`managed.unregister`, which `migrate-mcp --undo`
+/// and `agents uninstall` call; T9-3, F-70): an agent's removal and one
+/// from a process without a terminal are `proof_refused`, a wrong
+/// passphrase is `wrong_passphrase`, and the record stays (the launch is
+/// still served: the positive control). The person's removal, audited
+/// `removed`, ends what the record covered: its launch id is no longer
+/// one (`managed_command_mismatch`), and the session grant made for the
+/// launch covers nothing of the project, whose plain run now asks for
+/// approval; a bridged server's removal likewise leaves its session grant
+/// covering nothing of the plain run.
+///
+/// Mutation checked: `managed.unregister` without its prover check and
+/// proof (`refuse_unless_prover` and `prove` removed): the agent's removal
+/// succeeds, and this fails.
+#[test]
+fn removal_needs_a_terminal_proof_and_ends_what_the_record_covered() {
+    let mut w = World::new(&[]);
+    let (launch, _, _) = w.launched();
+    let pass =
+        w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
+    let input = json!({
+        "id": "claude-code/fixture",
+        "passphrase_file": pass.to_str().unwrap(),
+    });
+    let by_agent = w.agent("unregister", &input);
+    assert_eq!(error_of(&by_agent), "proof_refused", "{by_agent}");
+    let no_terminal = w.no_terminal("unregister", &input);
+    assert_eq!(error_of(&no_terminal), "proof_refused", "{no_terminal}");
+    let wrong = w.h.files().join("wrong");
+    std::fs::write(
+        &wrong,
+        format!("wrong {:016x}\n", envcloak_testkit::fresh_seed()),
+    )
+    .unwrap();
+    let mut bad = input.clone();
+    bad["passphrase_file"] = json!(wrong.to_str().unwrap());
+    let (i, o) = w.io_paths();
+    std::fs::write(&i, bad.to_string()).unwrap();
+    let argv = World::helper_argv("unregister", &i, &o);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let home = w.h.home.home();
+    let ran = w.h.human_argv(&home, &argv, &[], &[]);
+    assert_eq!(ran.code, 0, "{}", ran.all());
+    let wrong = w.read_out(&o, "the removal with a wrong passphrase");
+    assert_eq!(error_of(&wrong), "wrong_passphrase", "{wrong}");
+    // The record stayed: the launch is served under its session grant.
+    let still = w.request(&launch);
+    assert!(started(&still), "{still}");
+    // The person removes it.
+    let removed = w.person("unregister", json!({"id": "claude-code/fixture"}));
+    assert_eq!(removed["removed"], true, "{removed}");
+    w.expect_trace("managed server removed launch=");
+    let stale = w.request(&launch);
+    assert_eq!(error_of(&stale), "managed_command_mismatch", "{stale}");
+    let manifest = w.project.join("envcloak.toml");
+    let run = w.h.agent(
+        &home,
+        &[
+            "run",
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--",
+            "true",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("approval_required"),
+        "{}",
+        text(&run)
+    );
+    // A bridged server: its session grant, then its removal.
+    let origin = "https://api.example.test";
+    let remote = w.h.home.root().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let suffix = envcloak_policy::managed::bridge_binding_suffix(origin);
+    std::fs::write(
+        remote.join("envcloak.toml"),
+        format!("[project]\nname = \"remote\"\n\n[env]\nAPI_KEY{suffix} = \"stripe/fixture\"\n"),
+    )
+    .unwrap();
+    let remote_manifest = remote.join("envcloak.toml");
+    let reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/remote",
+            "manifest": remote_manifest.to_str().unwrap(),
+            "origin": origin,
+            "headers": ["Authorization"],
+        }),
+    );
+    assert_eq!(reg["receipt"]["transport"], "bridge", "{reg}");
+    let asked = w.agent(
+        "request",
+        &json!({
+            "manifest": remote_manifest.to_str().unwrap(),
+            "origin": origin,
+            "headers": ["Authorization"],
+        }),
+    );
+    w.approve(&pending_id(&asked));
+    let removed = w.person("unregister", json!({"id": "claude-code/remote"}));
+    assert_eq!(removed["removed"], true, "{removed}");
+    let run = w.h.agent(
+        &home,
+        &[
+            "run",
+            "--manifest",
+            remote_manifest.to_str().unwrap(),
+            "--",
+            "true",
+        ],
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("approval_required"),
+        "the bridge-era grant covered the plain run: {}",
+        text(&run)
+    );
+    w.h.assert_swept("after the removals");
+}
+
+/// The agent's `envcloak run` against `manifest` started in the
+/// background (`printenv` of the key, discarded): the files its exit code
+/// and its standard error go to.
+fn run_in_background(w: &mut World, manifest: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let code =
+        w.h.files()
+            .join(format!("bg-{:016x}.code", envcloak_testkit::fresh_seed()));
+    let err = code.with_extension("err");
+    let q = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
+    let line = format!(
+        "( {} run --manifest {} -- sh -c {} >/dev/null 2>{}; echo $? >{}.tmp; mv {}.tmp {} )",
+        q(&w.h.cli()),
+        q(manifest),
+        envcloak_e2e::quoted(&format!("printenv {KEY} >/dev/null")),
+        q(&err),
+        q(&code),
+        q(&code),
+        q(&code)
+    );
+    let home = w.h.home.home();
+    w.h.agent_spawn(&home, &line);
+    (code, err)
+}
+
+/// The record a request is decided on is the record as it is at the
+/// decision (review: a stale snapshot): the daemon held between its
+/// managed check and its decision (a `testing` barrier) while the record
+/// changes. A plain run of a project that was not managed when it was
+/// checked, under a session grant for it (the positive control: the same
+/// run covered before), is refused `managed_command_mismatch` once the
+/// project is registered meanwhile, and releases nothing; a launch's
+/// request checked at revision 1, under a session grant for revision 1,
+/// is a fresh pending request once `managed.update` makes revision 2
+/// meanwhile.
+///
+/// Mutation checked: the decision taken on the record read before the
+/// check, without reading it again under the decision's lock: the plain
+/// run is covered (exit 0) and the launch is `started` under the old
+/// revision's grant, and this fails.
+#[test]
+fn a_request_is_decided_on_the_record_as_it_is_then() {
+    if managed_common::release_run("a_request_is_decided_on_the_record_as_it_is_then") {
+        return;
+    }
+    let site = "launch.checked_before_decision";
+    let (mut w, gate) = held_world(site);
+    let release = gate.path().join("release");
+    let held = gate.path().join("held");
+    let manifest = w.project.join("envcloak.toml");
+    let home = w.h.home.home();
+    // A session grant for the plain run, while the project is not managed.
+    let printenv = format!("printenv {KEY} >/dev/null");
+    let args = [
+        "run",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--",
+        "sh",
+        "-c",
+        printenv.as_str(),
+    ];
+    let first = w.h.agent(&home, &args);
+    let err = String::from_utf8_lossy(&first.stderr).into_owned();
+    assert_eq!(
+        envcloak_e2e::token(&first.stderr),
+        "approval_required",
+        "{}",
+        text(&first)
+    );
+    let pending = err
+        .split("request=")
+        .nth(1)
+        .and_then(|r| r.get(..8))
+        .unwrap_or_else(|| panic!("no request id: {err}"))
+        .to_owned();
+    w.approve(&pending);
+    let covered = w.h.agent(&home, &args);
+    assert_eq!(covered.status.code(), Some(0), "{}", text(&covered));
+    // Held at the barrier; the project is registered meanwhile.
+    let stops = paused(&w, site);
+    std::fs::rename(&release, &held).unwrap();
+    let (code, err) = run_in_background(&mut w, &manifest);
+    wait_paused(&w, site, stops + 1);
+    let (launch, reg) = w.register_fixture();
+    std::fs::rename(&held, &release).unwrap();
+    assert!(
+        appears(&code, Duration::from_secs(60)),
+        "the run never ended"
+    );
+    let stderr = std::fs::read(&err).unwrap_or_default();
+    w.h.record("the held run", &stderr);
+    assert_eq!(
+        std::fs::read_to_string(&code).unwrap().trim(),
+        "125",
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("managed_command_mismatch"),
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    // A session grant for revision 1 of the launch.
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    assert_eq!(reported_identity(&report(&answer)), receipt_identity(&reg));
+    // Held at the barrier; revision 2 is made meanwhile.
+    let stops = paused(&w, site);
+    std::fs::rename(&release, &held).unwrap();
+    let out = w.agent_background("request", &json!({"launch": launch, "send": ["report"]}));
+    wait_paused(&w, site, stops + 1);
+    let plan = w.person("plan", json!({"launch": launch}));
+    let digest = plan["statement"]["digest"].as_str().unwrap().to_owned();
+    let updated = w.person("update", json!({"launch": launch, "digest": digest}));
+    assert_eq!(updated["revision"], 2, "{updated}");
+    std::fs::rename(&held, &release).unwrap();
+    let answer = w.wait_out(&out, Duration::from_secs(60), "the held request");
+    pending_id(&answer);
+    w.h.assert_swept("after the held requests");
+}
+
+/// A registration takes its launch id and revision from the record as it
+/// is when it commits (review: a revision computed before resolution and
+/// the proof): a registration held after its resolution and before its
+/// proof and commit (a `testing` barrier)
+/// while an update makes revision 2 commits revision 3, never a second
+/// revision 2; a session grant made for the update's revision 2 then
+/// covers nothing of the registration's launch (a fresh pending request).
+///
+/// Mutation checked: the revision computed before resolution, as before
+/// (`prior` read once, outside the commit's lock): the registration
+/// commits revision 2 again, the grant for revision 2 covers its launch,
+/// and this fails.
+#[test]
+fn a_registration_takes_its_revision_at_its_commit() {
+    if managed_common::release_run("a_registration_takes_its_revision_at_its_commit") {
+        return;
+    }
+    let site = "managed.register_resolved";
+    let (mut w, gate) = held_world(site);
+    let release = gate.path().join("release");
+    let held = gate.path().join("held");
+    let (launch, _) = w.register_fixture();
+    // The registration again, with another argument, held at its commit.
+    let stops = paused(&w, site);
+    std::fs::rename(&release, &held).unwrap();
+    let mut argv = w.fixture_argv();
+    argv.as_array_mut().unwrap().push(json!("--linger"));
+    argv.as_array_mut().unwrap().push(json!("0"));
+    let again = w.person_background(
+        "register",
+        json!({
+            "name": "claude-code/fixture",
+            "manifest": w.project.join("envcloak.toml").to_str().unwrap(),
+            "argv": argv,
+        }),
+    );
+    wait_paused(&w, site, stops + 1);
+    let plan = w.person("plan", json!({"launch": launch}));
+    let digest = plan["statement"]["digest"].as_str().unwrap().to_owned();
+    let updated = w.person("update", json!({"launch": launch, "digest": digest}));
+    assert_eq!(updated["revision"], 2, "{updated}");
+    // A session grant for revision 2.
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    std::fs::rename(&held, &release).unwrap();
+    let registered = w.person_done(again);
+    assert_eq!(registered["launch"], launch.as_str(), "{registered}");
+    assert_eq!(registered["revision"], 3, "{registered}");
+    let next = w.request(&launch);
+    pending_id(&next);
+}
+
+/// CR-2: an update statement shows the declaration as it is stored and
+/// as the update would store it, whole: a change to an argument, to
+/// `PATH` and to a variable's value each shows there, though the receipts
+/// (which show names and identities) read alike. A statement that changed
+/// between its plan and the update (the executable replaced meanwhile) is
+/// `statement_mismatch`, and nothing is committed (the revision stays).
+///
+/// Mutation checked: the statement without the declarations (receipts
+/// only, as before): the argument, `PATH` and value changes are not shown,
+/// and this fails.
+#[test]
+fn an_update_statement_shows_every_change_of_the_declaration() {
+    let mut w = World::new(&[]);
+    let argv = w.fixture_argv();
+    let bin = w.fixture.parent().unwrap().to_str().unwrap().to_owned();
+    let reg = w.register(json!({"argv": argv, "env": [["MODE", "dev"]], "path_env": bin}));
+    let launch = reg["launch"].as_str().unwrap().to_owned();
+    let mut new_argv = w.fixture_argv();
+    new_argv.as_array_mut().unwrap().push(json!("--linger"));
+    new_argv.as_array_mut().unwrap().push(json!("0"));
+    let path = format!("{bin}:/usr/bin");
+    let changes = json!({
+        "argv": new_argv,
+        "set_env": [["MODE", "fast"]],
+        "path_env": path,
+    });
+    let shown = w.person("plan", json!({"launch": launch, "changes": changes}));
+    let st = &shown["statement"];
+    assert_eq!(st["old_declaration"]["argv"], argv, "{shown}");
+    assert_eq!(st["new_declaration"]["argv"], new_argv, "{shown}");
+    assert_eq!(
+        st["old_declaration"]["env"],
+        json!([["MODE", "dev"]]),
+        "{shown}"
+    );
+    assert_eq!(
+        st["new_declaration"]["env"],
+        json!([["MODE", "fast"]]),
+        "{shown}"
+    );
+    assert_eq!(st["old_declaration"]["path_env"], bin.as_str(), "{shown}");
+    assert_eq!(st["new_declaration"]["path_env"], path.as_str(), "{shown}");
+    // The receipts alone do not show the value change.
+    assert_eq!(st["old"]["env_names"], st["new"]["env_names"], "{shown}");
+    // A statement changed between its plan and the update.
+    let plan = w.person("plan", json!({"launch": launch}));
+    let digest = plan["statement"]["digest"].as_str().unwrap().to_owned();
+    let other = w.fixture.with_extension("other");
+    other_build(&other);
+    std::fs::rename(&other, &w.fixture).unwrap();
+    let mismatch = w.person("update", json!({"launch": launch, "digest": digest}));
+    assert_eq!(error_of(&mismatch), "statement_mismatch", "{mismatch}");
+    let again = w.person("plan", json!({"launch": launch}));
+    assert_eq!(again["statement"]["revision"], 1, "{again}");
+}
+
+/// Gate 13 in the daemon (behind the client's own check, which lane B's
+/// typed helpers do not run): a registration or an update plan whose
+/// argument or variable value looks like a key is refused `invalid_params`
+/// (`key_shaped`) before anything is stored, and the key is in no
+/// answer; the project stays unmanaged.
+///
+/// Mutation checked: the daemon's refusal removed: the registration with
+/// the key in its argv is stored and its receipt is answered, and this
+/// fails (the sweep finds the key in the answer).
+#[test]
+fn a_key_in_a_declaration_is_refused_by_the_daemon() {
+    let mut w = World::new(&[]);
+    let key = managed_common::stripe_test_key();
+    w.h.add_needle("the key in a declaration".into(), key.clone().into_bytes());
+    let mut argv = w.fixture_argv();
+    argv.as_array_mut().unwrap().push(json!(key));
+    let reg = w.register(json!({ "argv": argv }));
+    assert_eq!(error_of(&reg), "invalid_params", "{reg}");
+    assert_eq!(reg["reason"], "key_shaped", "{reg}");
+    let reg = w.register(json!({"argv": w.fixture_argv(), "env": [["TOKEN", key]]}));
+    assert_eq!(reg["reason"], "key_shaped", "{reg}");
+    let (launch, _) = w.register_fixture();
+    let plan = w.person(
+        "plan",
+        json!({"launch": launch, "changes": {"set_env": [["TOKEN", key]]}}),
+    );
+    assert_eq!(plan["reason"], "key_shaped", "{plan}");
+    w.h.assert_swept("after the refusals");
+}
+
+/// D-18 against the bindings a request resolves to: a bridged project's
+/// request whose profile or reference names a binding without the
+/// origin's digest is `managed_command_mismatch`, though every binding of
+/// the manifest's defaults carries it (the plain request is pending: the
+/// positive control).
+///
+/// Mutation checked: the origin check on the manifest's default bindings
+/// only (as before): the profile's and the reference's requests are
+/// pending, and this fails.
+#[test]
+fn a_bridged_request_is_checked_on_every_binding_it_names() {
+    let mut w = World::new(&[]);
+    let origin = "https://api.example.test";
+    let remote = w.h.home.root().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let suffix = envcloak_policy::managed::bridge_binding_suffix(origin);
+    std::fs::write(
+        remote.join("envcloak.toml"),
+        format!(
+            "[project]\nname = \"remote\"\n\n[env]\nAPI_KEY{suffix} = \"stripe/fixture\"\n\n\
+             [env.extra]\nPLAIN_KEY = \"stripe/fixture\"\n"
+        ),
+    )
+    .unwrap();
+    let manifest = remote.join("envcloak.toml");
+    let manifest = manifest.to_str().unwrap();
+    let reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/remote",
+            "manifest": manifest,
+            "origin": origin,
+            "headers": ["Authorization"],
+        }),
+    );
+    assert_eq!(reg["receipt"]["transport"], "bridge", "{reg}");
+    let ask = |w: &mut World, extra: Value| {
+        let mut input = json!({
+            "manifest": manifest,
+            "origin": origin,
+            "headers": ["Authorization"],
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            input[k] = v.clone();
+        }
+        w.agent("request", &input)
+    };
+    pending_id(&ask(&mut w, json!({})));
+    let pending = w.pending_count();
+    let by_profile = ask(&mut w, json!({"profile": "extra"}));
+    assert_eq!(
+        error_of(&by_profile),
+        "managed_command_mismatch",
+        "{by_profile}"
+    );
+    let by_ref = ask(&mut w, json!({"refs": ["PLAIN_KEY=stripe/fixture"]}));
+    assert_eq!(error_of(&by_ref), "managed_command_mismatch", "{by_ref}");
+    assert_eq!(w.pending_count(), pending, "a pending request exists");
 }
