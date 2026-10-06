@@ -102,6 +102,10 @@ fn main() {
                 a_prompt_without_a_newline_shows_and_the_start_of_a_value_waits,
             ),
             (
+                "inherited_output_translations_are_cleared_before_redaction",
+                inherited_output_translations_are_cleared_before_redaction,
+            ),
+            (
                 "canonical_and_raw_input_reach_the_command",
                 canonical_and_raw_input_reach_the_command,
             ),
@@ -1123,22 +1127,16 @@ fn gate8_real_serializers_through_a_pty_are_redacted_crlf_forms_included() {
 // ---------------------------------------------------------------------------
 // Prompts, input, echo, Ctrl-C and the window size.
 
-/// A prompt without a newline shows while the command waits for its
-/// answer: the 40 ms idle flush releases it within 100 ms of the read that
-/// brought it (the plan's bound), measured from the marker the same write
-/// carried, which the relay released at that read (the timing origin the
-/// relay itself sets). Five prompts, the fastest held to 100 ms: a load
-/// spike can delay one, never the flush itself. The answer typed on the
-/// terminal reaches the command, and the start of a value is held back
-/// until what follows shows it is not the value.
-///
-/// Mutation checked: an idle flush of 300 ms (`IDLE_FLUSH`): every prompt
-/// takes 300 ms or more, and this fails.
+/// An acknowledgement barrier precedes each prompt: timing starts before
+/// the child can emit it. Every sample must meet the 100 ms bound. The
+/// exact 40 ms deadline is checked separately with an injected time.
 fn a_prompt_without_a_newline_shows_and_the_start_of_a_value_waits() {
     let case = Case::new();
     let script = r#"i=0
 while [ $i -lt 5 ]; do
-  printf 'mark-%d%8192sPassword: ' $i ''
+  printf 'mark-%d\n' $i
+  read ready
+  printf 'Password: '
   read answer
   printf 'got %s\n' "$answer"
   i=$((i+1))
@@ -1159,14 +1157,17 @@ printf '!\n'"#;
     for i in 0..5 {
         outer.expect(&format!("mark-{i}"), 1, "the marker");
         let t0 = Instant::now();
+        outer.type_bytes(b"ready\r");
         outer.expect("Password: ", i + 1, "the prompt while the command waits");
         took.push(t0.elapsed());
         outer.type_bytes(b"yes\r");
         outer.expect("got yes", i + 1, "the answer reached the command");
     }
-    let fastest = took.iter().min().copied().unwrap();
-    println!("pty prompt: shown {took:?} after the marker before it (fastest {fastest:?})");
-    assert!(fastest <= Duration::from_millis(100), "{took:?}");
+    println!("pty prompt: shown {took:?} after acknowledgement");
+    assert!(
+        took.iter().all(|t| *t <= Duration::from_millis(100)),
+        "{took:?}"
+    );
     let prefix = &by_label(&case.cs, labels::OPENAI_API_KEY).value()[..12];
     let early = outer.wait_for_within(Duration::from_millis(300), |o| contains(&o.seen, prefix));
     assert!(!early, "the start of a value was released");
@@ -1176,6 +1177,91 @@ printf '!\n'"#;
     assert!(contains(&outer.seen, prefix), "{}", outer.text());
     assert!(contains(&outer.seen, b"!\r\n"), "{}", outer.text());
     case.assert_clean(&outer.seen);
+}
+
+/// Python's termios and the kernel are independent oracles: each inherited
+/// translation is enabled on the outer terminal, and the plain command
+/// records its actual byte rewrite. Through the runner only OPOST/ONLCR
+/// remain, and a value containing tabs, CR, LF, lowercase and EOT is masked.
+fn inherited_output_translations_are_cleared_before_redaction() {
+    let case = Case::new();
+    let value = format!("\rline{:x}\tcol\rnext\x04end\n", case.seed);
+    let canary = Canary::new("OUTPUT_FLAGS", value.clone());
+    never_shown(std::slice::from_ref(&canary));
+    let value_file = case.path("value");
+    std::fs::write(&value_file, value.as_bytes()).unwrap();
+    let launcher = case.script(
+        "translations.py",
+        r"import os, sys, termios
+settings = termios.tcgetattr(0)
+settings[1] = termios.OPOST | termios.ONLCR | getattr(termios, sys.argv[1])
+termios.tcsetattr(0, termios.TCSANOW, settings)
+os.execv(sys.argv[2], sys.argv[2:])",
+    );
+    let emitter = case.script(
+        "output.py",
+        r"import os, pathlib, sys, termios
+if sys.argv[1] == 'env':
+    flags = termios.tcgetattr(1)[1]
+    os.write(1, ('FLAGS=%d\n' % flags).encode())
+    value = os.environ['TEST_VALUE'].encode()
+else:
+    value = pathlib.Path(sys.argv[1]).read_bytes()
+os.write(1, value)",
+    );
+    let python = python3();
+    #[cfg(target_os = "macos")]
+    let flags = ["OXTABS", "ONOEOT", "OCRNL", "ONOCR", "ONLRET"];
+    #[cfg(target_os = "linux")]
+    let flags = ["TAB3", "OLCUC", "OCRNL", "ONOCR", "ONLRET"];
+    for flag in flags {
+        let mut plain = Outer::new(24, 80);
+        let argv = vec![
+            python.clone().into_os_string(),
+            launcher.clone().into_os_string(),
+            flag.into(),
+            python.clone().into_os_string(),
+            emitter.clone().into_os_string(),
+            value_file.clone().into_os_string(),
+        ];
+        let mut child = Running {
+            child: lead(&case, &plain, &argv, &[]),
+        };
+        assert_eq!(plain.wait_exit(&mut child.child, DEADLINE).code(), Some(0));
+        if flag != "ONLRET" {
+            assert_ne!(
+                plain.seen,
+                crlf(value.as_bytes()),
+                "{flag}: kernel control did not rewrite output"
+            );
+        }
+        let file_arg = format!("TEST_VALUE:{}", value_file.display());
+        let runner = case.runner_argv(
+            &[],
+            &["--file", &file_arg],
+            &[python.as_os_str(), emitter.as_os_str(), OsStr::new("env")],
+        );
+        let mut argv = vec![
+            python.clone().into_os_string(),
+            launcher.clone().into_os_string(),
+            flag.into(),
+        ];
+        argv.extend(runner);
+        let mut outer = Outer::new(24, 80);
+        let mut run = Running {
+            child: lead(&case, &outer, &argv, &[]),
+        };
+        assert_eq!(outer.wait_exit(&mut run.child, DEADLINE).code(), Some(0));
+        let expected = format!(
+            "FLAGS={}\r\n[envcloak:fixture0/t]",
+            libc::OPOST | libc::ONLCR
+        );
+        assert!(
+            outer.seen == expected.as_bytes(),
+            "{flag}: unexpected output flags or value not redacted"
+        );
+        assert_no_canary(&outer.seen, std::slice::from_ref(&canary));
+    }
 }
 
 /// Canonical input: a typed line is echoed by the command's terminal and
