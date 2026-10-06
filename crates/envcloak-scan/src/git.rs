@@ -4,7 +4,10 @@ use crate::candidates::{Budget, Candidate, Source};
 use crate::source::ConfigFormat;
 use crate::transcript::{StreamReport, scan_reader};
 use crate::{ScanError, ScanErrorKind, ScanRoot};
+use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
+use std::os::unix::fs::MetadataExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -27,6 +30,97 @@ impl Drop for Git {
     }
 }
 
+struct GitLocation {
+    dir: File,
+    git_dir: &'static str,
+}
+
+// Do not interpret Git's pointer-file grammar here. Any nonempty pointer is
+// conservatively partial, even when its target might stay inside this root.
+// This also covers transitive alternates and common stores beyond that pointer.
+fn note_pointer(
+    repo: &ScanRoot,
+    dir: &File,
+    name: &str,
+    reason: &'static str,
+    source: &Source,
+    report: &mut StreamReport,
+) -> Result<(), ScanErrorKind> {
+    let (_, metadata) = match crate::root::open_file(dir, OsStr::new(name), crate::MAX_DOTENV) {
+        Ok(file) => file,
+        Err(ScanErrorKind::NotFound) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if metadata.dev() != repo.dev() {
+        return Err(ScanErrorKind::MountPoint);
+    }
+    if metadata.nlink() > 1 {
+        report.issue(source, "hard_link");
+    }
+    if metadata.len() != 0 {
+        report.issue(source, reason);
+    }
+    Ok(())
+}
+
+fn git_location(
+    repo: &ScanRoot,
+    source: &Source,
+    report: &mut StreamReport,
+) -> Result<GitLocation, ScanErrorKind> {
+    // Open first, then inspect that descriptor. A kind-only preflight would
+    // leave Git free to follow a replaced .git pathname after inspection.
+    let dir = match envcloak_sys::open_beneath(repo.dir(), OsStr::new(".git")) {
+        Ok(file) => {
+            let metadata = file.metadata().map_err(|e| crate::root::io_kind(&e))?;
+            if metadata.dev() != repo.dev() {
+                return Err(ScanErrorKind::MountPoint);
+            }
+            if metadata.is_dir() {
+                file
+            } else if metadata.is_file() {
+                if metadata.uid() != envcloak_sys::effective_uid() {
+                    return Err(ScanErrorKind::NotOwned);
+                }
+                if metadata.len() > crate::MAX_DOTENV as u64 {
+                    return Err(ScanErrorKind::TooLarge);
+                }
+                if metadata.nlink() > 1 {
+                    report.issue(source, "hard_link");
+                }
+                // Gitfiles include real linked worktrees. Keep their findings,
+                // but never imply their stores are confined to the held root.
+                report.issue(source, "gitfile_indirection");
+                return Ok(GitLocation {
+                    dir: repo
+                        .dir()
+                        .try_clone()
+                        .map_err(|e| crate::root::io_kind(&e))?,
+                    git_dir: ".git",
+                });
+            } else {
+                return Err(ScanErrorKind::NotRegular);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => repo
+            .dir()
+            .try_clone()
+            .map_err(|e| crate::root::io_kind(&e))?,
+        Err(e) => return Err(crate::root::io_kind(&e)),
+    };
+    note_pointer(repo, &dir, "commondir", "git_common_dir", source, report)?;
+    match repo.open_subdir(&dir, OsStr::new("objects")) {
+        Ok(objects) => match repo.open_subdir(&objects, OsStr::new("info")) {
+            Ok(info) => note_pointer(repo, &info, "alternates", "git_alternates", source, report)?,
+            Err(ScanErrorKind::NotFound) => {}
+            Err(e) => return Err(e),
+        },
+        Err(ScanErrorKind::NotFound) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(GitLocation { dir, git_dir: "." })
+}
+
 /// Scan the object database, including blobs no longer present in HEAD.
 /// Git ranges identify object bytes and are never eligible for file rewriting.
 pub fn scan_git_history(
@@ -38,18 +132,27 @@ pub fn scan_git_history(
         path: repo.path().to_path_buf(),
         object: None,
     };
+    let mut report = StreamReport::default();
+    let location = match git_location(repo, &source, &mut report) {
+        Ok(location) => location,
+        Err(e) => {
+            report.issue(&source, e.token());
+            return Ok(report);
+        }
+    };
+    scan_location(location, source, budget, report, emit)
+}
+
+fn scan_location(
+    location: GitLocation,
+    source: Source,
+    budget: Budget,
+    mut report: StreamReport,
+    emit: &mut impl FnMut(Candidate) -> bool,
+) -> Result<StreamReport, ScanError> {
     let error = || ScanError {
         rel: std::path::PathBuf::new(),
         kind: ScanErrorKind::Io(std::io::ErrorKind::Other),
-    };
-    let mut report = StreamReport::default();
-    // Both working trees (including linked worktrees) and bare repositories
-    // are explicit. Discovery must never climb from the held directory, even
-    // if its display path was renamed after opening.
-    let git_dir = if envcloak_sys::kind_beneath(repo.dir(), std::ffi::OsStr::new(".git")).is_ok() {
-        ".git"
-    } else {
-        "."
     };
     let mut command = Command::new("/usr/bin/git");
     command
@@ -66,7 +169,7 @@ pub fn scan_git_history(
         .env("GIT_NO_LAZY_FETCH", "1")
         // An empty allowlist overrides repository protocol.<name>.allow too.
         .env("GIT_ALLOW_PROTOCOL", "")
-        .args(["--git-dir", git_dir, "--work-tree", "."])
+        .args(["--git-dir", location.git_dir, "--work-tree", "."])
         .env("LC_ALL", "C")
         .args([
             "--no-pager",
@@ -82,7 +185,7 @@ pub fn scan_git_history(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    envcloak_sys::chdir_on_spawn(&mut command, repo.dir()).map_err(|_| error())?;
+    envcloak_sys::chdir_on_spawn(&mut command, &location.dir).map_err(|_| error())?;
     let mut process = command.spawn().map_err(|_| error())?;
     let stdout = process.stdout.take().ok_or_else(error)?;
     let child = Arc::new(Mutex::new(process));
@@ -102,6 +205,7 @@ pub fn scan_git_history(
     };
     let mut reader = BufReader::with_capacity(8192, stdout.take(budget.bytes));
     let mut objects = 0;
+    let mut reached_eof = false;
     loop {
         // Headers contain only an object id, type and size. An oversized or
         // malformed header is never copied into an error.
@@ -114,6 +218,8 @@ pub fn scan_git_history(
         if n == 0 {
             if reader.get_ref().limit() == 0 {
                 report.issue(&source, "byte_budget");
+            } else {
+                reached_eof = true;
             }
             break;
         }
@@ -205,7 +311,7 @@ pub fn scan_git_history(
         }
     }
     report.bytes = budget.bytes.saturating_sub(reader.get_ref().limit());
-    if report.complete() {
+    if reached_eof {
         let status = loop {
             if let Some(status) = child
                 .child
@@ -223,4 +329,59 @@ pub fn scan_git_history(
         }
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repository(path: &std::path::Path, value: &[u8]) {
+        std::fs::create_dir(path).expect("directory");
+        std::fs::write(path.join("fixture"), value).expect("fixture");
+        for args in [["init", "-q"], ["add", "fixture"]] {
+            let output = Command::new("/usr/bin/git")
+                .args(args)
+                .current_dir(path)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", path)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "fixture preparation failed");
+        }
+    }
+
+    #[test]
+    fn prepared_git_directory_survives_path_replacement() {
+        let d = tempfile::tempdir_in("/tmp").expect("temporary root");
+        let project = d.path().join("project");
+        let other = d.path().join("other");
+        repository(&project, b"fixtureZheldGitDirectory");
+        repository(&other, b"fixtureZreplacedGitDirectory");
+        let root = crate::open_root(&project).expect("root");
+        let source = Source {
+            path: root.path().to_path_buf(),
+            object: None,
+        };
+        let mut report = StreamReport::default();
+        let location = git_location(&root, &source, &mut report).expect("location");
+        // This is the exact boundary between selecting the directory and
+        // starting the child. No scheduling delay is needed for the gate.
+        std::fs::rename(project.join(".git"), d.path().join("held")).expect("move");
+        std::os::unix::fs::symlink(other.join(".git"), project.join(".git")).expect("link");
+        let mut found = false;
+        let report = scan_location(location, source, Budget::default(), report, &mut |c| {
+            assert!(
+                !c.value.ct_eq(b"fixtureZreplacedGitDirectory"),
+                "reopened Git directory"
+            );
+            found |= c.value.ct_eq(b"fixtureZheldGitDirectory");
+            true
+        })
+        .expect("scan");
+        assert!(report.complete(), "{report:?}");
+        assert!(found, "held Git directory was not scanned");
+    }
 }

@@ -343,6 +343,181 @@ fn explicit_bare_repository_still_scans() {
 }
 
 #[test]
+fn symlinked_git_directory_is_refused() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let project = d.path().join("project");
+    let other = d.path().join("other");
+    std::fs::create_dir(&project).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    object(&other, "blob", b"fixtureZsymlinkedGitValue");
+    std::os::unix::fs::symlink(other.join(".git"), project.join(".git")).unwrap();
+    let report = scan_git_history(
+        &open_root(&project).unwrap(),
+        Budget::default(),
+        &mut |_| panic!("followed a symlinked Git directory"),
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert_eq!(report.bytes, 0);
+    assert!(report.issues.iter().any(|i| i.reason == "symlink"));
+}
+
+#[test]
+fn external_gitfile_store_is_reported() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let project = d.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    // Git writes the gitfile, including its absolute path and line ending.
+    git(
+        &project,
+        &[
+            "init",
+            "-q",
+            "--separate-git-dir",
+            d.path().join("store").to_str().unwrap(),
+        ],
+    );
+    object(&project, "blob", b"fixtureZexternalGitfileValue");
+    let mut found = false;
+    let report = scan_git_history(&open_root(&project).unwrap(), Budget::default(), &mut |c| {
+        found |= c.value.ct_eq(b"fixtureZexternalGitfileValue");
+        true
+    })
+    .unwrap();
+    assert!(found);
+    assert!(
+        !report.complete(),
+        "external gitfile store was not reported"
+    );
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.reason == "gitfile_indirection")
+    );
+}
+
+#[test]
+fn invalid_gitfile_still_reports_the_child_failure() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::write(d.path().join(".git"), b"invalid gitfile\n").unwrap();
+    let report = scan_git_history(
+        &open_root(d.path()).unwrap(),
+        Budget::default(),
+        &mut |_| panic!("invalid gitfile emitted a candidate"),
+    )
+    .unwrap();
+    assert!(!report.complete());
+    for reason in ["gitfile_indirection", "git_failed"] {
+        assert!(report.issues.iter().any(|i| i.reason == reason), "{reason}");
+    }
+}
+
+#[test]
+fn external_alternate_store_is_reported() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let other = d.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    object(&other, "blob", b"fixtureZalternateStoreValue");
+    // A real shared clone supplies the alternates file, not this test.
+    git(
+        d.path(),
+        &[
+            "clone",
+            "--shared",
+            "--quiet",
+            "--no-checkout",
+            "other",
+            "project",
+        ],
+    );
+    let project = d.path().join("project");
+    assert!(project.join(".git/objects/info/alternates").is_file());
+    let mut found = false;
+    let report = scan_git_history(&open_root(&project).unwrap(), Budget::default(), &mut |c| {
+        found |= c.value.ct_eq(b"fixtureZalternateStoreValue");
+        true
+    })
+    .unwrap();
+    assert!(found);
+    assert!(
+        !report.complete(),
+        "external alternate store was not reported"
+    );
+    assert!(report.issues.iter().any(|i| i.reason == "git_alternates"));
+}
+
+#[test]
+fn external_common_directory_is_reported() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let project = d.path().join("project");
+    let other = d.path().join("other");
+    for dir in [&project, &other] {
+        std::fs::create_dir(dir).unwrap();
+        git(dir, &["init", "-q"]);
+    }
+    object(&other, "blob", b"fixtureZcommonDirectoryValue");
+    // Synthetic metadata fixture for the standalone commondir spelling.
+    // The native linked-worktree gate separately covers Git-authored metadata.
+    std::fs::write(
+        project.join(".git/commondir"),
+        format!("{}\n", other.join(".git").display()),
+    )
+    .unwrap();
+    let mut found = false;
+    let report = scan_git_history(&open_root(&project).unwrap(), Budget::default(), &mut |c| {
+        found |= c.value.ct_eq(b"fixtureZcommonDirectoryValue");
+        true
+    })
+    .unwrap();
+    assert!(found);
+    assert!(
+        !report.complete(),
+        "external common directory was not reported"
+    );
+    assert!(report.issues.iter().any(|i| i.reason == "git_common_dir"));
+}
+
+#[test]
+fn git_store_symlinks_are_refused_before_object_reads() {
+    for relative in [
+        "objects",
+        "objects/info",
+        "objects/info/alternates",
+        "commondir",
+    ] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let project = d.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        git(&project, &["init", "-q"]);
+        object(&project, "blob", b"fixtureZlinkedStoreValue");
+        let path = project.join(".git").join(relative);
+        if relative == "commondir" {
+            std::fs::write(&path, b".\n").unwrap();
+        } else if relative == "objects/info/alternates" {
+            std::fs::write(&path, b"").unwrap();
+        }
+        let moved = d.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &path).unwrap();
+        let report = scan_git_history(
+            &open_root(&project).unwrap(),
+            Budget::default(),
+            &mut |_| panic!("followed a symlinked Git store"),
+        )
+        .unwrap();
+        assert!(!report.complete());
+        assert_eq!(report.bytes, 0);
+        assert!(
+            report.issues.iter().any(|i| i.reason == "symlink"),
+            "{relative}"
+        );
+    }
+}
+
+#[test]
 fn linked_worktree_uses_its_explicit_git_file() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     git(d.path(), &["init", "-q"]);
@@ -378,6 +553,12 @@ fn linked_worktree_uses_its_explicit_git_file() {
         true
     })
     .unwrap();
-    assert!(report.complete(), "{report:?}");
+    assert!(!report.complete());
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.reason == "gitfile_indirection")
+    );
     assert!(found);
 }
