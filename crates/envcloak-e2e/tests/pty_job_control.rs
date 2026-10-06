@@ -1065,6 +1065,9 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         "the ticker does not tick"
     );
     assert!(!state_of(pid).starts_with('T'), "the ticker starts running");
+    // pause_point releases itself after 60 seconds. An observation made
+    // after that must fail, even if a later stop made its state look right.
+    let check_by = Instant::now() + Duration::from_secs(30);
     std::fs::OpenOptions::new()
         .write(true)
         .open(&fifo)
@@ -1082,7 +1085,9 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     // later Suspend or Stopped report can hide the wrong ordering.
     let at_restore = state_of(pid);
     let settings_restored = sh.outer.settings().same_as(&before_tstp);
+    let barrier_held = Instant::now() < check_by;
     std::fs::write(&restored, b"").unwrap();
+    assert!(barrier_held, "the restore observation outlived its barrier");
     assert!(
         at_restore.starts_with('T'),
         "the command ran at the actual terminal restore: state {at_restore:?}"
