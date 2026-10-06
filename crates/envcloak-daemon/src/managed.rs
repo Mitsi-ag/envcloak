@@ -49,8 +49,8 @@ use envcloak_ipc::proto::{
     ManagedUpdateParams, ManagedUpdatePlanParams, RunRequestParams,
 };
 use envcloak_ipc::view::{
-    LaunchReceiptView, ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView,
-    ManagedUpdatedView, UpdateStatementView,
+    LaunchDeclarationView, LaunchReceiptView, ManagedRegisteredView, ManagedUnregisteredView,
+    ManagedUpdatePlanView, ManagedUpdatedView, UpdateStatementView,
 };
 use envcloak_policy::managed::{
     ArgvClass, apply_changes, bridge_binding_suffix, class_word, classify_argv, launch_digest,
@@ -375,6 +375,33 @@ fn resolve_refused(
     err
 }
 
+/// Gate 13 in the daemon, behind the client's own refusal: a declaration
+/// whose argument or variable value looks like a key is refused
+/// `invalid_params` (`key_shaped`) and audited, before anything of it
+/// is resolved or stored. A key in a launch would sit in the record, on
+/// the server's argv (where `ps` shows it) and in the receipt; it belongs
+/// in the vault, bound by the managed manifest.
+fn refuse_key_shaped(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    who: &SubjectSummary,
+    d: &LaunchDecl,
+) -> Result<(), RpcError> {
+    let shaped = |v: &str| crate::items::looks_like_value(shared, v);
+    if d.argv.iter().any(|a| shaped(a)) || d.env.iter().any(|(_, v)| shaped(v)) {
+        shared.audit(AuditEvent::ManagedRegistered {
+            pid: peer.pid,
+            subject: who.clone(),
+            outcome: "key_shaped",
+            launch: None,
+            project: None,
+            counts: None,
+        });
+        return Err(invalid("key_shaped"));
+    }
+    Ok(())
+}
+
 /// `managed.register`. See the module documentation.
 pub fn register(
     shared: &Shared,
@@ -414,6 +441,7 @@ pub fn register(
     let transport = match &p.server {
         ManagedServerDecl::Stdio { launch } => {
             let decl = LaunchDecl::from(launch);
+            refuse_key_shaped(shared, peer, &who, &decl)?;
             let (id, revision) = prior.map_or_else(|| (new_launch_id(), 1), |(id, r)| (id, r + 1));
             // Resolved and identified outside the state lock: hashing a
             // large executable never holds it.
@@ -469,8 +497,30 @@ pub fn register(
         // what `migrate-mcp` sends on this device.
         written_by_migrate_mcp: true,
     };
+    let mut record = record;
+    // A test stops here, after the resolution and before the proof and
+    // the commit.
+    envcloak_sys::pause_point("managed.register_resolved");
     let mut s = prove(shared, peer, &who, pass)?;
     let vault = s.unlocked_mut()?;
+    // The launch id and revision are taken from the record of this name as
+    // it is now, under the lock the commit holds: a registration or an
+    // update that committed since the declaration was resolved is the
+    // predecessor, so no two launches share a revision, and none goes back.
+    if let ManagedTransport::Stdio(l) = &mut record.transport {
+        let current = records(vault)?
+            .into_iter()
+            .find(|(_, m)| m.name == record.name)
+            .and_then(|(_, m)| match m.transport {
+                ManagedTransport::Stdio(c) => Some((c.launch_id, c.revision)),
+                ManagedTransport::Bridge { .. } => None,
+            });
+        // Without a stdio record of this name now, a new launch id: never
+        // the first revision of one an earlier record had.
+        let (id, revision) = current.map_or_else(|| (new_launch_id(), 1), |(id, r)| (id, r + 1));
+        l.launch_id = id;
+        l.revision = revision;
+    }
     // The record of this name or this project is replaced: one record per
     // project and per name. Its id stays that of the record of this name.
     let replaced: Vec<(PolicyId, ManagedServer)> = records(vault)?
@@ -585,6 +635,7 @@ fn plan(
     shared: &Shared,
     launch: &[u8; 16],
     changes: &envcloak_policy::managed::LaunchChanges,
+    key_shaped: impl FnOnce(&LaunchDecl) -> Result<(), RpcError>,
 ) -> Result<Option<Result<Plan, ResolveError>>, RpcError> {
     let found = {
         let s = locked(&shared.state);
@@ -601,6 +652,7 @@ fn plan(
         Ok(d) => d,
         Err(e) => return Ok(Some(Err(ResolveError::Decl(e)))),
     };
+    key_shaped(&decl)?;
     let dir = PathBuf::from(std::ffi::OsStr::from_bytes(&record.project.canonical_dir));
     let new = match launch_check::resolve(
         &decl,
@@ -620,6 +672,16 @@ fn plan(
     })))
 }
 
+/// A declaration as an update statement shows it.
+fn declaration_view(d: &LaunchDecl) -> LaunchDeclarationView {
+    LaunchDeclarationView {
+        argv: d.argv.clone(),
+        cwd: d.cwd.clone(),
+        env: d.env.clone(),
+        path_env: d.path_env.clone(),
+    }
+}
+
 fn hex(d: &[u8]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -637,10 +699,12 @@ pub fn update_plan(
     if caller.proof_refusal().is_some() {
         return Ok(ManagedUpdatePlanView { statement: None });
     }
-    let plan = match plan(shared, &launch, &p.changes)? {
+    let who = subject_summary(peer, &caller);
+    let plan = match plan(shared, &launch, &p.changes, |d| {
+        refuse_key_shaped(shared, peer, &who, d)
+    })? {
         None => return Ok(ManagedUpdatePlanView { statement: None }),
         Some(Err(e)) => {
-            let who = subject_summary(peer, &caller);
             return Err(resolve_refused(shared, peer, &who, None, e));
         }
         Some(Ok(plan)) => plan,
@@ -651,6 +715,8 @@ pub fn update_plan(
             revision: plan.old.revision,
             old: launch_receipt(&plan.record.name, &plan.old),
             new: launch_receipt(&plan.record.name, &plan.new),
+            old_declaration: declaration_view(&plan.old.declaration),
+            new_declaration: declaration_view(&plan.new.declaration),
             digest: hex(&plan.digest()),
         }),
     })
@@ -672,7 +738,9 @@ pub fn update(
     let who = subject_summary(peer, &caller);
     // The plan made again: anything changed since the statement was shown
     // is another digest.
-    let plan = match plan(shared, &launch, &p.changes)? {
+    let plan = match plan(shared, &launch, &p.changes, |d| {
+        refuse_key_shaped(shared, peer, &who, d)
+    })? {
         None => return Err(RpcError::new(ErrorKind::StatementMismatch)),
         Some(Err(e)) => return Err(resolve_refused(shared, peer, &who, None, e)),
         Some(Ok(plan)) => plan,
@@ -786,8 +854,13 @@ fn refused(
 /// record, the request must name its launch or its bridge and hand over
 /// its descriptors, and a stdio launch must pass the daemon's own check.
 /// `Ok(None)` for a project without a record, whose request must name no
-/// launch or bridge. Called without the state lock held, so the launch
-/// check (which may copy and hash a large executable) never holds it.
+/// launch or bridge. `requested` is the names of the bindings the request
+/// resolves to (its profile, references and env file applied): a bridged
+/// server's origin digest is checked on each of them, not on the
+/// manifest's defaults only. Called without the state lock held, so the
+/// launch check (which may copy and hash a large executable) never holds
+/// it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_request(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -796,6 +869,7 @@ pub(crate) fn check_request(
     record: Option<&ManagedServer>,
     p: &RunRequestParams,
     has_fds: bool,
+    requested: &[&str],
 ) -> Result<Option<Checked>, RpcError> {
     let mismatch = || {
         refused(
@@ -858,10 +932,12 @@ pub(crate) fn check_request(
                 origin: origin.clone(),
                 header_names: header_names.clone(),
             };
-            let names = binding_names(project);
+            // Every binding the request resolves to, whatever layer chose
+            // it: a profile, a reference or an env file can name bindings
+            // the manifest's defaults do not.
             if p.launch.is_some()
                 || p.bridge.as_ref() != Some(&declared)
-                || !bindings_carry_origin(names.iter().map(String::as_str), origin)
+                || !bindings_carry_origin(requested.iter().copied(), origin)
             {
                 return Err(mismatch());
             }

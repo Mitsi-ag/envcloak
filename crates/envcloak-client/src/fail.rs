@@ -296,6 +296,21 @@ const REASON_TEXTS: &[(&str, &str)] = &[
          so EnvCloak cannot check what runs",
     ),
     (
+        "wrapper_program",
+        "the launch starts a program that starts another one its arguments name (such as env \
+         or nice), so EnvCloak cannot check what runs",
+    ),
+    (
+        "disguised_launcher",
+        "the launch's program is an interpreter, a package runner or a wrapper under another \
+         name, so EnvCloak cannot check what runs",
+    ),
+    (
+        "key_shaped",
+        "a launch argument or variable looks like a key: put the key in the vault and bind it \
+         in the managed manifest; nothing was stored",
+    ),
+    (
         "limited",
         "this process tree has used an hour's comparisons with the vault (100,000 short values \
          for a person's import, 2,000,000 others), so nothing more was compared and the run is \

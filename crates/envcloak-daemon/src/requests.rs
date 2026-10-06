@@ -447,7 +447,7 @@ pub fn run_request(
     // project's identity however the manifest was found, and the checks
     // of its launch or bridge, all before any grant is consulted or any
     // pending request exists (`crate::managed`).
-    let record = {
+    let mut record = {
         let s = locked(&shared.state);
         managed::by_project(s.unlocked()?, &project.identity)?.map(|(_, r)| r)
     };
@@ -474,18 +474,44 @@ pub fn run_request(
             return Err(RpcError::new(ErrorKind::InvalidParams));
         }
     };
-    let checked = managed::check_request(
-        shared,
-        peer,
-        &subject,
-        &project,
-        record.as_ref(),
-        &p,
-        ends.is_some(),
-    )?;
+    // The check runs without the state lock, so a registration, an update
+    // or a removal can commit meanwhile. The decision is taken only on the
+    // record the check passed: under the lock the decision holds, the
+    // record must still be the one checked, or the check runs again on the
+    // current one. A request is never decided on a record that is no longer
+    // the project's (a new registration, another revision, or none).
+    let requested: Vec<&str> = bindings.iter().map(|(b, _)| b.env_name.as_str()).collect();
+    let mut rechecks = 0;
+    let (checked, mut s) = loop {
+        let checked = managed::check_request(
+            shared,
+            peer,
+            &subject,
+            &project,
+            record.as_ref(),
+            &p,
+            ends.is_some(),
+            &requested,
+        )?;
+        // A test stops here, between the check and the decision.
+        envcloak_sys::pause_point("launch.checked_before_decision");
+        let s = locked(&shared.state);
+        let current = managed::by_project(s.unlocked()?, &project.identity)?.map(|(_, r)| r);
+        if current == record {
+            break (checked, s);
+        }
+        drop(s);
+        rechecks += 1;
+        if rechecks > MAX_DECISIONS {
+            return Err(RpcError::new(ErrorKind::Busy));
+        }
+        // The descriptors were taken for the record's transport; a record
+        // of another transport refuses a request made for the first one
+        // (`managed_command_mismatch`), whatever they are.
+        record = current;
+    };
     let managed_request = record.as_ref().map(managed::managed_request);
 
-    let mut s = locked(&shared.state);
     let vault = s.unlocked()?;
     let (bound, new_project) = bind_request(vault, &bindings, &project.identity.vault_key())?;
     // What every entry for this request records.
