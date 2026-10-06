@@ -353,9 +353,27 @@ pub fn read_capped(
         kind,
     };
     let (dir, name) = r.open_parent(rel).map_err(fail)?;
-    let (mut f, m) = open_file(&dir, &name, cap).map_err(fail)?;
+    let opened = open_file(&dir, &name, cap).map_err(fail)?;
+    read_opened_capped(r, rel, opened, cap)
+}
+
+/// Consume the descriptor already validated by catalog discovery.
+pub(crate) fn read_opened_capped(
+    r: &ScanRoot,
+    rel: &Path,
+    opened: (File, Metadata),
+    cap: usize,
+) -> Result<(SecretBytes, FileStamp), ScanError> {
+    let fail = |kind| ScanError {
+        rel: rel.to_path_buf(),
+        kind,
+    };
+    let (mut f, m) = opened;
     if m.dev() != r.dev() {
         return Err(fail(ScanErrorKind::MountPoint));
+    }
+    if m.len() > cap as u64 {
+        return Err(fail(ScanErrorKind::TooLarge));
     }
     let stamp = FileStamp::of(&m);
     let size = usize::try_from(m.len()).map_err(|_| fail(ScanErrorKind::TooLarge))?;

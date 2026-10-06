@@ -2,7 +2,9 @@
 //! Unsupported syntax produces an incomplete report; reference values stay names-only.
 use crate::candidates::{Budget, Disposition, Found, ScanReport, Source};
 use crate::json::{Node, Text};
+use crate::root::read_opened_capped;
 use crate::source::{ConfigFormat, ConfigSource};
+use crate::sources::walk_sources;
 use crate::{MAX_DOTENV, ScanError, parse_dotenv, read_capped};
 use envcloak_core::SecretBytes;
 use secrecy::ExposeSecret;
@@ -314,177 +316,183 @@ pub fn scan_config_sources_with_budget(
     let mut report = ScanReport::default();
     let mut attempted = std::collections::HashSet::new();
     let mut failed = std::collections::HashSet::new();
-    crate::sources::walk_sources(sources, budget, &mut report, |root, rel, source, report| {
-        if failed.contains(&root.path().join(rel))
-            || !admit_file(
-                root.path().join(rel),
-                Reader::Config(source.format),
-                budget,
-                &mut attempted,
-                report,
-            )
-        {
-            return;
-        }
-        let remaining = budget.bytes.saturating_sub(report.bytes);
-        let (bytes, stamp) = match read_capped(root, rel, MAX_DOTENV.min(remaining as usize)) {
-            Ok(v) => v,
-            Err(e) => {
-                failed.insert(root.path().join(rel));
-                // A failed read may have consumed bytes before the error.
-                // Reserve its whole allowance so repeated failures stay bounded.
-                if matches!(
-                    e.kind,
-                    crate::ScanErrorKind::Changed | crate::ScanErrorKind::Io(_)
-                ) {
-                    report.bytes += remaining.min(MAX_DOTENV as u64);
-                }
-                report.issue(
+    walk_sources(
+        sources,
+        budget,
+        &mut report,
+        |root, rel, source, opened, report| {
+            if failed.contains(&root.path().join(rel))
+                || !admit_file(
                     root.path().join(rel),
-                    if remaining < MAX_DOTENV as u64 {
-                        "byte_budget"
-                    } else {
-                        e.kind.token()
-                    },
-                );
+                    Reader::Config(source.format),
+                    budget,
+                    &mut attempted,
+                    report,
+                )
+            {
                 return;
             }
-        };
-        report.files += 1;
-        report.bytes += bytes.len() as u64;
-        let mut parsed = parse_config_limited(
-            &bytes,
-            source.format,
-            Budget {
-                candidates: budget.candidates.saturating_sub(report.findings.len()),
-                occurrences: budget.occurrences.saturating_sub(report.findings.len()),
-                ..budget
-            },
-        );
-        for f in &mut parsed.findings {
-            f.source.path = root.path().join(rel);
-            f.stamp = Some(stamp);
-        }
-        for i in &mut parsed.issues {
-            i.source.path = root.path().join(rel);
-        }
-        let mut includes = Vec::new();
-        parsed.findings.retain(|f| {
-            if f.env_file {
-                if let Some(v) = &f.value {
-                    #[allow(clippy::disallowed_methods)]
-                    includes.push(SecretBytes::copy_from(v.expose_secret()));
-                    false
+            let remaining = budget.bytes.saturating_sub(report.bytes);
+            let (bytes, stamp) =
+                match read_opened_capped(root, rel, opened, MAX_DOTENV.min(remaining as usize)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        failed.insert(root.path().join(rel));
+                        // A failed read may have consumed bytes before the error.
+                        // Reserve its whole allowance so repeated failures stay bounded.
+                        if matches!(
+                            e.kind,
+                            crate::ScanErrorKind::Changed | crate::ScanErrorKind::Io(_)
+                        ) {
+                            report.bytes += remaining.min(MAX_DOTENV as u64);
+                        }
+                        report.issue(
+                            root.path().join(rel),
+                            if remaining < MAX_DOTENV as u64 {
+                                "byte_budget"
+                            } else {
+                                e.kind.token()
+                            },
+                        );
+                        return;
+                    }
+                };
+            report.files += 1;
+            report.bytes += bytes.len() as u64;
+            let mut parsed = parse_config_limited(
+                &bytes,
+                source.format,
+                Budget {
+                    candidates: budget.candidates.saturating_sub(report.findings.len()),
+                    occurrences: budget.occurrences.saturating_sub(report.findings.len()),
+                    ..budget
+                },
+            );
+            for f in &mut parsed.findings {
+                f.source.path = root.path().join(rel);
+                f.stamp = Some(stamp);
+            }
+            for i in &mut parsed.issues {
+                i.source.path = root.path().join(rel);
+            }
+            let mut includes = Vec::new();
+            parsed.findings.retain(|f| {
+                if f.env_file {
+                    if let Some(v) = &f.value {
+                        #[allow(clippy::disallowed_methods)]
+                        includes.push(SecretBytes::copy_from(v.expose_secret()));
+                        false
+                    } else {
+                        true
+                    }
                 } else {
                     true
                 }
-            } else {
-                true
-            }
-        });
-        for f in &parsed.findings {
-            if f.env_file && f.value.is_none() {
-                report.issue(root.path().join(rel), "unread_env_file");
-            }
-        }
-        report.append(parsed);
-        for included in includes {
-            #[allow(clippy::disallowed_methods)]
-            let text = std::str::from_utf8(included.expose_secret());
-            let Ok(text) = text else {
-                report.issue(root.path().join(rel), "invalid_env_file");
-                continue;
-            };
-            let path = Path::new(text);
-            let path = if path.is_absolute() {
-                match path.strip_prefix(root.path()) {
-                    Ok(p) => p.to_path_buf(),
-                    Err(_) => {
-                        report.issue(root.path().join(rel), "env_file_outside_root");
-                        continue;
-                    }
+            });
+            for f in &parsed.findings {
+                if f.env_file && f.value.is_none() {
+                    report.issue(root.path().join(rel), "unread_env_file");
                 }
-            } else {
-                rel.parent().unwrap_or(Path::new("")).join(path)
-            };
-            if !path.components().all(|c| matches!(c, Component::Normal(_))) {
-                report.issue(root.path().join(rel), "env_file_outside_root");
-                continue;
             }
-            if crate::sources::omitted_path(sources, &root.path().join(&path)) {
-                report.issue(root.path().join(&path), "unread_env_file");
-                continue;
-            }
-            if failed.contains(&root.path().join(&path)) {
-                continue;
-            }
-            if attempted.len() >= budget.files
-                && !attempted.contains(&(root.path().join(&path), Reader::Dotenv))
-            {
-                report.issue(root.path().join(rel), "file_budget");
-                break;
-            }
-            if !admit_file(
-                root.path().join(&path),
-                Reader::Dotenv,
-                budget,
-                &mut attempted,
-                report,
-            ) {
-                continue;
-            }
-            let remain = budget.bytes.saturating_sub(report.bytes);
-            match read_capped(root, &path, MAX_DOTENV.min(remain as usize)) {
-                Ok((b, stamp)) => {
-                    if stamp.nlink > 1 {
-                        report.issue(root.path().join(&path), "hard_link");
-                    }
-                    report.files += 1;
-                    report.bytes += b.len() as u64;
-                    match parse_dotenv(&b) {
-                        Ok(entries) => {
-                            for e in entries {
-                                if !room(report, budget, &root.path().join(&path)) {
-                                    break;
-                                }
-                                let template = e.kind != crate::EntryKind::Plain
-                                    || path.file_name().and_then(crate::dotenv_kind)
-                                        == Some(Ok(crate::FileKind::Template));
-                                report.findings.push(Found {
-                                    name: SecretBytes::copy_from(e.name.as_str().as_bytes()),
-                                    value: if template { None } else { Some(e.value) },
-                                    disposition: if template {
-                                        Disposition::Template
-                                    } else {
-                                        Disposition::Literal
-                                    },
-                                    env_file: false,
-                                    range: e.span.start as u64..e.span.end as u64,
-                                    single_complete_line: false,
-                                    source: Source {
-                                        path: root.path().join(&path),
-                                        object: None,
-                                    },
-                                    stamp: Some(stamp),
-                                });
-                            }
+            report.append(parsed);
+            for included in includes {
+                #[allow(clippy::disallowed_methods)]
+                let text = std::str::from_utf8(included.expose_secret());
+                let Ok(text) = text else {
+                    report.issue(root.path().join(rel), "invalid_env_file");
+                    continue;
+                };
+                let path = Path::new(text);
+                let path = if path.is_absolute() {
+                    match path.strip_prefix(root.path()) {
+                        Ok(p) => p.to_path_buf(),
+                        Err(_) => {
+                            report.issue(root.path().join(rel), "env_file_outside_root");
+                            continue;
                         }
-                        Err(_) => report.issue(root.path().join(&path), "invalid_dotenv"),
                     }
+                } else {
+                    rel.parent().unwrap_or(Path::new("")).join(path)
+                };
+                if !path.components().all(|c| matches!(c, Component::Normal(_))) {
+                    report.issue(root.path().join(rel), "env_file_outside_root");
+                    continue;
                 }
-                Err(e) => {
-                    failed.insert(root.path().join(&path));
-                    if matches!(
-                        e.kind,
-                        crate::ScanErrorKind::Changed | crate::ScanErrorKind::Io(_)
-                    ) {
-                        report.bytes += remain.min(MAX_DOTENV as u64);
+                if crate::sources::omitted_path(sources, &root.path().join(&path)) {
+                    report.issue(root.path().join(&path), "unread_env_file");
+                    continue;
+                }
+                if failed.contains(&root.path().join(&path)) {
+                    continue;
+                }
+                if attempted.len() >= budget.files
+                    && !attempted.contains(&(root.path().join(&path), Reader::Dotenv))
+                {
+                    report.issue(root.path().join(rel), "file_budget");
+                    break;
+                }
+                if !admit_file(
+                    root.path().join(&path),
+                    Reader::Dotenv,
+                    budget,
+                    &mut attempted,
+                    report,
+                ) {
+                    continue;
+                }
+                let remain = budget.bytes.saturating_sub(report.bytes);
+                match read_capped(root, &path, MAX_DOTENV.min(remain as usize)) {
+                    Ok((b, stamp)) => {
+                        if stamp.nlink > 1 {
+                            report.issue(root.path().join(&path), "hard_link");
+                        }
+                        report.files += 1;
+                        report.bytes += b.len() as u64;
+                        match parse_dotenv(&b) {
+                            Ok(entries) => {
+                                for e in entries {
+                                    if !room(report, budget, &root.path().join(&path)) {
+                                        break;
+                                    }
+                                    let template = e.kind != crate::EntryKind::Plain
+                                        || path.file_name().and_then(crate::dotenv_kind)
+                                            == Some(Ok(crate::FileKind::Template));
+                                    report.findings.push(Found {
+                                        name: SecretBytes::copy_from(e.name.as_str().as_bytes()),
+                                        value: if template { None } else { Some(e.value) },
+                                        disposition: if template {
+                                            Disposition::Template
+                                        } else {
+                                            Disposition::Literal
+                                        },
+                                        env_file: false,
+                                        range: e.span.start as u64..e.span.end as u64,
+                                        single_complete_line: false,
+                                        source: Source {
+                                            path: root.path().join(&path),
+                                            object: None,
+                                        },
+                                        stamp: Some(stamp),
+                                    });
+                                }
+                            }
+                            Err(_) => report.issue(root.path().join(&path), "invalid_dotenv"),
+                        }
                     }
-                    report.issue(root.path().join(&path), e.kind.token());
+                    Err(e) => {
+                        failed.insert(root.path().join(&path));
+                        if matches!(
+                            e.kind,
+                            crate::ScanErrorKind::Changed | crate::ScanErrorKind::Io(_)
+                        ) {
+                            report.bytes += remain.min(MAX_DOTENV as u64);
+                        }
+                        report.issue(root.path().join(&path), e.kind.token());
+                    }
                 }
             }
-        }
-    });
+        },
+    );
     Ok(report)
 }
 
