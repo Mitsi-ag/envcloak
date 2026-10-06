@@ -25,6 +25,7 @@ It accepts this subset of the [Key URI format](https://github.com/google/google-
   origin or authority input. Both are stored as `SecretBytes`. A label may
   contain one colon separating a nonempty issuer prefix and account. An
   issuer parameter need not equal that prefix; neither is trusted identity.
+  Each component must contain a character other than Unicode whitespace.
 - Values and labels may use `%HH` escapes, decoded exactly once. Text must
   be valid UTF-8 without control or bidi-format characters. Raw non-ASCII
   bytes and `+` are refused: spaces must be `%20`. Parameter names are

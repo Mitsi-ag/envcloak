@@ -177,6 +177,48 @@ fn hostile_grammar_is_refused_without_echo() {
 }
 
 #[test]
+fn every_label_component_requires_nonblank_unicode_text() {
+    let encoded = bytes(&fixtures()[0], "base32");
+    // Check the full label, its prefix/account, and the separate issuer
+    // against the same Unicode whitespace rule. Controls stay forbidden.
+    for whitespace in [
+        ' ', '\u{0085}', '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2007}', '\u{2028}', '\u{2029}',
+        '\u{202f}', '\u{205f}', '\u{3000}',
+    ] {
+        let escaped: String = whitespace
+            .to_string()
+            .as_bytes()
+            .iter()
+            .map(|b| format!("%{b:02X}"))
+            .collect();
+        for label in [
+            escaped.clone(),
+            format!("{escaped}:account"),
+            format!("issuer:{escaped}"),
+        ] {
+            let mut raw = format!("otpauth://totp/{label}?secret=").into_bytes();
+            raw.extend_from_slice(&encoded);
+            refuse(&raw);
+        }
+        refuse(&enrollment(
+            &encoded,
+            format!("&issuer={escaped}").as_bytes(),
+        ));
+        if !whitespace.is_control() {
+            // Nonblank components keep their original display bytes.
+            let mut raw =
+                format!("otpauth://totp/{escaped}issuer:{escaped}account?secret=").into_bytes();
+            raw.extend_from_slice(&encoded);
+            let spec = parse(&raw).unwrap();
+            assert!(
+                spec.label()
+                    .ct_eq(format!("{whitespace}issuer:{whitespace}account").as_bytes())
+            );
+        }
+    }
+}
+
+#[test]
 fn input_and_decoded_caps_refuse_instead_of_truncating() {
     let raw = vec![b'x'; MAX_URI_BYTES + 1];
     refuse(&raw);
