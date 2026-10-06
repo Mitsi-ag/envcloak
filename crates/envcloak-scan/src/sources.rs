@@ -9,18 +9,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 /// Opens a catalog-selected directory without following any user-controlled
-/// component. The system's /tmp alias on macOS is resolved before walking.
+/// component. Only root-owned, fixed-target macOS system aliases are resolved.
 pub(crate) fn absolute_root(path: &Path) -> Result<ScanRoot, ScanErrorKind> {
     if !path.is_absolute() {
         return Err(ScanErrorKind::InvalidPath);
     }
-    let path = if let Ok(rest) = path.strip_prefix("/tmp") {
-        std::fs::canonicalize("/tmp")
-            .map_err(|e| crate::root::io_kind(&e))?
-            .join(rest)
-    } else {
-        path.to_path_buf()
-    };
+    let path = system_path(path)?;
     let mut dir = File::open("/").map_err(|e| crate::root::io_kind(&e))?;
     for c in path.components() {
         match c {
@@ -38,6 +32,38 @@ pub(crate) fn absolute_root(path: &Path) -> Result<ScanRoot, ScanErrorKind> {
         }
     }
     crate::root::held_root(path, dir).map_err(|e| crate::root::io_kind(&e))
+}
+
+fn system_path(path: &Path) -> Result<PathBuf, ScanErrorKind> {
+    #[cfg(target_os = "macos")]
+    for alias in ["/tmp", "/var", "/etc"] {
+        if let Ok(rest) = path.strip_prefix(alias) {
+            let metadata =
+                std::fs::symlink_metadata(alias).map_err(|e| crate::root::io_kind(&e))?;
+            if metadata.file_type().is_symlink() {
+                let target = std::fs::read_link(alias).map_err(|e| crate::root::io_kind(&e))?;
+                let target =
+                    trusted_alias(alias, metadata.uid(), &target).ok_or(ScanErrorKind::Symlink)?;
+                return Ok(Path::new(target).join(rest));
+            }
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_alias(alias: &str, uid: u32, target: &Path) -> Option<&'static str> {
+    let expected = match alias {
+        "/tmp" => "/private/tmp",
+        "/var" => "/private/var",
+        "/etc" => "/private/etc",
+        _ => return None,
+    };
+    if uid == 0 && (target == Path::new(expected) || target == Path::new(&expected[1..])) {
+        Some(expected)
+    } else {
+        None
+    }
 }
 
 /// A strict name shape, not ownership evidence. Includes interrupted restore
@@ -296,10 +322,16 @@ fn process(
     read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
     optional: bool,
 ) {
+    let path = root.path().join(rel);
+    if visited.contains(&path) {
+        return;
+    }
     if *attempts >= budget.files {
         report.issue(root.path().join(rel), "file_budget");
         return;
     }
+    *attempts += 1;
+    visited.insert(path);
     let file = root
         .open_parent(rel)
         .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
@@ -307,21 +339,16 @@ fn process(
         Ok(v) => v,
         Err(ScanErrorKind::NotFound) if optional => return,
         Err(e) => {
-            *attempts += 1;
             report.issue(root.path().join(rel), e.token());
             return;
         }
     };
-    *attempts += 1;
     if m.dev() != root.dev() {
         report.issue(root.path().join(rel), "mount_point");
         return;
     }
     if m.nlink() > 1 {
         report.issue(root.path().join(rel), "hard_link");
-    }
-    if !visited.insert(root.path().join(rel)) {
-        return;
     }
     if note_omitted(source, &root.path().join(rel), report) {
         return;
@@ -357,4 +384,111 @@ fn note_omitted(source: &ConfigSource, path: &Path, report: &mut ScanReport) -> 
             .push(crate::candidates::Issue { source, reason });
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn system_aliases_require_root_ownership_and_the_exact_target() {
+        for (alias, target) in [
+            ("/tmp", "/private/tmp"),
+            ("/var", "/private/var"),
+            ("/etc", "/private/etc"),
+        ] {
+            assert_eq!(trusted_alias(alias, 0, Path::new(target)), Some(target));
+            assert_eq!(
+                trusted_alias(alias, 0, Path::new(&target[1..])),
+                Some(target)
+            );
+            assert!(trusted_alias(alias, 501, Path::new(target)).is_none());
+            assert!(trusted_alias(alias, 0, Path::new("/private/elsewhere")).is_none());
+            assert!(trusted_alias("/other", 0, Path::new(target)).is_none());
+            let root = absolute_root(Path::new(alias)).expect("system directory");
+            assert_eq!(root.path(), Path::new(target));
+        }
+    }
+
+    fn source(path: PathBuf) -> ConfigSource {
+        ConfigSource {
+            path,
+            format: crate::source::ConfigFormat::Raw,
+            source_kind: SourceKind::Transcript,
+            label: "fixture".into(),
+            names: None,
+        }
+    }
+
+    #[test]
+    fn source_leaf_mount_is_refused_before_the_callback() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        std::fs::write(d.path().join("store"), b"fixtureZsourceDeviceValue").expect("write");
+        let mut root = crate::open_root(d.path()).expect("root");
+        for mounted in [false, true] {
+            if mounted {
+                root.model_other_device();
+            }
+            let mut called = false;
+            let mut report = ScanReport::default();
+            process(
+                &root,
+                Path::new("store"),
+                &source(d.path().join("store")),
+                Budget::default(),
+                &mut 0,
+                &mut Default::default(),
+                &mut report,
+                &mut |_, _, _, _| called = true,
+                false,
+            );
+            assert_eq!(called, !mounted);
+            assert_eq!(report.complete(), !mounted);
+            if mounted {
+                assert!(report.issues.iter().any(|i| i.reason == "mount_point"));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_source_open_is_charged_and_not_retried() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        let root = crate::open_root(d.path()).expect("root");
+        let mut report = ScanReport::default();
+        let mut attempts = 0;
+        let mut visited = Default::default();
+        for _ in 0..2 {
+            process(
+                &root,
+                Path::new("missing"),
+                &source(d.path().join("missing")),
+                Budget::default(),
+                &mut attempts,
+                &mut visited,
+                &mut report,
+                &mut |_, _, _, _| panic!("missing file was read"),
+                false,
+            );
+        }
+        assert_eq!(attempts, 1);
+        assert_eq!(visited.len(), 1);
+        assert!(!report.complete());
+    }
+
+    #[test]
+    fn leftover_leaf_mount_is_reported_without_reading_contents() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        let name = Path::new(".store.envcloak-new-ab.tmp");
+        std::fs::write(d.path().join(name), b"fixtureZleftoverDeviceValue").expect("write");
+        let mut root = crate::open_root(d.path()).expect("root");
+        for expected in ["possible_leftover", "mount_point"] {
+            let mut report = ScanReport::default();
+            leftover(&root, name, &mut report);
+            assert_eq!(report.leftovers.len(), 1);
+            assert_eq!(report.leftovers[0].inspection, expected);
+            assert!(!report.complete());
+            root.model_other_device();
+        }
+    }
 }
