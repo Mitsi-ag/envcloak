@@ -229,14 +229,14 @@ impl ProbeSession {
     ///
     /// # Panics
     /// When there are more than [`MAX_NEEDLES`] needles, a needle is shorter
-    /// than 2 or longer than [`MAX_NEEDLE_LEN`] bytes, or `window < 2`. The
+    /// than 1 or longer than [`MAX_NEEDLE_LEN`] bytes, or `window < 1`. The
     /// message never includes needle bytes.
     pub fn start(needles: &[&[u8]], window: usize, mode: ProbeMode) -> Self {
         assert!(needles.len() <= MAX_NEEDLES, "too many probe needles");
-        assert!(window >= 2, "probe window must be at least 2 bytes");
+        assert!(window >= 1, "probe window must be at least 1 byte");
         for n in needles {
             assert!(
-                (2..=MAX_NEEDLE_LEN).contains(&n.len()),
+                (1..=MAX_NEEDLE_LEN).contains(&n.len()),
                 "probe needle length out of range"
             );
         }
