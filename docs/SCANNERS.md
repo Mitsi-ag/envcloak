@@ -136,18 +136,30 @@ Git history is opt-in. An absolute `/usr/bin/git` runs `cat-file
 --batch-all-objects --batch` with a cleared environment, global/system config
 disabled, replacement objects disabled and fsmonitor disabled. Lazy fetching
 is disabled and all transports are denied, overriding repository allowances.
-Missing or corrupt objects report a partial scan without fetching. An explicit
-Git directory and work tree relative to the held root prevent discovery of a
-parent repository, including after a rename. Working trees and bare
-repositories are covered. The held root supplies the child's working directory.
+Missing or corrupt objects report a partial scan without fetching. Ordinary
+Git directories are opened without following symlinks and held as the child's
+working directory; bare repositories use the held root itself. Git never
+discovers a parent repository. A symlinked `.git` is refused. Replacing the
+pathname after opening the original Git directory cannot redirect the child.
+
+Gitfiles, including linked worktrees, retain their findings and report
+`gitfile_indirection`. Nonempty `commondir` and `objects/info/alternates` files
+report `git_common_dir` and `git_alternates`. Each makes the scan partial:
+these pointers can reach stores outside the held root, including further
+indirections. Their target grammar is left to Git, so the warnings also apply
+to pointers whose targets happen to stay inside the root. Symlinks encountered
+while inspecting `commondir`, `objects`, `objects/info` or `alternates` are
+refused before Git starts. Pointer inspection checks metadata only, with a
+1 MiB size cap, ownership and device checks, and hard-link reporting.
+
 Bytes and objects are bounded, stderr is discarded, and an owned-child deadline caps the whole Git subprocess at
 30 seconds, including time spent making progress. Larger histories may therefore
 be incomplete. Blobs, commits and annotated tags are scanned; recoverable token
 issues are retained while later objects are still read. Object ranges
 are distinct from file ranges and never authorize rewriting history. Git owns
-the interpretation of the repository's object database, including its linked
-object stores; this reader makes no working-tree filesystem-safety claim about
-git's internal traversal.
+the interpretation of the repository's object database. The reported
+indirections and subsequent changes inside an open store are not a claim of
+full filesystem confinement for Git's internal traversal.
 
 Possible restore leftovers match both `.<name>.envcloak-new-<hex>.tmp` and
 `.<name>.envcloak-swap-<hex>.tmp`, including non-env configs and transcripts.
