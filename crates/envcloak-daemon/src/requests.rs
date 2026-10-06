@@ -451,15 +451,21 @@ pub fn run_request(
         let s = locked(&shared.state);
         managed::by_project(s.unlocked()?, &project.identity)?.map(|(_, r)| r)
     };
+    // A managed project's request without a well-formed set of ends (none,
+    // too few, of the wrong kind or the wrong access) has no ends: it is
+    // refused `managed_command_mismatch` below, audited, as any request
+    // that is not its registered launch's or bridge's. The descriptors
+    // that came are closed.
     let ends = match &record {
-        Some(r) if !fds.is_empty() => Some(ClientEnds::from_request(
+        Some(r) if !fds.is_empty() => ClientEnds::from_request(
             fds,
             &p.fds,
             matches!(
                 r.transport,
                 envcloak_core::vault::ManagedTransport::Stdio(_)
             ),
-        )?),
+        )
+        .ok(),
         Some(_) => None,
         // No record: a request that names a launch or a bridge is refused
         // `managed_command_mismatch` below, descriptors or not; any other
@@ -511,6 +517,10 @@ pub fn run_request(
         record = current;
     };
     let managed_request = record.as_ref().map(managed::managed_request);
+    // Where a covered request's values go, settled before any decision: a
+    // managed project's only to the runner or relay on its checked ends,
+    // never to the client, whatever let a request this far.
+    let route = route(record.is_some(), checked, ends)?;
 
     let vault = s.unlocked()?;
     let (bound, new_project) = bind_request(vault, &bindings, &project.identity.vault_key())?;
@@ -588,7 +598,7 @@ pub fn run_request(
                 // The daemon hands out no value under a tracer.
                 refuse_if_traced()?;
                 let (fields, released) = release_plan(s.unlocked()?, &again.bindings)?;
-                if let (Some(checked), Some(ends)) = (&checked, &ends) {
+                if let Some((checked, ends)) = &route {
                     // A managed server's values go to the runner or relay
                     // the daemon starts, never to the client (D-36).
                     let c = Covered {
@@ -887,6 +897,25 @@ impl Ready {
     }
 }
 
+/// Where a request's covered values may go: `None` to the client, for an
+/// unmanaged project only; `Some` to the runner or relay of a managed
+/// project's checked launch or bridge, on the request's ends. A managed
+/// project's request that reaches this without both is refused
+/// `internal`, never answered as an unmanaged one: the request check
+/// refuses it first (`managed_command_mismatch`), and this holds when it
+/// does not.
+fn route<C, E>(
+    managed: bool,
+    checked: Option<C>,
+    ends: Option<E>,
+) -> Result<Option<(C, E)>, RpcError> {
+    match (managed, checked, ends) {
+        (false, None, _) => Ok(None),
+        (true, Some(c), Some(e)) => Ok(Some((c, e))),
+        _ => Err(RpcError::new(ErrorKind::Internal)),
+    }
+}
+
 /// A covered managed request (D-36): the daemon starts EnvCloak's runner
 /// or relay from its anchor on the pipe ends the request handed over, then
 /// delivers as for any covered request (the values read from the verified
@@ -916,12 +945,15 @@ fn prepare_runner(
             },
         ),
     };
-    let role = match (checked, &launch) {
+    // The role follows the check's transport alone: a checked launch is
+    // never started as a relay, whatever else holds.
+    let role = match (checked, launch.as_deref()) {
         (Checked::Stdio { checked, .. }, Some(text)) => Role::Runner {
             launch: text,
             checked,
         },
-        _ => Role::Relay,
+        (Checked::Bridge { .. }, None) => Role::Relay,
+        _ => return Prepared::Done(Err(RpcError::new(ErrorKind::Internal))),
     };
     let started = match spawn_envcloak::start(&shared.anchor, role, ends) {
         Ok(st) => st,
@@ -1392,6 +1424,32 @@ pub fn grants_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gate 39, the backstop: a managed project's covered values go to its
+    /// runner or relay on checked ends, or nowhere. A managed request that
+    /// reaches the decision without a check or without ends is refused,
+    /// never routed to the client; an unmanaged one goes to the client,
+    /// any ends it brought unused. Mutation checked: the fall-through to
+    /// the client release when either half is missing (`route` answering
+    /// `Ok(None)` for a managed project): the managed cases fail.
+    #[test]
+    fn a_managed_request_is_routed_to_its_runner_or_refused() {
+        let kind = |r: Result<Option<((), ())>, RpcError>| r.map_err(|e| e.kind);
+        assert_eq!(kind(route(true, Some(()), Some(()))), Ok(Some(((), ()))));
+        for (checked, ends) in [(Some(()), None), (None, Some(())), (None, None)] {
+            assert_eq!(
+                kind(route(true, checked, ends)),
+                Err(ErrorKind::Internal),
+                "{checked:?} {ends:?}"
+            );
+        }
+        assert_eq!(kind(route(false, None, None)), Ok(None));
+        assert_eq!(kind(route(false, None, Some(()))), Ok(None));
+        assert_eq!(
+            kind(route(false, Some(()), Some(()))),
+            Err(ErrorKind::Internal)
+        );
+    }
 
     /// Gate 27, the sweep's half: a root is alive only while its pid has
     /// the start time the grant recorded. A pid in use by another process

@@ -14,7 +14,16 @@
 //! records the file's code directory hash and starts each runner suspended,
 //! resuming it only when the kernel's cdhash of the started process is the
 //! anchor's (and, for a Developer ID build, its Team ID is `envcloakd`'s
-//! own); otherwise it kills it through its handle before it runs. An
+//! own); otherwise it kills it through its handle before it runs. One
+//! window is left there: a daemon killed outright (`SIGKILL`, a crash)
+//! between the suspended start and the resumption leaves the runner
+//! stopped, leading a session of its own, so no orphaned-group `SIGCONT`
+//! reaches it, and no one resumes or signals it; it holds the client's
+//! pipe ends and a control channel whose other end is gone, and no value
+//! (the values go only after the resumption). Its client, whose request
+//! the dead daemon never answered, sees its connection end and exits; the
+//! stopped runner stays until it is killed or the machine restarts. A
+//! timer of its own cannot run while it is suspended. An
 //! anchor that could not be taken, or a runner that could not be started
 //! from it, is `runner_unavailable`: nothing falls back to the file.
 //!

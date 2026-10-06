@@ -123,6 +123,61 @@ fn every_other_command_is_refused_before_a_pending_request() {
     w.h.assert_swept("after the refusals");
 }
 
+/// The agent's client names `launch` but hands over no descriptors, too
+/// few, or a lifeline it can only write: each refused
+/// `managed_command_mismatch` with no pending request and nothing
+/// released, to the client or a runner.
+fn refused_without_ends(w: &mut World, launch: &str, when: &str) {
+    let pending = w.pending_count();
+    let released = w.released();
+    for mode in ["none", "too_few", "wrong_access"] {
+        let answer = w.agent(
+            "request",
+            &json!({"launch": launch, "fds": mode, "send": ["report"], "hold_ms": 0}),
+        );
+        assert_eq!(
+            error_of(&answer),
+            "managed_command_mismatch",
+            "{when}, {mode}: {answer}"
+        );
+    }
+    assert_eq!(
+        w.pending_count(),
+        pending,
+        "{when}: a pending request exists"
+    );
+    assert_eq!(w.released(), released, "{when}: something was released");
+}
+
+/// Gate 39, R-M2-24: a request that names the registered launch is the
+/// launch's only with the ends its runner is started on. Without them
+/// (none, too few, one of the wrong access) it is refused
+/// `managed_command_mismatch` with no pending request and nothing
+/// released, under no grant and under a live session grant, whose own
+/// requests before and after are the positive controls; the daemon is
+/// swept clean after.
+///
+/// Mutations checked: the request check's refusal of a managed request
+/// without ends removed (`check_request`'s `has_fds` guard made
+/// `let _ = has_fds;`): the requests reach the decision's backstop
+/// (`route`), are refused `internal`, and this fails; with the backstop
+/// also made to route them to the client, the first is pending under no
+/// grant, and this fails.
+#[test]
+fn a_launch_asked_for_without_its_ends_is_refused() {
+    let mut w = World::new(&[]);
+    let (launch, _) = w.register_fixture();
+    refused_without_ends(&mut w, &launch, "no grant");
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    refused_without_ends(&mut w, &launch, "a live session grant");
+    let again = w.request(&launch);
+    assert!(started(&again), "{again}");
+    w.h.assert_swept("after the refusals");
+}
+
 /// Changes the stopped daemon's vault with SQLite itself: `flip` flips one
 /// bit of every policy row's sealed bytes (the managed record's among
 /// them); otherwise every policy row is deleted, as if the project had
@@ -812,6 +867,20 @@ fn an_edited_origin_is_refused_until_registered_again() {
     assert_eq!(error_of(&answer), "managed_command_mismatch", "{answer}");
     assert_eq!(w.pending_count(), pending, "a pending request exists");
     register(&mut w, edited);
+    // The declared bridge asked for without descriptors: refused, with no
+    // pending request (gate 39's bridge half).
+    let pending = w.pending_count();
+    let bare = w.agent(
+        "request",
+        &json!({
+            "manifest": manifest_text,
+            "origin": edited,
+            "headers": ["Authorization"],
+            "fds": "none",
+        }),
+    );
+    assert_eq!(error_of(&bare), "managed_command_mismatch", "{bare}");
+    assert_eq!(w.pending_count(), pending, "a pending request exists");
     let answer = ask(&mut w, edited);
     pending_id(&answer);
 }
