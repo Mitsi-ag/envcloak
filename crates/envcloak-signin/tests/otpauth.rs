@@ -71,7 +71,7 @@ fn accepted_forms_match_python_base32_bytes() {
             .collect();
         let spec = parse(&enrollment(
             &escaped,
-            b"&algorithm=SHA256&digits=6&period=1",
+            b"&algorithm=SHA256&digits=6&period=4",
         ))
         .unwrap();
         assert!(spec.seed().ct_eq(&expected));
@@ -252,20 +252,26 @@ fn uri_cap_has_valid_boundary_controls() {
         raw.iter().map(|b| format!("%{b:02X}")).collect()
     }
     let seed = vec![b'A'; (MAX_SEED_BYTES * 8).div_ceil(5)];
-    // Valid enrollments at both sides of the cap. Invalid filler would
-    // still fail with the cap removed and would prove nothing.
-    for (label_len, unescaped, length, accepted) in [(256, 19, 4097, false), (255, 18, 4096, true)]
+    // Adjust only the encoding overhead of otherwise valid fields. Both
+    // controls satisfy every decoded cap and the enrollment period policy.
+    for (label_len, length, accepted) in
+        [(256, MAX_URI_BYTES, true), (255, MAX_URI_BYTES + 1, false)]
     {
-        let mut label = "x".repeat(unescaped);
-        label.push_str(&escaped(&vec![b'x'; label_len - unescaped]));
-        let raw = format!(
-            "otpauth://totp/{label}?secret={}&issuer={}&algorithm={}&digits={}&period={}",
-            escaped(&seed),
-            escaped(&vec![b'y'; MAX_LABEL_BYTES]),
-            escaped(b"SHA512"),
-            escaped(b"8"),
-            escaped(u64::MAX.to_string().as_bytes())
-        );
+        let make = |label: String| {
+            format!(
+                "otpauth://totp/{label}?secret={}&issuer={}&algorithm={}&digits={}&period={}",
+                escaped(&seed),
+                escaped(&vec![b'y'; MAX_LABEL_BYTES]),
+                escaped(b"SHA512"),
+                escaped(b"8"),
+                escaped(b"300")
+            )
+        };
+        let full_length = make(escaped(&vec![b'x'; label_len])).len();
+        assert_eq!((full_length - length) % 2, 0);
+        let unescaped = (full_length - length) / 2;
+        let label = "x".repeat(unescaped) + &escaped(&vec![b'x'; label_len - unescaped]);
+        let raw = make(label);
         assert_eq!(raw.len(), length);
         assert_eq!(parse(raw.as_bytes()).is_ok(), accepted);
     }
@@ -339,7 +345,7 @@ proptest! {
     }
 
     #[test]
-    fn every_public_debug_type_hides_seed_and_code(index in any::<usize>(), period in 1..=u64::MAX, step in any::<u64>()) {
+    fn every_public_debug_type_hides_seed_and_code(index in any::<usize>(), period in 4..=300u64, step in any::<u64>()) {
         let rows = fixtures();
         let row = &rows[index % rows.len()];
         let encoded = bytes(row, "base32");
@@ -354,6 +360,19 @@ proptest! {
         let seed = bytes(row, "seed");
         for needle in [&seed, &encoded] {
             prop_assert!(!shown.as_bytes().windows(needle.len()).any(|w| w == needle), "seed appeared in public formatting");
+        }
+    }
+}
+
+#[test]
+fn enrollment_refuses_periods_without_bounded_eligibility() {
+    let encoded = bytes(&fixtures()[0], "base32");
+    for period in [0, 1, 2, 3, 4, 30, 300, 301, 3600, u64::MAX] {
+        let raw = enrollment(&encoded, format!("&period={period}").as_bytes());
+        if (4..=300).contains(&period) {
+            assert_eq!(parse(&raw).unwrap().params().period().seconds(), period);
+        } else {
+            refuse(&raw);
         }
     }
 }

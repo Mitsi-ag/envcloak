@@ -19,7 +19,7 @@ It accepts this subset of the [Key URI format](https://github.com/google/google-
   impossible lengths and nonzero unused tail bits are refused.
 - Optional `algorithm`: exactly `SHA1`, `SHA256` or `SHA512`, default `SHA1`.
 - Optional `digits`: exactly `6` or `8`, default `6`.
-- Optional `period`: canonical positive decimal seconds, at most `u64::MAX`,
+- Optional `period`: canonical decimal seconds in the inclusive range 4 to 300,
   default `30`. No sign, leading zeroes, fraction or overflow.
 - Optional `issuer` and the label are display-only, never an account,
   origin or authority input. Both are stored as `SecretBytes`. A label may
@@ -32,8 +32,10 @@ It accepts this subset of the [Key URI format](https://github.com/google/google-
   literal lowercase ASCII, never percent-decoded. Unknown and duplicate
   parameters, empty fields and malformed escapes fail.
 
-Caps: 4096 input bytes, 512 decoded seed bytes, 256 decoded bytes per label
-or issuer. Caps refuse the whole enrollment; nothing is truncated. Secret
+Caps: 4000 input bytes, 512 decoded seed bytes, 256 decoded bytes per label
+or issuer. The raw cap remains below the largest otherwise valid escaped
+enrollment, so it has independent boundary controls. Caps refuse the whole
+enrollment; nothing is truncated. Secret
 strength and account policy are the daemon's responsibility. Every parser
 failure has the same value-free `invalid_otpauth` message. Formatting a
 specification or a generated code prints only a fixed type marker.
@@ -51,7 +53,10 @@ The clock helpers take Unix seconds and a validated `Period`:
 - `step_at` uses integer floor division from Unix epoch zero.
 - `seconds_left` includes the current second; at a boundary it is the full
   period. `too_late_in_step` is true when three seconds or fewer remain.
-  Periods of one to three seconds therefore never have an eligible instant.
+  Enrollment rejects periods without an eligible instant (one to three
+  seconds) or beyond 300 seconds. A fresh step is at most five minutes
+  away; the daemon still rechecks its lease and timeout before use.
+  `Period` itself remains a positive arithmetic input for boundary modeling.
 - `refused_after_start` returns the start's current and previous steps. At
   epoch step zero it returns `[0, 0]`, since no previous step exists.
 

@@ -5,6 +5,11 @@ use std::num::NonZeroU64;
 
 use envcloak_core::SecretBytes;
 
+/// Enrollment policy: at least one eligible second, at most five minutes
+/// to the next step. Arithmetic helpers can still model any positive period.
+pub const MIN_PERIOD_SECONDS: u64 = 4;
+pub const MAX_PERIOD_SECONDS: u64 = 300;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Algorithm {
     Sha1,
@@ -40,7 +45,8 @@ pub struct TotpParams {
 
 impl TotpParams {
     pub fn new(algorithm: Algorithm, digits: u8, period: u64) -> Result<Self, ParamsError> {
-        if !matches!(digits, 6 | 8) {
+        if !matches!(digits, 6 | 8) || !(MIN_PERIOD_SECONDS..=MAX_PERIOD_SECONDS).contains(&period)
+        {
             return Err(ParamsError);
         }
         Ok(Self {
