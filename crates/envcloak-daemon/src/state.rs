@@ -599,6 +599,7 @@ impl State {
     /// nothing is recorded then either, and the answer is dropped, and
     /// wiped. [`Delivery::AuditFailed`] when the entry could not be
     /// written; the answer is dropped, and wiped.
+    #[allow(clippy::too_many_arguments)]
     pub fn deliver<T>(
         &mut self,
         grant: GrantId,
@@ -606,6 +607,7 @@ impl State {
         alive: &dyn Fn(&ProcessInstance) -> bool,
         e: AuditEvent,
         fields: &[FieldId],
+        project: Option<envcloak_core::vault::ProjectRecord>,
         answer: impl FnOnce(Vec<SecretBytes>) -> Result<T, RpcError>,
     ) -> Result<T, Delivery> {
         let vault = self.unlocked().map_err(Delivery::Refused)?;
@@ -627,6 +629,29 @@ impl State {
         if !self.grants.in_force(grant, &now, alive) {
             self.grants.sweep(&now, alive);
             return Err(Delivery::Lapsed);
+        }
+        if let Some(mut project) = project {
+            project.last_seen = now
+                .wall
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| Delivery::Refused(RpcError::new(ErrorKind::Internal)))?
+                .as_secs();
+            self.unlocked_mut()
+                .map_err(Delivery::Refused)?
+                .transact(|t| t.upsert_project(project))
+                .map_err(|e| {
+                    Delivery::Refused(RpcError::with_reason(
+                        ErrorKind::VaultUnavailable,
+                        vault_reason(e.kind()),
+                    ))
+                })?;
+            // The durable index write took time. Recheck before auditing
+            // and releasing, just as after framing the answer.
+            let now = now_of(clocks);
+            if !self.grants.in_force(grant, &now, alive) {
+                self.grants.sweep(&now, alive);
+                return Err(Delivery::Lapsed);
+            }
         }
         if !self.audit_delivery(e) {
             return Err(Delivery::AuditFailed);
@@ -1705,6 +1730,70 @@ mod tests {
 
     const VALUE: &[u8] = b"a value of forty bytes, made for this..";
 
+    #[test]
+    fn project_adoption_failure_releases_nothing_and_keeps_the_index() {
+        use envcloak_core::vault::{ProjectKey, ProjectRecord};
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        create(&f, &mut s);
+        let field = stored_value(&mut s, "a/b", VALUE);
+        let g = granted(
+            &f,
+            &mut s,
+            request("OPENAI_API_KEY"),
+            envcloak_policy::ApprovalOptions::session(Duration::from_secs(600)),
+        );
+        let record = ProjectRecord {
+            key: ProjectKey::new(b"project").unwrap(),
+            display_path: "/fixture".into(),
+            manifest_sha256: [0; 32],
+            bindings: vec![],
+            last_seen: 0,
+        };
+        s.deliver(
+            g,
+            &f.clocks,
+            &running,
+            delivery(1),
+            &[field],
+            Some(record.clone()),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let before: Vec<_> = s
+            .unlocked()
+            .unwrap()
+            .projects()
+            .unwrap()
+            .map(|(id, p)| (id, p.clone()))
+            .collect();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].1.last_seen > 0);
+        let audit_before = entries(&s).len();
+        let mut too_large = record;
+        too_large.display_path = "x".repeat(65536);
+        let result = s.deliver(
+            g,
+            &f.clocks,
+            &running,
+            delivery(2),
+            &[field],
+            Some(too_large),
+            |_| Ok(()),
+        );
+        assert!(matches!(result, Err(Delivery::Refused(_))));
+        assert_eq!(entries(&s).len(), audit_before);
+        let after: Vec<_> = s
+            .unlocked()
+            .unwrap()
+            .projects()
+            .unwrap()
+            .map(|(id, p)| (id, p.clone()))
+            .collect();
+        assert_eq!(before, after);
+        assert!(s.grants().in_force(g, &at(&f.clocks), &running));
+    }
+
     /// Gate 33's release order, at the one place values are released
     /// from: `deliver` gives values out only after the delivery's entry
     /// reads back from the log on disk, and when the entry cannot be
@@ -1724,7 +1813,7 @@ mod tests {
         let c = &f.clocks;
 
         let values = s
-            .deliver(g, c, &running, delivery(1), &[field], Ok)
+            .deliver(g, c, &running, delivery(1), &[field], None, Ok)
             .unwrap();
         // The values exist: the entry is already in the log's files.
         assert_eq!(
@@ -1738,9 +1827,15 @@ mod tests {
         let before = entries(&s).len();
         let too_large = RpcError::new(ErrorKind::FrameTooLarge);
         assert_eq!(
-            s.deliver(g, c, &running, delivery(5), &[field], |_| Err::<(), _>(
-                too_large
-            ))
+            s.deliver(
+                g,
+                c,
+                &running,
+                delivery(5),
+                &[field],
+                None,
+                |_| Err::<(), _>(too_large)
+            )
             .unwrap_err(),
             Delivery::Unsendable(too_large)
         );
@@ -1751,13 +1846,13 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::write(dir, b"in the way").unwrap();
         assert_eq!(
-            s.deliver(g, c, &running, delivery(2), &[field], Ok)
+            s.deliver(g, c, &running, delivery(2), &[field], None, Ok)
                 .unwrap_err(),
             Delivery::AuditFailed
         );
         std::fs::remove_file(dir).unwrap();
         assert_eq!(
-            s.deliver(g, c, &running, delivery(3), &[field], Ok)
+            s.deliver(g, c, &running, delivery(3), &[field], None, Ok)
                 .unwrap()
                 .len(),
             1
@@ -1766,7 +1861,7 @@ mod tests {
         // Locked: refused before anything is read or written.
         s.lock(LockReason::Request);
         assert_eq!(
-            s.deliver(g, c, &running, delivery(4), &[field], Ok)
+            s.deliver(g, c, &running, delivery(4), &[field], None, Ok)
                 .unwrap_err(),
             Delivery::Refused(RpcError::new(ErrorKind::VaultLocked))
         );
@@ -1835,11 +1930,19 @@ mod tests {
             );
             let before = entries(&s).len();
             let mut prepared = false;
-            let got = s.deliver(g, &f.clocks, &running, delivery(1), &[field], |values| {
-                prepare(&f.clocks, ttl);
-                prepared = true;
-                Ok(values)
-            });
+            let got = s.deliver(
+                g,
+                &f.clocks,
+                &running,
+                delivery(1),
+                &[field],
+                None,
+                |values| {
+                    prepare(&f.clocks, ttl);
+                    prepared = true;
+                    Ok(values)
+                },
+            );
             assert!(prepared, "{case}: the answer was not built");
             if delivered {
                 let values = got.unwrap_or_else(|e| panic!("{case}: {e:?}"));
@@ -1892,10 +1995,18 @@ mod tests {
             let exited = Cell::new(false);
             let alive = |p: &ProcessInstance| !(exited.get() && *p == root);
             let before = entries(&s).len();
-            let got = s.deliver(g, &f.clocks, &alive, delivery(1), &[field], |values| {
-                exited.set(exits);
-                Ok(values)
-            });
+            let got = s.deliver(
+                g,
+                &f.clocks,
+                &alive,
+                delivery(1),
+                &[field],
+                None,
+                |values| {
+                    exited.set(exits);
+                    Ok(values)
+                },
+            );
             if exits {
                 assert!(
                     matches!(got, Err(Delivery::Lapsed)),

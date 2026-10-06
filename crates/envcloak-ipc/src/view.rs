@@ -1870,3 +1870,63 @@ pub struct BackupListView {
     /// Restore leases open now, for any process.
     pub open_leases: u32,
 }
+
+/// Position in descending `(last_seen, id)` order, exclusive on continuation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCursor {
+    pub last_seen: u64,
+    pub id: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectBindingView {
+    pub env_name: String,
+    pub reference: String,
+}
+
+/// Adopted metadata, not a fresh read of the project's manifest.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectView {
+    pub dir: String,
+    pub manifest_sha256: String,
+    pub bindings: Vec<ProjectBindingView>,
+    pub last_seen_secs: u64,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsView {
+    pub projects: Vec<ProjectView>,
+    pub next: Option<ProjectCursor>,
+}
+
+/// The removed binding, for a caller's undo action. No value crosses.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefUnsetView {
+    pub profile: Option<String>,
+    pub env_name: String,
+    pub reference: String,
+}
+
+macro_rules! project_debug {
+    ($($t:ty),* $(,)?) => {$(
+        impl core::fmt::Debug for $t {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(stringify!($t))?;
+                f.write_str(" { .. }")
+            }
+        }
+    )*};
+}
+project_debug!(
+    ProjectCursor,
+    ProjectBindingView,
+    ProjectView,
+    ProjectsView,
+    RefUnsetView
+);
+views!(ProjectsView, RefUnsetView);

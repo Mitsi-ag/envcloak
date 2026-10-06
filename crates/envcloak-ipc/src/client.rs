@@ -992,3 +992,13 @@ impl AsFd for Client {
         self.stream.as_fd()
     }
 }
+
+impl Client {
+    /// One page of the vault's adopted project metadata, never values.
+    pub fn projects_list(
+        &mut self,
+        after: Option<crate::view::ProjectCursor>,
+    ) -> Result<crate::view::ProjectsView, ClientError> {
+        self.call::<crate::proto::ProjectsList>(&crate::proto::ProjectsListParams { after })
+    }
+}
