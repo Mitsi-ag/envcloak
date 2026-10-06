@@ -82,7 +82,7 @@ class Fixture:
         os.symlink("MacOSX.sdk", os.path.join(platform, "SDKs", "MacOSX26.5.sdk"))
         self.product = self.source("App.swift")
         self.kit = self.source("Client.swift")
-        self.test = self.source("AppTests.swift")
+        self.test = self.source("apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKitTestSupport/FakeDaemon.swift")
         self.accessor = os.path.join(self.derived, "Build/Intermediates.noindex/EnvCloakDesign.build/Debug/EnvCloakDesign.build/DerivedSources/resource_bundle_accessor.swift")
         self.touch(self.accessor)
         self.listing = {self.product: "product", self.kit: "product", self.test: "test"}

@@ -1251,6 +1251,8 @@ def classify(rel):
     parts = rel.split("/")
     if rel.startswith(APP + "/EnvCloak/"):
         return "product"
+    if rel.startswith(APP + "/Packages/EnvCloakKit/Sources/EnvCloakKitTestSupport/"):
+        return "test"
     if len(parts) >= 5 and parts[2] == "Packages" and parts[4] == "Sources":
         return "product"
     if len(parts) >= 3 and parts[2] in ("EnvCloakTests", "EnvCloakUITests", "EnvCloakHardwareTests"):

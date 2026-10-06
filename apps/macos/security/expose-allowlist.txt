@@ -7,3 +7,7 @@
 #
 # Adding a file needs review, as security/expose-allowlist.txt does for
 # expose_secret in Rust. Task M3-03 adds the first entries.
+apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/SecretBuffer.swift  # owns and wipes the page allocation
+apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/Base64.swift  # encodes and decodes directly between wiped buffers
+apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Wire/Frame.swift  # framing, in-place parsing and verified-socket I/O
+apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/CLI/CLIRunner.swift  # validates bounded metadata-only CLI stdout

@@ -52,6 +52,7 @@ KIT = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Client.swift"
 TOKEN_FILE = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Log/LogToken.swift"
 DESIGN = "apps/macos/Packages/EnvCloakDesign/Sources/EnvCloakDesign/Tokens.swift"
 TEST = "apps/macos/EnvCloakTests/AppTests.swift"
+TEST_SUPPORT = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKitTestSupport/FakeDaemon.swift"
 # A product file of its own, for fixtures whose import changes what the
 # clean tree's files mean.
 STREAM = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Stream.swift"
@@ -76,6 +77,7 @@ PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 BASE = {
+    TEST_SUPPORT: "func testOnly() { print(1) }\n",
     APP: """import SwiftUI
 import EnvCloakKit
 
@@ -884,7 +886,7 @@ class CheckSwift(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr.decode())
         listed = {tuple(line.split(" ", 1)) for line in p.stdout.decode().splitlines()}
         product = {os.path.realpath(os.path.join(tree.root, rel)) for rel in (APP, VIEW, KIT, TOKEN_FILE, DESIGN, BRAND_SWIFT)}
-        want = {("product", path) for path in product} | {("test", os.path.realpath(os.path.join(tree.root, TEST)))}
+        want = {("product", path) for path in product} | {("test", os.path.realpath(os.path.join(tree.root, rel))) for rel in (TEST, TEST_SUPPORT)}
         self.assertEqual(listed, want)
 
 
