@@ -12,9 +12,12 @@
 //! (`execveat`): an `envcloak` rewritten or replaced since leaves the
 //! daemon starting the image it took, until it restarts. On macOS it
 //! records the file's code directory hash and starts each runner suspended,
-//! resuming it only when the kernel's cdhash of the started process is the
-//! anchor's (and, for a Developer ID build, its Team ID is `envcloakd`'s
-//! own); otherwise it kills it through its handle before it runs. One
+//! resuming it only when the kernel's view of the started process is the
+//! anchor's: its cdhash and signing identifier those of the file the daemon
+//! read at start, its Team ID `envcloakd`'s own (none for an ad hoc build,
+//! which the daemon knows only from its own signature, read: one it cannot
+//! read leaves no anchor); otherwise it kills it through its handle before
+//! it runs. One
 //! window is left there: a daemon killed outright (`SIGKILL`, a crash)
 //! between the suspended start and the resumption leaves the runner
 //! stopped, leading a session of its own, so no orphaned-group `SIGCONT`
@@ -59,7 +62,7 @@ use envcloak_sys::OwnedChild;
 use envcloak_sys::fdpass::{Access, DescriptorKind, descriptor_kind};
 use envcloak_sys::launch::{Program, Session, Spawn, spawn};
 
-use crate::launch_check::{CheckedExec, CheckedLaunch};
+use crate::launch_check::{CheckedExec, CheckedLaunch, ExpectedCode};
 
 /// The most descriptors one request may hand over.
 pub(crate) const MAX_REQUEST_FDS: usize = 4;
@@ -80,9 +83,14 @@ pub(crate) enum AnchorError {
     /// refused by the system's policy) or checked.
     #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
     Copy,
-    /// macOS: the file has no code directory the kernel would check.
+    /// macOS: the file has no code directory the kernel would check, or
+    /// none with a signing identifier.
     #[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
     Unsigned,
+    /// macOS: the daemon's own signature could not be read, or the
+    /// anchor's Team ID is not the daemon's.
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
+    Identity,
 }
 
 impl AnchorError {
@@ -91,6 +99,7 @@ impl AnchorError {
             AnchorError::NotFound => "not_found",
             AnchorError::Copy => "copy_refused",
             AnchorError::Unsigned => "unsigned",
+            AnchorError::Identity => "identity_unread",
         }
     }
 }
@@ -109,9 +118,11 @@ struct Image {
 #[derive(Debug)]
 struct Image {
     path: PathBuf,
-    cdhash: Vec<u8>,
-    /// `envcloakd`'s own Team ID, for a Developer ID build.
-    team: Option<String>,
+    /// What a started runner must show the kernel: the anchor file's
+    /// cdhash and signing identifier, read when the daemon started, and
+    /// `envcloakd`'s own Team ID (`None` only for a daemon whose own
+    /// signature the kernel reported as ad hoc or platform signed).
+    expected: ExpectedCode,
 }
 
 impl Anchor {
@@ -188,13 +199,31 @@ fn take() -> Result<Image, AnchorError> {
         .map_err(|_| AnchorError::Unsigned)?
         .ok_or(AnchorError::Unsigned)?;
     let cdhash = crate::launch_check::cdhash_of(&cd).ok_or(AnchorError::Unsigned)?;
+    let identifier = cd.identifier.clone().ok_or(AnchorError::Unsigned)?;
+    // The daemon's own signature, as the kernel validated it: read, or no
+    // anchor. A daemon that cannot say what signed it cannot tell an ad
+    // hoc build (no Team ID) from a Developer ID one, and never treats a
+    // failed read as the former.
     let me = i32::try_from(std::process::id()).map_err(|_| AnchorError::NotFound)?;
-    let team = envcloak_sys::proc_info(me)
+    envcloak_sys::fail_point("launch.own_signature").map_err(|_| AnchorError::Identity)?;
+    let own = envcloak_sys::proc_info(me)
         .ok()
         .and_then(|p| p.exe)
         .and_then(|e| e.signature)
-        .and_then(|s| s.team_id);
-    Ok(Image { path, cdhash, team })
+        .ok_or(AnchorError::Identity)?;
+    // The anchor file must be signed by the daemon's own team (both ad
+    // hoc, or both the same Developer ID team).
+    if cd.team != own.team_id {
+        return Err(AnchorError::Identity);
+    }
+    Ok(Image {
+        path,
+        expected: ExpectedCode {
+            cdhash,
+            identifier: Some(identifier),
+            team: own.team_id,
+        },
+    })
 }
 
 /// The pipe ends a managed request handed over, checked: each role once,
@@ -303,7 +332,7 @@ pub(crate) struct Started {
     control: UnixStream,
     /// macOS: the code directory hash the server the runner starts
     /// suspended must have, before it may run.
-    confirm: Option<Vec<u8>>,
+    confirm: Option<ExpectedCode>,
 }
 
 /// Starts the runner or relay `role` from `anchor` on `ends`.
@@ -413,10 +442,7 @@ fn spawn_anchor(
         .ok()
         .and_then(|p| p.exe)
         .and_then(|e| e.signature);
-    let same = sig.as_ref().is_some_and(|s| {
-        s.cdhash.is_some_and(|h| h[..] == image.cdhash[..])
-            && (image.team.is_none() || s.team_id == image.team)
-    });
+    let same = sig.as_ref().is_some_and(|s| image.expected.matches(s));
     if !same {
         let _ = child.kill_and_reap();
         return Err(());
@@ -479,7 +505,7 @@ impl Started {
 fn confirm_spawn(
     control: &UnixStream,
     runner: &OwnedChild,
-    expected: &[u8],
+    expected: &ExpectedCode,
 ) -> Result<(), RpcError> {
     let changed = || RpcError::new(ErrorKind::ManagedLaunchChanged);
     let _ = control.set_read_timeout(Some(CONFIRM_WAIT));
@@ -496,8 +522,7 @@ fn confirm_spawn(
             u32::try_from(p.ppid).is_ok_and(|ppid| ppid == runner.id())
                 && p.exe
                     .and_then(|e| e.signature)
-                    .and_then(|s| s.cdhash)
-                    .is_some_and(|h| h[..] == *expected)
+                    .is_some_and(|s| expected.matches(&s))
         });
     let answer = if ok {
         ToRunner::Confirmed
