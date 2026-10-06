@@ -58,6 +58,10 @@
 //!   [`TerminalGuard`] (the outer terminal in raw mode, restored on every
 //!   way out) and [`OwnedChild`] and, on Linux, [`owned::OwnedSession`]
 //!   (the only processes the PTY path signals).
+//! - Probes on the person's machine (`envcloak agents status --probe`,
+//!   M2-28): [`new_session_on_spawn`] (a child leading a session of its
+//!   own, on a terminal of its own, which the kernel hangs up when the
+//!   starter's side of it closes).
 //! - Panics (gate 12): [`install_panic_hook`], which both binaries call so
 //!   a panic shows its place and never its message, after it puts back a
 //!   terminal a [`TerminalGuard`] holds raw; [`panic_point`], where
@@ -90,6 +94,7 @@ mod perm;
 mod proc;
 pub mod pty;
 mod pty_monitor;
+mod session;
 mod signal;
 mod sock;
 mod sync;
@@ -138,6 +143,7 @@ pub use proc::{
     parse_stat_state, parse_status_euid, proc_argv, proc_info, process_running, reaches_top,
     stat_state_exited,
 };
+pub use session::new_session_on_spawn;
 pub use signal::{
     TerminationSignals, TerminationWatch, exit_by_signal, interrupt_ends_process,
     termination_ends_process, termination_recorded, unblock_termination_on_spawn,
