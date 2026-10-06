@@ -11,6 +11,7 @@ final class CLITests: XCTestCase, @unchecked Sendable {
         test "$LANG" = en_US.UTF-8 || exit 10
         test -d "$HOME" || exit 11
         test "$PWD" -ef "$HOME" || exit 12
+        test -c /dev/fd/0 && test /dev/fd/0 -ef /dev/null || exit 14
         if read -r ignored; then exit 13; fi
         printf '{"ok":true}'
         """)
@@ -34,6 +35,23 @@ final class CLITests: XCTestCase, @unchecked Sendable {
             do { _ = try await fixture.runner.run(arguments: ["ref"], workingDirectory: fixture.root); XCTFail("failed CLI succeeded") }
             catch { XCTAssertEqual(error as? CLIError, expected) }
             XCTAssertLessThan(start.duration(to: .now), .seconds(5))
+        }
+    }
+
+    func testCLICompletionAfterDeadlineNeverReportsSuccess() async throws {
+        for expired in [false, true] {
+            let clock = TestClock()
+            let fixture = try fixture("printf '{}'")
+            defer { try? FileManager.default.removeItem(atPath: fixture.root) }
+            await CLIProbe.$hooks.withValue(CLITestHooks(now: { clock.now }, beforeResult: {
+                if expired { clock.advance(.seconds(3)) }
+            })) {
+                do {
+                    let result = try await fixture.runner.run(arguments: ["ref"], workingDirectory: fixture.root)
+                    XCTAssertFalse(expired)
+                    XCTAssertEqual(result.json, "{}")
+                } catch { XCTAssertTrue(expired); XCTAssertEqual(error as? CLIError, .timedOut) }
+            }
         }
     }
 

@@ -10,6 +10,7 @@ import selectors
 import subprocess
 import sys
 import time
+import uuid
 
 
 def main():
@@ -38,8 +39,10 @@ def main():
                 received += part
             selector.close()
             # This suite has only a few read/lock calls, far below pipe capacity.
-            child_env = dict(os.environ, ENVCLOAK_TEST_RUNTIME=str(runtime))
-            return subprocess.run(sys.argv[2:], env=child_env, stdin=subprocess.DEVNULL).returncode
+            # Poison both inherited channels: a child that forgets to clear
+            # its environment or replace stdin must fail the CLI fixtures.
+            child_env = dict(os.environ, ENVCLOAK_TEST_RUNTIME=str(runtime), ENVCLOAK_POISON=uuid.uuid4().hex)
+            return subprocess.run(sys.argv[2:], env=child_env, input=(uuid.uuid4().hex + "\n").encode()).returncode
         finally:
             daemon.terminate()
             try:
