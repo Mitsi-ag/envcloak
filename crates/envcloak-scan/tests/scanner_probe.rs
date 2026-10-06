@@ -23,43 +23,40 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
     let mut inputs = Vec::new();
     for c in &cs {
         let escaped = serde_json::to_string(c.as_str()).unwrap();
-        inputs.push((
-            SecretBytes::from_vec(format!("A='{}'\n", c.as_str()).into_bytes()),
-            0,
-            true,
-        ));
-        inputs.push((
-            SecretBytes::from_vec(
-                format!("{{\"mcpServers\":{{\"s\":{{\"env\":{{\"A\":{escaped}}}}}}}}}")
-                    .into_bytes(),
+        for (text, format, valid) in [
+            (format!("A='{}'\n", c.as_str()), 0, true),
+            (format!("A='{}'; other\n", c.as_str()), 0, false),
+            (
+                format!("{{\"mcpServers\":{{\"s\":{{\"env\":{{\"A\":{escaped}}}}}}}}}"),
+                1,
+                true,
             ),
-            1,
-            true,
-        ));
-        inputs.push((
-            SecretBytes::from_vec(format!("[mcp_servers.s.env]\nA={escaped}\n").into_bytes()),
-            2,
-            true,
-        ));
-        inputs.push((
-            SecretBytes::from_vec(format!("{{\"text\":{escaped}}}\n").into_bytes()),
-            3,
-            c.as_str().chars().count() >= 16,
-        ));
-        inputs.push((
-            SecretBytes::from_vec(format!("{{\"text\":{escaped},BROKEN").into_bytes()),
-            1,
-            false,
-        ));
-        inputs.push((
-            SecretBytes::from_vec(format!("[mcp_servers.s.env]\nA={escaped}\nBROKEN").into_bytes()),
-            2,
-            false,
-        ));
+            (format!("[mcp_servers.s.env]\nA={escaped}\n"), 2, true),
+            (format!("{{\"text\":{escaped}}}\n"), 3, true),
+            (format!("{{\"text\":{escaped},BROKEN"), 1, false),
+            (
+                format!("[mcp_servers.s.env]\nA={escaped}\nBROKEN"),
+                2,
+                false,
+            ),
+            (format!("{{\"text\":{escaped},BROKEN\n"), 3, false),
+        ] {
+            let expected = if valid && (format != 3 || c.as_str().chars().count() >= 16) {
+                Some(c.value())
+            } else {
+                None
+            };
+            inputs.push((
+                SecretBytes::from_vec(text.into_bytes()),
+                format,
+                valid,
+                expected,
+            ));
+        }
     }
     for mode in [ProbeMode::Unwiped, ProbeMode::Wiping] {
         let session = probe_canaries(&cs, mode);
-        for (input, format, valid) in &inputs {
+        for (input, format, valid, expected) in &inputs {
             if mode == ProbeMode::Unwiped && *format == 2 {
                 continue;
             }
@@ -72,7 +69,13 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
                     };
                     assert_eq!(parsed.complete(), *valid);
                     if *valid {
-                        assert!(!parsed.findings.is_empty(), "parser was not exercised");
+                        assert!(
+                            parsed.findings.iter().any(|f| f
+                                .value
+                                .as_ref()
+                                .is_some_and(|v| expected.is_some_and(|want| v.ct_eq(want)))),
+                            "parser did not retain the fixture"
+                        );
                     }
                     drop(parsed);
                 }
@@ -81,19 +84,28 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
                     #[allow(clippy::disallowed_methods)]
                     let bytes = input.expose_secret();
                     let mut matched = false;
+                    let mut emitted = 0;
                     let report = scan_reader(
                         &mut std::io::Cursor::new(bytes),
                         ConfigFormat::Jsonl,
                         Default::default(),
                         Budget::default(),
                         &mut |c| {
-                            matched |= cs.iter().any(|v| c.value.ct_eq(v.value()));
+                            emitted += 1;
+                            matched |= expected.is_some_and(|want| c.value.ct_eq(want));
                             true
                         },
                     )
                     .unwrap();
-                    assert!(report.complete());
-                    assert_eq!(matched, *valid, "transcript candidate eligibility");
+                    assert_eq!(report.complete(), *valid);
+                    assert_eq!(
+                        matched,
+                        expected.is_some(),
+                        "transcript candidate eligibility"
+                    );
+                    if expected.is_none() {
+                        assert_eq!(emitted, 0);
+                    }
                     drop(report);
                 }
             }
