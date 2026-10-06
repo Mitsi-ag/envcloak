@@ -8,11 +8,13 @@ use envcloak_scan::{
 };
 use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 fn fixture() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("ec-p")
+        .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).expect("temporary root"))
         .unwrap()
 }
@@ -20,6 +22,11 @@ fn fixture() -> tempfile::TempDir {
 #[test]
 fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
     let dir = fixture();
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "oracle bundle must be private"
+    );
     let oracle = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles/profile.py");
     let output = std::process::Command::new("/usr/bin/python3")
         .arg("-I")

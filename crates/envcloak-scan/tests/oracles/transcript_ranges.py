@@ -1,4 +1,4 @@
-"""Cycle432 generator, unchanged except the portable owned /tmp root guard.
+"""Cycle432 generator with a portable owned /tmp guard and value-free errors.
 
 The Rust adapter checks scanner ranges only. Scrub previews are not qualified.
 """
@@ -18,6 +18,17 @@ import urllib.parse
 
 VERSION = "envcloak-transcript-range-oracle-v1"
 MARKER = "[envcloak:redacted:oracle-item]"
+GUARD_FAILURES = ("bundle_location", "bundle_name", "bundle_owner", "bundle_mode",
+                  "bundle_nonempty", "bundle_marker")
+
+
+def failure_code(error):
+    # Only guard-owned codes may leave the process, never exception text.
+    if type(error) is ValueError and len(error.args) == 1:
+        code = error.args[0]
+        if isinstance(code, str) and code in GUARD_FAILURES:
+            return code
+    return "internal"
 
 
 def digest(data):
@@ -164,6 +175,6 @@ if __name__ == "__main__":
     try:
         cases = generate(Path(sys.argv[1]))
         print(json.dumps({"cases": len(cases), "ranges": sum(c["count"] for c in cases)}))
-    except Exception:
-        print("oracle_failed", file=sys.stderr)
+    except Exception as error:
+        print("oracle_failed:" + failure_code(error), file=sys.stderr)
         sys.exit(1)
