@@ -1129,7 +1129,6 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path.rstrip("/") == "/ec-fixture-server":
             v = dict(manifest)
             v["dist"] = {"tarball": "http://127.0.0.1:%d/ec-fixture-server/-/ec-fixture-server-1.0.0.tgz" % port,
-                "shasum": hashlib.sha1(tgz).hexdigest(),
                 "integrity": "sha512-" + base64.b64encode(hashlib.sha512(tgz).digest()).decode()}
             body, kind = json.dumps({"name": "ec-fixture-server", "dist-tags": {"latest": "1.0.0"},
                 "versions": {"1.0.0": v}}).encode(), "application/json"
