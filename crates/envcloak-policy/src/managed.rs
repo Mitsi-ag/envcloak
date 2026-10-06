@@ -261,10 +261,21 @@ fn dynamic_loader(name: &str) -> bool {
     name == "ld.so" || name.starts_with("ld-linux") || name.starts_with("ld-musl")
 }
 
+/// The [`WRAPPERS`] GNU's packages for macOS install with a `g` before
+/// their name, beside the system's own (Homebrew's `coreutils`,
+/// `findutils` and `gnu-time`: `gtimeout`, `genv`, `gxargs`, `gtime`).
+const GNU_PREFIXED: &[&str] = &[
+    "env", "nice", "nohup", "stdbuf", "timeout", "time", "xargs", "chroot",
+];
+
 /// Whether `name` starts another program its arguments name
-/// ([`WRAPPERS`]).
+/// ([`WRAPPERS`], and [`GNU_PREFIXED`] ones with their `g`).
 pub fn is_wrapper(name: &str) -> bool {
-    WRAPPERS.contains(&name) || dynamic_loader(name)
+    WRAPPERS.contains(&name)
+        || name
+            .strip_prefix('g')
+            .is_some_and(|n| GNU_PREFIXED.contains(&n))
+        || dynamic_loader(name)
 }
 
 /// The interpreter options that load other code (SPEC §6.6: `-e`, `-c`,
@@ -609,16 +620,31 @@ fn base(arg: &str) -> &str {
     arg.rsplit('/').next().unwrap_or(arg)
 }
 
-/// Whether `name` is an interpreter's, by its name or, for
-/// [`VERSIONED`] ones, its name with a version (`python3.12`, `node22`).
-fn interpreter(name: &str) -> bool {
+/// CPython's ABI flags, which its executables' names end in after the
+/// version (`sys.abiflags`): `t` free-threaded (3.13 and later), `d` a
+/// debug build, `m` pymalloc (up to 3.7), `u` wide Unicode (up to 3.2).
+const ABI_FLAGS: &str = "tdmu";
+
+/// The interpreter family `name` is, by its name: one of [`INTERPRETERS`],
+/// or one of [`VERSIONED`] with a version after it (`python3.12`,
+/// `node22`), which may end in CPython's ABI flags ([`ABI_FLAGS`]:
+/// `python3.14t`, a free-threaded build; `python3.13d`, a debug build;
+/// `python3.13td`; `python3.7m`) and in Debian's `-dbg`
+/// (`python3.12-dbg`). `None` for any other name. The match leans towards
+/// an interpreter: a name it missed would pass as a native program, whose
+/// class binds what runs, while the interpreter's code is chosen by its
+/// arguments (review of M2-27: `python3.14t` was a program).
+fn interpreter_family(name: &str) -> Option<&str> {
     if INTERPRETERS.contains(&name) {
-        return true;
+        return Some(name);
     }
-    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    stem.len() < name.len()
+    let versioned = name.strip_suffix("-dbg").unwrap_or(name);
+    let versioned = versioned.trim_end_matches(|c: char| ABI_FLAGS.contains(c));
+    let stem = versioned.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    (stem.len() < versioned.len()
         && VERSIONED.contains(&stem)
-        && name[stem.len()..].starts_with(|c: char| c.is_ascii_digit())
+        && versioned[stem.len()..].starts_with(|c: char| c.is_ascii_digit()))
+    .then_some(stem)
 }
 
 /// The first argument of `argv` after `from` that is not an option.
@@ -752,13 +778,12 @@ fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
         }
         return Ok(ArgvClass::PackageRunner { label });
     }
-    if !interpreter(name) {
+    let Some(stem) = interpreter_family(name) else {
         return Ok(ArgvClass::Program);
-    }
+    };
     // `deno run x.ts` and `bun run x.ts` name their entry after a
     // subcommand; any other subcommand of theirs (`bun x`, `deno task`)
     // runs a package or a task: a package runner.
-    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     let mut i = 1;
     if matches!(stem, "deno" | "bun") {
         match argv.get(1).map(String::as_str) {
@@ -1511,6 +1536,87 @@ mod tests {
         ] {
             assert!(is_code_selecting(n), "{n}");
         }
+    }
+
+    /// CPython's builds are installed under their version with ABI flags
+    /// (`python3.14t` free-threaded, `python3.13d` debug, `python3.13td`,
+    /// `python3.7m`, `python3t`) and Debian's debug build under `-dbg`:
+    /// each is an interpreter of the `python` family, whose code-loading
+    /// options are refused (`-c`, `-m`, `-ic`) and whose entry file is the
+    /// first argument after its options (`-Xdev`; `-X dev` leaves it unknown,
+    /// as for `python3`); a link
+    /// named as a program to one is refused by its file's name. GNU's
+    /// wrappers as Homebrew installs them (`gtimeout`, `genv`, `gnice`,
+    /// `gxargs`) are wrappers. A native program whose name merely ends in
+    /// those letters (`mytool`, `gserver`, `pythond`) stays a program (the
+    /// positive controls).
+    ///
+    /// Mutations checked: the version match without the ABI flags (the
+    /// previous `interpreter`): `python3.14t -c x` is a program and
+    /// registers, and this fails; the `g` names left out of `is_wrapper`:
+    /// `gtimeout 5 node /srv/s.js` is a program, and this fails.
+    #[test]
+    fn abi_flagged_interpreters_and_gnu_wrappers_are_never_native() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let c = |a: &[&str]| classify_argv(&v(a));
+        for name in [
+            "python3.14t",
+            "/usr/local/bin/python3.14t",
+            "python3.13d",
+            "python3.13td",
+            "python3.7m",
+            "python3.7dm",
+            "python3t",
+            "python3.12-dbg",
+            "pypy3.10",
+        ] {
+            assert_eq!(
+                c(&[name, "/srv/s.py"]),
+                Ok(ArgvClass::Interpreter { entry: 1 }),
+                "{name}"
+            );
+            assert_eq!(
+                c(&[name, "-Xdev", "/srv/s.py"]),
+                Ok(ArgvClass::Interpreter { entry: 2 }),
+                "{name}"
+            );
+            assert_eq!(
+                c(&[name, "-X", "dev", "/srv/s.py"]),
+                Err(DeclError::NoEntry),
+                "{name}"
+            );
+            for loads in [&["-c", "import x"][..], &["-m", "server"], &["-ic", "x"]] {
+                let mut argv = vec![name];
+                argv.extend_from_slice(loads);
+                assert_eq!(
+                    c(&argv),
+                    Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+                    "{argv:?}"
+                );
+            }
+            assert_eq!(c(&[name, "s.py"]), Err(DeclError::NotAbsolute), "{name}");
+            assert_eq!(
+                refuse_disguised(&v(&["/srv/bin/server"]), &format!("/usr/bin/{name}")),
+                Err(DeclError::Disguised),
+                "{name}"
+            );
+        }
+        for name in [
+            "gtimeout", "genv", "gnice", "gnohup", "gstdbuf", "gxargs", "gtime",
+        ] {
+            assert_eq!(
+                c(&[name, "5", "node", "/srv/s.js"]),
+                Err(DeclError::Wrapper),
+                "{name}"
+            );
+        }
+        for name in ["mytool", "gserver", "pythond", "python-server", "nodemon"] {
+            assert_eq!(c(&[name, "--port", "1"]), Ok(ArgvClass::Program), "{name}");
+        }
+        assert_eq!(
+            refuse_disguised(&v(&["python3.14t", "/srv/s.py"]), "/usr/bin/python3.14t"),
+            Ok(ArgvClass::Interpreter { entry: 1 })
+        );
     }
 
     /// The programs that run a script file their argument names are never
