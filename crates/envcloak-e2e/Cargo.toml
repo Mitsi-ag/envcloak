@@ -32,7 +32,7 @@ envcloak-agents.workspace = true
 # The catalog's tests (M2 plan task M2-10) gather a caller's evidence as
 # the daemon does, against the pinned hosts.
 envcloak-policy.workspace = true
-envcloak-sys.workspace = true
+envcloak-sys = { workspace = true, features = ["testing"] }
 # The coverage probes' tests (M2 plan task M2-09) read the published
 # compatibility matrix (integrations/compat/matrix.toml) and hand the
 # probe the output fixture's values in wiping buffers.

@@ -150,11 +150,13 @@ for line in sys.stdin.buffer:
     os.write(1, b'GOT [' + line + b']\n')
 ";
 
-/// Starts argv[2..] as its child and owns it: a word `TSTP` on the FIFO
-/// argv[1] sends that child SIGTSTP (its own unreaped child, never a
+/// Starts argv[2..] as its child and owns it: a signal name on the FIFO
+/// argv[1] signals that child (its own unreaped child, never a
 /// number read from elsewhere). Exits as the child did.
 const SIGNALLER: &str = r"import os, select, signal, sys
 fifo = sys.argv[1]
+signals = {b'TSTP': signal.SIGTSTP, b'INT': signal.SIGINT,
+           b'QUIT': signal.SIGQUIT, b'TERM': signal.SIGTERM, b'HUP': signal.SIGHUP}
 pid = os.fork()
 if pid == 0:
     os.execv(sys.argv[2], sys.argv[2:])
@@ -163,8 +165,8 @@ while True:
     r, _, _ = select.select([fd], [], [], 0.05)
     if r:
         for word in os.read(fd, 64).split():
-            if word == b'TSTP':
-                os.kill(pid, signal.SIGTSTP)
+            if word in signals:
+                os.kill(pid, signals[word])
     done, status = os.waitpid(pid, os.WNOHANG)
     if done:
         code = os.waitstatus_to_exitcode(status)
@@ -556,6 +558,135 @@ fn state_of(pid: u32) -> String {
 
 fn lines(path: &Path) -> usize {
     std::fs::read(path).map_or(0, |b| b.iter().filter(|c| **c == b'\n').count())
+}
+
+/// The real CLI is the signaller's owned child. Both a direct command and
+/// a nested shell's foreground job keep one counter per forwarded signal.
+fn cli_signal_receipts(h: &Harness, sh: &mut Shell, py: &str, signaller: &str) {
+    const NAMES: [&str; 4] = ["INT", "QUIT", "TERM", "HUP"];
+    let counter = fixture(
+        h,
+        "signal-counter.py",
+        r"import os, pathlib, select, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+names = {signal.SIGINT: 'INT', signal.SIGQUIT: 'QUIT',
+         signal.SIGTERM: 'TERM', signal.SIGHUP: 'HUP'}
+def got(sig, frame):
+    with (root / ('job-' + names[sig])).open('a') as f:
+        f.write('x\n')
+for sig in names:
+    signal.signal(sig, got)
+os.write(1, b'RECEIPT-READY\n')
+end = time.monotonic() + 30
+while root.exists() and time.monotonic() < end:
+    ready, _, _ = select.select([0], [], [], 0.05)
+    if not ready:
+        continue
+    try:
+        line = os.read(0, 65536)
+    except OSError:
+        break
+    if not line or line.strip() == b'done':
+        break",
+    );
+    #[cfg(target_os = "linux")]
+    let narrow = !envcloak_sys::testing::group_signal_supported();
+    #[cfg(not(target_os = "linux"))]
+    let narrow = false;
+    for nested in [false, true] {
+        let name = if nested { "nested" } else { "direct" };
+        let dir = h.files().join(format!("receipts-{name}"));
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = dir.join("signals");
+        assert!(
+            Command::new("/usr/bin/mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let root = dir.to_str().unwrap();
+        let command = if nested {
+            run_pty(h, &["/bin/sh", "-i"])
+        } else {
+            run_pty(h, &[py, &counter, root])
+        };
+        let mark = sh.mark();
+        sh.start_job(&format!(
+            "PS1={} {} {} {} {command}",
+            quoted(INNER),
+            quoted(py),
+            quoted(signaller),
+            quoted(fifo.to_str().unwrap())
+        ));
+        if nested {
+            // The typed command echoes the prompt's text once.
+            sh.outer
+                .expect_since(mark, INNER.as_bytes(), 2, "the receipt shell");
+            let traps: String = NAMES
+                .iter()
+                .map(|sig| {
+                    let path = quoted(dir.join(format!("shell-{sig}")).to_str().unwrap());
+                    format!("trap {} {sig}; ", quoted(&format!("echo x >> {path}")))
+                })
+                .collect();
+            sh.outer
+                .type_bytes(format!("{traps}{NO_EDITING}set -m\r").as_bytes());
+            sh.outer
+                .expect_since(mark, INNER.as_bytes(), 3, "the shell's receipt traps");
+            sh.outer.type_bytes(
+                format!("{} {} {}\r", quoted(py), quoted(&counter), quoted(root)).as_bytes(),
+            );
+        }
+        sh.outer
+            .expect_since(mark, b"RECEIPT-READY", 1, "the signal counter");
+        let counts = |who: &str| NAMES.map(|sig| lines(&dir.join(format!("{who}-{sig}"))));
+        let mut job = [0; 4];
+        let mut shell = [0; 4];
+        for (i, sig) in NAMES.iter().enumerate() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)
+                .unwrap()
+                .write_all(format!("{sig}\n").as_bytes())
+                .unwrap();
+            if nested && narrow && matches!(*sig, "TERM" | "HUP") {
+                shell[i] = 1;
+            } else {
+                assert!(
+                    sh.outer
+                        .wait_for_within(Duration::from_secs(10), |_| counts("job")[i] > 0),
+                    "real CLI {name}: SIG{sig} missed the job; job {:?}, shell {:?}; {}",
+                    counts("job"),
+                    counts("shell"),
+                    sh.outer.text()
+                );
+                job[i] = 1;
+            }
+            assert_eq!(counts("job"), job, "real CLI {name}, SIG{sig}");
+        }
+        sh.outer.type_bytes(b"done\r");
+        if nested {
+            sh.outer
+                .expect_since(mark, INNER.as_bytes(), 4, "the receipt job ended");
+            sh.outer.type_bytes(b":\r");
+            sh.outer
+                .expect_since(mark, INNER.as_bytes(), 5, "the shell handled pending traps");
+            sh.outer.type_bytes(b"exit 0\r");
+        }
+        sh.prompt_again("the real CLI receipt run ended");
+        assert_eq!(sh.status(), 0);
+        assert_eq!(counts("job"), job, "real CLI {name}, final job counts");
+        assert_eq!(
+            counts("shell"),
+            shell,
+            "real CLI {name}, final shell counts"
+        );
+        println!(
+            "real CLI ({}, {name}): job {job:?}, shell {shell:?}",
+            std::env::consts::OS
+        );
+    }
 }
 
 /// The suspend character's cycle for a job just started: it stops, the
@@ -962,6 +1093,8 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         .expect_since(mark, b"done", 1, "the ticker read done");
     sh.prompt_again("the ticker and the run ended");
     assert_eq!(sh.status(), 0);
+
+    cli_signal_receipts(&h, &mut sh, &py, &signaller);
 
     // Under dash, which leaves the terminal as a stopped job had it (bash
     // and ksh put back their own settings when a job stops, dash does not;
