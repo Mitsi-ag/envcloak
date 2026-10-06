@@ -1569,6 +1569,101 @@ fn a_suspended_server_runs_nothing_until_the_daemon_confirms() {
     w.h.assert_swept("after the confirmation");
 }
 
+/// The kernel's child list is an observation only, never a signal target.
+fn children_of(parent: i32) -> Vec<i32> {
+    let ps = std::process::Command::new("/bin/ps")
+        .env_clear()
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .unwrap();
+    assert!(ps.status.success());
+    String::from_utf8(ps.stdout)
+        .unwrap()
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let ppid: i32 = fields.next()?.parse().ok()?;
+            (ppid == parent).then_some(pid)
+        })
+        .collect()
+}
+
+fn failed_confirmation(fault: &str) {
+    if managed_common::release_run(fault) || !cfg!(target_os = "macos") {
+        return;
+    }
+    let gate = tempfile::Builder::new()
+        .prefix("ecg")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let release = gate.path().join("release");
+    let site = "launch.confirm";
+    let mut w = World::new(&[
+        ("ENVCLOAK_TEST_FAIL", fault),
+        ("ENVCLOAK_TEST_PAUSE", site),
+        ("ENVCLOAK_TEST_PAUSE_RELEASE", release.to_str().unwrap()),
+    ]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let out = w.agent_background("request", &json!({"launch": launch, "send": ["report"]}));
+    wait_paused(&w, site, 1);
+    let runners = children_of(w.h.daemon.pid());
+    assert_eq!(runners.len(), 1);
+    let servers = children_of(runners[0]);
+    assert_eq!(
+        servers.len(),
+        1,
+        "the failure must follow the suspended spawn"
+    );
+    let server = envcloak_sys::proc_info(servers[0]).unwrap();
+    let runner = envcloak_sys::proc_info(runners[0]).unwrap();
+    assert!(!w.marker.exists());
+    std::fs::write(&release, b"").unwrap();
+    let answer = w.wait_out(&out, Duration::from_secs(60), "failed confirmation");
+    assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
+    assert!(!w.marker.exists(), "an unconfirmed server ran");
+    for process in [server, runner] {
+        assert!(
+            envcloak_sys::proc_info(process.pid)
+                .map_or(true, |now| now.start_time != process.start_time),
+            "failed launch left process {}",
+            process.pid
+        );
+    }
+    w.assert_released(0, 0, "the failed handshake records no completed release");
+    // The same record works after restarting without the injected fault.
+    w.h.stop_daemon();
+    w.h.start_daemon(&[("ENVCLOAK_TEST_FAIL", "")]);
+    let pass =
+        w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
+    let home = w.h.home.home();
+    let unlocked = w.h.human(
+        &home,
+        &["unlock", "--passphrase-fd", "3"],
+        &[(3, &pass, true)],
+        &[],
+    );
+    assert_eq!(unlocked.code, 0, "{}", unlocked.all());
+    let next = w.request(&launch);
+    w.approve(&pending_id(&next));
+    assert!(started(&w.request(&launch)));
+    w.h.assert_swept("confirmation failure and positive control");
+}
+
+/// Mutation: report a failed confirmation as started, after cleanup.
+#[test]
+fn confirmation_timeout_after_spawn_cleans_the_server() {
+    failed_confirmation("launch.confirm_timeout");
+}
+
+/// Mutation: report a failed confirmation as started, after cleanup.
+#[test]
+fn confirmation_channel_loss_after_spawn_cleans_the_server() {
+    failed_confirmation("launch.confirm_channel_loss");
+}
+
 /// D-33: the source changed while the daemon copies it into the sealed
 /// memory file (a `testing` barrier inside the copy): the launch either
 /// runs the exact approved image or is refused before release; it never

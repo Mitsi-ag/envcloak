@@ -478,23 +478,22 @@ impl Started {
         } = self;
         let mut w = &control;
         if release.write_to(&mut w).is_err() {
-            let _ = child.kill_and_reap();
+            retire_failed_runner(control, child);
             return Err(RpcError::new(ErrorKind::RunnerUnavailable));
         }
         let outcome = match confirm {
             None => Ok(()),
             Some(expected) => confirm_spawn(&control, &child, &expected),
         };
-        drop(control);
-        match &outcome {
-            // The runner never asked, or was never answered: it holds the
-            // values, and its client was told the launch failed. It goes.
-            Err(e) if e.kind == ErrorKind::RunnerUnavailable => {
-                let _ = child.kill_and_reap();
-            }
-            // Confirmed, or refused (the runner kills its server and
-            // exits on its own).
-            _ => reap_later(child),
+        if outcome.is_err() {
+            // Once release starts, the runner may own a suspended server
+            // in another group. Its exit, after cleaning that child up,
+            // must precede our return. Killing the runner loses the only
+            // handle allowed to stop that server.
+            retire_failed_runner(control, child);
+        } else {
+            drop(control);
+            reap_later(child);
         }
         outcome
     }
@@ -503,6 +502,18 @@ impl Started {
     pub(crate) fn abandon(self) {
         let _ = self.child.kill_and_reap();
     }
+}
+
+/// Closes a failed release and waits for the runner to clean up its own
+/// server and exit. No force-kill is safe after release: the server leads
+/// another group, and only the runner owns its unreaped handle.
+fn retire_failed_runner<O: envcloak_sys::owned::ProcessOps>(
+    control: UnixStream,
+    child: OwnedChild<O>,
+) {
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    drop(control);
+    let _ = child.reap();
 }
 
 /// Waits for the runner's `ConfirmSpawn` and answers it (macOS).
@@ -519,6 +530,15 @@ fn confirm_spawn(
     // A test stops here, with the server started and not yet answered: it
     // must have run nothing.
     envcloak_sys::pause_point("launch.confirm");
+    // Faults after a real suspended spawn. The timeout waits on the real
+    // channel while the runner waits for its answer; the loss closes it.
+    if envcloak_sys::fail_point("launch.confirm_timeout").is_err() {
+        let _ = control::receive::<FromRunner>(control);
+        return Err(RpcError::new(ErrorKind::RunnerUnavailable));
+    }
+    if envcloak_sys::fail_point("launch.confirm_channel_loss").is_err() {
+        let _ = control.shutdown(std::net::Shutdown::Both);
+    }
     let ok = i32::try_from(pid)
         .ok()
         .and_then(|pid| envcloak_sys::proc_info(pid).ok())
@@ -552,6 +572,18 @@ fn reap_later(child: OwnedChild) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mutation: kill the runner before its owned server cleanup completes.
+    #[test]
+    fn failed_release_waits_for_runner_cleanup_without_signalling() {
+        use envcloak_sys::owned::{Recorded, RecordingProcesses};
+        let model = RecordingProcesses::new();
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        retire_failed_runner(control, model.child(71));
+        assert_eq!(model.calls(), vec![Recorded::Reap(71)]);
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+    }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
         envcloak_sys::pipe_cloexec().unwrap()
