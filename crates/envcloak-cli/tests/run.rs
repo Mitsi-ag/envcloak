@@ -255,6 +255,55 @@ fn request_id(err: &str) -> String {
         .to_owned()
 }
 
+/// M3-04's end-to-end story: the real agent shell runs two projects,
+/// each approved in a separate terminal, and the real daemon lists the
+/// adopted bindings and independently hashed on-disk manifests.
+#[test]
+fn projects_list_two_projects_adopted_through_cli_run() {
+    let f = Fixture::new();
+    let mut agent = f.agent();
+    let paths = envcloak_ipc::RunPaths::under(envcloak_testkit::daemon_run_dir(&f.home)).unwrap();
+    let mut client = envcloak_ipc::Client::connect(&paths).unwrap();
+    for (name, variable, reference) in [
+        ("one", "FIRST", "openai/acme-web"),
+        ("two", "SECOND", "stripe/acme-web"),
+    ] {
+        let dir = project(&f.home, name, &format!("[env]\n{variable}='{reference}'\n"));
+        let manifest = dir.join("envcloak.toml");
+        let args = [
+            "--manifest",
+            manifest.to_str().unwrap(),
+            "--",
+            "/usr/bin/true",
+        ];
+        let out = agent.run(&args);
+        assert_eq!(out.status.code(), Some(125));
+        let before = client.projects_list(None).unwrap().projects.len();
+        f.approve(&request_id(&stderr(&out)));
+        let out = agent.run(&args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let rows = client.projects_list(None).unwrap();
+        assert_eq!(rows.projects.len(), before + 1);
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let row = rows
+            .projects
+            .iter()
+            .find(|p| std::path::Path::new(&p.dir) == canonical)
+            .unwrap();
+        assert_eq!(
+            row.manifest_sha256,
+            sha256_hex(&std::fs::read(&manifest).unwrap())
+        );
+        assert_eq!(row.bindings.len(), 1);
+        assert_eq!(row.bindings[0].env_name, variable);
+        assert_eq!(row.bindings[0].reference, reference);
+        assert!(row.last_seen_secs > 0);
+        assert_no_canary(&serde_json::to_vec(&rows).unwrap(), &f.cs);
+    }
+    assert_eq!(client.projects_list(None).unwrap().projects.len(), 2);
+    f.sweep();
+}
+
 /// Story S4 to S6 through the CLI: the agent's run waits for an approval,
 /// then starts the command with the values in its environment (their
 /// digests match) and every form of them redacted on both streams; the

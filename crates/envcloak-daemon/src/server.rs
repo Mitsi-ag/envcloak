@@ -803,6 +803,9 @@ fn respond<'s>(
             answer::<AuditVerify>(id, &req, |_| locked(&shared.state).audit_verify())
         }
         ItemsList::NAME => answer::<ItemsList>(id, &req, |p| items::list(shared, p)),
+        proto::ProjectsList::NAME => {
+            answer::<proto::ProjectsList>(id, &req, |p| crate::projects::list(shared, p))
+        }
         ItemsShow::NAME => answer::<ItemsShow>(id, &req, |p| items::show(shared, p)),
         ItemsCheck::NAME => answer::<ItemsCheck>(id, &req, |p| items::check(shared, p)),
         ItemsAdd::NAME => answer::<ItemsAdd>(id, &req, |p| items::add(shared, peer, p)),

@@ -1438,7 +1438,7 @@ impl Method for BackupList {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 39] = [
+pub const CLIENT_METHODS: [&str; 40] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1478,6 +1478,7 @@ pub const CLIENT_METHODS: [&str; 39] = [
     BackupOpenRestore::NAME,
     BackupRead::NAME,
     BackupList::NAME,
+    ProjectsList::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -2278,5 +2279,28 @@ pub fn parse_response<'a, T: Deserialize<'a>>(
             Err(ResponseError::Rpc(e))
         }
         _ => Err(ResponseError::Protocol),
+    }
+}
+
+/// M3-04: the verified vault's adopted project index, newest first.
+#[derive(Debug)]
+pub struct ProjectsList;
+
+impl Method for ProjectsList {
+    const NAME: &'static str = "projects.list";
+    type Params = ProjectsListParams;
+    type Output = crate::view::ProjectsView;
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsListParams {
+    #[serde(default)]
+    pub after: Option<crate::view::ProjectCursor>,
+}
+
+impl core::fmt::Debug for ProjectsListParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ProjectsListParams { .. }")
     }
 }

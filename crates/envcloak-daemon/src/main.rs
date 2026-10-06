@@ -40,6 +40,7 @@ mod exe_hash;
 mod import;
 mod items;
 mod lock;
+mod projects;
 mod redact;
 mod requests;
 mod scan_match;

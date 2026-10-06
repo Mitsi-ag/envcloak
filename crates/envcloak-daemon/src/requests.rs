@@ -544,11 +544,31 @@ pub fn run_request(
                     &alive,
                     AuditEvent::Request(Box::new(covered)),
                     &fields,
+                    Some(envcloak_core::vault::ProjectRecord {
+                        key: again.project.vault_key(),
+                        display_path: project_dir.clone(),
+                        manifest_sha256: project.manifest.sha256,
+                        bindings: bindings
+                            .iter()
+                            .map(|(b, _)| envcloak_core::vault::ProjectBinding {
+                                env_name: b.env_name.as_str().to_owned(),
+                                reference: b.reference.to_string(),
+                            })
+                            .collect(),
+                        last_seen: 0, // Read at commit, after framing.
+                    }),
                     answer,
                 );
                 let frame = match delivered {
                     Ok(frame) => frame,
-                    Err(Delivery::Refused(e)) => return Err(e),
+                    Err(Delivery::Refused(e)) => {
+                        s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                            decision: e.kind.token(),
+                            grant_id: Some(g.to_string()),
+                            ..entry
+                        })));
+                        return Err(e);
+                    }
                     Err(Delivery::Lapsed) => {
                         // The grant ran out, or its root exited, while the
                         // answer was prepared: nothing was recorded or
