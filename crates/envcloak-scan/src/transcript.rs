@@ -606,7 +606,7 @@ pub fn scan_transcript_sources(
         &ordered,
         budget,
         &mut report,
-        |root, rel, source, report| {
+        |root, rel, source, opened, report| {
             let path = root.path().join(rel);
             let format = crate::sources::effective_format(rel, source.format);
             if let Some(previous) = scanned.get(&path) {
@@ -621,6 +621,7 @@ pub fn scan_transcript_sources(
                 root,
                 rel,
                 source,
+                opened,
                 budget,
                 report,
                 &mut occurrences,
@@ -637,6 +638,7 @@ fn scan_file(
     root: &crate::ScanRoot,
     rel: &std::path::Path,
     source: &crate::source::ConfigSource,
+    opened: (File, std::fs::Metadata),
     budget: Budget,
     report: &mut crate::candidates::ScanReport,
     occurrences: &mut usize,
@@ -652,16 +654,11 @@ fn scan_file(
     } else {
         usize::MAX
     };
-    let opened = root
-        .open_parent(rel)
-        .and_then(|(d, n)| crate::root::open_file(&d, &n, cap));
-    let (mut file, metadata) = match opened {
-        Ok(v) => v,
-        Err(e) => {
-            report.issue(path, e.token());
-            return;
-        }
-    };
+    let (mut file, metadata) = opened;
+    if metadata.len() > cap as u64 {
+        report.issue(path, "too_large");
+        return;
+    }
     let stamp = crate::FileStamp::of(&metadata);
     if stamp.dev != root.dev() {
         report.issue(path, "mount_point");
@@ -710,6 +707,60 @@ mod device_tests {
     use super::*;
 
     #[test]
+    fn transcript_reads_the_discovered_handle_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        let path = d.path().join("store");
+        let value = b"fixtureZheldTranscriptValue";
+        std::fs::write(&path, value).expect("write");
+        let stamp = crate::FileStamp::of(&std::fs::metadata(&path).expect("metadata"));
+        let source = crate::source::ConfigSource {
+            path: path.clone(),
+            format: ConfigFormat::Raw,
+            source_kind: crate::source::SourceKind::Transcript,
+            label: "fixture".into(),
+            names: None,
+        };
+        let mut report = crate::candidates::ScanReport::default();
+        let mut found = false;
+        crate::sources::walk_sources(
+            &[source],
+            Budget::default(),
+            &mut report,
+            |root, rel, source, opened, report| {
+                // The callback is a deterministic barrier after discovery's
+                // open. Reopening this path must fail, while the held file
+                // remains readable and its original stamp must be retained.
+                std::fs::rename(&path, d.path().join("held")).expect("rename");
+                std::fs::write(&path, b"replacement").expect("replace");
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                    .expect("permissions");
+                scan_file(
+                    root,
+                    rel,
+                    source,
+                    opened,
+                    Budget::default(),
+                    report,
+                    &mut 0,
+                    &mut false,
+                    &mut |c| {
+                        assert!(c.value.ct_eq(value));
+                        assert_eq!(c.occurrence.stamp, Some(stamp));
+                        found = true;
+                        true
+                    },
+                );
+            },
+        );
+        assert!(found, "reader reopened the path instead of its held file");
+        assert_eq!(report.files, 1);
+        assert_eq!(report.bytes, value.len() as u64);
+        assert!(!report.issues.iter().any(|i| i.reason == "unreadable"));
+    }
+
+    #[test]
     fn transcript_leaf_mount_is_refused_at_the_actual_read() {
         let d = tempfile::tempdir_in("/tmp").expect("fixture");
         std::fs::write(d.path().join("store"), b"fixtureZtranscriptDeviceValue").expect("write");
@@ -731,6 +782,8 @@ mod device_tests {
                 &root,
                 std::path::Path::new("store"),
                 &source,
+                crate::root::open_file(root.dir(), std::ffi::OsStr::new("store"), usize::MAX)
+                    .expect("open"),
                 Budget::default(),
                 &mut report,
                 &mut 0,

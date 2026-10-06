@@ -3,7 +3,7 @@ use crate::candidates::{Budget, Leftover, ScanReport, Source};
 use crate::source::{ConfigFormat, ConfigSource, SourceKind};
 use crate::{FileStamp, ScanErrorKind, ScanRoot};
 use envcloak_sys::{DirEntryKind, list_dir, open_dir_beneath};
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -156,7 +156,7 @@ pub(crate) fn walk_sources(
     sources: &[ConfigSource],
     budget: Budget,
     report: &mut ScanReport,
-    mut read: impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
+    mut read: impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut ScanReport),
 ) {
     let mut visited = Visits {
         omissions: sources
@@ -340,7 +340,7 @@ fn walk(
     attempts: &mut usize,
     visited: &mut Visits,
     report: &mut ScanReport,
-    read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
+    read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut ScanReport),
 ) {
     if depth > 12 {
         report.issue(root.path().join(rel), "too_deep");
@@ -426,7 +426,7 @@ fn process(
     attempts: &mut usize,
     visited: &mut Visits,
     report: &mut ScanReport,
-    read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
+    read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut ScanReport),
     optional: bool,
 ) {
     let path = root.path().join(rel);
@@ -445,7 +445,7 @@ fn process(
     let file = root
         .open_parent(rel)
         .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
-    let (_, m) = match file {
+    let (file, m) = match file {
         Ok(v) => v,
         Err(ScanErrorKind::NotFound) if optional => {
             visited.files.insert(path, ReadState::Closed);
@@ -485,8 +485,8 @@ fn process(
     }
     let stamp = FileStamp::of(&m);
     let before = report.findings.len();
-    read(root, rel, source, report);
-    // Parsers' stamps belong to their own descriptor read, not this walk.
+    read(root, rel, source, (file, m), report);
+    // The reader and discovery share the descriptor and its original stamp.
     for f in &mut report.findings[before..] {
         if stamp.nlink > 1 {
             f.single_complete_line = false;
@@ -570,7 +570,7 @@ mod tests {
                 &mut 0,
                 &mut Default::default(),
                 &mut report,
-                &mut |_, _, _, _| called = true,
+                &mut |_, _, _, _, _| called = true,
                 false,
             );
             assert_eq!(called, !mounted);
@@ -597,7 +597,7 @@ mod tests {
                 &mut attempts,
                 &mut visited,
                 &mut report,
-                &mut |_, _, _, _| panic!("missing file was read"),
+                &mut |_, _, _, _, _| panic!("missing file was read"),
                 false,
             );
         }
