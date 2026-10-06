@@ -310,6 +310,17 @@ const REASON_TEXTS: &[(&str, &str)] = &[
         "a launch argument or variable looks like a key: put the key in the vault and bind it \
          in the managed manifest; nothing was stored",
     ),
+    // A bridged server's registration refused (`invalid_params`, M2-27).
+    (
+        "invalid_header",
+        "a header name of the bridged server cannot have a binding of its own, so the relay \
+         could not tell which value goes in it; nothing was stored",
+    ),
+    (
+        "header_bindings",
+        "the managed manifest does not bind exactly one value to each header of the bridged \
+         server; nothing was stored",
+    ),
     (
         "limited",
         "this process tree has used an hour's comparisons with the vault (100,000 short values \
