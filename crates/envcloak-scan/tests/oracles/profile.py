@@ -36,11 +36,11 @@ def generated_cases(home):
     def add(name,source,expected_a,expected_b=None,policy='literal_candidate',rewrite=True,mutation=None):
         cases.append(dict(name=name,source=source,a=expected_a,b=expected_b,policy=policy,
                           proposed_whole_line_delete_eligible=rewrite,mutation=mutation))
-    for exported in (False,True):
-        prefix=b'\texport ' if exported else b''
+    for exported in (False,True,"tab"):
+        prefix=b'\texport\t ' if exported == "tab" else b'\texport ' if exported else b''
         for name,encoded,value in shapes:
             expanded_braces=exported and name=='assignment_braces'
-            add(('export_' if exported else 'assign_')+name,
+            add(('export_tab_' if exported == 'tab' else 'export_' if exported else 'assign_')+name,
                 prefix+b'EC_ORACLE_A='+encoded+b'\n',a+b'y' if expanded_braces else value,
                 policy='manual_expansion_proposed' if expanded_braces else 'literal_candidate',
                 rewrite=not expanded_braces and name != 'quoted_cr')
@@ -71,6 +71,13 @@ def generated_cases(home):
     # Two deletions produce syntactically valid but different shell behavior.
     add('deletion_continuation',b'EC_ORACLE_A='+a+b'\\\nEC_ORACLE_B='+b+b'\n',a+b'EC_ORACLE_B='+b,rewrite=False)
     add('deletion_quoted_multiline',b"EC_ORACLE_A='"+a+b'\n'+b+b"'\n",a+b'\n'+b,rewrite=False)
+    included=b'EC_ORACLE_A='+a+b'\n'
+    (home.parent/'included.sh').write_bytes(included)
+    for command in (b'source',b'.'):
+        for i,separator in enumerate((b' ',b'\t',b' \t')):
+            add('include_'+command.decode().replace('.', 'dot')+str(i),
+                command+separator+b'included.sh\n',a)
+            cases[-1]['include_file']='included.sh'
     return cases
 
 # Data is returned through a dedicated inherited pipe, never stdout/stderr or
@@ -116,5 +123,5 @@ for case in generated_cases(root/'home'):
     assert observed['a']==case['a'] and observed['b']==case['b']
     name=case['name']+'.sh'; (root/name).write_bytes(case['source'])
     value=observed['a']
-    rows.append(dict(name=case['name'],source_file=name,expected_a={'bytes':len(value),'sha256':hashlib.sha256(value).hexdigest()},proposed_policy=case['policy'],proposed_whole_line_delete_eligible=case['proposed_whole_line_delete_eligible']))
+    rows.append(dict(name=case['name'],source_file=name,include_file=case.get('include_file'),expected_a={'bytes':len(value),'sha256':hashlib.sha256(value).hexdigest()},proposed_policy=case['policy'],proposed_whole_line_delete_eligible=case['proposed_whole_line_delete_eligible']))
 print(json.dumps(rows))
