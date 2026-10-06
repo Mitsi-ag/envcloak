@@ -23,10 +23,16 @@ nonblocking opens; traversal never crosses mount points. Only regular files
 owned by the current user are read. Symlinks, non-regular files and unreadable
 paths are reported. Hard links are reported even when their contents can be
 read, and do not grant modification permission. Profile and config files have
-a 1 MiB cap.
+a 1 MiB cap. Catalog roots accept only the root-owned macOS `/tmp`, `/var`
+and `/etc` aliases with their fixed `/private` targets. User-controlled links
+remain refused. Device checks apply both during discovery and at the actual
+read, including plain metadata files.
 
 Profiles cover the seven conventional shell files, literal `source`/`.` paths
-within the supplied home root, at most four source edges and 64 readable files.
+within the supplied home root, at most four source edges and 64 attempted paths,
+including missing conventional profiles and failed includes. Attempts and their
+failures are reused within one run, and recomputed on the next run. Once a
+budget is exhausted, remaining includes do not create unbounded diagnostics.
 Only `$HOME` and `~` path prefixes expand. Assignments never execute. Dollar or
 backtick values contribute names only after syntax validation; comments do
 not affect value classification. POSIX quoting preserves Bash's ordinary
@@ -73,6 +79,14 @@ Alternatives are capped at 256 per reading; exhausting this or an emission
 budget makes the report incomplete. Binary boundaries record `invalid_text`
 while still scanning adjacent UTF-8 text.
 
+Whole JSON sources, including host backups, decode as documents within the
+1 MiB config cap. Malformed documents get a raw fallback and an `invalid_json`
+issue, so fallback never reports complete. JSONL keeps its per-line behavior.
+Assignment and query readings are bounded by words and URL fragments while
+retaining internal punctuation. Equals-run lookahead is linear; overlapping
+password lookahead has a linear work allowance and reports `reading_budget`
+when exhausted.
+
 This is a bounded tokenizer, not a complete shell or connection-string parser.
 Raw values spanning whitespace, dialect-specific backslash or doubled-quote
 escapes, nested encodings and every interpretation of ambiguous punctuation
@@ -109,9 +123,11 @@ keys are refused and nesting and node counts are bounded.
 
 Git history is opt-in. An absolute `/usr/bin/git` runs `cat-file
 --batch-all-objects --batch` with a cleared environment, global/system config
-disabled, replacement objects disabled and fsmonitor disabled. The held root
-supplies the child's working directory. Bytes and objects are bounded, stderr
-is discarded, and an owned-child deadline caps the whole Git subprocess at
+disabled, replacement objects disabled and fsmonitor disabled. An explicit
+Git directory and work tree relative to the held root prevent discovery of a
+parent repository, including after a rename. Working trees and bare
+repositories are covered. The held root supplies the child's working directory.
+Bytes and objects are bounded, stderr is discarded, and an owned-child deadline caps the whole Git subprocess at
 30 seconds, including time spent making progress. Larger histories may therefore
 be incomplete. Blobs, commits and annotated tags are scanned; recoverable token
 issues are retained while later objects are still read. Object ranges
@@ -130,7 +146,11 @@ refused undo; cleanup and those command-level reports belong to those tasks.
 The tests use the independent cycle200 Bash corpus, Python JSON/encoding output,
 real git objects, and the pinned Claude Code and Codex CLIs and transcript
 stores. CodexBar is a documentation-derived fixture. Bounded proptest targets
-cover profile, config and transcript parsers; the milestone hardening task owns
+cover profile, config and transcript parsers, including planted values in
+errors, Debug, reports and captured process channels. The independent cycle432
+JSON/encoding oracle checks 37 cases and 100,080 ranges with ordinary reads and
+seven-byte chunks, including matching occurrence counts before normalization.
+It does not qualify scrub rewrites. The milestone hardening task owns
 longer fuzz campaigns. Gate 11 checks profile, JSON and JSONL buffers without allocator-assisted
 wiping as well as under the production wiping allocator. TOML's library parser
 is covered under the production allocator, including its failure paths.
