@@ -314,22 +314,15 @@ pub fn scan_config_sources_with_budget(
     budget: Budget,
 ) -> Result<ScanReport, ScanError> {
     let mut report = ScanReport::default();
-    let mut attempted = std::collections::HashSet::new();
+    let mut included_paths = std::collections::HashSet::new();
     let mut failed = std::collections::HashSet::new();
     walk_sources(
         sources,
         budget,
         &mut report,
-        |root, rel, source, opened, report| {
-            if failed.contains(&root.path().join(rel))
-                || !admit_file(
-                    root.path().join(rel),
-                    Reader::Config(source.format),
-                    budget,
-                    &mut attempted,
-                    report,
-                )
-            {
+        |root, rel, source, opened, attempts, report| {
+            // Discovery already charged this open to the shared attempt count.
+            if failed.contains(&root.path().join(rel)) {
                 return;
             }
             let remaining = budget.bytes.saturating_sub(report.bytes);
@@ -422,24 +415,25 @@ pub fn scan_config_sources_with_budget(
                     report.issue(root.path().join(&path), "unread_env_file");
                     continue;
                 }
-                if failed.contains(&root.path().join(&path)) {
+                if failed.contains(&root.path().join(&path))
+                    || included_paths.contains(&root.path().join(&path))
+                {
                     continue;
                 }
-                if attempted.len() >= budget.files
-                    && !attempted.contains(&(root.path().join(&path), Reader::Dotenv))
-                {
+                if *attempts >= budget.files {
                     report.issue(root.path().join(rel), "file_budget");
                     break;
                 }
-                if !admit_file(
-                    root.path().join(&path),
-                    Reader::Dotenv,
-                    budget,
-                    &mut attempted,
-                    report,
-                ) {
+                *attempts += 1;
+                included_paths.insert(root.path().join(&path));
+                if path
+                    .file_name()
+                    .is_some_and(crate::sources::restore_leftover_name)
+                {
+                    crate::sources::leftover(root, &path, report);
                     continue;
                 }
+                crate::sources::inspect_include_siblings(root, &path, budget, attempts, report);
                 let remain = budget.bytes.saturating_sub(report.bytes);
                 match read_capped(root, &path, MAX_DOTENV.min(remain as usize)) {
                     Ok((b, stamp)) => {
@@ -494,31 +488,4 @@ pub fn scan_config_sources_with_budget(
         },
     );
     Ok(report)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Reader {
-    Config(ConfigFormat),
-    Dotenv,
-}
-
-// Charge every distinct attempted file, including failures, before opening it.
-// Shared by catalog configs and their envFile includes for the whole run.
-fn admit_file(
-    path: std::path::PathBuf,
-    reader: Reader,
-    budget: Budget,
-    attempted: &mut std::collections::HashSet<(std::path::PathBuf, Reader)>,
-    report: &mut ScanReport,
-) -> bool {
-    let key = (path, reader);
-    if attempted.contains(&key) {
-        return false;
-    }
-    if attempted.len() >= budget.files {
-        report.issue(key.0, "file_budget");
-        return false;
-    }
-    attempted.insert(key);
-    true
 }

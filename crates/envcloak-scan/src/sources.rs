@@ -156,7 +156,7 @@ pub(crate) fn walk_sources(
     sources: &[ConfigSource],
     budget: Budget,
     report: &mut ScanReport,
-    mut read: impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut ScanReport),
+    mut read: impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut usize, &mut ScanReport),
 ) {
     let mut visited = Visits {
         omissions: sources
@@ -267,6 +267,27 @@ pub(crate) fn walk_sources(
         }
     }
 }
+/// Inspect only siblings of an approved include, even if its leaf is absent.
+/// Parent traversal keeps the same no-follow and device rules as reading it.
+pub(crate) fn inspect_include_siblings(
+    root: &ScanRoot,
+    rel: &Path,
+    budget: Budget,
+    attempts: &mut usize,
+    report: &mut ScanReport,
+) {
+    let parent = root.open_parent(rel).and_then(|(dir, name)| {
+        crate::root::held_root(root.path().join(rel.parent().unwrap_or(Path::new(""))), dir)
+            .map(|root| (root, name))
+            .map_err(|e| crate::root::io_kind(&e))
+    });
+    match parent {
+        Ok((parent, name)) => inspect_siblings(&parent, Some(&name), budget, attempts, report),
+        // The include read reports a missing or unsafe parent once.
+        Err(_) => {}
+    }
+}
+
 fn inspect_siblings(
     root: &ScanRoot,
     base: Option<&std::ffi::OsStr>,
@@ -291,6 +312,13 @@ fn inspect_siblings(
                         continue;
                     }
                 }
+                if report
+                    .leftovers
+                    .iter()
+                    .any(|l| l.source.path == root.path().join(&e.name))
+                {
+                    continue;
+                }
                 if *attempts >= budget.files {
                     report.issue(root.path(), "file_budget");
                     break;
@@ -302,7 +330,7 @@ fn inspect_siblings(
         Err(_) => report.issue(root.path(), "unreadable"),
     }
 }
-fn leftover(root: &ScanRoot, rel: &Path, report: &mut ScanReport) {
+pub(crate) fn leftover(root: &ScanRoot, rel: &Path, report: &mut ScanReport) {
     let inspection = match root
         .open_parent(rel)
         .and_then(|(d, n)| crate::root::open_file(&d, &n, crate::MAX_DOTENV))
@@ -340,7 +368,14 @@ fn walk(
     attempts: &mut usize,
     visited: &mut Visits,
     report: &mut ScanReport,
-    read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut ScanReport),
+    read: &mut impl FnMut(
+        &ScanRoot,
+        &Path,
+        &ConfigSource,
+        (File, Metadata),
+        &mut usize,
+        &mut ScanReport,
+    ),
 ) {
     if depth > 12 {
         report.issue(root.path().join(rel), "too_deep");
@@ -391,6 +426,13 @@ fn walk(
             continue;
         }
         if restore_leftover_name(&e.name) {
+            if report
+                .leftovers
+                .iter()
+                .any(|l| l.source.path == root.path().join(&child))
+            {
+                continue;
+            }
             *attempts += 1;
             leftover(root, &child, report);
             continue;
@@ -426,7 +468,14 @@ fn process(
     attempts: &mut usize,
     visited: &mut Visits,
     report: &mut ScanReport,
-    read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, (File, Metadata), &mut ScanReport),
+    read: &mut impl FnMut(
+        &ScanRoot,
+        &Path,
+        &ConfigSource,
+        (File, Metadata),
+        &mut usize,
+        &mut ScanReport,
+    ),
     optional: bool,
 ) {
     let path = root.path().join(rel);
@@ -442,6 +491,11 @@ fn process(
         return;
     }
     *attempts += 1;
+    if rel.file_name().is_some_and(restore_leftover_name) {
+        leftover(root, rel, report);
+        visited.files.insert(path, ReadState::Closed);
+        return;
+    }
     let file = root
         .open_parent(rel)
         .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
@@ -485,7 +539,7 @@ fn process(
     }
     let stamp = FileStamp::of(&m);
     let before = report.findings.len();
-    read(root, rel, source, (file, m), report);
+    read(root, rel, source, (file, m), attempts, report);
     // The reader and discovery share the descriptor and its original stamp.
     for f in &mut report.findings[before..] {
         if stamp.nlink > 1 {
@@ -570,7 +624,7 @@ mod tests {
                 &mut 0,
                 &mut Default::default(),
                 &mut report,
-                &mut |_, _, _, _, _| called = true,
+                &mut |_, _, _, _, _, _| called = true,
                 false,
             );
             assert_eq!(called, !mounted);
@@ -597,7 +651,7 @@ mod tests {
                 &mut attempts,
                 &mut visited,
                 &mut report,
-                &mut |_, _, _, _, _| panic!("missing file was read"),
+                &mut |_, _, _, _, _, _| panic!("missing file was read"),
                 false,
             );
         }
