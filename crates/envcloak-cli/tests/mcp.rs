@@ -1609,7 +1609,7 @@ fn sigterm_stops_the_calls_in_hand_first() {
     let held = std::fs::File::open(&lock).unwrap();
     assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
     let pid = i32::try_from(m.child.id()).unwrap();
-    envcloak_sys::signal_process(pid, libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGTERM), 0);
     let end = Instant::now() + Duration::from_secs(15);
     let status = loop {
         if let Some(s) = m.child.try_wait().unwrap() {

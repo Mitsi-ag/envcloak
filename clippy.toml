@@ -24,6 +24,10 @@ disallowed-methods = [
   { path = "secrecy::ExposeSecretMut::expose_secret_mut", reason = "opens a secret; allowed only in files listed in security/expose-allowlist.txt", allow-invalid = true },
   { path = "libc::kill", reason = "signals a process by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
   { path = "libc::killpg", reason = "signals a process group by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
+  { path = "envcloak_sys::signal_process", reason = "signals a process by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
+  { path = "envcloak_sys::signal_group", reason = "signals a process group by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
+  { path = "envcloak_sys::child::signal_process", reason = "signals a process by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
+  { path = "envcloak_sys::child::signal_group", reason = "signals a process group by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
   { path = "nix::sys::signal::kill", reason = "signals a process by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34)", allow-invalid = true },
   { path = "nix::sys::signal::killpg", reason = "signals a process group by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34)", allow-invalid = true },
 ]

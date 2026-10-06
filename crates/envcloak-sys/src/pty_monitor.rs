@@ -2031,7 +2031,7 @@ mod tests {
             None,
             "the stop is reported once"
         );
-        crate::signal_process(pid, libc::SIGCONT).unwrap();
+        assert_eq!(crate::testing::kill_raw(pid, libc::SIGCONT), 0);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut continued = None;
         while continued.is_none() && std::time::Instant::now() < end {

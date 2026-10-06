@@ -1533,6 +1533,7 @@ mod tests {
     /// Signals outside 1 to 126 are refused: 127 would read as the
     /// wake-up, and 128 on as a mark or a process's signal.
     #[test]
+    #[allow(clippy::disallowed_methods)] // The wrappers' own bounds.
     fn out_of_range_signals_and_pids_are_refused() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         for sig in [0, 127, 128, 256, -1] {
