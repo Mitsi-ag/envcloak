@@ -18,7 +18,10 @@ canary = root / 'crates/envcloak-signin/tests/sha1_canary.rs'
 expected = {i for i,line in enumerate(canary.read_text().splitlines(), 1) if line.endswith('// EXPECT-SHA1-REFUSAL')}
 env = dict(os.environ)
 env['RUSTFLAGS'] = env.get('RUSTFLAGS', '') + ' --cfg envcloak_lint_canary'
-result = subprocess.run(['cargo', 'clippy', '--locked', '-p', 'envcloak-signin', '--test', 'sha1_canary', '--message-format=json'], env=env, capture_output=True, text=True)
+try:
+    result = subprocess.run(['cargo', 'clippy', '--locked', '-p', 'envcloak-signin', '--test', 'sha1_canary', '--message-format=json'], env=env, capture_output=True, text=True, timeout=600)
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit('check-totp-lint: compiler unavailable') from None
 observed = set()
 for line in result.stdout.splitlines():
     try:
