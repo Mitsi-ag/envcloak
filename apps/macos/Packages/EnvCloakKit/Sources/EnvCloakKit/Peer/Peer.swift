@@ -120,7 +120,8 @@ final class Connection {
             // M3-10 adds the pinned audit-token code-identity check here,
             // before this connection can be used by any method.
         } catch {
-            Darwin.close(fd)
+            // All stored properties are initialized, so Swift runs deinit
+            // on this throw too. It is the descriptor's only closer.
             throw error
         }
     }

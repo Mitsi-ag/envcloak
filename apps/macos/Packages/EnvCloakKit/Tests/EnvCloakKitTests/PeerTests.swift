@@ -170,4 +170,23 @@ final class PeerTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testFailedConnectReleasesItsOwnedDescriptor() throws {
+        let root = try root()
+        defer { try? FileManager.default.removeItem(atPath: root) }
+        let daemon = try FakeDaemon(directory: root + "/run") { _ in nil }
+        daemon.stop()
+        // The socket node remains, but there is no listener. The failure
+        // happens after the client allocates its descriptor.
+        func openDescriptors() -> Set<Int32> {
+            Set((0..<512).filter { fcntl(Int32($0), F_GETFD) >= 0 }.map(Int32.init))
+        }
+        let before = openDescriptors()
+        for _ in 0..<64 {
+            XCTAssertThrowsError(try Connection(directory: daemon.directory, timeout: .seconds(1))) {
+                XCTAssertEqual($0 as? EnvCloakError, .daemonUnavailable)
+            }
+        }
+        XCTAssertEqual(openDescriptors(), before)
+    }
+
 }

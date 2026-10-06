@@ -836,6 +836,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-app
+      - name: Swift client wire, peer, oracle and real-daemon tests
+        run: |
+          kit_root="$(mktemp -d /tmp/eck.XXXXXXXX)"
+          trap 'rm -rf "$kit_root"' EXIT
+          mkdir -m 700 "$kit_root"/{home,tmp,config,data,state,runtime,cache,vectors}
+          env -i HOME="$kit_root/home" TMPDIR="$kit_root/tmp" \
+            XDG_CONFIG_HOME="$kit_root/config" XDG_DATA_HOME="$kit_root/data" \
+            XDG_STATE_HOME="$kit_root/state" XDG_RUNTIME_DIR="$kit_root/runtime" \
+            XDG_CACHE_HOME="$kit_root/cache" ENVCLOAK_SWIFT_VECTORS="$kit_root/vectors" \
+            PATH="$PATH" LANG=en_US.UTF-8 DEVELOPER_DIR="$DEVELOPER_DIR" \
+            CARGO_HOME="$HOME/.cargo" RUSTUP_HOME="$HOME/.rustup" \
+            CARGO_TARGET_DIR="$RUNNER_TEMP/kit-target" CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=3 \
+            scripts/macos/test-kit.sh
       - name: Build, sign, check and install the app (ad hoc)
         run: |
           scripts/macos/build-app.sh --sign adhoc --out "$RUNNER_TEMP/app" --derived-data "$RUNNER_TEMP/dd-release" \

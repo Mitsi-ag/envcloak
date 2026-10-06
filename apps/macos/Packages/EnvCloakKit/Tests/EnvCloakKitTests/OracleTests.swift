@@ -61,4 +61,38 @@ final class OracleTests: XCTestCase {
             XCTAssertEqual(kind.code, (error["code"] as! NSNumber).int64Value)
         }
     }
+    func testEveryTypedSuccessResponseFromRust() throws {
+        guard let directory = ProcessInfo.processInfo.environment["ENVCLOAK_SWIFT_VECTORS"] else {
+            throw XCTSkip("Run scripts/macos/test-kit.sh for Rust fixtures")
+        }
+        let vectors = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: directory + "/rust.json"))) as! [String: Any]
+        let responses = vectors["responses"] as! [String: [Int]]
+        func decode<M: DaemonMethod & ~Copyable>(_ type: M.Type) throws -> M.Output {
+            let bytes = try XCTUnwrap(responses[M.name]).map { UInt8($0) }
+            var offset = 0
+            let frame = try Frame.read { destination in
+                let n = min(destination.count, bytes.count - offset)
+                for i in 0..<n { destination[i] = bytes[offset + i] }
+                offset += n
+                return n
+            }
+            return try M.response(frame, id: UInt64.max)
+        }
+        XCTAssertEqual(try decode(Status.self).audit.head_seq, 8)
+        XCTAssertTrue(try decode(Lock.self).was_unlocked)
+        XCTAssertEqual(try decode(ItemsList.self).items.count, 1)
+        let item = try decode(ItemsShow.self)
+        XCTAssertEqual(item.fields.first?.prior_count, 2)
+        XCTAssertEqual(item.exposed?.sources, [.agentConfig])
+        XCTAssertEqual(item.account?.email?.escaped, "fixture@example.invalid")
+        XCTAssertEqual(item.detail?.allowed_hosts.map(\.escaped), ["example.invalid"])
+        XCTAssertEqual(try decode(ItemsAdd.self).length, .ok)
+        XCTAssertEqual(try decode(ItemsCheck.self).refs, [.unknownItem])
+        XCTAssertEqual(try decode(GrantsList.self).grants.first?.uses, .session)
+        XCTAssertEqual(try decode(GrantsRevoke.self).revoked, 1)
+        XCTAssertTrue(try decode(Deny.self).root_auto_denied)
+        XCTAssertEqual(try decode(AuditVerify.self).first_problem?.kind, .altered)
+        XCTAssertEqual(try decode(BackupCreate.self).bytes, 1024)
+    }
+
 }
