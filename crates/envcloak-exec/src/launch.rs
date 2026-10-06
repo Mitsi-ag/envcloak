@@ -35,12 +35,11 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
 use envcloak_sys::launch::{Program, Session, Spawn, spawn};
-use envcloak_sys::{OwnedChild, ProcessOps, TerminationSignals};
+use envcloak_sys::{Interrupter, OwnedChild, ProcessOps, TerminationSignals};
 use zeroize::Zeroizing;
 
 use crate::pump::{Cutoff, pump};
@@ -225,74 +224,27 @@ pub fn serve(
         redactor,
         idle_flush,
     } = l;
-    let (server_in, to_server) = pipe().map_err(LaunchError::Setup)?;
-    let (from_out, server_out) = pipe().map_err(LaunchError::Setup)?;
-    let (from_err, server_err) = pipe().map_err(LaunchError::Setup)?;
-    // A test makes the start fail here, as a refused `execveat` would: no
-    // other file is started in its place.
-    envcloak_sys::fail_point("launch.server_exec").map_err(LaunchError::Start)?;
-    let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
-    let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_slice()).collect();
-    let fds = [
-        (server_in.as_fd(), 0),
-        (server_out.as_fd(), 1),
-        (server_err.as_fd(), 2),
-    ];
-    let program = match &program {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        ServerProgram::Descriptor(fd) => Program::Descriptor(fd.as_fd()),
-        ServerProgram::Path(p) => Program::Path(p),
-    };
-    let child = spawn(&Spawn {
-        program,
-        argv: &argv_refs,
-        env: &env_refs,
-        fds: &fds,
-        cwd: Some(cwd.as_fd()),
-        session: Session::Group,
-        suspended,
-    })
-    .map_err(|e| LaunchError::Start(io::Error::new(e.io().kind(), "spawn")))?;
-    drop(env);
-    drop(server_in);
-    drop(server_out);
-    drop(server_err);
-    let child = if suspended {
-        let ok = confirm(child.id());
-        confirm_or_kill(child, ok)?
-    } else {
-        child
-    };
-
+    // Every thread is started, and every step that can fail is taken,
+    // before the server exists: after its start nothing returns without
+    // stopping its group and reaping it. A thread started for a server
+    // that then never starts ends with its pipe (the pumps and the input),
+    // or with this process (the lifeline and the signals).
+    let interrupter = Interrupter::install().map_err(LaunchError::Setup)?;
+    let cutoff = Cutoff::default();
     let (tx, rx) = mpsc::channel::<Ending>();
-    let redactor = Arc::new(redactor);
-    let cutoff = Arc::new(Cutoff::default());
-    let mut pumps = Vec::new();
-    for (source, sink) in [(from_out, io.output), (from_err, io.errors)] {
-        let redactor = Arc::clone(&redactor);
-        let cutoff = Arc::clone(&cutoff);
-        pumps.push(
-            std::thread::Builder::new()
-                .name("server-output".into())
-                .spawn(move || {
-                    let token = cutoff.pump_token();
-                    pump(File::from(source), sink, &redactor, idle_flush, token)
-                })
-                .map_err(LaunchError::Followed)?,
-        );
-    }
+    let (server_in, to_server) = pipe().map_err(LaunchError::Setup)?;
     let input_tx = tx.clone();
     let input = io.input;
     std::thread::Builder::new()
         .name("server-input".into())
         .spawn(move || relay_input(input, to_server, &input_tx))
-        .map_err(LaunchError::Followed)?;
+        .map_err(LaunchError::Setup)?;
     let life_tx = tx.clone();
     let lifeline = io.lifeline;
     std::thread::Builder::new()
         .name("lifeline".into())
         .spawn(move || watch_lifeline(lifeline, &life_tx))
-        .map_err(LaunchError::Followed)?;
+        .map_err(LaunchError::Setup)?;
     let sig_tx = tx;
     std::thread::Builder::new()
         .name("signals".into())
@@ -303,36 +255,161 @@ pub fn serve(
                 }
             }
         })
-        .map_err(LaunchError::Followed)?;
+        .map_err(LaunchError::Setup)?;
+    let (output, errors) = (io.output, io.errors);
+    // The pumps are scoped: the scope ends only once they have, and the
+    // server's ends of their pipes are made, and closed, inside it.
+    std::thread::scope(|s| {
+        let (from_out, server_out) = pipe().map_err(LaunchError::Setup)?;
+        let (from_err, server_err) = pipe().map_err(LaunchError::Setup)?;
+        let redactor = &redactor;
+        let interrupter = &interrupter;
+        let mut pumps = Vec::new();
+        for (source, sink) in [(from_out, output), (from_err, errors)] {
+            // Counted before its thread starts, so the drain waits for it
+            // (`Cutoff::wait_for_pumps`); a thread that cannot start drops
+            // its closure and the count with it.
+            let token = cutoff.pump_token();
+            pumps.push(
+                std::thread::Builder::new()
+                    .name("server-output".into())
+                    .spawn_scoped(s, move || {
+                        // Interruptible, so a write the drain must give up
+                        // is broken off.
+                        interrupter
+                            .run(|| pump(File::from(source), sink, redactor, idle_flush, token))
+                    })
+                    .map_err(LaunchError::Setup)?,
+            );
+        }
+        // A test makes the start fail here, as a refused `execveat` would:
+        // no other file is started in its place.
+        envcloak_sys::fail_point("launch.server_exec").map_err(LaunchError::Start)?;
+        let argv_refs: Vec<&[u8]> = argv.iter().map(Vec::as_slice).collect();
+        let env_refs: Vec<&[u8]> = env.iter().map(|e| e.as_slice()).collect();
+        let fds = [
+            (server_in.as_fd(), 0),
+            (server_out.as_fd(), 1),
+            (server_err.as_fd(), 2),
+        ];
+        let program = match &program {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            ServerProgram::Descriptor(fd) => Program::Descriptor(fd.as_fd()),
+            ServerProgram::Path(p) => Program::Path(p),
+        };
+        let spawned = spawn(&Spawn {
+            program,
+            argv: &argv_refs,
+            env: &env_refs,
+            fds: &fds,
+            cwd: Some(cwd.as_fd()),
+            session: Session::Group,
+            suspended,
+        });
+        drop(env_refs);
+        drop(env);
+        drop(server_in);
+        drop(server_out);
+        drop(server_err);
+        let child =
+            spawned.map_err(|e| LaunchError::Start(io::Error::new(e.io().kind(), "spawn")))?;
+        let child = if suspended {
+            let ok = confirm(child.id());
+            confirm_or_kill(child, ok)?
+        } else {
+            child
+        };
+        let followed = follow(&child, &rx, &cutoff, interrupter, pumps);
+        let status = child.reap().map_err(LaunchError::Followed);
+        let stopped_by = followed?;
+        let status = status?;
+        Ok(match stopped_by {
+            Some(Ending::Signal(sig)) => ChildExit::Stopped(sig),
+            _ => ChildExit::from(status),
+        })
+    })
+}
 
+/// What ended the wait for a server: `None` when it exited on its own.
+type StoppedBy = Option<Ending>;
+
+/// Waits for the started server `child` until it exits or `rx` says the
+/// client or a signal ended it; then stops its whole group (a server that
+/// exited first may have left descendants in it, which hold the values
+/// too) and drains its output, while a signal or the client's going stops
+/// the drain at once. Whatever fails, the group is stopped; the caller
+/// reaps the child.
+fn follow<O: ProcessOps>(
+    child: &OwnedChild<O>,
+    rx: &mpsc::Receiver<Ending>,
+    cutoff: &Cutoff,
+    interrupter: &Interrupter,
+    pumps: Vec<std::thread::ScopedJoinHandle<'_, io::Result<crate::pump::PumpEnd>>>,
+) -> Result<StoppedBy, LaunchError> {
+    let mut failed = None;
     let stopped_by = loop {
-        if child.has_exited().map_err(LaunchError::Followed)? {
-            break None;
+        match child.has_exited() {
+            Ok(true) => break None,
+            Ok(false) => {}
+            Err(e) => {
+                failed = Some(e);
+                break None;
+            }
         }
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(end) => break Some(end),
             Err(mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected) => {}
         }
     };
-    if let Some(end) = stopped_by {
-        envcloak_sys::test_event(match end {
-            Ending::Input => "runner: input ended, stopping the server",
-            Ending::Lifeline => "runner: lifeline ended, stopping the server",
-            Ending::Signal(_) => "runner: signal, stopping the server",
-        });
-        child
-            .stop_group(STOP_GRACE)
-            .map_err(LaunchError::Followed)?;
-    }
+    envcloak_sys::test_event(match stopped_by {
+        None => "runner: the server exited, stopping its group",
+        Some(Ending::Input) => "runner: input ended, stopping the server",
+        Some(Ending::Lifeline) => "runner: lifeline ended, stopping the server",
+        Some(Ending::Signal(_)) => "runner: signal, stopping the server",
+    });
+    // Always: the group outlives a leader that exited first while any of
+    // its members runs, and the leader, unreaped, keeps its number its own.
+    let stopped = child.stop_group(STOP_GRACE);
     cutoff.start(DRAIN_LIMIT);
+    // The client gone, or a signal: nothing is left to deliver to.
+    match stopped_by {
+        Some(Ending::Lifeline) => cutoff.stop_now(libc::SIGHUP),
+        Some(Ending::Signal(sig)) => cutoff.stop_now(sig),
+        Some(Ending::Input) | None => {}
+    }
+    drain(rx, cutoff, interrupter);
     for p in pumps {
         let _ = p.join();
     }
-    let status = child.reap().map_err(LaunchError::Followed)?;
-    Ok(match stopped_by {
-        Some(Ending::Signal(sig)) => ChildExit::Stopped(sig),
-        _ => ChildExit::from(status),
-    })
+    if let Some(e) = failed {
+        return Err(LaunchError::Followed(e));
+    }
+    stopped.map_err(LaunchError::Followed)?;
+    Ok(stopped_by)
+}
+
+/// Waits for the pumps to end, interrupting a write they must give up
+/// (`Cutoff::wait_for_pumps`), while the client's going (the lifeline's
+/// end) or a signal read from `rx` stops the drain at once: a pump
+/// writing to an output nobody reads never holds the runner up after
+/// that.
+fn drain(rx: &mpsc::Receiver<Ending>, cutoff: &Cutoff, interrupter: &Interrupter) {
+    std::thread::scope(|s| {
+        let waiter = s.spawn(|| cutoff.wait_for_pumps(interrupter));
+        while !waiter.is_finished() {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(Ending::Lifeline) => cutoff.stop_now(libc::SIGHUP),
+                Ok(Ending::Signal(sig)) => cutoff.stop_now(sig),
+                Ok(Ending::Input) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Nothing can stop the drain any more but its own
+                    // deadline and the reader.
+                    let _ = waiter.join();
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// The server's whole environment, each `NAME=value`, wiped when

@@ -427,20 +427,26 @@ impl<O: ProcessOps> OwnedChild<O> {
     ///
     /// # Errors
     /// `waitid`'s errors. A group with no process left (`ESRCH`) is no
-    /// error.
+    /// error, and neither is `EPERM` once the child has exited: macOS
+    /// answers it for a group whose members are all zombies (measured on
+    /// macOS 26.4: `killpg` of an exited, unreaped leader's group), which
+    /// leaves nothing to stop. Called for a child that already exited, it
+    /// stops what the child left in its group.
     pub fn stop_group(&self, grace: Duration) -> io::Result<bool> {
-        let quiet = |r: io::Result<()>| match r {
+        let quiet = |r: io::Result<()>, exited: bool| match r {
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) && exited => Ok(()),
             other => other,
         };
-        quiet(self.signal_group(libc::SIGTERM))?;
+        let before = self.has_exited()?;
+        quiet(self.signal_group(libc::SIGTERM), before)?;
         let end = Instant::now() + grace;
-        let mut exited = self.has_exited()?;
+        let mut exited = before || self.has_exited()?;
         while !exited && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
             exited = self.has_exited()?;
         }
-        quiet(self.signal_group(libc::SIGKILL))?;
+        quiet(self.signal_group(libc::SIGKILL), exited)?;
         Ok(exited)
     }
 

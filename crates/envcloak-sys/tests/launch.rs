@@ -261,3 +261,62 @@ fn hardened_helper() {
     println!("helper ready");
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
+
+/// D-34: stopping the group of a child that has already exited (unreaped,
+/// so its group's number is still its own) is no error, on both systems,
+/// though macOS answers `EPERM` to `killpg` of a group whose members are
+/// all zombies; a member the child left in its group is stopped. The
+/// runner stops a server's group whether or not the server exited first,
+/// so a server that exits on its own must not read as a failed run.
+///
+/// Mutation checked: `stop_group` quiet on `ESRCH` only (as before): on
+/// macOS the stop of the exited child's group fails with `EPERM`, and this
+/// fails.
+#[test]
+fn stopping_an_exited_childs_group_is_no_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let pidfile = dir.path().join("left");
+    let script = format!(
+        "sleep 60 </dev/null >/dev/null 2>&1 & echo $! > '{}'; exit 0",
+        pidfile.display()
+    );
+    let start = |line: &str| {
+        spawn(&Spawn {
+            program: Program::Path(b"/bin/sh"),
+            argv: &[b"sh", b"-c", line.as_bytes()],
+            env: &[],
+            fds: &[],
+            cwd: None,
+            session: Session::Group,
+            suspended: false,
+        })
+        .unwrap()
+    };
+    // Alone in its group.
+    let child = start("exit 0");
+    child.wait_exit().unwrap();
+    assert!(child.stop_group(std::time::Duration::from_secs(5)).unwrap());
+    assert_eq!(child.reap().unwrap().code(), Some(0));
+    // With a member it left behind: stopped too.
+    let child = start(&script);
+    child.wait_exit().unwrap();
+    let left: i32 = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(
+        envcloak_sys::proc_info(left).is_ok(),
+        "the member is not running"
+    );
+    assert!(child.stop_group(std::time::Duration::from_secs(5)).unwrap());
+    assert_eq!(child.reap().unwrap().code(), Some(0));
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while envcloak_sys::proc_info(left).is_ok_and(|p| p.comm == "sleep") {
+        assert!(
+            std::time::Instant::now() < end,
+            "the member outlived the stop"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
