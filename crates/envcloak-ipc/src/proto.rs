@@ -2362,6 +2362,13 @@ pub const REASONS: &[&str] = &[
     // a variable, or an interpreter option.
     "code_selecting_variable",
     "interpreter_option",
+    // A launch declaration naming a program that starts another one its
+    // arguments name, or a launcher known by another name (M2-27).
+    "wrapper_program",
+    "disguised_launcher",
+    // A launch declaration's argument or variable value shaped like a key
+    // (`invalid_params`, gate 13 in the daemon, M2-27).
+    "key_shaped",
 ];
 
 /// An error response. Built from fixed tokens only.

@@ -1943,6 +1943,21 @@ pub struct ManagedUnregisteredView {
     pub removed: bool,
 }
 
+/// A launch declaration as the record stores it (CR-2): its argv, working
+/// directory, variables with their values (never a secret: a key-shaped
+/// value is refused before it is stored) and `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchDeclarationView {
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_env: Option<String>,
+}
+
 /// An update statement (CR-2): the launch as it is and as the update would
 /// make it, and the digest `managed.update` sends back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1953,6 +1968,11 @@ pub struct UpdateStatementView {
     pub revision: u64,
     pub old: LaunchReceiptView,
     pub new: LaunchReceiptView,
+    /// The declaration as it is stored and as the update would store it,
+    /// whole (CR-2): a change to an argument, `PATH` or a variable's value
+    /// shows here even when the receipts read alike.
+    pub old_declaration: LaunchDeclarationView,
+    pub new_declaration: LaunchDeclarationView,
     /// SHA-256 of `envcloak-update-statement/1`, 64 hex characters.
     pub digest: String,
 }
