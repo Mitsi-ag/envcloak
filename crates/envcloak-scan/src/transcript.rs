@@ -571,70 +571,138 @@ pub fn scan_transcript_sources(
     let mut occurrences = 0usize;
     let mut stopped = false;
     crate::sources::walk_sources(sources, budget, &mut report, |root, rel, source, report| {
-        if stopped {
-            return;
-        }
-        let path = root.path().join(rel);
-        let opened = root
-            .open_parent(rel)
-            .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
-        let (mut file, metadata) = match opened {
-            Ok(v) => v,
-            Err(e) => {
-                report.issue(path, e.token());
-                return;
-            }
-        };
-        let stamp = crate::FileStamp::of(&metadata);
-        if stamp.dev != root.dev() {
-            report.issue(path, "mount_point");
-            return;
-        }
-        let format = match source.format {
-            ConfigFormat::Mixed => {
-                if rel.extension().is_some_and(|s| s == "jsonl") {
-                    ConfigFormat::Jsonl
-                } else {
-                    ConfigFormat::Raw
-                }
-            }
-            f => f,
-        };
-        let remaining = Budget {
-            bytes: budget.bytes.saturating_sub(report.bytes),
-            occurrences: budget.occurrences.saturating_sub(occurrences),
-            ..budget
-        };
-        match scan_reader(
-            &mut file,
-            format,
-            Source {
-                path: path.clone(),
-                object: None,
-            },
-            remaining,
-            &mut |mut c| {
-                c.occurrence.stamp = Some(stamp);
-                c.occurrence.rewritable &= stamp.nlink == 1;
-                let accepted = emit(c);
-                if !accepted {
-                    stopped = true;
-                }
-                accepted
-            },
-        ) {
-            Ok(part) => {
-                report.files += 1;
-                report.bytes += part.bytes;
-                occurrences += part.candidates as usize;
-                report.issues.extend(part.issues);
-            }
-            Err(_) => report.issue(&path, "unreadable"),
-        }
-        match file.metadata() {
-            Ok(after) if crate::FileStamp::of(&after) == stamp => {}
-            _ => report.issue(path, "changed"),
-        }
+        scan_file(
+            root,
+            rel,
+            source,
+            budget,
+            report,
+            &mut occurrences,
+            &mut stopped,
+            emit,
+        );
     });
     Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_file(
+    root: &crate::ScanRoot,
+    rel: &std::path::Path,
+    source: &crate::source::ConfigSource,
+    budget: Budget,
+    report: &mut crate::candidates::ScanReport,
+    occurrences: &mut usize,
+    stopped: &mut bool,
+    emit: &mut impl FnMut(Candidate) -> bool,
+) {
+    if *stopped {
+        return;
+    }
+    let path = root.path().join(rel);
+    let opened = root
+        .open_parent(rel)
+        .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
+    let (mut file, metadata) = match opened {
+        Ok(v) => v,
+        Err(e) => {
+            report.issue(path, e.token());
+            return;
+        }
+    };
+    let stamp = crate::FileStamp::of(&metadata);
+    if stamp.dev != root.dev() {
+        report.issue(path, "mount_point");
+        return;
+    }
+    let format = match source.format {
+        ConfigFormat::Mixed => {
+            if rel.extension().is_some_and(|s| s == "jsonl") {
+                ConfigFormat::Jsonl
+            } else {
+                ConfigFormat::Raw
+            }
+        }
+        f => f,
+    };
+    let remaining = Budget {
+        bytes: budget.bytes.saturating_sub(report.bytes),
+        occurrences: budget.occurrences.saturating_sub(*occurrences),
+        ..budget
+    };
+    match scan_reader(
+        &mut file,
+        format,
+        Source {
+            path: path.clone(),
+            object: None,
+        },
+        remaining,
+        &mut |mut c| {
+            c.occurrence.stamp = Some(stamp);
+            c.occurrence.rewritable &= stamp.nlink == 1;
+            let accepted = emit(c);
+            if !accepted {
+                *stopped = true;
+            }
+            accepted
+        },
+    ) {
+        Ok(part) => {
+            report.files += 1;
+            report.bytes += part.bytes;
+            *occurrences += part.candidates as usize;
+            report.issues.extend(part.issues);
+        }
+        Err(_) => report.issue(&path, "unreadable"),
+    }
+    match file.metadata() {
+        Ok(after) if crate::FileStamp::of(&after) == stamp => {}
+        _ => report.issue(path, "changed"),
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_leaf_mount_is_refused_at_the_actual_read() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        std::fs::write(d.path().join("store"), b"fixtureZtranscriptDeviceValue").expect("write");
+        let mut root = crate::open_root(d.path()).expect("root");
+        let source = crate::source::ConfigSource {
+            path: d.path().join("store"),
+            format: ConfigFormat::Raw,
+            source_kind: crate::source::SourceKind::Transcript,
+            label: "fixture".into(),
+            names: None,
+        };
+        for mounted in [false, true] {
+            if mounted {
+                root.model_other_device();
+            }
+            let mut report = crate::candidates::ScanReport::default();
+            let mut found = false;
+            scan_file(
+                &root,
+                std::path::Path::new("store"),
+                &source,
+                Budget::default(),
+                &mut report,
+                &mut 0,
+                &mut false,
+                &mut |c| {
+                    found |= c.value.ct_eq(b"fixtureZtranscriptDeviceValue");
+                    true
+                },
+            );
+            assert_eq!(found, !mounted);
+            assert_eq!(report.complete(), !mounted);
+            if mounted {
+                assert_eq!(report.bytes, 0);
+                assert!(report.issues.iter().any(|i| i.reason == "mount_point"));
+            }
+        }
+    }
 }

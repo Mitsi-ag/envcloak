@@ -54,6 +54,11 @@ impl ScanRoot {
         self.dev
     }
 
+    #[cfg(test)]
+    pub(crate) fn model_other_device(&mut self) {
+        self.dev = self.dev.wrapping_add(1);
+    }
+
     /// The root's own device and inode.
     pub fn identity(&self) -> (u64, u64) {
         (self.dev, self.ino)
@@ -319,6 +324,9 @@ pub fn read_plain(r: &ScanRoot, rel: &Path, cap: usize) -> Result<(Vec<u8>, File
     };
     let (dir, name) = r.open_parent(rel).map_err(fail)?;
     let (f, m) = open_file(&dir, &name, cap).map_err(fail)?;
+    if m.dev() != r.dev() {
+        return Err(fail(ScanErrorKind::MountPoint));
+    }
     let stamp = FileStamp::of(&m);
     let mut out = Vec::with_capacity(usize::try_from(m.len()).unwrap_or(0));
     (&f).take(cap as u64 + 1)
@@ -390,6 +398,21 @@ pub(crate) fn held_root(path: PathBuf, dir: File) -> std::io::Result<ScanRoot> {
 #[cfg(test)]
 mod scanner_device_tests {
     use super::*;
+    #[test]
+    fn plain_leaf_mount_is_refused_before_reading() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        std::fs::write(d.path().join("plain"), b"fixture-value").expect("write");
+        let mut root = open_root(d.path()).expect("root");
+        assert!(read_plain(&root, Path::new("plain"), 64).is_ok());
+        root.model_other_device();
+        assert_eq!(
+            read_plain(&root, Path::new("plain"), 64)
+                .expect_err("mount refused")
+                .kind,
+            ScanErrorKind::MountPoint
+        );
+    }
+
     /// Recording model of a file mount: the opened leaf's device differs
     /// from the held root. No mounts or privileged host state are changed.
     #[test]
