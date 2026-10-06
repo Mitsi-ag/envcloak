@@ -71,11 +71,8 @@ fn parse_bytes(raw: &[u8]) -> Result<TotpSpec, OtpauthError> {
         return Err(OtpauthError);
     }
     if let Some(colon) = label.iter().position(|b| *b == b':') {
-        if label[..colon].iter().all(|b| *b == b' ')
-            || label[colon + 1..].iter().all(|b| *b == b' ')
-        {
-            return Err(OtpauthError);
-        }
+        display_text(&label[..colon])?;
+        display_text(&label[colon + 1..])?;
     }
     let mut seed = None;
     let mut issuer = None;
