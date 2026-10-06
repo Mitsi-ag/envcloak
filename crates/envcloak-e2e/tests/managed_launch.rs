@@ -1185,13 +1185,17 @@ fn a_package_runner_launch_runs_its_package_from_a_registry() {
         .arg(&reg_dir)
         .arg(&port_file)
         .stdin(std::process::Stdio::null())
+        .stderr(std::fs::File::create(reg_dir.join("registry.err")).unwrap())
         .spawn()
         .unwrap();
-    let _registry = Registry(child);
-    assert!(
-        appears(&port_file, Duration::from_secs(30)),
-        "the registry did not start"
-    );
+    let mut registry = Registry(child);
+    if !appears(&port_file, Duration::from_secs(90)) {
+        panic!(
+            "the registry did not start ({:?}): {}",
+            registry.0.try_wait(),
+            std::fs::read_to_string(reg_dir.join("registry.err")).unwrap_or_default()
+        );
+    }
     let port = std::fs::read_to_string(&port_file).unwrap();
     let cache = w.h.files().join("npm-cache");
     let path_env = format!("{}:/usr/bin:/bin", npx.parent().unwrap().display());
