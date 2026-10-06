@@ -723,7 +723,14 @@ fn the_fingerprint_follows_what_a_result_depends_on() {
         }
         h.write(file, &v.to_string());
         let mut after = h.read(host, &[]);
+        // What EnvCloak installed, as `ConfigSet::shape` reads it, follows
+        // the change too; the rest of the facts do not.
+        assert_ne!(
+            after.installed, facts.installed,
+            "{host:?}: the timeout: the installed entries"
+        );
         after.context = facts.context.clone();
+        after.installed = facts.installed.clone();
         assert_eq!(after, facts, "{host:?}: the facts changed with the timeout");
         assert_ne!(fp(host), first, "{host:?}: the timeout");
         h.write(file, &installed);
@@ -854,7 +861,14 @@ fn claude_registration_changes_make_a_result_stale() {
         h.write(&path, &file(&e, json!({})));
         let mut after = h.read(Host::ClaudeCode, &[]);
         assert!(!current(), "{name}: still current");
+        // What EnvCloak installed, as `ConfigSet::shape` reads it, follows
+        // the change too; the rest of the facts do not.
+        assert_ne!(
+            after.installed, first.installed,
+            "{name}: the installed entries"
+        );
         after.context = first.context.clone();
+        after.installed = first.installed.clone();
         assert_eq!(after, first, "{name}: the facts changed");
         h.write(&path, &file(&entry, json!({})));
         assert!(current(), "{name} put back");
