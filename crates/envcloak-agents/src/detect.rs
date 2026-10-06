@@ -15,7 +15,7 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -45,6 +45,10 @@ pub enum DetectError {
     /// `--version` failed, or printed something that is not this host's
     /// version line.
     NotRecognized,
+    /// The executable could not be read whole, or was another before and
+    /// after it answered `--version` ([`detect_identified`]): the version
+    /// is then not known to be that of any one binary.
+    Changed,
 }
 
 impl DetectError {
@@ -53,6 +57,7 @@ impl DetectError {
             DetectError::NotFound => "not_installed",
             DetectError::Timeout => "version_timeout",
             DetectError::NotRecognized => "not_recognized",
+            DetectError::Changed => "changed_while_asked",
         }
     }
 
@@ -63,6 +68,10 @@ impl DetectError {
             DetectError::NotRecognized => {
                 "its --version did not print this product's version line, so EnvCloak does not \
                  know which format to write"
+            }
+            DetectError::Changed => {
+                "its executable could not be read whole, or changed while it was asked its \
+                 version, so the version is not known to be that of the binary there now"
             }
         }
     }
@@ -174,6 +183,37 @@ pub fn detect_with(
     version_of(host, exe, &mut cmd)
 }
 
+/// [`detect_with`], with the version bound to one binary (Codex review of
+/// M2-28: the version was asked before the binary was hashed, so a host
+/// updated in between ran under the old version's qualification): the
+/// executable `PATH` leads to is resolved and hashed before `--version`
+/// and again after it, and the two must be the same, readable bytes.
+/// Gives the SHA-256 the version is that of; whatever is measured later
+/// (`probe::run_surfaces` hashes the binary before and after its runs) is
+/// compared with it, so a binary replaced at any point after the first
+/// hash is never credited with this version's result.
+///
+/// # Errors
+/// As [`detect_with`], and [`DetectError::Changed`].
+pub fn detect_identified(
+    host: Host,
+    path: &OsStr,
+    vars: &[(OsString, OsString)],
+) -> Result<(Detected, String), DetectError> {
+    let exe = find_on_path(exe_name(host), path).ok_or(DetectError::NotFound)?;
+    let digest = || {
+        std::fs::canonicalize(&exe)
+            .ok()
+            .and_then(|p| crate::coverage::file_sha256(&p))
+    };
+    let before = digest().ok_or(DetectError::Changed)?;
+    let d = detect_with(host, path, vars)?;
+    if d.exe != exe || digest().as_deref() != Some(before.as_str()) {
+        return Err(DetectError::Changed);
+    }
+    Ok((d, before))
+}
+
 /// Runs `cmd` (`exe --version`) and reads `host`'s version from it.
 fn version_of(host: Host, exe: PathBuf, cmd: &mut Command) -> Result<Detected, DetectError> {
     let out = run_limited(cmd, LIMIT).map_err(|timed_out| {
@@ -197,6 +237,24 @@ fn run_limited(cmd: &mut Command, limit: Duration) -> Result<Vec<u8>, bool> {
         Err(Bounded::Timeout) => Err(true),
         Err(Bounded::Failed) => Err(false),
     }
+}
+
+/// Starts `cmd` as a child that stays this process's own until it waits
+/// for it (D-34): the kernel is first made not to reap this process's
+/// children on its own (`envcloak_sys::owned::keep_children_unreaped`),
+/// since a SIGCHLD inherited ignored, or set with `SA_NOCLDWAIT` by
+/// whatever started `envcloak`, would have the child reaped the moment it
+/// exits, its pid and process group free for another process's use while
+/// the probes still signal them by number (the verifier's review of
+/// M2-28). Every child the probes and the host detection start, and later
+/// signal or wait for, is started here.
+///
+/// # Errors
+/// When SIGCHLD cannot be made to leave children unreaped (nothing is
+/// started then), or `spawn`'s own.
+pub fn spawn_unreaped(cmd: &mut Command) -> std::io::Result<Child> {
+    envcloak_sys::owned::keep_children_unreaped()?;
+    cmd.spawn()
 }
 
 /// Why [`run_bounded`] has no output to give.
@@ -231,19 +289,22 @@ fn read_pipe(pipe: Option<impl Read + Send + 'static>, max: u64) -> mpsc::Receiv
 pub(crate) fn run_bounded(cmd: &mut Command, limit: Duration, max: u64) -> Result<Output, Bounded> {
     let start = Instant::now();
     let deadline = start + limit;
-    let mut child = cmd.spawn().map_err(|_| Bounded::Failed)?;
+    let mut child = spawn_unreaped(cmd).map_err(|_| Bounded::Failed)?;
     let out_rx = read_pipe(child.stdout.take(), max);
     let err_rx = read_pipe(child.stderr.take(), max);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            Ok(None) | Err(_) => break None,
+            Ok(None) => break None,
+            // Not this process's child any more (reaped behind its back):
+            // its pid may be another process's, so nothing is sent.
+            Err(_) => return Err(Bounded::Failed),
         }
     };
     let Some(status) = status else {
-        // Still this process's unreaped child: the signal reaches it, and
-        // the wait reaps it.
+        // Still this process's unreaped child (`spawn_unreaped`): the
+        // signal reaches it, and the wait reaps it.
         let _ = child.kill();
         let _ = child.wait();
         return Err(Bounded::Timeout);
@@ -288,6 +349,58 @@ mod tests {
             assert_eq!(parse_version(Host::ClaudeCode, bad), None, "{bad:?}");
         }
         assert_eq!(parse_version(Host::Codex, b"2.1.280 (Claude Code)\n"), None);
+    }
+
+    /// The version is bound to the binary that answered it (Codex review
+    /// of M2-28): an executable replaced while it is asked its version
+    /// (here, by itself, as an update in between would) is
+    /// `changed_while_asked`, never the old version with the new binary's
+    /// digest. Mutation checked: `detect_identified` without its second
+    /// hash: the replaced binary is given the first answer's version and
+    /// this fails.
+    #[test]
+    fn a_binary_replaced_while_asked_its_version_has_no_version() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let fake = dir.path().join("claude");
+        let write = |body: &str| {
+            std::fs::write(&fake, body).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        let vars = [(OsString::from("HOME"), dir.path().as_os_str().to_owned())];
+        let path = dir.path().as_os_str().to_owned();
+        // A binary that stays as it is: its version and its digest.
+        write("#!/bin/sh\necho '2.1.280 (Claude Code)'\n");
+        let (d, sha) =
+            detect_identified(Host::ClaudeCode, &path, &vars).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(d.version, "2.1.280");
+        assert_eq!(
+            Some(sha),
+            crate::coverage::file_sha256(&std::fs::canonicalize(&fake).unwrap_or_default())
+        );
+        // One replaced while it answers (an update landing then): the
+        // answer is the old version's, the binary there after it another.
+        let next = dir.path().join("next");
+        std::fs::write(&next, "#!/bin/sh\necho '2.1.999 (Claude Code)'\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("{e}"));
+        write(&format!(
+            "#!/bin/sh\n/bin/mv '{}' '{}'\necho '2.1.280 (Claude Code)'\n",
+            next.display(),
+            fake.display()
+        ));
+        assert_eq!(
+            detect_identified(Host::ClaudeCode, &path, &vars).map(|(d, _)| d.version),
+            Err(DetectError::Changed)
+        );
+        // The replacement answers for itself afterwards.
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            detect_identified(Host::ClaudeCode, &path, &vars).map(|(d, _)| d.version),
+            Ok("2.1.999".to_owned())
+        );
     }
 
     /// The Codex review's finding: a `--version` that exits at once but

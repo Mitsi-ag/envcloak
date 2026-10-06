@@ -330,7 +330,10 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
     let mut kept_any = false;
     let mut cache = Cache::load(&cache_path);
     for host in hosts {
-        let d = match detect::detect_with(host, &path, &version_env) {
+        // The version is bound to the binary hashed before and after it
+        // answered (Codex review of M2-28); the probes' own hashes are held
+        // to that digest (`keep_record`).
+        let (d, exe_sha) = match detect::detect_identified(host, &path, &version_env) {
             Ok(d) => d,
             Err(DetectError::NotFound) if a.hosts.is_empty() => continue,
             Err(e) => {
@@ -343,10 +346,6 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
                 continue;
             }
         };
-        let exe_sha = std::fs::canonicalize(&d.exe)
-            .ok()
-            .and_then(|p| coverage::file_sha256(&p))
-            .unwrap_or_default();
         let before = read(host).fingerprint(&me);
         let opts = probe::local::LocalOptions {
             envcloak: me.clone(),
