@@ -232,3 +232,64 @@ fn git_scans_the_held_root_after_its_path_is_replaced() {
     assert!(report.complete());
     assert!(found, "git reopened a replaced path");
 }
+
+#[test]
+fn history_never_discovers_a_repository_above_the_held_root() {
+    let d = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    git(d.path(), &["init", "-q"]);
+    object(d.path(), "blob", b"fixtureZparentRepositoryValue");
+    let nested = d.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let mut emitted = 0;
+    let report = scan_git_history(&open_root(&nested).unwrap(), Budget::default(), &mut |_| {
+        emitted += 1;
+        true
+    })
+    .unwrap();
+    assert!(!report.complete());
+    assert_eq!(emitted, 0);
+    assert!(report.issues.iter().any(|i| i.reason == "git_failed"));
+    git(&nested, &["init", "-q"]);
+    object(&nested, "blob", b"fixtureZlocalRepositoryValue");
+    let mut found = false;
+    let report = scan_git_history(&open_root(&nested).unwrap(), Budget::default(), &mut |c| {
+        assert!(!c.value.ct_eq(b"fixtureZparentRepositoryValue"));
+        found |= c.value.ct_eq(b"fixtureZlocalRepositoryValue");
+        true
+    })
+    .unwrap();
+    assert!(report.complete());
+    assert!(found);
+}
+
+#[test]
+fn renamed_non_repository_cannot_discover_its_new_parent() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    git(d.path(), &["init", "-q"]);
+    object(d.path(), "blob", b"fixtureZparentRepositoryValue");
+    let path = d.path().join("before");
+    std::fs::create_dir(&path).unwrap();
+    let held = open_root(&path).unwrap();
+    std::fs::rename(&path, d.path().join("after")).unwrap();
+    let report = scan_git_history(&held, Budget::default(), &mut |_| {
+        panic!("scanned a parent repository")
+    })
+    .unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "git_failed"));
+}
+
+#[test]
+fn explicit_bare_repository_still_scans() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    git(d.path(), &["init", "--bare", "-q"]);
+    object(d.path(), "blob", b"fixtureZbareRepositoryValue");
+    let mut found = false;
+    let report = scan_git_history(&open_root(d.path()).unwrap(), Budget::default(), &mut |c| {
+        found |= c.value.ct_eq(b"fixtureZbareRepositoryValue");
+        true
+    })
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(found);
+}

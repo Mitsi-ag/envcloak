@@ -43,6 +43,14 @@ pub fn scan_git_history(
         kind: ScanErrorKind::Io(std::io::ErrorKind::Other),
     };
     let mut report = StreamReport::default();
+    // Both working trees (including linked worktrees) and bare repositories
+    // are explicit. Discovery must never climb from the held directory, even
+    // if its display path was renamed after opening.
+    let git_dir = if envcloak_sys::kind_beneath(repo.dir(), std::ffi::OsStr::new(".git")).is_ok() {
+        ".git"
+    } else {
+        "."
+    };
     let mut command = Command::new("/usr/bin/git");
     command
         .env_clear()
@@ -53,6 +61,7 @@ pub fn scan_git_history(
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["--git-dir", git_dir, "--work-tree", "."])
         .env("LC_ALL", "C")
         .args([
             "--no-pager",
