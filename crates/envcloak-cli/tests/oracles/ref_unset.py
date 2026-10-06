@@ -69,13 +69,19 @@ for before, expected, profile in (
     assert manifest.read_bytes() == expected, "alternate bytes"
     tomllib.loads(manifest.read_text())
 
-for args in (("--unset", ""), ("--unset", "A=B"), ("--unset", "DROP", "A=b"),
-             ("--unset", "DROP", "--unset", "KEEP"), ("--unset", "é"),
-             ("--unset", "DROP\n"), ("--unset", "DROP", "--profile", "missing")):
+for args, code, reason in (
+    (("--unset", ""), 2, b"invalid variable name"),
+    (("--unset", "A=B"), 2, b"invalid variable name"),
+    (("--unset", "DROP", "A=b"), 2, b"ref needs one binding or --unset NAME"),
+    (("--unset", "DROP", "--unset", "KEEP"), 2, b"unknown or repeated option"),
+    (("--unset", "é"), 2, b"invalid variable name"),
+    (("--unset", "DROP\n"), 2, b"invalid variable name"),
+    (("--unset", "DROP", "--profile", "missing"), 1, b"binding_absent"),
+):
     manifest.write_bytes(b"[env]\nDROP = 'ordinary'\n[policy]\nagents = 'deny'\n")
     old = stamp()
     result = run(*args)
-    assert result.returncode != 0 and not result.stdout
+    assert result.returncode == code and reason in result.stderr and not result.stdout
     assert stamp() == old, "hostile/absent write"
 
 target = project / "target"
@@ -83,5 +89,6 @@ manifest.rename(target)
 manifest.symlink_to(target)
 original = target.read_bytes()
 result = run("--unset", "DROP", "--json")
-assert result.returncode != 0 and manifest.is_symlink() and target.read_bytes() == original
+assert result.returncode == 1 and b"manifest_invalid" in result.stderr and b"symlink" in result.stderr
+assert not result.stdout and manifest.is_symlink() and target.read_bytes() == original
 print("M3-04 independent TOML/byte oracle passed")

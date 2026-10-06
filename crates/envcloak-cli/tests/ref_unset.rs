@@ -5,7 +5,8 @@ mod common;
 
 use std::process::Command;
 
-use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
+use envcloak_client::fail::USAGE;
+use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed, labels};
 
 #[test]
 fn unset_matches_independent_toml_and_byte_oracle() {
@@ -28,21 +29,49 @@ fn unset_refuses_value_shaped_names_without_echo_or_write() {
     let home = TestHome::new();
     let dir = common::project(&home, "project", "[env]\nKEEP = 'ordinary'\n");
     let path = dir.join("envcloak.toml");
-    let before = std::fs::read(&path).unwrap();
     let cs = canaries(fresh_seed());
-    for c in &cs {
+    // These four fixtures are provider key shapes. The short token,
+    // passphrase and URL fixtures are not necessarily value-shaped names.
+    for c in cs.iter().filter(|c| {
+        matches!(
+            c.label.as_str(),
+            labels::OPENAI_API_KEY
+                | labels::OPENAI_API_KEY_ROTATED
+                | labels::STRIPE_SECRET_KEY
+                | labels::GITHUB_TOKEN
+        )
+    }) {
         let name = std::str::from_utf8(c.value()).unwrap();
-        for args in [
-            vec!["ref", "--unset", name, "--json"],
-            vec!["ref", "--unset", "KEEP", "--profile", name],
-        ] {
-            let mut cmd = common::cli_command(&home, &args, &[]);
-            cmd.current_dir(&dir);
-            let out = common::finish_within(cmd, std::time::Duration::from_secs(30));
-            assert!(!out.status.success());
-            assert_no_canary(&out.stdout, &cs);
-            assert_no_canary(&out.stderr, &cs);
-            assert_eq!(std::fs::read(&path).unwrap(), before);
+        for bound in [false, true] {
+            let before = if bound {
+                // GitHub and Stripe key shapes are valid EnvNames. If
+                // argv screening is skipped, those bindings are removed.
+                format!("[env]\nKEEP = 'ordinary'\n'{name}' = 'ordinary'\n")
+            } else {
+                "[env]\nKEEP = 'ordinary'\n".to_owned()
+            };
+            std::fs::write(&path, before.as_bytes()).unwrap();
+            for json in [false, true] {
+                for mut args in [
+                    vec!["ref", "--unset", name],
+                    vec!["ref", "--unset", "KEEP", "--profile", name],
+                ] {
+                    if json {
+                        args.push("--json");
+                    }
+                    let mut cmd = common::cli_command(&home, &args, &[]);
+                    cmd.current_dir(&dir);
+                    let out = common::finish_within(cmd, std::time::Duration::from_secs(30));
+                    assert_no_canary(&out.stdout, &cs);
+                    assert_no_canary(&out.stderr, &cs);
+                    assert_eq!(out.status.code(), Some(i32::from(USAGE)), "{}", c.label);
+                    assert!(out.stdout.is_empty());
+                    let error = std::str::from_utf8(&out.stderr).unwrap();
+                    assert!(error.starts_with("envcloak: value_on_argv:"), "{}", c.label);
+                    assert!(error.contains("rotate it"), "{}", c.label);
+                    assert!(std::fs::read(&path).unwrap() == before.as_bytes());
+                }
+            }
         }
     }
 }
