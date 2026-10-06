@@ -301,6 +301,11 @@ fn public_debug_and_display_are_value_free() {
             otpauth::OtpauthError,
             otpauth::OtpauthError
         );
+        assert!(
+            shown
+                == "TotpSpec(..) TotpSpec(..) Code(..) Code(..) TotpParams(..) Period(..) ParamsError invalid_totp_parameters OtpauthError invalid_otpauth",
+            "public formatting changed"
+        );
         assert_eq!(six_digits(shown.as_bytes()), 0);
         for secret in [
             bytes(&row, "seed"),
@@ -324,13 +329,13 @@ proptest! {
     fn parser_fuzz_and_public_debug(raw in prop::collection::vec(any::<u8>(), 0..(MAX_URI_BYTES + 32)), time in any::<u64>(), period in 1..=u64::MAX) {
         let result = parse(&raw);
         let shown = format!("{result:?}");
-        prop_assert_eq!(six_digits(shown.as_bytes()), 0);
+        prop_assert!(shown == if result.is_ok() { "Ok(TotpSpec(..))" } else { "Err(OtpauthError)" }, "result formatting changed");
         if let Ok(spec) = result {
             prop_assert!(!spec.seed().is_empty() && spec.seed().len() <= MAX_SEED_BYTES);
-            prop_assert_eq!(six_digits(format!("{spec} {:?}", spec.params()).as_bytes()), 0);
+            prop_assert!(format!("{spec} {:?}", spec.params()) == "TotpSpec(..) TotpParams(..)", "spec formatting changed");
         }
         let p = Period::new(period).unwrap();
-        prop_assert_eq!(six_digits(format!("{p:?}").as_bytes()), 0);
+        prop_assert!(format!("{p:?}") == "Period(..)", "period formatting changed");
         prop_assert_eq!(totp::step_at(time, p), time / period);
         prop_assert_eq!(totp::too_late_in_step(time, p), (u128::from(time / period) + 1) * u128::from(period) - u128::from(time) <= 3);
     }
@@ -341,7 +346,7 @@ proptest! {
         let mut raw = enrollment(&encoded, b"&algorithm=SHA256&digits=8&period=60&issuer=fixture");
         for (index, byte) in edits { let at = index % raw.len(); raw[at] = byte; }
         let result = parse(&raw);
-        prop_assert_eq!(six_digits(format!("{result:?}").as_bytes()), 0);
+        prop_assert!(format!("{result:?}") == if result.is_ok() { "Ok(TotpSpec(..))" } else { "Err(OtpauthError)" }, "result formatting changed");
     }
 
     #[test]
@@ -356,7 +361,7 @@ proptest! {
             Algorithm::Sha1, Algorithm::Sha256, Algorithm::Sha512,
             spec.params(), spec.params().period(), totp::ParamsError, totp::ParamsError,
             otpauth::OtpauthError, otpauth::OtpauthError);
-        prop_assert_eq!(six_digits(shown.as_bytes()), 0);
+        prop_assert!(shown == "TotpSpec(..) TotpSpec(..) Code(..) Code(..) Sha1 Sha256 Sha512 TotpParams(..) Period(..) ParamsError invalid_totp_parameters OtpauthError invalid_otpauth", "public formatting changed");
         let seed = bytes(row, "seed");
         for needle in [&seed, &encoded] {
             prop_assert!(!shown.as_bytes().windows(needle.len()).any(|w| w == needle), "seed appeared in public formatting");
