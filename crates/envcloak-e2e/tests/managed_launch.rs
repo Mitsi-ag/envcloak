@@ -832,6 +832,107 @@ fn a_proof_is_refused_beside_a_waiting_agent_on_its_terminal() {
     assert_eq!(w.pending_count(), 1, "the agent's request waits");
 }
 
+/// Gate 23: a pending request inserted after the first proof-origin
+/// check is observed again under the commit lock. Mutation: remove only
+/// the requester_terminal_in recheck in managed::prove.
+#[test]
+fn a_pending_request_arriving_during_registration_is_rechecked() {
+    if managed_common::release_run("proof recheck") {
+        return;
+    }
+    for same_terminal in [true, false] {
+        let site = "managed.register_resolved";
+        let (mut w, gate) = held_world(site);
+        let release = gate.path().join("release");
+        let held = gate.path().join("held");
+        let (launch, _) = w.register_fixture();
+        let other = w.h.home.root().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::write(
+            other.join("envcloak.toml"),
+            format!("[project]\nname = \"other\"\n[env]\n{KEY} = \"stripe/fixture\"\n"),
+        )
+        .unwrap();
+        let request = json!({"manifest": other.join("envcloak.toml"),
+            "fds": "none", "claims": ["CLAUDECODE"]});
+        let pass =
+            w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
+        let registration = json!({"name": "claude-code/fixture",
+            "manifest": w.project.join("envcloak.toml"), "argv": w.fixture_argv(),
+            "passphrase_file": pass});
+        let stops = paused(&w, site);
+        std::fs::rename(&release, &held).unwrap();
+        let answer = if same_terminal {
+            let (ri, ro) = w.io_paths();
+            let (ai, ao) = w.io_paths();
+            std::fs::write(&ri, registration.to_string()).unwrap();
+            std::fs::write(&ai, request.to_string()).unwrap();
+            let quote = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
+            let command = |action, i: &Path, o: &Path| {
+                World::helper_argv(action, i, o)
+                    .iter()
+                    .map(|s| envcloak_e2e::quoted(s))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let trigger = gate.path().join("request");
+            let done = gate.path().join("done");
+            // Both children share this owned terminal. The requester's
+            // shell remains live until after the registration completes.
+            let line = format!(
+                "{} & proof=$!; while [ ! -e {} ]; do sleep 0.02; done; \
+                 ( {}; while [ ! -e {} ]; do sleep 0.02; done ) & agent=$!; \
+                 wait $proof; wait $agent",
+                command("register", &ri, &ro),
+                quote(&trigger),
+                command("request", &ai, &ao),
+                quote(&done)
+            );
+            let person = w.h.person();
+            let home = w.h.home.home();
+            let thread = std::thread::spawn(move || {
+                let result = person.run_argv(
+                    &home,
+                    &["/bin/sh", "-c", &line],
+                    &[],
+                    Duration::from_secs(120),
+                );
+                (person, result.map(|r| r.code))
+            });
+            wait_paused(&w, site, stops + 1);
+            std::fs::write(trigger, b"").unwrap();
+            let queued = w.wait_out(&ao, Duration::from_secs(30), "late request");
+            pending_id(&queued);
+            std::fs::rename(&held, &release).unwrap();
+            let answer = w.wait_out(&ro, Duration::from_secs(60), "late proof");
+            std::fs::write(done, b"").unwrap();
+            let (person, code) = thread.join().unwrap();
+            w.h.keep_person(&person);
+            assert_eq!(code, Some(0));
+            answer
+        } else {
+            let proof = w.person_background("register", registration);
+            wait_paused(&w, site, stops + 1);
+            let queued = w.agent("request", &request);
+            pending_id(&queued);
+            std::fs::rename(&held, &release).unwrap();
+            w.person_done(proof)
+        };
+        let plan = w.person("plan", json!({"launch": launch}));
+        if same_terminal {
+            assert_eq!(error_of(&answer), "proof_refused", "{answer}");
+            assert_eq!(answer["reason"], "requester_terminal");
+            assert_eq!(plan["statement"]["revision"], 1, "{plan}");
+            w.expect_trace("proof refused method=managed.register reason=requester_terminal");
+        } else {
+            assert_eq!(answer["revision"], 2, "{answer}");
+            assert_eq!(plan["statement"]["revision"], 2, "{plan}");
+        }
+        assert_eq!(w.pending_count(), 1);
+        w.h.assert_swept("pending transition during registration");
+    }
+}
+
 /// CR-2: an update is built from the declaration stored in the record.
 /// After the fixture's executable is replaced (the launch is then
 /// refused), `managed.update_plan` with no changes shows the old and the
