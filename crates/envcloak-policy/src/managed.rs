@@ -56,21 +56,37 @@ pub const PASSTHROUGH: [&str; 6] = ["HOME", "USER", "LOGNAME", "LANG", "TZ", "TM
 
 /// The variables that select the code a program runs (SPEC §6.6), refused
 /// in a declaration and never passed to a server, besides every `LD_*`
-/// and `DYLD_*` ([`is_code_selecting`]).
-pub const CODE_SELECTING: [&str; 21] = [
+/// and `DYLD_*` and the Lua variables of [`CODE_SELECTING_PREFIXES`]
+/// ([`is_code_selecting`]). Beyond SPEC's list, each interpreter of
+/// [`INTERPRETERS`] has its own here: a module or library path, a file run
+/// at start, a debugger, an ini or gem directory, a cache of compiled code,
+/// a configuration directory a shell reads.
+pub const CODE_SELECTING: [&str; 37] = [
     "NODE_OPTIONS",
     "NODE_PATH",
     "BUN_OPTIONS",
     "BUN_BE_BUN",
+    "DENO_DIR",
     "PYTHONPATH",
     "PYTHONHOME",
     "PYTHONSTARTUP",
     "PYTHONUSERBASE",
+    "PYTHONINSPECT",
+    "PYTHONBREAKPOINT",
+    "PYTHONPYCACHEPREFIX",
+    "PYTHONPLATLIBDIR",
     "PERL5LIB",
     "PERLLIB",
     "PERL5OPT",
+    "PERL5DB",
+    "PERLIO",
     "RUBYLIB",
     "RUBYOPT",
+    "GEM_PATH",
+    "GEM_HOME",
+    "BUNDLE_GEMFILE",
+    "PHPRC",
+    "PHP_INI_SCAN_DIR",
     "JAVA_TOOL_OPTIONS",
     "JDK_JAVA_OPTIONS",
     "_JAVA_OPTIONS",
@@ -78,17 +94,30 @@ pub const CODE_SELECTING: [&str; 21] = [
     "BASH_ENV",
     "ENV",
     "ZDOTDIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_DIRS",
     "GCONV_PATH",
+    "LUA_INIT",
+    "LUA_PATH",
 ];
 
 /// The prefixes of the dynamic loaders' variables, every one of which
 /// selects code (SPEC §6.6: `LD_*`, `DYLD_*`).
 pub const LOADER_PREFIXES: [&str; 2] = ["LD_", "DYLD_"];
 
-/// Whether `name` is a variable that selects code: a loader variable or
-/// one of [`CODE_SELECTING`].
+/// The prefixes of other variables that select code under a versioned
+/// name too (`LUA_INIT_5_4`, `LUA_PATH_5_4`, `LUA_CPATH`).
+pub const CODE_SELECTING_PREFIXES: [&str; 3] = ["LUA_INIT", "LUA_PATH", "LUA_CPATH"];
+
+/// Whether `name` is a variable that selects code: a loader variable, one
+/// of [`CODE_SELECTING`], or one of [`CODE_SELECTING_PREFIXES`] in any
+/// version.
 pub fn is_code_selecting(name: &str) -> bool {
-    LOADER_PREFIXES.iter().any(|p| name.starts_with(p)) || CODE_SELECTING.contains(&name)
+    LOADER_PREFIXES
+        .iter()
+        .chain(CODE_SELECTING_PREFIXES.iter())
+        .any(|p| name.starts_with(p))
+        || CODE_SELECTING.contains(&name)
 }
 
 /// The interpreters whose first argument that is not an option names the
@@ -162,11 +191,20 @@ pub fn is_wrapper(name: &str) -> bool {
 /// The interpreter options that load other code (SPEC §6.6: `-e`, `-c`,
 /// `-m`, `-r`, `--require`, `--import`, `--loader`), with the forms the
 /// same interpreters take for the same thing (an evaluated or printed
-/// expression, a preloaded or included module). A short one also counts
-/// with its value attached (`-eCODE`, `-Mstrict`), and a long one with
-/// `=value`.
-const CODE_LOADING_SHORT: [&str; 8] = ["-e", "-E", "-c", "-m", "-M", "-r", "-I", "-p"];
-const CODE_LOADING_LONG: [&str; 12] = [
+/// expression, a preloaded or included module). A short one counts
+/// anywhere in a cluster of short options (`-ec`, `-we`, `-Bc`, `-xc`), so
+/// also with its value attached (`-eCODE`, `-Mstrict`); a long one also
+/// with `=value`.
+const CODE_LOADING_SHORT: [char; 8] = ['e', 'E', 'c', 'm', 'M', 'r', 'I', 'p'];
+/// The short options that, before an interpreter's entry file, load code
+/// or take it from elsewhere besides [`CODE_LOADING_SHORT`]: an
+/// interactive session or commands from standard input (`-i`, `sh -s`),
+/// a debugger or an ini setting (`perl -d:Mod`, `php -d`), a library
+/// (`lua -l`), an extension (`php -z`), resolution conditions (`node -C`).
+/// Some are harmless to one interpreter and load code in another; each is
+/// refused for all.
+const INTERPRETER_LOADING_SHORT: [char; 6] = ['i', 's', 'd', 'l', 'z', 'C'];
+const CODE_LOADING_LONG: [&str; 23] = [
     "--inspect",
     "--inspect-brk",
     "--inspect-wait",
@@ -179,9 +217,65 @@ const CODE_LOADING_LONG: [&str; 12] = [
     "--preload",
     "--command",
     "--module",
+    "--interactive",
+    "--conditions",
+    "--env-file",
+    "--env-file-if-exists",
+    "--experimental-config-file",
+    "--experimental-default-config-file",
+    "--config",
+    "--import-map",
+    "--rcfile",
+    "--init-file",
+    "--experimental-policy",
 ];
 
-/// Whether `arg` is an interpreter option that loads other code.
+/// The long interpreter options that take no value, and so may stand
+/// before the entry file without `=`. Any other long option without `=`
+/// may take the next argument as its value (`node --title /a /b.js` runs
+/// `/b.js`), so which argument is the entry file is not known.
+const BOOLEAN_LONG: [&str; 18] = [
+    "--trace-warnings",
+    "--trace-deprecation",
+    "--trace-uncaught",
+    "--enable-source-maps",
+    "--expose-gc",
+    "--pending-deprecation",
+    "--throw-deprecation",
+    "--preserve-symlinks",
+    "--smol",
+    "--jit",
+    "--yjit",
+    "--norc",
+    "--noprofile",
+    "--posix",
+    "--login",
+    "--verbose",
+    "--quiet",
+    "--unsafe-proto",
+];
+/// The prefixes of long interpreter options that take no value
+/// (`--no-warnings`, deno's `--allow-env`, ruby's `--disable-gems`).
+const BOOLEAN_LONG_PREFIXES: [&str; 5] =
+    ["--no-", "--allow-", "--deny-", "--enable-", "--disable-"];
+
+/// The short options of an interpreter family that take the next argument
+/// as their value when nothing is attached (`python -W ignore`, `python
+/// -X dev`, `bash -o posix`, `bash -O extglob`, `ruby -F :`, `php -t
+/// /root`, `php -f /x.php`).
+fn value_short(stem: &str) -> &'static [char] {
+    match stem {
+        "python" | "pypy" => &['W', 'X'],
+        "ruby" => &['F', 'K', 'T'],
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish" => &['o', 'O'],
+        "php" => &['f', 't'],
+        _ => &[],
+    }
+}
+
+/// Whether `arg` is an option that loads other code: a long one of
+/// [`CODE_LOADING_LONG`] (with or without `=value`), or a cluster of short
+/// ones holding any of [`CODE_LOADING_SHORT`].
 pub fn is_code_loading_option(arg: &str) -> bool {
     if let Some(long) = arg.strip_prefix("--") {
         let name = long.split('=').next().unwrap_or(long);
@@ -189,9 +283,49 @@ pub fn is_code_loading_option(arg: &str) -> bool {
             .iter()
             .any(|o| o.strip_prefix("--") == Some(name));
     }
-    CODE_LOADING_SHORT
-        .iter()
-        .any(|o| arg == *o || (arg.len() > 2 && arg.starts_with(o)))
+    arg.strip_prefix('-')
+        .is_some_and(|cluster| cluster.chars().any(|c| CODE_LOADING_SHORT.contains(&c)))
+}
+
+/// One option of interpreter family `stem` before its entry file: an
+/// error when it loads code ([`is_code_loading_option`], or a short one of
+/// [`INTERPRETER_LOADING_SHORT`] in its cluster before any value), or when
+/// it may take the next argument as its value (a short one of
+/// [`value_short`] ending its cluster, a long one without `=` that is not
+/// known to take none): which argument is the entry file is then not
+/// known, [`DeclError::NoEntry`].
+fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
+    let loads = Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+    if arg.starts_with("--") {
+        if is_code_loading_option(arg) {
+            return loads;
+        }
+        if arg.contains('=')
+            || BOOLEAN_LONG.contains(&arg)
+            || BOOLEAN_LONG_PREFIXES.iter().any(|p| arg.starts_with(p))
+        {
+            return Ok(());
+        }
+        return Err(DeclError::NoEntry);
+    }
+    let cluster = arg.strip_prefix('-').unwrap_or(arg);
+    let values = value_short(stem);
+    let mut letters = cluster.chars().peekable();
+    while let Some(c) = letters.next() {
+        if CODE_LOADING_SHORT.contains(&c) || INTERPRETER_LOADING_SHORT.contains(&c) {
+            return loads;
+        }
+        if values.contains(&c) {
+            // The rest of the cluster is the value; none, and the next
+            // argument is.
+            return if letters.peek().is_some() {
+                Ok(())
+            } else {
+                Err(DeclError::NoEntry)
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Why a declaration, or a change to one, is refused. Carries no byte of
@@ -461,9 +595,7 @@ fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
         if !a.starts_with('-') || a == "-" {
             break;
         }
-        if is_code_loading_option(a) {
-            return Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
-        }
+        interpreter_option(stem, a)?;
         i += 1;
     }
     let entry = argv.get(i).ok_or(DeclError::NoEntry)?;
@@ -847,6 +979,17 @@ mod tests {
             "LD_LIBRARY_PATH",
             "DYLD_INSERT_LIBRARIES",
             "DYLD_X",
+            "LUA_INIT",
+            "LUA_INIT_5_4",
+            "LUA_PATH",
+            "LUA_PATH_5_4",
+            "LUA_CPATH",
+            "LUA_CPATH_5_3",
+            "PHPRC",
+            "PHP_INI_SCAN_DIR",
+            "GEM_PATH",
+            "GEM_HOME",
+            "PERL5DB",
         ] {
             assert!(is_code_selecting(n), "{n}");
         }
@@ -866,6 +1009,18 @@ mod tests {
     /// A declared variable that selects code, and an interpreter option
     /// that loads code before the entry file, are `code_selecting_env`;
     /// the same text after the entry file is the script's own argument.
+    /// A code-loading letter counts anywhere in a cluster (`-ec`, `-we`,
+    /// `-Bc`, `-xc`), and an option that may take the next argument as its
+    /// value leaves the entry file unknown (`no_entry_file`); options that
+    /// take none, or have it attached, are the positive controls.
+    ///
+    /// Mutations checked: a short option matched only exactly or with its
+    /// value attached (the previous `is_code_loading_option`): `sh -ec`
+    /// classes `/srv/;id` as the entry file and this fails; a long option
+    /// without `=` taken as one that takes no value: `node --title
+    /// /srv/other.js /srv/s.js` checks `/srv/other.js` and this fails; the
+    /// Lua, PHP, gem and Perl debugger variables left out of
+    /// `CODE_SELECTING`: their declarations register and this fails.
     #[test]
     fn code_selecting_declarations_are_refused() {
         let mut d = decl(&["/usr/bin/server"]);
@@ -887,6 +1042,22 @@ mod tests {
             &["perl", "-Mstrict", "/srv/s.pl"],
             &["bun", "--preload", "x.ts", "/srv/s.ts"],
             &["npx", "-c", "echo"],
+            // A code-loading letter anywhere in a cluster of short options.
+            &["sh", "-ec", "/srv/;id", "/srv/s.sh"],
+            &["perl", "-we", "print 1", "/srv/s.pl"],
+            &["ruby", "-we", "p 1", "/srv/s.rb"],
+            &["python3", "-Bc", "import x", "/srv/s.py"],
+            &["bash", "-xc", "id", "/srv/s.sh"],
+            &["npx", "-yc", "echo"],
+            // An interpreter's own way of taking code from elsewhere.
+            &["python3", "-i", "/srv/s.py"],
+            &["sh", "-s", "/srv/s.sh"],
+            &["perl", "-d:Trace", "/srv/s.pl"],
+            &["lua", "-l", "mod", "/srv/s.lua"],
+            &["php", "-d", "auto_prepend_file=/x.php", "/srv/s.php"],
+            &["node", "-C", "dev", "/srv/s.js"],
+            &["node", "--env-file", "/srv/.env", "/srv/s.js"],
+            &["deno", "run", "--config", "/srv/c.json", "/srv/s.ts"],
         ] {
             assert_eq!(
                 classify_argv(&argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()),
@@ -898,6 +1069,56 @@ mod tests {
             classify_argv(&["node".into(), "/srv/s.js".into(), "-e".into()]),
             Ok(ArgvClass::Interpreter { entry: 1 })
         );
+        // An option that may take the next argument as its value: which
+        // argument is the entry file is not known.
+        for argv in [
+            &["python3", "-X", "/srv/other.py", "/srv/s.py"][..],
+            &["python3", "-uW", "/srv/other.py", "/srv/s.py"],
+            &["node", "--title", "/srv/other.js", "/srv/s.js"],
+            &["bash", "-o", "/srv/other.sh", "/srv/s.sh"],
+            &["php", "-f", "/srv/s.php"],
+            &["ruby", "--encoding", "/srv/other.rb", "/srv/s.rb"],
+        ] {
+            assert_eq!(
+                classify_argv(&argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()),
+                Err(DeclError::NoEntry),
+                "{argv:?}"
+            );
+        }
+        // The positive controls: options that take no value, or have it
+        // attached, before the entry file.
+        for (argv, entry) in [
+            (&["python3", "-u", "-B", "/srv/s.py"][..], 3),
+            (&["python3", "-Wignore", "-Xdev", "/srv/s.py"], 3),
+            (
+                &[
+                    "node",
+                    "--no-warnings",
+                    "--max-old-space-size=512",
+                    "/srv/s.js",
+                ],
+                3,
+            ),
+            (&["bash", "-x", "/srv/s.sh"], 2),
+            (&["python3", "-OO", "/srv/s.py"], 2),
+            (&["deno", "run", "--allow-env", "-A", "/srv/s.ts"], 4),
+            (&["ruby", "-W", "--disable-gems", "/srv/s.rb"], 3),
+        ] {
+            assert_eq!(
+                classify_argv(&argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>()),
+                Ok(ArgvClass::Interpreter { entry }),
+                "{argv:?}"
+            );
+        }
+        for name in ["LUA_INIT", "LUA_PATH_5_4", "PHPRC", "GEM_PATH", "PERL5DB"] {
+            let mut d = decl(&["/usr/bin/server"]);
+            d.env.push((name.into(), "x".into()));
+            assert_eq!(
+                check_declaration(&d),
+                Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
+                "{name}"
+            );
+        }
     }
 
     #[test]
