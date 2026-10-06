@@ -1,8 +1,6 @@
 // swift-tools-version: 6.2
-// EnvCloakKit: the app's client for envcloakd (docs/APP.md "The Swift
-// client"). Task M3-03 adds the wire format, SecretBuffer, the client-side
-// peer checks and the typed calls; M3-02 lays out the package and the
-// logging rule every later file follows.
+// EnvCloakKit: the app's Swift socket client. Test support is a separate
+// target, never a dependency of the shipping library or app.
 import PackageDescription
 
 let package = Package(
@@ -15,9 +13,10 @@ let package = Package(
         .target(
             name: "EnvCloakKit"
         ),
+        .target(name: "EnvCloakKitTestSupport"),
         .testTarget(
             name: "EnvCloakKitTests",
-            dependencies: ["EnvCloakKit"]
+            dependencies: ["EnvCloakKit", "EnvCloakKitTestSupport"]
         ),
     ]
 )

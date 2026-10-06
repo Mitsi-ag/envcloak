@@ -295,12 +295,12 @@ public struct GrantsView: Sendable, WireDecodable, CustomStringConvertible, Cust
 }
 
 public struct GrantView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `id`: String
+    public let `id`: DaemonText
     public let `kind`: SubjectKind
-    public let `label`: String?
+    public let `label`: DaemonText?
     public let `root_pid`: Int32
-    public let `root_exe`: String?
-    public let `project_dir`: String
+    public let `root_exe`: DaemonText?
+    public let `project_dir`: DaemonText
     public let `bindings`: [GrantBindingView]
     public let `mode`: Mode
     public let `uses`: Uses
@@ -325,8 +325,8 @@ public struct GrantView: Sendable, WireDecodable, CustomStringConvertible, Custo
 }
 
 public struct GrantBindingView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `env_name`: String
-    public let `slug`: String
+    public let `env_name`: DaemonText
+    public let `slug`: DaemonText
     public let `live`: Bool
     public var description: String { "[GrantBindingView]" }
     public var debugDescription: String { description }
@@ -437,13 +437,13 @@ public struct ItemsView: Sendable, WireDecodable, CustomStringConvertible, Custo
 }
 
 public struct ItemView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `id`: String
-    public let `slug`: String
+    public let `id`: DaemonText
+    public let `slug`: DaemonText
     public let `class`: ItemClassView
-    public let `title`: String
-    public let `provider`: String?
+    public let `title`: DaemonText
+    public let `provider`: DaemonText?
     public let `classification`: ClassificationView
-    public let `env_hint`: String?
+    public let `env_hint`: DaemonText?
     public let `allow_short`: Bool
     public let `fields`: [FieldView]
     public let `created_secs`: UInt64
@@ -491,7 +491,7 @@ public struct ExposedView: Sendable, WireDecodable, CustomStringConvertible, Cus
 }
 
 public struct FieldView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `name`: String
+    public let `name`: DaemonText
     public let `prior_count`: UInt8
     public let `created_secs`: UInt64
     public let `updated_secs`: UInt64
@@ -507,9 +507,9 @@ public struct FieldView: Sendable, WireDecodable, CustomStringConvertible, Custo
 }
 
 public struct AccountView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `email`: String?
-    public let `label`: String?
-    public let `org_id`: String?
+    public let `email`: DaemonText?
+    public let `label`: DaemonText?
+    public let `org_id`: DaemonText?
     public var description: String { "[AccountView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
@@ -521,11 +521,11 @@ public struct AccountView: Sendable, WireDecodable, CustomStringConvertible, Cus
 }
 
 public struct ItemDetailView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `allowed_hosts`: [String]
-    public let `tags`: [String]
+    public let `allowed_hosts`: [DaemonText]
+    public let `tags`: [DaemonText]
     public let `links`: LinksView
     public let `last_used_secs`: UInt64?
-    public let `notes`: String?
+    public let `notes`: DaemonText?
     public var description: String { "[ItemDetailView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
@@ -539,10 +539,10 @@ public struct ItemDetailView: Sendable, WireDecodable, CustomStringConvertible, 
 }
 
 public struct LinksView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `docs`: String?
-    public let `billing`: String?
-    public let `keys_page`: String?
-    public let `dashboard`: String?
+    public let `docs`: DaemonText?
+    public let `billing`: DaemonText?
+    public let `keys_page`: DaemonText?
+    public let `dashboard`: DaemonText?
     public var description: String { "[LinksView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
@@ -556,8 +556,8 @@ public struct LinksView: Sendable, WireDecodable, CustomStringConvertible, Custo
 
 public struct AddedView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `item`: ItemView
-    public let `field`: String
-    public let `detected`: String?
+    public let `field`: DaemonText
+    public let `detected`: DaemonText?
     public let `ambiguous`: Bool
     public let `length`: LengthClass
     public var description: String { "[AddedView]" }
@@ -573,8 +573,8 @@ public struct AddedView: Sendable, WireDecodable, CustomStringConvertible, Custo
 }
 
 public struct CheckView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `project_dir`: String?
-    public let `project_name`: String?
+    public let `project_dir`: DaemonText?
+    public let `project_name`: DaemonText?
     public let `bindings`: [CheckBindingView]
     public let `refs`: [RefStatus]
     public var description: String { "[CheckView]" }
@@ -589,8 +589,8 @@ public struct CheckView: Sendable, WireDecodable, CustomStringConvertible, Custo
 }
 
 public struct BackupView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `path`: String
-    public let `file_name`: String
+    public let `path`: DaemonText
+    public let `file_name`: DaemonText
     public let `items`: UInt64
     public let `bytes`: UInt64
     public let `created_secs`: UInt64
@@ -607,9 +607,9 @@ public struct BackupView: Sendable, WireDecodable, CustomStringConvertible, Cust
 }
 
 public struct CheckBindingView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `profile`: String?
-    public let `env_name`: String?
-    public let `reference`: String?
+    public let `profile`: DaemonText?
+    public let `env_name`: DaemonText?
+    public let `reference`: DaemonText?
     public let `status`: RefStatus
     public var description: String { "[CheckBindingView]" }
     public var debugDescription: String { description }
