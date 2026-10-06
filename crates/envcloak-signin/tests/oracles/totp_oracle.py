@@ -142,6 +142,14 @@ def invalid_controls():
     return len(fns)
 
 
+def run_node(payload, env):
+    try:
+        return subprocess.run(["node", str(HERE / "totp-oracle-node.mjs")], input=payload,
+                              capture_output=True, env=env, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        raise RuntimeError("Node oracle unavailable") from None
+
+
 def main():
     rows, refs = cases()
     controls = mutation_checks(rows)
@@ -150,13 +158,13 @@ def main():
     # Never inherit HOME, credentials, runtime options or agent markers.
     with tempfile.TemporaryDirectory(prefix="otp-", dir=os.environ["TMPDIR"]) as home:
         env = {"PATH":os.environ["PATH"], "HOME":home, "TMPDIR":home, "LC_ALL":"C"}
-        result = subprocess.run(["node", str(HERE / "totp-oracle-node.mjs")], input=payload, capture_output=True, env=env, check=False)
+        result = run_node(payload, env)
         assert result.returncode == 0 and not result.stderr, "Node oracle failed"
         observed = json.loads(result.stdout)["cases"]
         assert len(observed) == len(rows)
         assert all(x["matches"] and x["width_matches"] and x["counter_matches"] and x["offset"] == r["offset"] for x,r in zip(observed,rows)), "Node mismatch"
         bad = dict(rows[0]); bad["expected_code"] = "0" * bad["digits"]
-        wrong = subprocess.run(["node", str(HERE / "totp-oracle-node.mjs")], input=json.dumps([bad]).encode(), capture_output=True, env=env, check=False)
+        wrong = run_node(json.dumps([bad]).encode(), env)
         assert wrong.returncode == 0 and not json.loads(wrong.stdout)["cases"][0]["matches"], "Node positive control failed"
     clean = []
     for row in rows:

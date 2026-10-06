@@ -209,6 +209,8 @@ jobs:
         run: scripts/check-expose-lint.sh
       - name: SHA-1 TOTP confinement canary
         run: scripts/check-totp-lint.sh
+      - name: TOTP oracle runner controls
+        run: python3 -I -B crates/envcloak-signin/tests/oracles/test_totp_oracle.py
       - name: unsafe_code forbid canary
         run: scripts/check-unsafe-lint.sh
       # Gate 12: the whole suite at RUST_LOG=trace with full backtraces;
