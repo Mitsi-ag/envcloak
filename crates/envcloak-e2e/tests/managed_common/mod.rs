@@ -13,6 +13,7 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -208,7 +209,29 @@ fn helper_request(input: &Value) -> Value {
         fds: Vec::new(),
     };
     let mut c = connect();
-    let answer = c.run_request_with_fds(&p, &fds);
+    // With `fds`, a client that hands over its ends wrongly: `none` asks
+    // with no descriptor, `too_few` names every role and sends two,
+    // `wrong_access` sends its lifeline's writing end as the lifeline.
+    let named = || {
+        let mut q = p.clone();
+        q.fds = fds.roles();
+        q
+    };
+    let answer = match input["fds"].as_str() {
+        Some("none") => c.run_request(&p),
+        Some("too_few") => c.call_with_fds::<envcloak_ipc::proto::RunRequest>(
+            &named(),
+            &[fds.stdin.as_fd(), fds.stdout.as_fd()],
+        ),
+        Some("wrong_access") => {
+            let mut sent = fds.borrowed();
+            if let Some(last) = sent.last_mut() {
+                *last = life_write.as_fd();
+            }
+            c.call_with_fds::<envcloak_ipc::proto::RunRequest>(&named(), &sent)
+        }
+        _ => c.run_request_with_fds(&p, &fds),
+    };
     drop(c);
     drop(fds);
     let answer = match answer {
