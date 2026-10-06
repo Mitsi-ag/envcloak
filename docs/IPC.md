@@ -126,7 +126,7 @@ Response, one of:
 | `backup.v2.list` | none | `backups`, newest first (at most 512): each `id`, `created_secs`, `purpose`, `creator`, `state` (also `damaged` for one that does not open), `files`, `bytes`; `truncated`; `open_leases` |
 | `managed.register` | `name` (`<agent>/<server>`), `manifest` (the absolute path of the managed project's `envcloak.toml`), `server`: `{"stdio": {"launch": {argv, cwd, env, path_env}}}` (the declaration as a host config gave it) or `{"bridge": {origin, header_names}}`, `passphrase`, `claims` | `id` (the record's, 26 Crockford base32 characters), `launch` and `revision` (a stdio server's), `receipt` (`server`, `transport`, `class`, `strength`, `executable`, `identity` (`sha256:<hex>` or `cdhash:<hex>`), `entry`, `entry_identity`, `cwd`, `env_names`, `bindings`, `origin`, `header_names`, `sentences`). A proof, from a terminal subject only |
 | `managed.unregister` | `id` (the record's id or name), `passphrase`, `claims` | `removed` |
-| `managed.update_plan` | `launch`, `changes` (`argv`, `cwd`, `set_env`, `unset_env`, `path_env`, each optional), `claims` | `statement` (`launch`, `revision` (now), `old` and `new` receipts, `digest`, 64 hex characters of `envcloak-update-statement/1`); none for a caller whose proof would be refused, or a launch no record has |
+| `managed.update_plan` | `launch`, `changes` (`argv`, `cwd`, `set_env`, `unset_env`, `path_env`, each optional), `claims` | `statement` (`launch`, `revision` (now), `old` and `new` receipts, `old_declaration` and `new_declaration` (each `argv`, `cwd`, `env` as `[name, value]` pairs, `path_env`: the declaration whole, so a change to an argument, `PATH` or a value shows where the receipts read alike), `digest`, 64 hex characters of `envcloak-update-statement/1`); none for a caller whose proof would be refused, or a launch no record has |
 | `managed.update` | `launch`, `changes`, `digest`, `passphrase`, `claims` | `revision` (the next), `receipt`. `statement_mismatch` when the plan made again has another digest |
 
 - `vault.create` checks the Argon2id bounds, the passphrase rules and the kit's check symbols before any key derivation. The CLI generates the Recovery Kit and shows it (on the terminal, or the descriptor `--kit-fd` names, never stdout or stderr), so the kit crosses the socket only from the client to the daemon (SPEC §4.4: unlocker material is never sent to a client). Both envelopes use Argon2id with the given memory, 3 passes and 4 lanes.
@@ -236,7 +236,8 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `result_unrecorded`, `created_by_agent` | `restore_refused` |
 | `substituted` | `files_backup_failed` |
 | `limited` | `too_many_checks` (from `scan.match`) |
-| `code_selecting_variable`, `interpreter_option` | `code_selecting_env` (from `managed.register`, `managed.update_plan` and `managed.update`; their `invalid_params` carries `not_found`, `not_regular_file`, `too_large`, `invalid_env_name` and `invalid_path` from the rows above) |
+| `code_selecting_variable`, `interpreter_option`, `wrapper_program`, `disguised_launcher` | `code_selecting_env` (from `managed.register`, `managed.update_plan` and `managed.update`; their `invalid_params` carries `not_found`, `not_regular_file`, `too_large`, `invalid_env_name` and `invalid_path` from the rows above, ) |
+| `key_shaped` | `invalid_params` from `managed.register`, `managed.update_plan` and `managed.update`: a launch argument or variable value shaped like a key (gate 13 in the daemon) |
 
 ## Lock
 
@@ -345,6 +346,9 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `limited` | M2-11 | landed | a comparison budget stopped `scan.match`, so the run reports `incomplete (limited)`: the reason of `too_many_checks` when nothing could be compared, and the answer's `limited` when the budget ran out during the call |
 | `code_selecting_variable` | M2-27 | landed | `code_selecting_env` for a launch declaration whose environment sets a variable that selects code (SPEC §6.6: `LD_*`, `DYLD_*`, `NODE_OPTIONS`, `PYTHONPATH` and the rest of its list) |
 | `interpreter_option` | M2-27 | landed | `code_selecting_env` for a launch declaration whose argv gives its interpreter an option that loads other code (`node -r`, `python -m`, `--import` and the like) |
+| `wrapper_program` | M2-27 | landed | `code_selecting_env` for a launch declaration whose program starts another one its arguments name (`env`, `nice`, `stdbuf`, a dynamic loader run as a program), which nothing could check |
+| `disguised_launcher` | M2-27 | landed | `code_selecting_env` for a launch declaration whose program, by its own name, is a native program, but whose file is named as an interpreter, a package runner or a wrapper (a link `server` to `node`) |
+| `key_shaped` | M2-27 | landed | `invalid_params` from `managed.register`, `managed.update_plan` and `managed.update` for a launch argument or variable value shaped like a key (gate 13 in the daemon, behind the client's own `value_on_argv`) |
 <!-- /reservations -->
 
 **Methods** (client role):
