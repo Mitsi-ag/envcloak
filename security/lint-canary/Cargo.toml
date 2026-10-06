@@ -16,6 +16,5 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-envcloak-sys.workspace = true
 libc.workspace = true
 secrecy.workspace = true

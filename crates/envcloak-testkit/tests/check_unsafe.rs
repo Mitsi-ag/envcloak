@@ -110,7 +110,7 @@ fn clean_tree() -> TestHome {
     write(
         &r,
         "clippy.toml",
-        "disallowed-methods = [\n  { path = \"secrecy::ExposeSecret::expose_secret\" },\n  { path = \"secrecy::ExposeSecretMut::expose_secret_mut\" },\n  { path = \"libc::kill\" },\n  { path = \"libc::killpg\" },\n]\n",
+        "disallowed-methods = [\n  { path = \"secrecy::ExposeSecret::expose_secret\" },\n  { path = \"secrecy::ExposeSecretMut::expose_secret_mut\" },\n  { path = \"libc::kill\" },\n  { path = \"libc::killpg\" },\n  { path = \"envcloak_sys::signal_process\" },\n  { path = \"envcloak_sys::signal_group\" },\n]\n",
     );
     write(
         &r,
@@ -944,6 +944,8 @@ fn the_clippy_cfg_fails() {
 }
 
 /// M2 plan D-34: clippy.toml forbids `libc::kill` and `libc::killpg` too,
+/// and EnvCloak's own numeric wrappers around them
+/// (`envcloak_sys::signal_process`, `signal_group`),
 /// and only files on security/signal-allowlist.txt (which must exist, and
 /// whose entries must) may allow `disallowed_methods` for them; a file on
 /// that list alone still may not name `expose_secret`, so the two lists
@@ -952,7 +954,12 @@ fn the_clippy_cfg_fails() {
 #[test]
 fn signal_calls_are_allowed_only_on_the_signal_list() {
     assert_passes(&clean_tree());
-    for missing in ["libc::kill\" }", "libc::killpg\" }"] {
+    for missing in [
+        "libc::kill\" }",
+        "libc::killpg\" }",
+        "envcloak_sys::signal_process\" }",
+        "envcloak_sys::signal_group\" }",
+    ] {
         let t = clean_tree();
         let path = t.home().join("clippy.toml");
         let text = std::fs::read_to_string(&path).unwrap();

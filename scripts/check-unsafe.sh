@@ -14,9 +14,11 @@
 #    - no package has a build script, is a proc-macro crate or points a
 #      target at a file that is not a `.rs` file inside it; no manifest sets
 #      rustflags, [patch] or [replace]; and the tree holds no cargo config.
-# 2. clippy.toml forbids secrecy's expose_secret methods and `libc::kill`
-#    and `libc::killpg` (M2 plan D-34: signals go only through an owned
-#    handle, envcloak-sys/src/owned.rs), and no other clippy config exists.
+# 2. clippy.toml forbids secrecy's expose_secret methods, `libc::kill`
+#    and `libc::killpg`, and EnvCloak's numeric wrappers around them,
+#    `envcloak_sys::signal_process` and `signal_group` (M2 plan D-34:
+#    signals go only through an owned handle, envcloak-sys/src/owned.rs),
+#    and no other clippy config exists.
 #    `disallowed_methods` may be allowed only in files listed in
 #    security/expose-allowlist.txt or security/signal-allowlist.txt (whose
 #    entries must exist), and those files may not declare out-of-line
@@ -114,7 +116,12 @@ SYS = "crates/envcloak-sys/Cargo.toml"
 TOOLS = ("rust", "clippy", "rustdoc")
 LEVELS = ("allow", "warn", "deny", "forbid")
 EXPOSE = ("secrecy::ExposeSecret::expose_secret", "secrecy::ExposeSecretMut::expose_secret_mut")
-SIGNALS = ("libc::kill", "libc::killpg")
+SIGNALS = (
+    "libc::kill",
+    "libc::killpg",
+    "envcloak_sys::signal_process",
+    "envcloak_sys::signal_group",
+)
 TARGETS = ("lib", "bin", "test", "bench", "example")
 CANARIES = {"envcloak-lint-canary": "security/lint-canary", "envcloak-unsafe-canary": "security/unsafe-canary"}
 DEPS = ("dependencies", "dev-dependencies", "dev_dependencies", "build-dependencies", "build_dependencies")
