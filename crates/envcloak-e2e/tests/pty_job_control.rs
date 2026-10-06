@@ -721,10 +721,9 @@ fn suspend_and_resume(
 }
 
 /// What `/bin/cat`, continued by `fg` inside a read of its terminal, does
-/// next: nothing is typed for a second, its chance to fail (macOS's ends
-/// with "Interrupted system call", as M2-17 measured; a line typed before
-/// it is continued would be read instead, so the baseline and the run
-/// under EnvCloak are given the same chance); then, if it is still there,
+/// next: nothing is typed for a second, its chance to exit with EINTR on
+/// macOS if the stop interrupted its read. A stop between reads may leave
+/// it reading on. Each run is observed independently; if it is still there,
 /// `line` must round-trip (the echo and the copy). Returns whether it read
 /// on.
 fn cat_after_fg(sh: &mut Shell, line: &str) -> bool {
@@ -752,7 +751,7 @@ fn cat_after_fg(sh: &mut Shell, line: &str) -> bool {
 /// dash the terminal is left raw, so `stty -g` at its prompt never runs;
 /// bash puts its own settings back when a job stops and cannot show it);
 /// the outer terminal restored on an outside SIGTSTP without the command
-/// stopped first (the ticker runs while the prompt is back); the PTY
+/// stopped first (the ticker is running at the actual restore barrier); the PTY
 /// redactor without the CR LF forms (the PEM-shaped value shows).
 #[test]
 fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pty() {
@@ -843,7 +842,7 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     sh.outer
         .expect_since(mark, b"env-one", 2, "a line round-trips through cat");
     suspend_and_resume(&mut sh, &files, &before, (0x1a, None), "/bin/cat");
-    // BSD cat may either retry or end with EINTR, depending on whether
+    // BSD cat may either read on or end with EINTR, depending on whether
     // the stop interrupted read. The baseline records an observation,
     // not an oracle for that scheduling choice. The retrying cat below
     // must always complete the post-fg round trip on both systems.
@@ -1036,9 +1035,12 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     let made = Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap();
     assert!(made.success());
     let ticks = files.join("ticks");
+    let restored = files.join("restore-checked");
+    let before_tstp = sh.outer.settings();
     let mark = sh.mark();
     let mut line = format!(
-        "{} {} {} {} run --pty --",
+        "ENVCLOAK_TEST_PAUSE=termios.restored ENVCLOAK_TEST_PAUSE_RELEASE={} {} {} {} {} run --pty --",
+        quoted(restored.to_str().unwrap()),
         quoted(&py),
         quoted(&signaller),
         quoted(fifo.to_str().unwrap()),
@@ -1062,12 +1064,37 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         sh.outer.wait_for_within(DEADLINE, |_| lines(&ticks) >= 3),
         "the ticker does not tick"
     );
+    assert!(!state_of(pid).starts_with('T'), "the ticker starts running");
     std::fs::OpenOptions::new()
         .write(true)
         .open(&fifo)
         .unwrap()
         .write_all(b"TSTP\n")
         .unwrap();
+    sh.outer.expect_since(
+        mark,
+        b"envcloak test: paused at termios.restored",
+        1,
+        "the actual outer-terminal restore",
+    );
+    // The barrier is inside TerminalGuard::restore, after tcsetattr. It
+    // catches an early restore through either relay call site, before a
+    // later Suspend or Stopped report can hide the wrong ordering.
+    let at_restore = state_of(pid);
+    let settings_restored = sh.outer.settings().same_as(&before_tstp);
+    std::fs::write(&restored, b"").unwrap();
+    assert!(
+        at_restore.starts_with('T'),
+        "the command ran at the actual terminal restore: state {at_restore:?}"
+    );
+    assert!(
+        settings_restored,
+        "the restore barrier precedes restored settings"
+    );
+    println!(
+        "outside SIGTSTP ({}): command {at_restore:?}, terminal restored at the restore barrier",
+        std::env::consts::OS
+    );
     sh.prompt_again("SIGTSTP from outside gave the shell its prompt");
     let state = state_of(pid);
     assert!(

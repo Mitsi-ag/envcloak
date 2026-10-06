@@ -621,7 +621,11 @@ impl TerminalGuard {
     /// # Errors
     /// When the settings cannot be changed.
     pub fn restore(&self) -> io::Result<()> {
-        set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0)
+        set(self.fd.as_raw_fd(), libc::TCSAFLUSH, &self.saved.0)?;
+        // Observe the command at the actual restore, before the caller
+        // can issue a later stop that hides an ordering error. Test only.
+        crate::pause_point("termios.restored");
+        Ok(())
     }
 
     /// Waits until this job owns the foreground, then reads the terminal's
