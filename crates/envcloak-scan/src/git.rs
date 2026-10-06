@@ -36,19 +36,19 @@ struct GitLocation {
 }
 
 // Do not interpret Git's pointer-file grammar here. Any nonempty pointer is
-// conservatively partial, even when its target might stay inside this root.
+// refused, even when its target might stay inside this root.
 // This also covers transitive alternates and common stores beyond that pointer.
-fn note_pointer(
+fn refuse_pointer(
     repo: &ScanRoot,
     dir: &File,
     name: &str,
     reason: &'static str,
     source: &Source,
     report: &mut StreamReport,
-) -> Result<(), ScanErrorKind> {
+) -> Result<bool, ScanErrorKind> {
     let (_, metadata) = match crate::root::open_file(dir, OsStr::new(name), crate::MAX_DOTENV) {
         Ok(file) => file,
-        Err(ScanErrorKind::NotFound) => return Ok(()),
+        Err(ScanErrorKind::NotFound) => return Ok(false),
         Err(e) => return Err(e),
     };
     if metadata.dev() != repo.dev() {
@@ -60,14 +60,14 @@ fn note_pointer(
     if metadata.len() != 0 {
         report.issue(source, reason);
     }
-    Ok(())
+    Ok(metadata.len() != 0)
 }
 
 fn git_location(
     repo: &ScanRoot,
     source: &Source,
     report: &mut StreamReport,
-) -> Result<GitLocation, ScanErrorKind> {
+) -> Result<Option<GitLocation>, ScanErrorKind> {
     // Open first, then inspect that descriptor. A kind-only preflight would
     // leave Git free to follow a replaced .git pathname after inspection.
     let dir = match envcloak_sys::open_beneath(repo.dir(), OsStr::new(".git")) {
@@ -88,16 +88,10 @@ fn git_location(
                 if metadata.nlink() > 1 {
                     report.issue(source, "hard_link");
                 }
-                // Gitfiles include real linked worktrees. Keep their findings,
-                // but never imply their stores are confined to the held root.
+                // A gitfile delegates path resolution to Git and drops the
+                // inspected descriptor. Refuse it before any child can read.
                 report.issue(source, "gitfile_indirection");
-                return Ok(GitLocation {
-                    dir: repo
-                        .dir()
-                        .try_clone()
-                        .map_err(|e| crate::root::io_kind(&e))?,
-                    git_dir: ".git",
-                });
+                return Ok(None);
             } else {
                 return Err(ScanErrorKind::NotRegular);
             }
@@ -108,17 +102,102 @@ fn git_location(
             .map_err(|e| crate::root::io_kind(&e))?,
         Err(e) => return Err(crate::root::io_kind(&e)),
     };
-    note_pointer(repo, &dir, "commondir", "git_common_dir", source, report)?;
+    if refuse_pointer(repo, &dir, "commondir", "git_common_dir", source, report)? {
+        return Ok(None);
+    }
     match repo.open_subdir(&dir, OsStr::new("objects")) {
-        Ok(objects) => match repo.open_subdir(&objects, OsStr::new("info")) {
-            Ok(info) => note_pointer(repo, &info, "alternates", "git_alternates", source, report)?,
-            Err(ScanErrorKind::NotFound) => {}
-            Err(e) => return Err(e),
-        },
+        Ok(objects) => {
+            match repo.open_subdir(&objects, OsStr::new("info")) {
+                Ok(info) => {
+                    if refuse_pointer(repo, &info, "alternates", "git_alternates", source, report)?
+                    {
+                        return Ok(None);
+                    }
+                }
+                Err(ScanErrorKind::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+            let mut remaining = envcloak_sys::MAX_DIR_ENTRIES;
+            inspect_objects(
+                repo,
+                &objects,
+                ObjectDir::Root,
+                &mut remaining,
+                source,
+                report,
+            )?;
+        }
         Err(ScanErrorKind::NotFound) => {}
         Err(e) => return Err(e),
     }
-    Ok(GitLocation { dir, git_dir: "." })
+    Ok(Some(GitLocation { dir, git_dir: "." }))
+}
+
+enum ObjectDir {
+    Root,
+    Info,
+    Files,
+}
+
+// Git reads pack files, loose-object fanouts and info metadata by pathname.
+// Inspect every entry through held directory descriptors, including unknown
+// entry kinds, before allowing that traversal. Bound the whole walk as well as
+// each listing so many small directories cannot evade the metadata cap.
+fn inspect_objects(
+    repo: &ScanRoot,
+    dir: &File,
+    layout: ObjectDir,
+    remaining: &mut usize,
+    source: &Source,
+    report: &mut StreamReport,
+) -> Result<(), ScanErrorKind> {
+    let entries = envcloak_sys::list_dir(dir, (*remaining).min(envcloak_sys::MAX_DIR_ENTRIES))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::OutOfMemory {
+                ScanErrorKind::TooManyEntries
+            } else {
+                crate::root::io_kind(&e)
+            }
+        })?;
+    *remaining = remaining
+        .checked_sub(entries.len())
+        .ok_or(ScanErrorKind::TooManyEntries)?;
+    for entry in entries {
+        let file =
+            envcloak_sys::open_beneath(dir, &entry.name).map_err(|e| crate::root::io_kind(&e))?;
+        let metadata = file.metadata().map_err(|e| crate::root::io_kind(&e))?;
+        check_store_metadata(&metadata, repo.dev(), envcloak_sys::effective_uid())?;
+        if metadata.is_dir() {
+            // The only nested directory Git uses here is info/commit-graphs.
+            // A directory in a fanout or pack file's place is not an object.
+            let next = match layout {
+                ObjectDir::Root if entry.name == "info" => ObjectDir::Info,
+                ObjectDir::Root => ObjectDir::Files,
+                ObjectDir::Info if entry.name == "commit-graphs" => ObjectDir::Files,
+                _ => return Err(ScanErrorKind::NotRegular),
+            };
+            inspect_objects(repo, &file, next, remaining, source, report)?;
+        } else if !metadata.is_file() {
+            return Err(ScanErrorKind::NotRegular);
+        } else if metadata.nlink() > 1 {
+            report.issue(source, "hard_link");
+        }
+    }
+    Ok(())
+}
+
+fn check_store_metadata(
+    metadata: &std::fs::Metadata,
+    device: u64,
+    owner: u32,
+) -> Result<(), ScanErrorKind> {
+    if metadata.dev() != device {
+        return Err(ScanErrorKind::MountPoint);
+    }
+    if metadata.uid() != owner {
+        return Err(ScanErrorKind::NotOwned);
+    }
+    Ok(())
 }
 
 /// Scan the object database, including blobs no longer present in HEAD.
@@ -134,7 +213,8 @@ pub fn scan_git_history(
     };
     let mut report = StreamReport::default();
     let location = match git_location(repo, &source, &mut report) {
-        Ok(location) => location,
+        Ok(Some(location)) => location,
+        Ok(None) => return Ok(report),
         Err(e) => {
             report.issue(&source, e.token());
             return Ok(report);
@@ -366,7 +446,9 @@ mod tests {
             object: None,
         };
         let mut report = StreamReport::default();
-        let location = git_location(&root, &source, &mut report).expect("location");
+        let location = git_location(&root, &source, &mut report)
+            .expect("location")
+            .expect("confined store");
         // This is the exact boundary between selecting the directory and
         // starting the child. No scheduling delay is needed for the gate.
         std::fs::rename(project.join(".git"), d.path().join("held")).expect("move");
@@ -383,5 +465,90 @@ mod tests {
         .expect("scan");
         assert!(report.complete(), "{report:?}");
         assert!(found, "held Git directory was not scanned");
+    }
+    #[test]
+    fn prepared_git_directory_survives_gitfile_replacement() {
+        let d = tempfile::tempdir_in("/tmp").expect("temporary root");
+        let project = d.path().join("project");
+        let other = d.path().join("other");
+        repository(&project, b"fixtureZheldGitDirectory");
+        repository(&other, b"fixtureZreplacedGitDirectory");
+        let root = crate::open_root(&project).expect("root");
+        let source = Source {
+            path: root.path().to_path_buf(),
+            object: None,
+        };
+        let mut report = StreamReport::default();
+        let location = git_location(&root, &source, &mut report)
+            .expect("location")
+            .expect("confined store");
+        // This is the exact boundary between selecting the directory and
+        // starting the child. No scheduling delay is needed for the gate.
+        std::fs::rename(project.join(".git"), d.path().join("held")).expect("move");
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", other.join(".git").display()),
+        )
+        .expect("gitfile");
+        let mut found = false;
+        let report = scan_location(location, source, Budget::default(), report, &mut |c| {
+            assert!(
+                !c.value.ct_eq(b"fixtureZreplacedGitDirectory"),
+                "reopened Git directory"
+            );
+            found |= c.value.ct_eq(b"fixtureZheldGitDirectory");
+            true
+        })
+        .expect("scan");
+        assert!(report.complete(), "{report:?}");
+        assert!(found, "held Git directory was not scanned");
+    }
+    #[test]
+    fn git_store_metadata_requires_the_same_device_and_owner() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        let file = File::create(d.path().join("file")).expect("file");
+        let metadata = file.metadata().expect("metadata");
+        assert_eq!(
+            check_store_metadata(&metadata, metadata.dev(), metadata.uid()),
+            Ok(())
+        );
+        // Recording models avoid privileged chown or a real mount on the host.
+        assert_eq!(
+            check_store_metadata(&metadata, metadata.dev() ^ 1, metadata.uid()),
+            Err(ScanErrorKind::MountPoint)
+        );
+        assert_eq!(
+            check_store_metadata(&metadata, metadata.dev(), metadata.uid() ^ 1),
+            Err(ScanErrorKind::NotOwned)
+        );
+    }
+
+    #[test]
+    fn git_store_entry_limit_covers_all_directories() {
+        let d = tempfile::tempdir_in("/tmp").expect("fixture");
+        for fanout in ["aa", "bb"] {
+            std::fs::create_dir(d.path().join(fanout)).expect("fanout");
+            std::fs::write(d.path().join(fanout).join("object"), b"").expect("object");
+        }
+        let root = crate::open_root(d.path()).expect("root");
+        let source = Source::default();
+        for cap in [3, 4] {
+            let result = inspect_objects(
+                &root,
+                root.dir(),
+                ObjectDir::Root,
+                &mut { cap },
+                &source,
+                &mut StreamReport::default(),
+            );
+            assert_eq!(
+                result,
+                if cap == 4 {
+                    Ok(())
+                } else {
+                    Err(ScanErrorKind::TooManyEntries)
+                }
+            );
+        }
     }
 }
