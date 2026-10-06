@@ -26,6 +26,7 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
         inputs.push((
             SecretBytes::from_vec(format!("A='{}'\n", c.as_str()).into_bytes()),
             0,
+            true,
         ));
         inputs.push((
             SecretBytes::from_vec(
@@ -33,48 +34,67 @@ fn three_parsers_leave_no_fixture_in_freed_memory() {
                     .into_bytes(),
             ),
             1,
+            true,
         ));
         inputs.push((
             SecretBytes::from_vec(format!("[mcp_servers.s.env]\nA={escaped}\n").into_bytes()),
             2,
+            true,
         ));
         inputs.push((
             SecretBytes::from_vec(format!("{{\"text\":{escaped}}}\n").into_bytes()),
             3,
+            c.as_str().chars().count() >= 16,
         ));
         inputs.push((
             SecretBytes::from_vec(format!("{{\"text\":{escaped},BROKEN").into_bytes()),
             1,
+            false,
         ));
         inputs.push((
             SecretBytes::from_vec(format!("[mcp_servers.s.env]\nA={escaped}\nBROKEN").into_bytes()),
             2,
+            false,
         ));
     }
     for mode in [ProbeMode::Unwiped, ProbeMode::Wiping] {
         let session = probe_canaries(&cs, mode);
-        for (input, format) in &inputs {
+        for (input, format, valid) in &inputs {
             if mode == ProbeMode::Unwiped && *format == 2 {
                 continue;
             }
             match format {
-                0 => drop(parse_profile(input, Shell::Posix)),
-                1 => drop(parse_config(input, ConfigFormat::Json)),
-                2 => drop(parse_config(input, ConfigFormat::Toml)),
+                0..=2 => {
+                    let parsed = match format {
+                        0 => parse_profile(input, Shell::Posix),
+                        1 => parse_config(input, ConfigFormat::Json),
+                        _ => parse_config(input, ConfigFormat::Toml),
+                    };
+                    assert_eq!(parsed.complete(), *valid);
+                    if *valid {
+                        assert!(!parsed.findings.is_empty(), "parser was not exercised");
+                    }
+                    drop(parsed);
+                }
                 _ => {
                     use secrecy::ExposeSecret;
                     #[allow(clippy::disallowed_methods)]
                     let bytes = input.expose_secret();
-                    drop(
-                        scan_reader(
-                            &mut std::io::Cursor::new(bytes),
-                            ConfigFormat::Jsonl,
-                            Default::default(),
-                            Budget::default(),
-                            &mut |_| true,
-                        )
-                        .unwrap(),
-                    );
+                    let mut matched = false;
+                    let report = scan_reader(
+                        &mut std::io::Cursor::new(bytes),
+                        ConfigFormat::Jsonl,
+                        Default::default(),
+                        Budget::default(),
+                        &mut |c| {
+                            matched |= cs.iter().any(|v| c.value.ct_eq(v.value()));
+                            true
+                        },
+                    )
+                    .unwrap();
+                    assert!(report.complete());
+                    assert_eq!(matched, *valid, "transcript candidate eligibility");
+                    drop(report);
                 }
             }
         }
