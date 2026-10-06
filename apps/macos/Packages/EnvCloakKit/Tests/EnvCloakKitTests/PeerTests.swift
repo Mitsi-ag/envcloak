@@ -200,7 +200,7 @@ final class PeerTests: XCTestCase, @unchecked Sendable {
     }
 
     func testGate20And21UIDCallSiteRefusesBeforeSending() async throws {
-        try await refusedBeforeSending(.daemonUnverified(.peerUID), hooks: PeerTestHooks(peerUID: geteuid() + 1))
+        try await refusedBeforeSending(.daemonUnverified(.peerUID), hooks: PeerTestHooks(peerUID: geteuid() + 1), method: Status())
     }
 
     func testGate20And21EveryNodeRuleRefusesBeforeSending() async throws {
@@ -218,7 +218,7 @@ final class PeerTests: XCTestCase, @unchecked Sendable {
         for (node, check, alter) in cases {
             try await refusedBeforeSending(.daemonUnverified(check), hooks: PeerTestHooks(metadata: { kind, value in
                 if kind == node { alter(&value) }
-            }))
+            }), method: Status())
         }
     }
 
@@ -239,13 +239,13 @@ final class PeerTests: XCTestCase, @unchecked Sendable {
         }
     }
 
-    private func refusedBeforeSending(_ expected: EnvCloakError, hooks: PeerTestHooks) async throws {
+    private func refusedBeforeSending<M: DaemonMethod>(_ expected: EnvCloakError, hooks: PeerTestHooks, method: M) async throws {
         let root = try root()
         defer { try? FileManager.default.removeItem(atPath: root) }
         let daemon = try FakeDaemon(directory: root + "/run", handler: Self.rpcRefusal)
         defer { daemon.stop() }
         await PeerProbe.$hooks.withValue(hooks) {
-            do { _ = try await DaemonClient(directory: daemon.directory).call(Status()); XCTFail("unverified call succeeded") }
+            do { _ = try await DaemonClient(directory: daemon.directory, timeout: nil).call(method); XCTFail("unverified call succeeded") }
             catch { XCTAssertEqual(error as? EnvCloakError, expected) }
         }
         daemon.stop()
@@ -302,8 +302,10 @@ final class PeerTests: XCTestCase, @unchecked Sendable {
 
     func testConnectTimeoutIsUnavailableAndSendsNothing() async throws {
         let clock = TestClock()
-        try await refusedBeforeSending(.daemonUnavailable, hooks: PeerTestHooks(
-            afterConnect: { clock.advance(.seconds(11)) }, now: { clock.now }))
+        let hooks = PeerTestHooks(afterConnect: { clock.advance(.seconds(11)) }, now: { clock.now })
+        try await refusedBeforeSending(.daemonUnavailable, hooks: hooks, method: Status())
+        try await refusedBeforeSending(.daemonUnavailable, hooks: hooks, method: AuditVerify())
+        try await refusedBeforeSending(.daemonUnavailable, hooks: hooks, method: BackupCreate())
         for code in [ENOENT, ECONNREFUSED, ETIMEDOUT] {
             XCTAssertEqual(Peer.failure(.socketType, code: code), .daemonUnavailable)
         }
