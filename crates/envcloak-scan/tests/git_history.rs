@@ -293,3 +293,43 @@ fn explicit_bare_repository_still_scans() {
     assert!(report.complete(), "{report:?}");
     assert!(found);
 }
+
+#[test]
+fn linked_worktree_uses_its_explicit_git_file() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    git(d.path(), &["init", "-q"]);
+    git(
+        d.path(),
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "fixture",
+        ],
+    );
+    object(d.path(), "blob", b"fixtureZlinkedWorktreeValue");
+    let linked = d.path().join("linked");
+    git(
+        d.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert!(linked.join(".git").is_file());
+    let mut found = false;
+    let report = scan_git_history(&open_root(&linked).unwrap(), Budget::default(), &mut |c| {
+        found |= c.value.ct_eq(b"fixtureZlinkedWorktreeValue");
+        true
+    })
+    .unwrap();
+    assert!(report.complete(), "{report:?}");
+    assert!(found);
+}

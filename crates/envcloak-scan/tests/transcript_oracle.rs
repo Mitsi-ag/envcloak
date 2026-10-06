@@ -74,6 +74,7 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
             assert!(report.complete() && !set.limited());
             let mut spans = Spans::new();
             let mut distinct = 0;
+            let mut matching_occurrences = 0;
             for entry in set.entries() {
                 let digest = Sha256::digest(entry.value.expose_secret())
                     .iter()
@@ -84,6 +85,7 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
                 }
                 distinct += 1;
                 for o in &entry.occurrences {
+                    matching_occurrences += 1;
                     let form = match o.encoding {
                         Encoding::Raw | Encoding::Json => "raw",
                         Encoding::Base64 => "base64",
@@ -99,13 +101,17 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
                     spans.insert((o.range.start, o.range.end, form.to_owned(), digest.clone()));
                 }
             }
-            observed.insert(case["id"].as_str().unwrap().to_owned(), (distinct, spans));
+            observed.insert(
+                case["id"].as_str().unwrap().to_owned(),
+                (distinct, matching_occurrences, spans),
+            );
         }
         let expected: serde_json::Value =
             serde_json::from_slice(&std::fs::read(d.path().join("expected.json")).unwrap())
                 .unwrap();
         for case in expected["cases"].as_array().unwrap() {
-            let (distinct, spans) = observed.remove(case["id"].as_str().unwrap()).unwrap();
+            let (distinct, matching_occurrences, spans) =
+                observed.remove(case["id"].as_str().unwrap()).unwrap();
             let wanted = case["occurrences"]
                 .as_array()
                 .unwrap()
@@ -120,7 +126,11 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
                 })
                 .collect::<Spans>();
             assert_eq!(distinct, case["distinct"].as_u64().unwrap() as usize);
-            assert_eq!(spans.len(), case["count"].as_u64().unwrap() as usize);
+            assert_eq!(
+                matching_occurrences,
+                case["count"].as_u64().unwrap() as usize
+            );
+            assert_eq!(spans.len(), matching_occurrences);
             assert!(spans == wanted, "independent ranges differ");
         }
         assert!(observed.is_empty());
