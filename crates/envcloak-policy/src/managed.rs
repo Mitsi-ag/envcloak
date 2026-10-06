@@ -60,8 +60,11 @@ pub const PASSTHROUGH: [&str; 6] = ["HOME", "USER", "LOGNAME", "LANG", "TZ", "TM
 /// ([`is_code_selecting`]). Beyond SPEC's list, each interpreter of
 /// [`INTERPRETERS`] has its own here: a module or library path, a file run
 /// at start, a debugger, an ini or gem directory, a cache of compiled code,
-/// a configuration directory a shell reads.
-pub const CODE_SELECTING: [&str; 39] = [
+/// a configuration directory a shell reads. And the variables that name a
+/// native library or plug-in a program loads by its own choice (OpenSSL's
+/// configuration and its engines and providers, GIO, Qt, GStreamer and GTK
+/// modules): a `bound` server would load what they name.
+pub const CODE_SELECTING: &[&str] = &[
     "NODE_OPTIONS",
     "NODE_PATH",
     "npm_config_node_options",
@@ -101,6 +104,40 @@ pub const CODE_SELECTING: [&str; 39] = [
     "GCONV_PATH",
     "LUA_INIT",
     "LUA_PATH",
+    "OPENSSL_CONF",
+    "OPENSSL_ENGINES",
+    "OPENSSL_MODULES",
+    "GIO_MODULE_DIR",
+    "GIO_EXTRA_MODULES",
+    "QT_PLUGIN_PATH",
+    "GST_PLUGIN_PATH",
+    "GST_PLUGIN_SYSTEM_PATH",
+    "GTK_PATH",
+    "GTK_MODULES",
+    "R_PROFILE",
+    "R_PROFILE_USER",
+    "R_ENVIRON",
+    "R_ENVIRON_USER",
+    "R_LIBS",
+    "R_LIBS_USER",
+    "JULIA_LOAD_PATH",
+    "JULIA_DEPOT_PATH",
+    "JULIA_PROJECT",
+    "ERL_LIBS",
+    "ERL_FLAGS",
+    "ERL_AFLAGS",
+    "ERL_ZFLAGS",
+    "ELIXIR_ERL_OPTIONS",
+    "TCLLIBPATH",
+    "RAKULIB",
+    "PERL6LIB",
+    "GUILE_LOAD_PATH",
+    "GUILE_LOAD_COMPILED_PATH",
+    "PLTCOLLECTS",
+    "PLTUSERHOME",
+    "PSModulePath",
+    "AWKPATH",
+    "MAKEFILES",
 ];
 
 /// The prefixes of the dynamic loaders' variables, every one of which
@@ -128,32 +165,71 @@ pub fn is_code_selecting(name: &str) -> bool {
 /// too, so none passes as a native program running code nothing checks).
 /// [`VERSIONED`] ones count with a version after the name (`python3.12`,
 /// `node22`, `ruby3.2`, `perl5.34`).
-pub const INTERPRETERS: [&str; 17] = [
-    "node", "nodejs", "python", "pypy", "bun", "deno", "ruby", "perl", "php", "lua", "sh", "bash",
-    "dash", "zsh", "ksh", "mksh", "fish",
+///
+/// Beyond SPEC's list, the other common programs that run a script file
+/// their first argument names (`Rscript`, `julia`, `tclsh`, `pwsh`,
+/// `osascript`, `swift` and the rest): classed as interpreters, each runs
+/// as a `script` launch whose entry file is checked, never as a native
+/// program whose class would bind it.
+pub const INTERPRETERS: &[&str] = &[
+    "node",
+    "nodejs",
+    "python",
+    "pypy",
+    "bun",
+    "deno",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "luajit",
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "ksh",
+    "mksh",
+    "fish",
+    "Rscript",
+    "julia",
+    "tclsh",
+    "wish",
+    "pwsh",
+    "raku",
+    "rakudo",
+    "guile",
+    "racket",
+    "elixir",
+    "escript",
+    "osascript",
+    "swift",
 ];
 
 /// The interpreters known by their name with a version after it.
-const VERSIONED: [&str; 10] = [
-    "node", "nodejs", "python", "pypy", "bun", "deno", "ruby", "perl", "php", "lua",
+const VERSIONED: &[&str] = &[
+    "node", "nodejs", "python", "pypy", "bun", "deno", "ruby", "perl", "php", "lua", "tclsh",
+    "wish", "guile",
 ];
 
 /// The launchers whose code is chosen when they start, from a package, a
 /// project, an image or a class path that EnvCloak does not check: each is
 /// a package runner in any form (`uv run`, `uv --directory d run`, `npm
 /// start`, `docker run`, `java -jar`), checked at rest, its label naming
-/// the form.
-pub const PACKAGE_RUNNERS: [&str; 24] = [
+/// the form. The programs whose arguments name the code they run in a way
+/// EnvCloak does not read (an `awk` program or its `-f` files, a `make`
+/// target, an `erl` module, `R CMD`) are classed with them: their code is
+/// checked at rest, never bound.
+pub const PACKAGE_RUNNERS: &[&str] = &[
     "npx", "pnpx", "bunx", "uvx", "pipx", "uv", "npm", "pnpm", "yarn", "poetry", "pdm", "hatch",
     "pipenv", "rye", "conda", "mamba", "docker", "podman", "nerdctl", "java", "go", "cargo",
-    "dotnet", "mvn",
+    "dotnet", "mvn", "awk", "gawk", "mawk", "nawk", "make", "gmake", "erl", "R",
 ];
 
 /// The programs that start another one their arguments name, with
 /// arguments or an environment of their own (`env FOO=1 node x.js`,
 /// `nice node x.js`), and the dynamic loaders run as programs: what they
 /// start could not be checked, so a declaration naming one is refused.
-pub const WRAPPERS: [&str; 22] = [
+pub const WRAPPERS: &[&str] = &[
     "env",
     "nice",
     "nohup",
@@ -176,6 +252,7 @@ pub const WRAPPERS: [&str; 22] = [
     "chroot",
     "script",
     "dyld",
+    "busybox",
 ];
 
 /// Whether `name` is a dynamic loader's file run as a program (`ld.so`,
@@ -202,11 +279,29 @@ const CODE_LOADING_SHORT: [char; 8] = ['e', 'E', 'c', 'm', 'M', 'r', 'I', 'p'];
 /// or take it from elsewhere besides [`CODE_LOADING_SHORT`]: an
 /// interactive session or commands from standard input (`-i`, `sh -s`),
 /// a debugger or an ini setting (`perl -d:Mod`, `php -d`), a library
-/// (`lua -l`), an extension (`php -z`), resolution conditions (`node -C`).
-/// Some are harmless to one interpreter and load code in another; each is
-/// refused for all.
-const INTERPRETER_LOADING_SHORT: [char; 6] = ['i', 's', 'd', 'l', 'z', 'C'];
-const CODE_LOADING_LONG: [&str; 23] = [
+/// (`lua -l`), an extension (`php -z`), resolution conditions (`node -C`),
+/// a file loaded first or a library directory (`julia -L`, `guile -L`,
+/// `swift -L`). Some are harmless to one interpreter and load code in
+/// another; each is refused for all.
+const INTERPRETER_LOADING_SHORT: [char; 7] = ['i', 's', 'd', 'l', 'z', 'C', 'L'];
+
+/// The short options of one interpreter family that load code besides
+/// [`CODE_LOADING_SHORT`] and [`INTERPRETER_LOADING_SHORT`]: a system
+/// image (`julia -J`), a file required or loaded (`racket -t`, `-f`,
+/// `-u`, `-k`), a script found on `PATH` (`elixir -S`), a framework
+/// directory (`swift -F`), an extension (`guile -x`).
+fn stem_loading_short(stem: &str) -> &'static [char] {
+    match stem {
+        "julia" => &['J'],
+        "racket" => &['t', 'f', 'u', 'k'],
+        "elixir" => &['S'],
+        "swift" => &['F'],
+        "guile" => &['x'],
+        _ => &[],
+    }
+}
+
+const CODE_LOADING_LONG: [&str; 30] = [
     "--inspect",
     "--inspect-brk",
     "--inspect-wait",
@@ -230,7 +325,42 @@ const CODE_LOADING_LONG: [&str; 23] = [
     "--rcfile",
     "--init-file",
     "--experimental-policy",
+    "--snapshot-blob",
+    "--build-snapshot",
+    "--openssl-config",
+    "--experimental-sea-config",
+    "--run",
+    "--test",
+    "--watch-path",
 ];
+
+/// The long interpreter options that take a value attached with `=` and
+/// load no code (`node --max-old-space-size=512`, `deno run
+/// --allow-net=host`, `ruby --encoding=utf-8`). Any other long option
+/// with `=value` is refused as one that may load code: which options of
+/// which interpreter read a file of code (`node --snapshot-blob=`,
+/// `--openssl-config=`) is not a list EnvCloak can keep complete, so the
+/// list kept is of the harmless ones.
+const VALUE_LONG: [&str; 14] = [
+    "--max-old-space-size",
+    "--max-semi-space-size",
+    "--stack-size",
+    "--title",
+    "--unhandled-rejections",
+    "--dns-result-order",
+    "--max-http-header-size",
+    "--stack-trace-limit",
+    "--encoding",
+    "--external-encoding",
+    "--internal-encoding",
+    "--threads",
+    "--optimize",
+    "--color",
+];
+
+/// The prefixes of long interpreter options that may take a value with
+/// `=` and load no code (deno's permission flags: `--allow-net=host`).
+const VALUE_LONG_PREFIXES: [&str; 2] = ["--allow-", "--deny-"];
 
 /// The long interpreter options that take no value, and so may stand
 /// before the entry file without `=`. Any other long option without `=`
@@ -271,6 +401,7 @@ fn value_short(stem: &str) -> &'static [char] {
         "ruby" => &['F', 'K', 'T'],
         "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish" => &['o', 'O'],
         "php" => &['f', 't'],
+        "julia" => &['t', 'p', 'O', 'g'],
         _ => &[],
     }
 }
@@ -290,8 +421,10 @@ pub fn is_code_loading_option(arg: &str) -> bool {
 }
 
 /// One option of interpreter family `stem` before its entry file: an
-/// error when it loads code ([`is_code_loading_option`], or a short one of
-/// [`INTERPRETER_LOADING_SHORT`] in its cluster before any value), or when
+/// error when it loads code ([`is_code_loading_option`], a short one of
+/// [`INTERPRETER_LOADING_SHORT`] or [`stem_loading_short`] in its cluster
+/// before any value, or a long one with `=value` not of [`VALUE_LONG`]), or
+/// when
 /// it may take the next argument as its value (a short one of
 /// [`value_short`] ending its cluster, a long one without `=` that is not
 /// known to take none): which argument is the entry file is then not
@@ -302,19 +435,26 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
         if is_code_loading_option(arg) {
             return loads;
         }
-        if arg.contains('=')
-            || BOOLEAN_LONG.contains(&arg)
-            || BOOLEAN_LONG_PREFIXES.iter().any(|p| arg.starts_with(p))
-        {
+        if let Some((name, _)) = arg.split_once('=') {
+            // A value attached: only to an option known to load nothing.
+            let known = VALUE_LONG.contains(&name)
+                || VALUE_LONG_PREFIXES.iter().any(|p| name.starts_with(p));
+            return if known { Ok(()) } else { loads };
+        }
+        if BOOLEAN_LONG.contains(&arg) || BOOLEAN_LONG_PREFIXES.iter().any(|p| arg.starts_with(p)) {
             return Ok(());
         }
         return Err(DeclError::NoEntry);
     }
     let cluster = arg.strip_prefix('-').unwrap_or(arg);
     let values = value_short(stem);
+    let own = stem_loading_short(stem);
     let mut letters = cluster.chars().peekable();
     while let Some(c) = letters.next() {
-        if CODE_LOADING_SHORT.contains(&c) || INTERPRETER_LOADING_SHORT.contains(&c) {
+        if CODE_LOADING_SHORT.contains(&c)
+            || INTERPRETER_LOADING_SHORT.contains(&c)
+            || own.contains(&c)
+        {
             return loads;
         }
         if values.contains(&c) {
@@ -546,6 +686,44 @@ pub fn refuse_disguised(argv: &[String], resolved: &str) -> Result<ArgvClass, De
         return Err(DeclError::Disguised);
     }
     Ok(own)
+}
+
+/// The argv the kernel would build for a `#!` file, made explicit so the
+/// interpreter the daemon checked is the one that runs: `interp` (as the
+/// `#!` line names it, or as `env` found it), the line's one option if
+/// any, the file `script` (its canonical path, the entry file checked) and
+/// the declaration's own arguments `args`. `resolved` is the interpreter's
+/// canonical path. The option is checked as the interpreter's own would
+/// be ([`classify_argv`]): one that loads code is
+/// [`DeclError::CodeSelecting`], and so is a line whose interpreter runs
+/// another program ([`DeclError::Wrapper`], [`DeclError::Disguised`]). The
+/// script must be the entry file that classification finds; an option
+/// that is not one, or any option to an interpreter EnvCloak does not
+/// know, leaves what runs unknown: [`DeclError::NoEntry`].
+///
+/// # Errors
+/// As above.
+pub fn shebang_argv(
+    interp: &str,
+    opt: Option<&str>,
+    script: &str,
+    args: &[String],
+    resolved: &str,
+) -> Result<Vec<String>, DeclError> {
+    if opt.is_some_and(|o| !o.starts_with('-') || o == "-" || o == "--") {
+        return Err(DeclError::NoEntry);
+    }
+    let mut argv = vec![interp.to_owned()];
+    argv.extend(opt.map(str::to_owned));
+    let at = argv.len();
+    argv.push(script.to_owned());
+    argv.extend(args.iter().cloned());
+    match refuse_disguised(&argv, resolved)? {
+        ArgvClass::Interpreter { entry } if entry == at => Ok(argv),
+        ArgvClass::Program if opt.is_none() => Ok(argv),
+        ArgvClass::PackageRunner { .. } => Err(DeclError::Wrapper),
+        _ => Err(DeclError::NoEntry),
+    }
 }
 
 fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
@@ -880,6 +1058,53 @@ pub fn bridge_binding_suffix(origin: &str) -> String {
         s.push_str(&format!("{b:02X}"));
     }
     s
+}
+
+/// The binding that carries header `header` of a bridged server at
+/// `origin` (D-18): the header's name upper-cased, each `-` written `_`,
+/// then [`bridge_binding_suffix`] (`Authorization` at an origin is
+/// `AUTHORIZATION_O<16 hex digits>`). This is how the relay knows which
+/// released value goes in which header, and it is fixed by the record's
+/// header names and origin alone. `None` for a header whose name is not
+/// made of ASCII letters, digits, `-` and `_`, or does not start with a
+/// letter: such a header cannot be bridged.
+pub fn bridge_binding_name(header: &str, origin: &str) -> Option<String> {
+    let first = header.chars().next()?;
+    if !first.is_ascii_alphabetic()
+        || !header
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let mut name: String = header
+        .chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_uppercase()
+            }
+        })
+        .collect();
+    name.push_str(&bridge_binding_suffix(origin));
+    EnvName::new(&name).ok().map(|_| name)
+}
+
+/// The header each binding of a bridged server goes in: for each of
+/// `header_names`, in order, the header and its binding
+/// ([`bridge_binding_name`]). `None` when a header cannot be bridged or two
+/// headers would share one binding (`X-Key` and `x_key`).
+pub fn bridge_headers(header_names: &[String], origin: &str) -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(header_names.len());
+    for h in header_names {
+        let b = bridge_binding_name(h, origin)?;
+        if out.iter().any(|(_, seen)| *seen == b) {
+            return None;
+        }
+        out.push((h.clone(), b));
+    }
+    Some(out)
 }
 
 /// SHA-256 of [`update_statement`].
@@ -1288,6 +1513,206 @@ mod tests {
         }
     }
 
+    /// The programs that run a script file their argument names are never
+    /// native (whose class would bind them while the script changes):
+    /// `Rscript`, `julia`, `tclsh`, `pwsh`, `osascript`, `swift` and the
+    /// rest are interpreters whose entry file is checked; `awk`, `make`,
+    /// `erl` and `R` are runners, checked at rest; `busybox` is a wrapper.
+    /// Each family's own code-loading options are refused (`julia -L`,
+    /// `racket -t`, `elixir -S`, `swift -F`). A long option with `=value`
+    /// registers only when it is known to load nothing: `node
+    /// --snapshot-blob=` and `--openssl-config=` restore or load code the
+    /// entry file does not name, and an unknown one may too. OpenSSL's
+    /// and the plug-in loaders' variables select code.
+    ///
+    /// Mutations checked: the interpreter list cut back to SPEC's
+    /// (`Rscript /srv/s.R` is a program, and this fails); any long option
+    /// with `=value` accepted (the previous rule: `node
+    /// --snapshot-blob=/x.blob /srv/s.js` registers with `/srv/s.js` as its
+    /// entry, and this fails); `OPENSSL_CONF` left out of `CODE_SELECTING`
+    /// (it registers, and this fails).
+    #[test]
+    fn script_running_programs_and_valued_options_are_never_bound() {
+        let c = |a: &[&str]| classify_argv(&a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        for argv in [
+            &["Rscript", "/srv/s.R"][..],
+            &["julia", "/srv/s.jl"],
+            &["tclsh", "/srv/s.tcl"],
+            &["tclsh8.6", "/srv/s.tcl"],
+            &["wish", "/srv/s.tcl"],
+            &["pwsh", "/srv/s.ps1"],
+            &["raku", "/srv/s.raku"],
+            &["guile", "/srv/s.scm"],
+            &["racket", "/srv/s.rkt"],
+            &["elixir", "/srv/s.exs"],
+            &["escript", "/srv/s.erl"],
+            &["osascript", "/srv/s.scpt"],
+            &["swift", "/srv/s.swift"],
+            &["luajit", "/srv/s.lua"],
+        ] {
+            assert_eq!(c(argv), Ok(ArgvClass::Interpreter { entry: 1 }), "{argv:?}");
+        }
+        for (argv, label) in [
+            (&["awk", "-f", "/srv/s.awk"][..], "awk /srv/s.awk"),
+            (&["gawk", "-f", "/srv/s.awk"], "gawk /srv/s.awk"),
+            (&["make", "serve"], "make serve"),
+            (&["erl", "-noshell", "-s", "server"], "erl server"),
+            (&["R", "-f", "/srv/s.R"], "R /srv/s.R"),
+        ] {
+            assert_eq!(
+                c(argv),
+                Ok(ArgvClass::PackageRunner {
+                    label: label.to_owned()
+                }),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(c(&["busybox", "sh", "/srv/s.sh"]), Err(DeclError::Wrapper));
+        for argv in [
+            &["julia", "-L", "/srv/pre.jl", "/srv/s.jl"][..],
+            &["julia", "-J", "/srv/sys.so", "/srv/s.jl"],
+            &["racket", "-t", "/srv/x.rkt", "/srv/s.rkt"],
+            &["elixir", "-S", "mix", "/srv/s.exs"],
+            &["swift", "-F", "/srv/fw", "/srv/s.swift"],
+            &["guile", "-L", "/srv/lib", "/srv/s.scm"],
+            &["node", "--snapshot-blob=/srv/x.blob", "/srv/s.js"],
+            &["node", "--openssl-config=/srv/x.cnf", "/srv/s.js"],
+            &["node", "--some-future-option=/srv/x", "/srv/s.js"],
+            &["node", "--run", "start"],
+            &["node", "--test", "/srv/s.js"],
+            &["npx", "--snapshot-blob=/srv/x.blob", "pkg"],
+        ] {
+            assert_eq!(
+                c(argv),
+                Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+                "{argv:?}"
+            );
+        }
+        // The positive controls: values known to load nothing.
+        for (argv, entry) in [
+            (&["node", "--max-old-space-size=512", "/srv/s.js"][..], 2),
+            (&["node", "--title=srv", "/srv/s.js"], 2),
+            (&["deno", "run", "--allow-net=api.example", "/srv/s.ts"], 3),
+            (&["ruby", "--encoding=utf-8", "/srv/s.rb"], 2),
+            (&["julia", "-t4", "/srv/s.jl"], 2),
+        ] {
+            assert_eq!(c(argv), Ok(ArgvClass::Interpreter { entry }), "{argv:?}");
+        }
+        for n in [
+            "OPENSSL_CONF",
+            "OPENSSL_ENGINES",
+            "OPENSSL_MODULES",
+            "GIO_MODULE_DIR",
+            "QT_PLUGIN_PATH",
+            "GST_PLUGIN_PATH",
+            "JULIA_LOAD_PATH",
+            "R_PROFILE_USER",
+            "ERL_LIBS",
+        ] {
+            let mut d = decl(&["/usr/bin/server"]);
+            d.env.push((n.into(), "/srv/x".into()));
+            assert_eq!(
+                check_declaration(&d),
+                Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
+                "{n}"
+            );
+        }
+    }
+
+    /// A `#!` file's argv made explicit: the interpreter, the line's
+    /// option, the script, the declaration's arguments. The line's option
+    /// is checked as the interpreter's own would be; an interpreter that
+    /// runs another program is refused; an unknown interpreter with an
+    /// option, or an option that is not one, leaves what runs unknown.
+    ///
+    /// Mutation checked: the option not checked (the previous `#!`
+    /// handling, which ignored it): `#!/bin/sh -c` registers, and this
+    /// fails.
+    #[test]
+    fn a_shebang_line_is_checked_as_an_argv() {
+        let args = vec!["--port".to_owned(), "1".to_owned()];
+        assert_eq!(
+            shebang_argv("/bin/sh", None, "/srv/s.sh", &args, "/bin/dash").unwrap(),
+            vec!["/bin/sh", "/srv/s.sh", "--port", "1"]
+        );
+        assert_eq!(
+            shebang_argv(
+                "/usr/bin/python3",
+                Some("-u"),
+                "/srv/s.py",
+                &[],
+                "/usr/bin/python3.12"
+            )
+            .unwrap(),
+            vec!["/usr/bin/python3", "-u", "/srv/s.py"]
+        );
+        assert_eq!(
+            shebang_argv("/opt/x/runtime", None, "/srv/s", &[], "/opt/x/runtime").unwrap(),
+            vec!["/opt/x/runtime", "/srv/s"]
+        );
+        for (interp, opt, resolved, err) in [
+            (
+                "/bin/sh",
+                Some("-c"),
+                "/bin/sh",
+                DeclError::CodeSelecting(CodeSelecting::InterpreterOption),
+            ),
+            (
+                "/usr/bin/node",
+                Some("--require=/x.js"),
+                "/usr/bin/node",
+                DeclError::CodeSelecting(CodeSelecting::InterpreterOption),
+            ),
+            (
+                "/usr/bin/perl",
+                Some("-Mstrict"),
+                "/usr/bin/perl",
+                DeclError::CodeSelecting(CodeSelecting::InterpreterOption),
+            ),
+            ("/usr/bin/nice", None, "/usr/bin/nice", DeclError::Wrapper),
+            ("/usr/bin/npx", None, "/usr/bin/npx", DeclError::Wrapper),
+            (
+                "/opt/x/runtime",
+                Some("-q"),
+                "/opt/x/runtime",
+                DeclError::NoEntry,
+            ),
+            ("/bin/sh", Some("x"), "/bin/sh", DeclError::NoEntry),
+            ("/srv/server", None, "/usr/bin/node", DeclError::Disguised),
+        ] {
+            assert_eq!(
+                shebang_argv(interp, opt, "/srv/s", &[], resolved),
+                Err(err),
+                "{interp} {opt:?}"
+            );
+        }
+    }
+
+    /// Each header of a bridged server has the one binding its name and
+    /// the origin give; a header that cannot be named so, or two headers
+    /// that would share a binding, cannot be bridged.
+    #[test]
+    fn each_bridged_header_has_its_own_binding() {
+        let o = "https://api.example.test";
+        let suffix = bridge_binding_suffix(o);
+        let h = bridge_headers(&["Authorization".into(), "X-Api-Key".into()], o).unwrap();
+        assert_eq!(
+            h,
+            vec![
+                ("Authorization".to_owned(), format!("AUTHORIZATION{suffix}")),
+                ("X-Api-Key".to_owned(), format!("X_API_KEY{suffix}")),
+            ]
+        );
+        assert_ne!(
+            bridge_binding_name("Authorization", o),
+            bridge_binding_name("Authorization", "https://other.example.test")
+        );
+        assert_eq!(bridge_headers(&["X-Key".into(), "x_key".into()], o), None);
+        assert_eq!(bridge_binding_name("1-Key", o), None);
+        assert_eq!(bridge_binding_name("X.Key", o), None);
+        assert_eq!(bridge_binding_name("", o), None);
+    }
+
     #[test]
     fn bounds_and_names() {
         assert_eq!(check_declaration(&decl(&[])), Err(DeclError::Empty));
@@ -1375,7 +1800,7 @@ mod tests {
             ("LC_LD_PRELOAD".into(), "fine".into()),
         ];
         for n in CODE_SELECTING {
-            inherited.push((n.into(), "x".into()));
+            inherited.push(((*n).into(), "x".into()));
         }
         for n in [
             "LD_PRELOAD",
