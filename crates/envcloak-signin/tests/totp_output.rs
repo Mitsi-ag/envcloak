@@ -57,9 +57,9 @@ fn fixture() {
         for suffix in [b"&period=0".as_slice(), b"&unknown=1", b"&secret=bad"] {
             let mut invalid = raw.clone();
             invalid.extend(suffix);
-            let error = otpauth::parse(&SecretBytes::copy_from(&invalid))
-                .err()
-                .expect("invalid fixture accepted");
+            let Err(error) = otpauth::parse(&SecretBytes::copy_from(&invalid)) else {
+                panic!("invalid fixture accepted");
+            };
             std::hint::black_box(format!("{error:?} {error}"));
         }
     }

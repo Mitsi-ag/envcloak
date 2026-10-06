@@ -1,86 +1,97 @@
 # M2b-03a validation
 
 Revalidated 2026-10-06 on branch `m2/m2b-03a`, macOS 26.4.1 arm64,
-Rust 1.98.1, Python 3.14.6 and Node 26.7.0. This is library evidence, not a claim about
-main, Linux execution, native sign-in, a browser or a real account.
+Rust 1.98.1, Python 3.14.6 and Node 26.7.0. This is library evidence, not a
+claim about main, Linux execution, native sign-in, a browser or a real account.
 
 ## Scope and requirements
 
 | Requirement or gate | Closed here | Remaining owner |
 | --- | --- | --- |
-| R-M2b-05 | Enrollment seed, algorithm, width and period; bounded URI parsing; display-only labels | M2b-03b: login items and commands |
+| R-M2b-05 | Enrollment seed, algorithm, width and 4-300-second period; bounded URI parsing; display-only labels | M2b-03b: login items and commands |
 | R-M2b-06, engine part | Typed `TotpSpec` and `Code`; seed and result remain `SecretBytes`; only two explicit exposure boundaries in the pure library | M2b-03b: the worker's credential reader and resolver integration |
-| R-M2b-40, library part; b3 diagnostic slice | Fixed errors, value-free Debug/Display, bounded digit sweeps with positive controls, heap wiping on success and failure | M2b-03b/M2b-09: tool, audit, stderr and other real output paths; M2b-11: full containment story |
+| R-M2b-40, library part; b3 diagnostic slice | Exact fixed Debug/Display, empty library stdout/stderr, encoded disclosure controls, heap wiping on success and failure | M2b-03b/M2b-09: tool, audit, native-process stderr and other integrated output paths; M2b-11: full containment story |
 | R-M2b-24 timing support, R-M2b-52; b15 primitive slice | RFC vectors, independent counter/width/offset cases, timing boundaries and the after-start pair | M2b-03b: leases, concurrent account serialization, submitted-step reuse and restart behavior in the daemon |
-| M2b-03a SHA-1 rule | Clippy rejects direct, HMAC-generic and block-core SHA-1 types outside `totp.rs`; CI runs the canary | No deferral |
+| M2b-03a SHA-1 rule | Clippy rejects SHA-1 types and compression function uses outside `totp.rs`; CI requires all six canaries | No deferral |
 | M2b-03a parser fuzzing | Three bounded proptest properties in the ordinary test suite, including arbitrary bytes and damaged valid enrollments | No `fuzz/` workspace exists at this revision; M2-25 owns libFuzzer infrastructure and its unsafe entry-point accommodation |
 
 The task's pure scope is complete. Full b3/b15, R-M2b-05/06/40/52 and the
 remaining M2b-03 gates are not declared complete by this split task.
 See [SIGNIN.md](SIGNIN.md) for the accepted grammar and daemon handoff.
 
-## Review input and class sweep
+## Review dispositions and class sweep
 
-The supplied `m2b-03a-open-findings.json` has `rounds: {}` and explicitly
-says there are no review findings yet. No finding was rejected. This round
-read the task split, its D-24 architecture, common rules, founder decisions,
-parent-task review rows 16, 17 and 31, SPEC, lessons L-01 to L-15 and the
-Cycle206/469/474/480 oracle and allocator handoffs.
+All six supplied findings are accepted and resolved. The verifier's CI
+results describe the prior rebased head, not this repair's current head.
+This receipt claims local macOS execution only. References use commit
+subjects rather than hashes so a later rebase does not stale the handoff.
 
-All 21 files added or changed by this task since `71e6fd0` were swept for
-both classes below, including production code, tests, scripts and docs.
+All 24 files added or changed by M2b-03a were swept, including source,
+tests, oracle fixtures, manifests, scripts, CI and documentation.
 
-| Bug class | Instances swept and repaired | Regression evidence |
+| Finding and bug class | Instances swept and repaired | Test and mutation evidence |
 | --- | --- | --- |
-| ASCII-only blank checks on Unicode text components | Both the issuer prefix and account portion of a label used ASCII spaces. Both now use `display_text`. Whole labels and separate issuer parameters already used Unicode trimming and remain covered. No other instance in the task files. | `every_label_component_requires_nonblank_unicode_text` failed before repair; both component mutations fail independently. Nonblank Unicode controls preserve their original display bytes. |
-| Unbounded validation subprocess waits and raw spawn-failure diagnostics | Both Node calls in `totp_oracle.py` now share a 30-second runner; the Cargo call in `check-totp-lint.sh` has a 600-second deadline. All three calls refuse timeout or spawn failure with fixed diagnostics. No other child launcher in the task files. | Three new Python runner controls failed before implementation. Four independent deadline/diagnostic mutations fail. CI runs the controls; real oracle and canary executions pass. |
+| Verifier formatting and reviewer encoded output: incomplete disclosure oracles | All four formatting/property tests; Debug of all seven public TOTP/parser types and every implemented Display; success/error Result wrappers; both process output streams. Exact markers supplement the old raw/digit controls. | The previously surviving `spec-debug-seed` and `code-debug-bytes` fail both formatting gates, as does `code-debug-base64`. The new output gate rejects five byte-list/base64/hex/percent/JSON disclosures. |
+| Reviewer SHA-1: primitive functions bypass a type-only ban | Pinned SHA-1 public exports: Sha1, Sha1Core and compress. Task source has no other SHA-1 use. Direct, aliased and function-pointer compression calls now join direct/core/generic type canaries. | Both `remove-sha1-type-ban` and `remove-sha1-compression-ban` leave only three of six refusals and fail the checker. |
+| Verifier periods: accepted configuration cannot make bounded progress | TotpParams constructor, URI parser, accepted-form and property inputs, raw-cap controls, arithmetic boundary tests and SIGNIN documentation. Enrollment accepts 4 through 300 seconds. The arithmetic-only Period still models every positive input. | Both new eligibility tests failed before repair. `accept-ineligible-short-period` and `accept-unbounded-period` each fail the constructor and parser gates. |
+| Verifier CI: independent oracle omitted from execution | Existing runner-only CI step, Node availability, full Python/Node comparison and checked-in corpus freshness. A new isolated shell entry point runs the full oracle on each CI test job. | `omit-full-oracle-ci`, `omit-oracle-isolation` and `hand-edited-corpus` fail. The restored real wrapper passes. |
+| Verifier receipt: derived references stale after rebase | All commit references in this document, its obsolete source-base reference, old counts and CI runtime commentary. Subjects replace hashes; historical measurements are not current passes. | Receipt-reference control failed before repair and rejects `stale-receipt-hash`. |
 
-The runner failure tests inject `TimeoutExpired` and `OSError` and verify
-fixed diagnostics and configured deadlines. They do not simulate an entire
-hung Cargo process tree. The independent calculation functions and all
-reference/corpus bytes remain unchanged.
+No finding was rejected or deferred. The Unicode component and bounded
+runner fixes from the preceding round remain intact and mutation-tested.
+
+The accepted-period range is a local enrollment policy, not an RFC limit.
+At least one second in every accepted step is eligible, and a fresh step
+is at most 300 seconds away. Daemon authorization, account serialization,
+lease expiry and submission-time rechecks still belong to M2b-03b.
+The input cap is now 4000 bytes: with a bounded period, the previous
+4096-byte cap exceeded the largest otherwise valid escaped enrollment.
+The new cap retains independently valid inputs on each side of its bound,
+so removing it still fails its own test instead of another field's limit.
 
 ## Execution and independent evidence
 
-All builds use
-`CARGO_TARGET_DIR=/Volumes/KeenShiftDev/tmp/envcloak-target/F`,
-`CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=3`. The ignored worktree `target`
-link points there for the exposure checker's explicit target directory.
-Tests use `--no-fail-fast -- --test-threads 3`, a double-fork/setsid runner,
-a cleared environment, disabled core dumps and isolated HOME/XDG/TMPDIR
-under `/tmp/ec-m2b03a-F`, an alias into the same target directory. No real
-account, credential file, browser or daemon is used by the new gates.
+Builds use `CARGO_TARGET_DIR=/Volumes/KeenShiftDev/tmp/envcloak-target/F`,
+`CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=3`. The ignored worktree target
+link points there for checkers with an explicit target directory. Tests
+use `--no-fail-fast -- --test-threads 3`, a double-fork/setsid runner, a
+cleared environment and disabled core dumps. HOME/XDG/TMPDIR live below
+`/tmp/ec-m2b03a-F`, an alias into the task target. No real credentials,
+account, browser or daemon are used by the task's new gates.
 
-The full `envcloak-signin` suite passed: 81 integration tests (including
-all ten exhaustive models) and 13 doctests. After mutation restoration,
-all 14 TOTP/parser/heap gates passed again, plus all three Python runner
-controls. The initial Unicode regression failed against the original
-parser; the new runner controls failed before their implementations.
+The full sign-in suite passes with 83 integration tests, 13 doctests and
+one harness-free output gate. All ten exhaustive state models pass.
+Five Python controls and three selected existing allocator controls pass.
 
-Cycle206's independently composed Python and Node oracles passed 36
-reference checks, 1,142 comparisons, 17 faulty-oracle controls, 20 invalid
-parameter controls and the wrong-expected-code positive control. The
-checked-in bytes regenerate exactly. The corpus retains all 16 dynamic
-offsets per algorithm and 115 leading-zero cases. This is actual execution
-of the adopted oracle, extending Cycle469's source-only evidence.
+Cycle206's independent Python/Node compositions pass 36 RFC-derived
+checks, 1,142 comparisons, 17 faulty-oracle controls, 20 invalid-parameter
+controls and the wrong-expected-code control. Fixture bytes regenerate
+exactly. The corpus retains all dynamic offsets and 115 leading-zero
+cases. The calculation functions and reference/corpus bytes are unchanged.
+`scripts/check-totp-oracle.sh` runs this actual oracle with isolated
+HOME/XDG/TMPDIR; CI installs Node on pull requests as well as full runs.
 
-For the Cycle474/480 allocator handoff, three existing `alloc_probe` controls
-passed: `wiping_mode_wipes_a_freed_block_that_held_the_needle`,
-`unwiped_mode_catches_a_growing_buffer` and
-`unwiped_mode_accepts_code_that_wipes_its_own_buffers`. The TOTP probe checks
-its actual decoded seed/code semantics, includes unwiped release controls
-for the seed, base32 and short code, and observes no protected bytes freed
-by the restored success or error paths. Removing the parser buffer wipe
-makes that gate fail. This is heap-release evidence, not a stack, live
-allocation or process-hardening claim.
+The harness-free output fixture calls the parser, code generator and all
+public formatters on all algorithms and widths, including refusals.
+Python standard-library serializers independently construct 13 forms for
+seed, base32 and code bytes: raw, Rust decimal byte-list, lower/upper hex,
+base64/base64url padded and unpadded, percent variants, JSON and Unicode
+escapes. All 39 disclosure controls fire. Real stdout and stderr are both
+empty and both hit counts are zero. The empty-stream rule also rejects
+transforms beyond this finite sweep's vocabulary. The gate never prints
+fixture content. Its deadline/spawn failure is a fixed refusal.
+
+The allocator controls from the Cycle474/480 handoff and the TOTP probe
+pass. Dropping the parser's own buffer wipe fails the probe. This measures
+heap releases of synthetic values, not stack/live-memory erasure or
+native process hardening. Runner timeout tests inject failures rather than
+simulating a hung Cargo process tree.
 
 ## Mutation receipts from this round
 
-All 19 deliberate mutations below caused the named tests/checker to fail.
-Each mutation was restored before the passing checks or any commit. Raw
-failure logs stay private in the target directory; this table contains no
-fixture values. This round rechecked every task gate, rather than treating
-the original commit's receipts as current execution.
+All 35 mutations caused the named gate to fail. Each was restored before
+passing checks and commits. Diagnostic logs remain private in the task
+target; this table contains no fixture values.
 
 | Gate or test | Mutation detected |
 | --- | --- |
@@ -92,8 +103,7 @@ the original commit's receipts as current execution.
 | `hostile_grammar_is_refused_without_echo` | `error-echoes-synthetic-seed` |
 | `input_and_decoded_caps_refuse_instead_of_truncating` | `remove-decoded-seed-cap` |
 | `uri_cap_has_valid_boundary_controls` | `remove-uri-cap` |
-| `public_debug_and_display_are_value_free` | `debug-prints-code` |
-| `every_public_debug_type_hides_seed_and_code` | `debug-prints-code` |
+| `public_debug_and_display_are_value_free` and `every_public_debug_type_hides_seed_and_code` | `debug-prints-code`, `spec-debug-seed`, `code-debug-bytes`, `code-debug-base64` |
 | `parser_fuzz_and_public_debug` | `step-rounded-up` |
 | `damaged_valid_enrollment_fuzz` | `error-debug-prints-code` |
 | `seed_decoding_and_code_buffers_wipe_on_every_exit` | `base32-buffer-not-wiped` |
@@ -101,61 +111,68 @@ the original commit's receipts as current execution.
 | `test_every_node_call_has_a_deadline` | `omit-node-deadline` |
 | `test_runner_failures_have_fixed_diagnostics` | `echo-node-runner-error` |
 | `test_compiler_call_has_a_deadline_and_fixed_failures` | `omit-compiler-deadline`, `echo-compiler-runner-error` |
-| `scripts/check-totp-lint.sh` | Direct, HMAC-generic and block-core uses are refused; `remove-sha1-ban` makes the checker fail |
+| `scripts/check-totp-lint.sh` | `remove-sha1-type-ban`, `remove-sha1-compression-ban` |
+| `totp_output` | `stdout-code-byte-list`, `stderr-code-hex`, `stdout-code-base64`, `stderr-code-percent`, `stdout-code-json-escapes`, `omit-base64-disclosure-needles` |
+| `accepted_periods_have_an_eligible_instant_and_bounded_wait` and `enrollment_refuses_periods_without_bounded_eligibility` | `accept-ineligible-short-period`, `accept-unbounded-period` |
+| `test_ci_runs_independent_oracle_with_isolation` | `omit-full-oracle-ci`, `omit-oracle-isolation` |
+| `test_receipt_commit_references_survive_rebase` | `stale-receipt-hash` |
+| `scripts/check-totp-oracle.sh` | `hand-edited-corpus` |
 
 ## Commits
 
-Original implementation, retained:
+References use unique subject lines so rebasing does not invalidate them:
 
-- `94dbad7`: pure TOTP, arithmetic, independent oracles and SHA-1 lint.
-  Its message records the original offset, counter, padding, clock,
-  startup-pair, invalid-width and removed-ban mutations.
-- `dd6b8fe`: parser, hostile-input/fuzz/output/wipe gates and accepted forms.
-  Its message records the original base32, duplicate, tail-bit, error-echo,
-  caps, Debug, clock and buffer-wipe mutations.
-- `a933dc5`: original validation receipt, superseded by this revalidation.
+- `M2 M2b-03a: add pure TOTP and RFC oracles`: engine and arithmetic.
+- `M2 M2b-03a: parse and protect TOTP enrollments`: parser and containment.
+- `M2 M2b-03a: record gate and mutation receipts`: original evidence.
+- `M2 M2b-03a: reject blank Unicode label parts`: Unicode component checks.
+- `M2 M2b-03a: bound validation subprocess waits`: runner deadlines.
+- `M2 M2b-03a: record repaired gate evidence`: prior class sweep receipts.
+- `M2 M2b-03a: bound enrollment periods`: period and cap controls.
+- `M2 M2b-03a: confine SHA-1 compression calls`: all public SHA-1 primitives.
+- `M2 M2b-03a: enforce exact and silent diagnostics`: formatting and streams.
+- `M2 M2b-03a: run independent gates in CI`: CI, receipt and final checks.
 
-This audit and repair:
-
-- `bff0b6f`: Unicode component repair; the two component mutations above.
-- `9e2239c`: bounded Node/compiler waits and fixed diagnostics; the four
-  deadline/diagnostic mutations above.
-- The commit updating this document records all 19 current mutations and
-  their gate mapping, plus the final check results.
+The receipt-reference gate rejects hash-based references in this section.
+Each implementation commit names its corresponding mutation controls.
 
 ## Final local checks
 
-Every check below exited zero on the restored implementation. Only this
-value-free validation document changed after these checks.
+Every final check below exited zero. The initial strict Clippy run caught
+`err_expect` in the new output fixture. Its refusal branch now uses a
+pattern match, avoiding value-bearing Debug even on an unexpected success.
+Strict workspace/all-target Clippy, the output gate and formatting were
+rerun and passed. Initial failures and final rechecks remain in the receipts.
 
 | Check | Result |
 | --- | --- |
 | `cargo fmt --all --check` | Pass |
 | `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets --locked` | Pass |
-| `cargo test -p envcloak-signin --locked --no-fail-fast -- --test-threads 3` | 81 integration tests and 13 doctests passed |
-| Restored TOTP/parser/heap targets | All 14 tests passed |
-| Python runner controls | All 3 tests passed |
+| `cargo test -p envcloak-signin --locked --no-fail-fast -- --test-threads 3` | 83 integration tests, 13 doctests and 1 output gate passed |
+| Restored TOTP/parser/heap targets | 16 named TOTP/parser/heap tests plus the output gate passed |
+| Python runner controls | All 5 tests passed |
 | Selected allocator controls | All 3 tests passed |
 | `scripts/check-unsafe.sh` | Pass |
 | `scripts/check-expose-lint.sh` | All 6 prohibited exposure sites detected |
-| `scripts/check-totp-lint.sh` | All 3 prohibited SHA-1 type sites detected |
+| `scripts/check-totp-lint.sh` | All 6 prohibited SHA-1 type/function sites detected |
 | `scripts/check-sources.sh` | Dev/all-target and release/shipped-source checks passed |
-| `totp_oracle.py` | Exact fixture regeneration and independent controls passed |
+| `scripts/check-totp-oracle.sh` | Exact fixture regeneration and independent controls passed |
 | `scripts/check-reservations.py` | Pass |
 | `scripts/check-spec-decisions.py` | Pass |
 | `scripts/check-crate-graph.py` | Pass |
 | `cargo tree --locked -p envcloak-signin -e normal,build` | Reviewed; HMAC/SHA-1 retain the existing digest/zeroize line, no new build script or proc macro |
 | `cargo deny check` | Advisories, bans, licenses and sources passed; existing unused-license allowances warn |
 
-Cargo-deny was unavailable on this host. Version 0.20.2 was fetched from
-its official release into the task target and verified against the release
-asset SHA-256 before use. No system tool installation was changed.
+Cargo-deny 0.20.2 is retained in the task target from the preceding round,
+which verified its official release asset SHA-256 before use. No system
+tool installation was changed.
 
 Private machine receipts are under
-`/Volumes/KeenShiftDev/tmp/envcloak-target/F/evidence`, including
-`mutation-results.json`, `check-results.json`, `signin-restored.json` and
-`deny-final.json`. No push, PR, GitHub comment or shared-memory update was
-made. No full workspace test suite was run.
+`/Volumes/KeenShiftDev/tmp/envcloak-target/F/evidence/r3`, including
+`mutation-results.json`, `check-results.json`, `final-rechecks.json` and
+the per-check logs. The initial Clippy failure remains recorded separately
+from its successful recheck. No push, PR, GitHub comment or shared-memory
+update was made. No full workspace test suite was run.
 
 ## Deliberate deferrals from the plan
 
