@@ -2708,14 +2708,23 @@ fn status_without_a_probe_claims_nothing() {
     ] {
         assert!(text.contains(want), "{want}: {text}");
     }
-    // `--probe` (probes on this machine) is M2-28's.
-    let out = f.agents(&["status", "--probe"]);
-    assert_eq!(out.status.code(), Some(125), "{}", stderr(&out));
-    assert!(
-        stderr(&out).starts_with("envcloak: not_in_this_build:"),
-        "{}",
-        stderr(&out)
-    );
+    // `--probe` (M2-28, crates/envcloak-e2e/tests/probe_local.rs) takes
+    // only its own options: anything else is a usage error, unechoed.
+    for args in [
+        &["status", "--probe", "--bogus"][..],
+        &["status", "--probe", "--probe"],
+        &["status", "--probe", "--agent", "nosuch"],
+        &["status", "--probe", "--agent", "codex", "--agent", "codex"],
+    ] {
+        let out = f.agents(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).starts_with("envcloak: usage:"),
+            "{}",
+            stderr(&out)
+        );
+        assert!(!stderr(&out).contains("bogus") && !stderr(&out).contains("nosuch"));
+    }
     f.sweep();
 }
 

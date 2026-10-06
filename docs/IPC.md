@@ -412,6 +412,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `command_refused` | M2-08 | landed | `run_with_secrets`: an argv the `PreToolUse` hook denies in a shell (an env file read, the environment printed, `envcloak reveal` or `approve`, or a script it cannot read), refused with the hook's message before the daemon is asked (D-22) |
 | `agents_incomplete` | M2-08 | landed | `envcloak agents install` or `uninstall` (or `init --agents-note`) left a file as it was (refused, with the reason on its line of the report), a host named with `--agent` is not installed, or a file an earlier write left beside a config under EnvCloak's temporary name is still there (named in the report); exit 1 |
 | `double_install` | M2-08 | landed | `envcloak agents status`: EnvCloak's Claude Code plugin is enabled while EnvCloak's own hooks or an `envcloak` MCP server are installed too, so each hook runs twice; the message names the files on both sides; exit 1 |
+| `probe_unavailable` | M2-28 | landed | `envcloak agents status --probe`: a host's probe could not be set up (the programs it needs are not beside this `envcloak`, or its probe home, probe daemon, throwaway vault or install could not be made), so it was not probed; after the report; exit 1 |
 <!-- /reservations -->
 
 **Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):

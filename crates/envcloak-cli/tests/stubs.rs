@@ -26,10 +26,6 @@ const STUBS: &[(&[&str], &str)] = &[
     (&["reveal"], "`envcloak reveal`"),
     (&["doctor"], "`envcloak doctor`"),
     (&["scrub"], "`envcloak scrub`"),
-    (
-        &["agents", "status", "--probe"],
-        "`envcloak agents status --probe` (probes on this machine, in a probe home of their own)",
-    ),
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["mcp-bridge"], "`envcloak mcp-bridge`"),
     (&["standing"], "`envcloak standing`"),
@@ -167,8 +163,12 @@ fn every_stub_refuses_an_argument_that_is_not_utf8() {
         assert_eq!(stderr(&out), want, "{what}");
     }
     // Elsewhere the argument is the usage error it was, `agents status`
-    // (landed by M2-09; its `--probe` is the stub) included.
-    for words in [&["run", "--"][..], &["agents", "status"]] {
+    // (landed by M2-09) and its `--probe` (landed by M2-28) included.
+    for words in [
+        &["run", "--"][..],
+        &["agents", "status"],
+        &["agents", "status", "--probe"],
+    ] {
         let mut cmd = cli_command(&home, words, &[]);
         cmd.arg(bad);
         let out = finish_within(cmd, Duration::from_secs(60));
