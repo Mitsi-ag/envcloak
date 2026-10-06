@@ -487,9 +487,9 @@ impl Started {
         };
         if outcome.is_err() {
             // Once release starts, the runner may own a suspended server
-            // in another group. Its exit, after cleaning that child up,
-            // must precede our return. Killing the runner loses the only
-            // handle allowed to stop that server.
+            // in another group. Keep its cleanup owner until it exits.
+            // Killing the runner loses the only handle allowed to stop
+            // that server.
             retire_failed_runner(control, child);
         } else {
             drop(control);
@@ -505,15 +505,36 @@ impl Started {
 }
 
 /// Closes a failed release and waits for the runner to clean up its own
-/// server and exit. No force-kill is safe after release: the server leads
-/// another group, and only the runner owns its unreaped handle.
-fn retire_failed_runner<O: envcloak_sys::owned::ProcessOps>(
+/// server and exit, retaining the handle on a reaper thread if it is
+/// slow. No force-kill is safe after release: the server leads another
+/// group, and only the runner owns its unreaped handle.
+fn retire_failed_runner(control: UnixStream, child: OwnedChild) {
+    if let Some(child) = finish_failed_runner(control, child, Duration::from_secs(1)) {
+        // The private runner can be blocked writing its diagnostic to a
+        // client-held pipe. Keep its handle until it exits; never kill
+        // the process that may still be cleaning up its own child.
+        reap_later(child);
+    }
+}
+
+fn finish_failed_runner<O: envcloak_sys::owned::ProcessOps>(
     control: UnixStream,
     child: OwnedChild<O>,
-) {
+    grace: Duration,
+) -> Option<OwnedChild<O>> {
     let _ = control.shutdown(std::net::Shutdown::Both);
     drop(control);
-    let _ = child.reap();
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if child.has_exited().is_ok_and(|exited| exited) {
+            let _ = child.reap();
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(child);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Waits for the runner's `ConfirmSpawn` and answers it (macOS).
@@ -579,10 +600,33 @@ mod tests {
         use envcloak_sys::owned::{Recorded, RecordingProcesses};
         let model = RecordingProcesses::new();
         let (control, mut peer) = UnixStream::pair().unwrap();
-        retire_failed_runner(control, model.child(71));
-        assert_eq!(model.calls(), vec![Recorded::Reap(71)]);
+        model.exit(71);
+        assert!(finish_failed_runner(control, model.child(71), Duration::ZERO).is_none());
+        assert_eq!(
+            model.calls(),
+            vec![Recorded::HasExited(71), Recorded::Reap(71)]
+        );
         let mut byte = [0];
         assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+    }
+
+    /// Mutation: reap or kill a runner whose cleanup has not finished.
+    #[test]
+    fn failed_release_keeps_a_slow_cleanup_owner() {
+        use envcloak_sys::owned::{Recorded, RecordingProcesses};
+        let model = RecordingProcesses::new();
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        let retained = finish_failed_runner(control, model.child(72), Duration::ZERO);
+        assert!(retained.is_some(), "the cleanup owner must remain owned");
+        assert_eq!(model.calls(), vec![Recorded::HasExited(72)]);
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+        model.exit(72);
+        retained.unwrap().reap().unwrap();
+        assert_eq!(
+            model.calls(),
+            vec![Recorded::HasExited(72), Recorded::Reap(72)]
+        );
     }
 
     fn pipe() -> (OwnedFd, OwnedFd) {
