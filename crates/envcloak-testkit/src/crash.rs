@@ -421,7 +421,7 @@ mod tests {
         if let Ok(pid) = std::fs::read_to_string(&marker) {
             let pid: i32 = pid.trim().parse().unwrap();
             assert!(
-                envcloak_sys::signal_process(pid, 0).is_err(),
+                envcloak_sys::testing::kill_raw(pid, 0) != 0,
                 "the stalled start is still running"
             );
         }

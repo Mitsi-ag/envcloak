@@ -1608,7 +1608,7 @@ impl GroupChild {
     /// signaller's own unreaped child).
     pub fn signal(&self, sig: i32) {
         if self.status.is_none() {
-            let _ = envcloak_sys::signal_process(self.pid, sig);
+            let _ = envcloak_sys::testing::kill_raw(self.pid, sig);
         }
     }
 
@@ -1625,7 +1625,7 @@ impl GroupChild {
     /// unreaped.
     fn signal_group(&self, sig: i32) {
         if self.status.is_none() {
-            let _ = envcloak_sys::signal_group(self.pid, sig);
+            let _ = envcloak_sys::testing::kill_raw(-self.pid, sig);
         }
     }
 

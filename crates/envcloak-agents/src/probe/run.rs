@@ -16,9 +16,9 @@
 
 use std::ffi::OsString;
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -85,7 +85,6 @@ pub fn run_surfaces(
         flags: flags.args.clone(),
         exe_sha256: String::new(),
         config_digest: String::new(),
-        config_shape: String::new(),
     };
     let want = |s: Surface| surfaces.contains(&s);
     if !model::qualified(host.host.id(), &host.version) {
@@ -121,10 +120,6 @@ pub fn run_surfaces(
         .config
         .as_ref()
         .and_then(|c| c.fingerprint(&home.envcloak));
-    let shape_before = p
-        .config
-        .as_ref()
-        .and_then(|c| c.shape(&home.home, &home.envcloak));
     let fixtures = Fixtures::write(&home.project, &home.root);
     let Ok(fx) = fixtures else {
         // No control could be set up: every probe fails through it.
@@ -162,16 +157,8 @@ pub fn run_surfaces(
     if server {
         report.server = p.sentinel();
     }
-    let after = p.read_config();
-    let digest_after = after.as_ref().and_then(|c| c.fingerprint(&home.envcloak));
-    let shape_after = after
-        .as_ref()
-        .and_then(|c| c.shape(&home.home, &home.envcloak));
+    let digest_after = p.read_config().and_then(|c| c.fingerprint(&home.envcloak));
     report.config_digest = match (digest_before, digest_after) {
-        (Some(a), Some(b)) if a == b => a,
-        _ => String::new(),
-    };
-    report.config_shape = match (shape_before, shape_after) {
         (Some(a), Some(b)) if a == b => a,
         _ => String::new(),
     };
@@ -592,15 +579,11 @@ impl Prober<'_, '_> {
             .current_dir(&spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // A session of its own on a terminal of its own (M2-28): nothing it
-        // or its commands do shares a session or a terminal with the
-        // approver's, so its requests can be approved (T9-3), and its
-        // process group is its pid's.
-        let Ok(mut session) = HostSession::spawn(cmd) else {
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let Ok(mut child) = cmd.spawn() else {
             return out;
         };
-        let child = &mut session.child;
         drop(args);
         let readers = [
             drain(child.stdout.take(), spec.watch.clone()),
@@ -616,16 +599,9 @@ impl Prober<'_, '_> {
                 s.spawn(move || a.approve(deadline, stop).is_ok())
             });
             let mut timed_out = false;
-            let mut own = true;
             loop {
                 match envcloak_sys::has_exited(pid) {
-                    Ok(true) => break,
-                    // Not known to be this process's child any more: its
-                    // numbers may name another's, so nothing is sent.
-                    Err(_) => {
-                        own = false;
-                        break;
-                    }
+                    Ok(true) | Err(_) => break,
                     Ok(false) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(25));
                     }
@@ -635,20 +611,16 @@ impl Prober<'_, '_> {
                     }
                 }
             }
-            // The host is this process's unreaped child (it was started by
-            // `spawn_unreaped`, and nothing has waited for it): its group's
-            // number is still its own (D-34). What is left there goes now.
-            if own {
-                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
-            }
+            // The host is this process's unreaped child: its group's number
+            // is still its own (D-34). What is left there goes now. Listed
+            // in security/signal-allowlist.txt.
+            #[allow(clippy::disallowed_methods)]
+            let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
             let status = child.wait().ok();
             stop.store(true, Ordering::SeqCst);
             let approved = approval.map(|h| h.join().unwrap_or(false));
             (timed_out, status, approved)
         });
-        // The session's terminal goes with it: whatever of the session is
-        // left gets its hang-up.
-        session.hang_up();
         let left = (deadline + Duration::from_secs(5)).saturating_duration_since(Instant::now());
         for r in readers {
             if let Ok(found) = r.recv_timeout(left) {
@@ -1466,109 +1438,6 @@ fn denial_checks(
     ]
 }
 
-/// A program started in a session of its own, on a pseudo-terminal of its
-/// own that is the session's controlling terminal (M2-28): the agent host a
-/// probe runs. Its standard streams are as its command sets them; the
-/// terminal is the session's only, so nothing the program or its commands
-/// do shares a session or a terminal with this process or with any
-/// approver this process starts (SPEC §10b, T9-3), and the session leads a
-/// process group whose number is the program's pid, which stays its own
-/// while it is unreaped (D-34).
-///
-/// The program also holds the terminal open, on a descriptor of its own
-/// beyond its standard streams (the number it has here when it starts),
-/// which its commands inherit: so the session keeps its terminal for as
-/// long as any of it runs (macOS takes a session's terminal away once no
-/// process has it open, measured on 26.4, and then sends no hang-up and
-/// judges an approval from there as one with no terminal at all, not as
-/// the requester's), and the terminal is the session's lifeline. This
-/// process holds its other side, the master, which nothing else holds
-/// (close-on-exec), and reads and drops what the session writes there, so
-/// no write to the terminal blocks: when this process ends, however it
-/// ends, `kill -9` included, or [`HostSession::hang_up`] is called, the
-/// kernel hangs the terminal up, and the program (the session's leader)
-/// and the process group in the terminal's foreground (the program's,
-/// where its commands run) get SIGHUP (Codex review of M2-28: a runner
-/// killed mid-run left the host and its commands running).
-pub struct HostSession {
-    pub child: std::process::Child,
-    /// The thread that holds the master side and reads it, and its stop.
-    terminal: Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>,
-}
-
-impl std::fmt::Debug for HostSession {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostSession")
-            .field("pid", &self.child.id())
-            .finish_non_exhaustive()
-    }
-}
-
-/// How long the master's reader waits between looks at its stop.
-const TERMINAL_POLL: Duration = Duration::from_millis(50);
-
-impl HostSession {
-    /// Starts `cmd` in a new session on a new pseudo-terminal, which it
-    /// holds open (see the type's documentation).
-    ///
-    /// # Errors
-    /// When no pseudo-terminal can be opened, or the program cannot be
-    /// started, or cannot make its session.
-    pub fn spawn(mut cmd: Command) -> std::io::Result<HostSession> {
-        use std::io::Read as _;
-        use std::os::fd::AsFd as _;
-        let pty = envcloak_sys::pty::open_pty(None, None)?;
-        envcloak_sys::new_session_on_spawn(&mut cmd, Some(pty.slave.as_fd()))?;
-        envcloak_sys::inherit_on_spawn(&mut cmd, pty.slave.as_fd())?;
-        let child = crate::detect::spawn_unreaped(&mut cmd)?;
-        // `cmd` holds copies of the slave side until it goes: the
-        // terminal is then open in the session alone.
-        drop(cmd);
-        drop(pty.slave);
-        let stop = Arc::new(AtomicBool::new(false));
-        let master = std::fs::File::from(pty.master);
-        let stopped = Arc::clone(&stop);
-        let reader = std::thread::spawn(move || {
-            let mut buf = Zeroizing::new([0u8; 4096]);
-            while !stopped.load(Ordering::SeqCst) {
-                match envcloak_sys::wait_readable(master.as_fd(), TERMINAL_POLL) {
-                    Ok(false) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    // Something to read, or the session has closed every
-                    // copy of its side (end of file, or EIO on Linux):
-                    // then nothing is left to hang up, and the master goes.
-                    Ok(true) => match (&master).read(&mut buf[..]) {
-                        Ok(n) if n > 0 => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        _ => break,
-                    },
-                    Err(_) => break,
-                }
-            }
-            drop(master);
-        });
-        Ok(HostSession {
-            child,
-            terminal: Some((stop, reader)),
-        })
-    }
-
-    /// Closes the terminal's master side, which hangs the session up:
-    /// whatever of it is left gets SIGHUP. Waits at most a poll step.
-    pub fn hang_up(&mut self) {
-        if let Some((stop, reader)) = self.terminal.take() {
-            stop.store(true, Ordering::SeqCst);
-            let _ = reader.join();
-        }
-    }
-}
-
-impl Drop for HostSession {
-    fn drop(&mut self) {
-        self.hang_up();
-    }
-}
-
 /// Reads a pipe to its end on a thread of its own, dropping what it reads
 /// through a wiping buffer (the host is never left blocked on a full
 /// pipe) after looking in it for each of `texts` ([`Watch`]); the receiver
@@ -2025,84 +1894,5 @@ mod tests {
                 &kept
             )));
         }
-    }
-
-    /// A host session keeps its terminal while it runs (`ps` names one for
-    /// it), and hanging it up ends the host and the command it runs in its
-    /// process group, with no signal sent to either by this process (Codex
-    /// review of M2-28: the runner's death left them running). Mutation
-    /// checked: the terminal not held open in the session (`HostSession`
-    /// without its `inherit_on_spawn`): on macOS the session then has no
-    /// terminal, the hang-up reaches nobody, and this fails.
-    #[test]
-    fn a_host_session_keeps_its_terminal_and_its_hang_up_ends_it() {
-        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let pid_file = dir.path().join("pid");
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args([
-            "-c",
-            &format!(
-                "sleep 60 & echo $! >{}; wait",
-                shell_quote(&pid_file.to_string_lossy())
-            ),
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-        let mut session = HostSession::spawn(cmd).unwrap_or_else(|e| panic!("{e}"));
-        let end = Instant::now() + Duration::from_secs(20);
-        let sleeper = loop {
-            if let Ok(p) = std::fs::read_to_string(&pid_file)
-                && !p.trim().is_empty()
-            {
-                break p.trim().to_owned();
-            }
-            assert!(Instant::now() < end, "the command did not start");
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let tty = Command::new("/bin/ps")
-            .args(["-o", "tty=", "-p", &session.child.id().to_string()])
-            .output()
-            .unwrap_or_else(|e| panic!("{e}"));
-        let tty = String::from_utf8_lossy(&tty.stdout).trim().to_owned();
-        let has_tty = !tty.is_empty() && tty != "?" && tty != "??";
-        session.hang_up();
-        let end = Instant::now() + Duration::from_secs(20);
-        let status = loop {
-            if let Some(s) = session.child.try_wait().unwrap_or_else(|e| panic!("{e}")) {
-                break Some(s);
-            }
-            if Instant::now() > end {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        };
-        let sleeping = || {
-            Command::new("/bin/kill")
-                .args(["-0", &sleeper])
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        };
-        let end = Instant::now() + Duration::from_secs(20);
-        while sleeping() && Instant::now() < end {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let left = sleeping();
-        if status.is_none() {
-            let _ = session.child.kill();
-            let _ = session.child.wait();
-        }
-        if left {
-            let _ = Command::new("/bin/kill").args(["-9", &sleeper]).status();
-        }
-        assert!(has_tty, "the session has no terminal: {tty:?}");
-        use std::os::unix::process::ExitStatusExt as _;
-        assert_eq!(
-            status.and_then(|s| s.signal()),
-            Some(libc::SIGHUP),
-            "the host outlived its session's hang-up"
-        );
-        assert!(!left, "its command outlived the hang-up");
     }
 }

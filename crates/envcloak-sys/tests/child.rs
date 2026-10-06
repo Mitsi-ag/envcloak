@@ -31,7 +31,10 @@ fn an_exited_child_stays_waitable_until_it_is_reaped() {
     );
 }
 
+/// The numeric wrappers themselves, which clippy.toml bans elsewhere
+/// (D-34; this file is listed in security/signal-allowlist.txt).
 #[test]
+#[allow(clippy::disallowed_methods)]
 fn a_signal_reaches_the_process_or_its_whole_group() {
     // A shell leading its own group, with a background sleeper in the
     // group; both report their pids, then wait.
@@ -127,7 +130,7 @@ fn a_stopped_child_has_not_exited() {
         stop_unconsumed(pid, Duration::ZERO),
         "the stop was consumed"
     );
-    signal_process(pid, libc::SIGCONT).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGCONT), 0);
     rx.recv_timeout(Duration::from_secs(10))
         .expect("wait_for_exit did not see the exit")
         .unwrap();

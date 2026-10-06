@@ -1311,7 +1311,7 @@ fn gate8_real_serializers_split_at_every_byte_are_redacted() {
                         p.wait_for(1, b"READY\n", Duration::from_secs(120)),
                         "{label}: the emitter did not get to its tail"
                     );
-                    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+                    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
                 }
                 let (status, out, err) = p.finish(Duration::from_secs(180));
                 assert_no_canary(&out, cs);
@@ -1476,7 +1476,7 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
     let p = Proc::spawn(detached(&home, &setup, &os(&sh(&traps_int(&life)))));
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
     let runner = p.pid();
-    envcloak_sys::signal_process(runner, libc::SIGINT).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(runner, libc::SIGINT), 0);
     let (status, out, err) = p.finish(Duration::from_secs(60));
     assert_eq!(status.code(), Some(130), "{}", lossy(&err));
     assert!(
@@ -1498,7 +1498,7 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
         &os(&sh(&format!("echo ready; {}", life.sh_wait()))),
     ));
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     let (status, _, err) = p.finish(Duration::from_secs(60));
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{}", lossy(&err));
 
@@ -1506,7 +1506,7 @@ fn without_a_terminal_signals_go_to_the_childs_own_group() {
     for (sig, name) in [(libc::SIGHUP, "HUP"), (libc::SIGQUIT, "QUIT")] {
         let p = Proc::spawn(detached(&home, &setup, &os(&sh(&traps(name, sig, &life)))));
         assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
-        envcloak_sys::signal_process(p.pid(), sig).unwrap();
+        assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), sig), 0);
         let (status, out, err) = p.finish(Duration::from_secs(60));
         assert_eq!(status.code(), Some(128 + sig), "{name}: {}", lossy(&err));
         let want = format!("[envcloak:openai_api_key/t]\ngot-{name}\n");
@@ -1577,7 +1577,7 @@ fn without_a_terminal_a_second_sigterm_kills_the_childs_group() {
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
     let held = std::fs::File::open(&lock).unwrap();
     assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     assert!(
         p.wait_for(0, b"got-TERM\n", Duration::from_secs(60)),
         "the first SIGTERM was not passed on"
@@ -1586,7 +1586,7 @@ fn without_a_terminal_a_second_sigterm_kills_the_childs_group() {
         !envcloak_sys::try_lock_exclusive(&held).unwrap(),
         "the first SIGTERM ended the child"
     );
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     let (status, out, err) = p.finish(Duration::from_secs(30));
     assert_eq!(status.code(), Some(128 + libc::SIGKILL), "{}", lossy(&err));
     assert_eq!(count(&out, b"got-TERM\n"), 1, "{}", lossy(&out));
@@ -1671,7 +1671,7 @@ fn without_a_terminal_a_sigterm_ends_what_the_child_left_in_its_group() {
     assert!(p.wait_for(0, b"ready\n", Duration::from_secs(60)));
     let held = std::fs::File::open(&lock).unwrap();
     assert!(!envcloak_sys::try_lock_exclusive(&held).unwrap());
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     let (status, out, err) = p.finish(Duration::from_secs(30));
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{}", lossy(&err));
     let end = Instant::now() + Duration::from_secs(10);
@@ -1773,7 +1773,7 @@ fn without_a_terminal_a_sigterm_while_the_output_drains_ends_the_childs_group() 
         !envcloak_sys::try_lock_exclusive(&held).unwrap(),
         "the descendant did not outlive the child"
     );
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     let (status, out, err) = p.finish(Duration::from_secs(30));
     assert_eq!(status.code(), Some(128 + libc::SIGTERM), "{}", lossy(&err));
     let end = Instant::now() + Duration::from_secs(10);
@@ -2402,9 +2402,9 @@ fn exited_within((pid, started): (i32, Option<StartTime>), limit: Duration) -> b
 fn reaped_within((pid, started): (i32, Option<StartTime>), limit: Duration) -> bool {
     let end = Instant::now() + limit;
     loop {
-        let reaped = match envcloak_sys::signal_process(pid, 0) {
-            Err(_) => true,
-            Ok(()) => matches!(envcloak_sys::process_start_time(pid), Ok(t) if Some(t) != started),
+        let reaped = match envcloak_sys::testing::kill_raw(pid, 0) {
+            0 => matches!(envcloak_sys::process_start_time(pid), Ok(t) if Some(t) != started),
+            _ => true,
         };
         if reaped {
             return true;
@@ -2527,7 +2527,7 @@ fn signal_stops_a_stalled_run(launcher: &str) {
         exited_within(child, Duration::from_secs(10)),
         "the child did not exit"
     );
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     let (status, _, err) = p.finish(Duration::from_secs(20));
     let took = exiting.elapsed();
     println!("stopped: the runner exited {took:?} after the child");

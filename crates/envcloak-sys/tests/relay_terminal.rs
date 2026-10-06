@@ -58,7 +58,7 @@ fn child() {
     }
     report(relay.next().unwrap());
     let me = i32::try_from(std::process::id()).unwrap();
-    envcloak_sys::signal_process(me, libc::SIGINT).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(me, libc::SIGINT), 0);
     report(relay.next().unwrap());
 }
 

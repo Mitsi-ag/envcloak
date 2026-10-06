@@ -1,6 +1,7 @@
 //! A deliberate violation: every way this file opens a secret, and every
-//! call of `libc::kill` and `libc::killpg` (M2 plan D-34: signals go only
-//! through an owned handle), must be reported by clippy's disallowed-methods
+//! call of `libc::kill` and `libc::killpg` and of EnvCloak's numeric
+//! wrappers around them (M2 plan D-34: signals go only through an owned
+//! handle), must be reported by clippy's disallowed-methods
 //! lint, configured in the root clippy.toml, at the lint levels every
 //! workspace crate inherits.
 //! scripts/check-expose-lint.sh counts the reports against the
@@ -56,4 +57,15 @@ pub fn kill_by_number() -> unsafe extern "C" fn(libc::pid_t, libc::c_int) -> lib
 /// A group signal by number.
 pub fn killpg_by_number() -> unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int {
     libc::killpg // EXPECT-DISALLOWED
+}
+
+/// EnvCloak's own numeric wrappers, which reach the same `kill` (review:
+/// D-34 makes the owned handle the only signalling API).
+pub fn signal_process_by_number() -> fn(i32, i32) -> std::io::Result<()> {
+    envcloak_sys::signal_process // EXPECT-DISALLOWED
+}
+
+/// The group form of the same.
+pub fn signal_group_by_number() -> fn(i32, i32) -> std::io::Result<()> {
+    envcloak_sys::signal_group // EXPECT-DISALLOWED
 }
