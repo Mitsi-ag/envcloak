@@ -218,7 +218,12 @@ public struct VaultView: Sendable, WireDecodable, CustomStringConvertible, Custo
         self.`state` = try o.decode("state")
         self.`integrity` = try o.optional("integrity")
         self.`read_only` = try o.decode("read_only")
-        self.`unavailable` = try o.optional("unavailable", as: String.self).map { Reason(rawValue: $0)?.rawValue ?? "unknown" }
+        self.`unavailable` = try o.optional("unavailable", as: String.self).map {
+            switch $0 {
+            case "damaged", "unsupported_version", "permissions", "disk_full", "storage", "io", "migration", "busy": $0
+            default: "unknown"
+            }
+        }
         self.`busy` = try o.decode("busy")
         self.`failed_unlocks` = try o.decode("failed_unlocks")
     }

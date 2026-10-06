@@ -79,6 +79,18 @@ final class MethodTests: XCTestCase {
         XCTAssertFalse(String(reflecting: text).contains(raw))
     }
 
+    func testVaultUnavailableUsesOnlyItsDocumentedReasonSubset() throws {
+        let allowed: Set<String> = ["damaged", "unsupported_version", "permissions", "disk_full", "storage", "io", "migration", "busy"]
+        // The expected subset comes from IPC.md's carrier table, not the
+        // implementation's general Reason list or sanitizing helper.
+        for reason in Reason.allCases.map(\.rawValue) + [UUID().uuidString, "", "unknown", "damaged\u{202e}"] {
+            let object: [String: Any] = ["state": "unavailable", "read_only": true, "unavailable": reason, "busy": false, "failed_unlocks": 0]
+            let bytes = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "result": object])
+            let view: VaultView = try Frame(text: String(decoding: bytes, as: UTF8.self)).response(id: 1)
+            XCTAssertEqual(view.unavailable, allowed.contains(reason) ? reason : "unknown", reason)
+        }
+    }
+
     func testHomeIgnoresLaunchEnvironment() throws {
         // No path is opened. This compares only the uid database's answer.
         let original = try UserPaths.home()
