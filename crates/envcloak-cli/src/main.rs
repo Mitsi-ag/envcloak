@@ -113,10 +113,10 @@ const HELP: &str = "usage:
   envcloak agents status [--json]
   envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
+  envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
-  envcloak doctor
   envcloak scrub
   envcloak agents migrate-mcp
   envcloak mcp-bridge
@@ -211,7 +211,6 @@ fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Opti
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
         "reveal" => cmd::reveal::run(&[]),
-        "doctor" => cmd::doctor::run(&[]),
         "scrub" => cmd::scrub::run(&[]),
         "mcp-bridge" => cmd::mcp_bridge::run(&[]),
         "standing" => cmd::standing::run(&[]),
