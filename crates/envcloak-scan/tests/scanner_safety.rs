@@ -203,3 +203,45 @@ fn json_backups_decode_escaped_values_and_report_raw_fallback() {
         }
     }
 }
+
+#[test]
+fn whole_json_sources_stop_at_the_document_cap() {
+    let limit = envcloak_scan::MAX_DOTENV;
+    let report = envcloak_scan::transcript::scan_reader(
+        &mut std::io::repeat(b'x'),
+        ConfigFormat::Json,
+        Default::default(),
+        Budget {
+            bytes: (limit * 2) as u64,
+            ..Budget::default()
+        },
+        &mut |_| panic!("oversized document emitted"),
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "too_large"));
+    assert!(
+        report.bytes <= limit as u64 + 1,
+        "read beyond the document allowance"
+    );
+}
+
+#[test]
+fn oversized_json_backup_is_refused_before_its_contents_are_read() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let path = d.path().join("backup.json");
+    std::fs::File::create(&path)
+        .unwrap()
+        .set_len(envcloak_scan::MAX_DOTENV as u64 + 1)
+        .unwrap();
+    let mut src = source(path);
+    src.format = ConfigFormat::Json;
+    src.source_kind = SourceKind::HostBackup;
+    let report = scan_transcript_sources(&[src], Budget::default(), &mut |_| {
+        panic!("oversized backup emitted")
+    })
+    .unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "too_large"));
+    assert_eq!(report.bytes, 0);
+}
