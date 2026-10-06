@@ -8,8 +8,12 @@
 //! the probe fixture's MCP tools, running each tool call the model asks
 //! for and sending its result back, until the model ends its turn. What
 //! it does where a real host's guard would act is set by
-//! `$HOME/.ec-fake-host.json` (every field optional):
+//! `$HOME/.ec-fake-host.json`, or, where `HOME` has none (a probe home
+//! `agents status --probe` makes, M2-28), by `ec-fake-host.json` beside
+//! the executable (every field optional):
 //!
+//! - `version`: the version `--version` prints (`2.1.280`, the pinned
+//!   Claude Code's, by default);
 //! - `url`: `"dead"` sends to a port nothing listens on (and then ends
 //!   with `exit`, as a host that swallows the error would);
 //! - `prompt`: `"block"` (the default) never sends a prompt holding a
@@ -74,6 +78,7 @@ use serde_json::{Value, json};
 const SWEEP_FILE_CAP: u64 = 64 * 1024 * 1024;
 
 struct Mode {
+    version: String,
     dead: bool,
     prompt: String,
     session_lost: bool,
@@ -91,12 +96,17 @@ struct Mode {
 }
 
 fn mode(home: &Path) -> Mode {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("ec-fake-host.json")));
     let v: Value = std::fs::read(home.join(".ec-fake-host.json"))
         .ok()
+        .or_else(|| beside.and_then(|p| std::fs::read(p).ok()))
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or(Value::Null);
     let s = |k: &str, d: &str| v.get(k).and_then(Value::as_str).unwrap_or(d).to_owned();
     Mode {
+        version: s("version", "2.1.280"),
         dead: s("url", "ok") == "dead",
         prompt: s("prompt", "block"),
         session_lost: s("session", "kept") == "lost",
@@ -137,7 +147,8 @@ fn env_file(path: &str) -> bool {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args == ["--version"] {
-        println!("2.1.280 (Claude Code)");
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
+        println!("{} (Claude Code)", mode(&home).version);
         return;
     }
     let Some(i) = args.iter().position(|a| a == "-p") else {

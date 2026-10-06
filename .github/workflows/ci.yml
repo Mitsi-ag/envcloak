@@ -575,8 +575,10 @@ jobs:
       ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
       # agent_hosts (M2-04's measurements) and probes (M2-09's coverage
       # probes on the pinned hosts, and the published matrix they are held
-      # to) on every run; the story steps on main, nightly and manual runs.
-      TESTS: ${{ github.event_name == 'pull_request' && '--test agent_hosts --test probes' || '--test agent_hosts --test probes --test m2_story' }}
+      # to), and probe_local (M2-28's probes on a person's machine, against
+      # a stand-in host) on every run; the story steps on main, nightly and
+      # manual runs.
+      TESTS: ${{ github.event_name == 'pull_request' && '--test agent_hosts --test probes --test probe_local' || '--test agent_hosts --test probes --test probe_local --test m2_story' }}
       # Gate 12 on the hosts' paths too (see the gates job).
       RUST_LOG: trace
       RUST_BACKTRACE: full
