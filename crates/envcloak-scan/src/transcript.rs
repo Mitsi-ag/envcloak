@@ -83,7 +83,12 @@ pub fn scan_reader(
             report.issue(&source, "byte_budget");
             break;
         }
-        let want = remaining.min(chunk.len() as u64) as usize;
+        let allowance = if format == ConfigFormat::Json {
+            remaining.min((cap as u64 + 1).saturating_sub(report.bytes))
+        } else {
+            remaining
+        };
+        let want = allowance.min(chunk.len() as u64) as usize;
         let n = match reader.read(&mut chunk[..want]) {
             Ok(n) => n,
             Err(_) => {
@@ -155,6 +160,10 @@ pub fn scan_reader(
                     );
                     buffer.clear();
                     skipped = true;
+                    if format == ConfigFormat::Json {
+                        stopped = true;
+                        break;
+                    }
                 } else {
                     if buffer.len() == buffer.capacity() {
                         buffer.grow((buffer.capacity() * 2).min(cap));
@@ -600,9 +609,14 @@ fn scan_file(
         return;
     }
     let path = root.path().join(rel);
+    let cap = if source.format == ConfigFormat::Json {
+        crate::MAX_DOTENV
+    } else {
+        usize::MAX
+    };
     let opened = root
         .open_parent(rel)
-        .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
+        .and_then(|(d, n)| crate::root::open_file(&d, &n, cap));
     let (mut file, metadata) = match opened {
         Ok(v) => v,
         Err(e) => {
