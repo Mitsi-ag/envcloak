@@ -85,7 +85,11 @@ impl ScanReport {
     }
     pub(crate) fn append(&mut self, mut other: Self) {
         self.findings.append(&mut other.findings);
-        self.issues.append(&mut other.issues);
+        for issue in other.issues {
+            if !self.issues.contains(&issue) {
+                self.issues.push(issue);
+            }
+        }
         self.notes.append(&mut other.notes);
         self.leftovers.append(&mut other.leftovers);
         self.files += other.files;

@@ -297,7 +297,9 @@ fn json_line(
                         .any(|i| matches!(i.reason, "occurrence_budget" | "candidate_budget"));
                     report.candidates += part.candidates;
                     report.not_scanned += part.not_scanned;
-                    report.issues.extend(part.issues);
+                    for issue in part.issues {
+                        report.issue(&issue.source, issue.reason);
+                    }
                 }
             }
             return accepted;
