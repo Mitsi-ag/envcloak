@@ -329,7 +329,9 @@ fn restore(files: &[PathBuf]) {
 }
 
 /// The output probe passed, through approvals given from the person's
-/// terminal; every other surface the stand-in serves passed.
+/// terminal; every other surface the stand-in serves passed, the MCP
+/// surface included (through `envcloak-probe-mcp`, shipped beside
+/// `envcloak`).
 fn assert_probed_and_approved(p: &Value) {
     assert_eq!(p["qualified"], true, "{p:#}");
     assert_eq!(p["needs_terminal"], false, "{p:#}");
@@ -340,6 +342,7 @@ fn assert_probed_and_approved(p: &Value) {
         "transcript",
         "file_read",
         "shell",
+        "mcp",
         "output",
     ] {
         assert_eq!(surface(p, s)["probe"], "passed", "{s}: {p:#}");
@@ -561,6 +564,65 @@ fn run_by_an_agent_the_probe_gives_no_approval() {
         );
     }
     m.h.assert_swept("after the agent's probes");
+}
+
+/// Run by an agent that only the person's catalog extension names (a
+/// renamed copy of the stand-in agent, `pairbot`, in `<data>/agents.d`),
+/// the probe gives no approval, as the person's own daemon would refuse
+/// it: the probe daemon is given the person's extensions (the verifier's
+/// review of M2-28: with the builtin catalog alone it judged that agent a
+/// terminal and approved). The control: the same run before the extension
+/// is written approves (the renamed copy is no agent of the builtin
+/// catalog's). Mutation checked: `probe_host` without its
+/// `copy_agent_extensions` call: the second run approves and this fails.
+#[test]
+fn an_agent_only_an_extension_names_gets_probe_needs_terminal() {
+    let mut m = machine(&json!({}));
+    m.install();
+    let pairbot = m.bin.join("pairbot");
+    std::fs::copy(testkit_bin("fixture-agent"), &pairbot).unwrap();
+    std::fs::set_permissions(&pairbot, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = m.path();
+    let cli = m.h.cli();
+    let cwd = m.cwd.clone();
+    let argv = [
+        pairbot.to_str().unwrap(),
+        "/usr/bin/env",
+        path.as_str(),
+        cli.to_str().unwrap(),
+        "agents",
+        "status",
+        "--probe",
+        "--agent",
+        "claude-code",
+        "--json",
+    ];
+    // The control: no extension, so no agent in the chain.
+    let human = m.h.human_argv(&cwd, &argv, &[], &[]);
+    assert_eq!(human.code, 0, "{}", human.all());
+    let v = one_document(&human);
+    assert_probed_and_approved(probe_of(&v));
+
+    let ext = m.h.data_dir().join("agents.d");
+    std::fs::create_dir(&ext).unwrap();
+    std::fs::set_permissions(&ext, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = ext.join("pairbot.toml");
+    std::fs::write(
+        &file,
+        "[[agent]]\nid = \"pairbot\"\nname = \"Pairbot\"\nnames = [\"pairbot\"]\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let human = m.h.human_argv(&cwd, &argv, &[], &[]);
+    assert_eq!(human.code, 0, "{}", human.all());
+    let v = one_document(&human);
+    let p = probe_of(&v);
+    assert_eq!(p["needs_terminal"], true, "{p:#}");
+    assert_eq!(p["approvals"], 0, "{p:#}");
+    let output = surface(p, "output");
+    assert_eq!(output["probe"], "skipped", "{p:#}");
+    assert_eq!(output["why"], json!(["probe_needs_terminal"]), "{p:#}");
+    m.h.assert_swept("after the extension agent's probes");
 }
 
 /// An agent's request, made in a session and on a terminal `HostSession`

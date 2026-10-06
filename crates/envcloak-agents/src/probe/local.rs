@@ -54,7 +54,7 @@
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
 use std::os::fd::AsFd as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -102,6 +102,13 @@ pub enum LocalError {
     Install,
     /// The probe's projects could not be written.
     Fixtures,
+    /// The person's agent catalog extensions could not be given to the
+    /// probe daemon.
+    Catalog,
+    /// A system or managed configuration of the host's is on this machine
+    /// ([`inherited_configuration`]), which the host would load in the
+    /// probe home too.
+    Inherited,
 }
 
 impl LocalError {
@@ -113,6 +120,16 @@ impl LocalError {
             LocalError::Vault => "the probe's throwaway vault could not be created",
             LocalError::Install => "EnvCloak could not be installed for the host in the probe home",
             LocalError::Fixtures => "the probe's projects could not be written in the probe home",
+            LocalError::Inherited => {
+                "a system or managed configuration for this host is on this machine (its system \
+                 directory, managed settings or a device profile), which the host loads whatever \
+                 its home: it could run that configuration's hooks and servers and write where it \
+                 says, outside the probe home, so the host was not probed"
+            }
+            LocalError::Catalog => {
+                "your agent catalog extensions (agents.d) could not be given to the probe's daemon, \
+                 so it could not tell your agents as your daemon does"
+            }
         }
     }
 }
@@ -146,6 +163,9 @@ pub struct LocalOptions {
     pub tmp: PathBuf,
     /// The person's own daemon socket, which the probe's must not be.
     pub person_socket: Option<PathBuf>,
+    /// The person's EnvCloak data directory, whose agent catalog
+    /// extensions (`agents.d`) the probe daemon is given, read-only.
+    pub person_data: PathBuf,
     /// How long one host run may take.
     pub run_limit: Duration,
 }
@@ -185,6 +205,7 @@ pub fn probe_host(host: &ProbeHost, opts: &LocalOptions) -> Result<LocalRun, Loc
     let mut env = home.env();
     env.push(("PATH".into(), opts.path.clone()));
     let run = (|| {
+        copy_agent_extensions(&opts.person_data, &home.data_dir()?)?;
         let mut daemon = ProbeDaemon::start(&opts.envcloakd, &home, &env)?;
         daemon.create_vault()?;
         install(host.host, &opts.envcloak, &home, &env)?;
@@ -421,6 +442,172 @@ pub fn keep_record(
     record.exe_sha256 = person.exe_sha256.to_owned();
     record.config_digest = before.to_owned();
     Ok(record)
+}
+
+/// The configuration `host` loads whatever its home and environment say,
+/// present on this machine: Claude Code's managed settings, their drop-ins
+/// and the organization's `managed-mcp.json` in `claude_managed`, and its
+/// device profiles; Codex's system directory (`config.toml`, `hooks.json`,
+/// `managed_config.toml`, `requirements.toml`) and its device profiles. A
+/// probe home cannot keep the host from these (Codex review of M2-28: a
+/// managed `log_dir` or `sqlite_home` given as an absolute path sends the
+/// probe's writes into the person's files, and a managed hook or server
+/// runs their real integration), so a host with any is not probed
+/// ([`LocalError::Inherited`]). A path whose state cannot be read, or a
+/// device profile folder that cannot be listed, counts as present.
+pub fn inherited_configuration(
+    host: Host,
+    l: &crate::locations::Locations,
+    claude_managed: &Path,
+) -> Vec<PathBuf> {
+    // Absent: nothing there, or a file where a folder of the path would
+    // be (a device profile entry that is a file, not a user's folder).
+    let present = |p: &Path| match std::fs::symlink_metadata(p) {
+        Ok(_) => true,
+        Err(e) => {
+            e.kind() != std::io::ErrorKind::NotFound && e.raw_os_error() != Some(libc::ENOTDIR)
+        }
+    };
+    let (mut candidates, profiles) = match host {
+        Host::ClaudeCode => (
+            vec![
+                claude_managed.join("managed-settings.json"),
+                claude_managed.join("managed-settings.d"),
+                claude_managed.join("managed-mcp.json"),
+            ],
+            l.claude_managed_preferences(),
+        ),
+        Host::Codex => (
+            vec![
+                l.codex_system_config(),
+                l.codex_system_hooks(),
+                l.codex_managed_config(),
+                l.codex_requirements(),
+            ],
+            l.codex_managed_preferences(),
+        ),
+    };
+    match profiles {
+        Ok(ps) => candidates.extend(ps),
+        // Not listed: what it holds is not known.
+        Err(_) => return vec![PathBuf::from("/Library/Managed Preferences")],
+    }
+    candidates.into_iter().filter(|p| present(p)).collect()
+}
+
+/// The programs a probe on this machine runs besides `envcloak`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbePrograms {
+    pub envcloakd: PathBuf,
+    pub model: PathBuf,
+    pub mcp: PathBuf,
+}
+
+/// The name of the probe's MCP server program.
+pub const MCP_PROGRAM: &str = "envcloak-probe-mcp";
+/// The name of the scripted model's program.
+pub const MODEL_PROGRAM: &str = "envcloak-probe-model";
+
+/// Finds what a probe runs, for `me`, this `envcloak` resolved: the
+/// scripted model and the probe's MCP server beside it, and `envcloakd`
+/// beside it or, when `me` is the CLI of the macOS app
+/// (`<app>/Contents/MacOS/envcloak`), in the app's helper
+/// (`<app>/Contents/Helpers/EnvCloakAgent.app/Contents/MacOS/envcloakd`,
+/// where `scripts/macos/build-app.sh` puts it; the verifier's and Codex's
+/// reviews of M2-28: `--probe` from the app could never find it). Each
+/// must be an executable regular file. All three are needed: a probe
+/// without its MCP server would leave that surface unmeasured, and
+/// `--probe` says so rather than report the others as the whole.
+///
+/// # Errors
+/// What is missing, value-free.
+pub fn locate_programs(me: &Path) -> Result<ProbePrograms, &'static str> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let executable = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    let dir = me
+        .parent()
+        .ok_or("the path of this envcloak could not be read")?;
+    let helper = dir
+        .parent()
+        .filter(|contents| {
+            dir.file_name() == Some(std::ffi::OsStr::new("MacOS"))
+                && contents.file_name() == Some(std::ffi::OsStr::new("Contents"))
+        })
+        .map(|contents| {
+            contents
+                .join("Helpers")
+                .join("EnvCloakAgent.app")
+                .join("Contents")
+                .join("MacOS")
+                .join("envcloakd")
+        });
+    let envcloakd = [Some(dir.join("envcloakd")), helper]
+        .into_iter()
+        .flatten()
+        .find(|p| executable(p))
+        .ok_or(
+            "the probes need envcloakd, which is neither beside this envcloak nor in its app's \
+             helper; nothing was probed",
+        )?;
+    let model = dir.join(MODEL_PROGRAM);
+    let mcp = dir.join(MCP_PROGRAM);
+    if !executable(&model) || !executable(&mcp) {
+        return Err(
+            "the probes need envcloak-probe-model and envcloak-probe-mcp installed beside this \
+             envcloak (a source build has them in its target directory; the macOS app ships \
+             them beside its CLI); nothing was probed",
+        );
+    }
+    Ok(ProbePrograms {
+        envcloakd,
+        model,
+        mcp,
+    })
+}
+
+/// Gives the probe daemon the person's agent catalog extensions: each
+/// file of `<person_data>/agents.d` that the person's own daemon reads
+/// (`AgentCatalog::extension_files`, with every check its `load` applies:
+/// no link followed, the directory and each file the person's and written
+/// by no one else, the size and count limits) is written, byte for byte,
+/// into `<probe_data>/agents.d` (mode 0700, each file 0600). The probe
+/// daemon then classifies the processes that ask it for an approval as the
+/// person's daemon would: an agent only an extension names is an agent
+/// there too, so `agents status --probe` run by it gives
+/// `probe_needs_terminal` and no grant (the verifier's review of M2-28:
+/// with the builtin catalog alone, the probe daemon judged it a terminal
+/// and approved). Nothing of the person's is written; a file their daemon
+/// skips is not copied.
+///
+/// # Errors
+/// [`LocalError::Catalog`] when the directory or a file cannot be made.
+pub fn copy_agent_extensions(person_data: &Path, probe_data: &Path) -> Result<(), LocalError> {
+    let read = envcloak_policy::AgentCatalog::extension_files(person_data);
+    let files: Vec<_> = read
+        .files
+        .into_iter()
+        .filter_map(|(name, bytes)| bytes.ok().map(|b| (name, b)))
+        .collect();
+    if read.directory.is_some() || files.is_empty() {
+        return Ok(());
+    }
+    let fail = |_| LocalError::Catalog;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(probe_data)
+        .map_err(fail)?;
+    let dir = probe_data.join(envcloak_policy::AGENTS_DIR);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(fail)?;
+    for (name, bytes) in files {
+        new_file(&dir.join(name), &bytes, 0o600).map_err(|_| LocalError::Catalog)?;
+    }
+    Ok(())
 }
 
 /// `envcloak agents install --agent <host> --yes --json` in the probe home.
@@ -932,6 +1119,216 @@ mod tests {
         assert_eq!(r.server.outcome, Outcome::NotQualified);
     }
 
+    /// The probe daemon is given the person's agent catalog extensions,
+    /// only those their own daemon reads, byte for byte, so it knows their
+    /// agents as their daemon does (the verifier's review of M2-28).
+    /// Mutation checked: `probe_host` without its `copy_agent_extensions`
+    /// call leaves the probe daemon the builtin catalog; this test then
+    /// fails on `copy_agent_extensions` taken out of its body (the probe
+    /// catalog lacks `pairbot`), and `probe_local.rs`'s
+    /// `an_agent_only_an_extension_names_gets_probe_needs_terminal` fails
+    /// on the call taken out.
+    #[test]
+    fn the_probe_daemon_gets_the_extensions_the_persons_daemon_reads() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let person = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let probe = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let probe_data = probe.path().join("data");
+        // Nothing to give: nothing made.
+        copy_agent_extensions(person.path(), &probe_data).unwrap_or_else(|e| panic!("{e:?}"));
+        assert!(!probe_data.exists());
+
+        let dir = person.path().join("agents.d");
+        std::fs::create_dir(&dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let write = |name: &str, body: &str, mode: u32| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        let good = "[[agent]]\nid = \"pairbot\"\nname = \"Pairbot\"\nnames = [\"pairbot\"]\n";
+        write("pairbot.toml", good, 0o600);
+        // Skipped by the person's daemon: group-writable, hidden, a link.
+        write(
+            "shared.toml",
+            "[[agent]]\nid = \"shared\"\nname = \"S\"\nnames = [\"shared\"]\n",
+            0o664,
+        );
+        write(
+            ".hidden.toml",
+            "[[agent]]\nid = \"hidden\"\nname = \"H\"\nnames = [\"hidden\"]\n",
+            0o600,
+        );
+        std::os::unix::fs::symlink(dir.join("pairbot.toml"), dir.join("link.toml"))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        copy_agent_extensions(person.path(), &probe_data).unwrap_or_else(|e| panic!("{e:?}"));
+        let copied = probe_data.join("agents.d");
+        let mut names: Vec<String> = std::fs::read_dir(&copied)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .map(|e| {
+                e.unwrap_or_else(|e| panic!("{e}"))
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, ["pairbot.toml"]);
+        assert_eq!(
+            std::fs::read_to_string(copied.join("pairbot.toml")).unwrap_or_default(),
+            good
+        );
+        let mode = |p: &Path| {
+            std::fs::metadata(p)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0)
+        };
+        assert_eq!(mode(&copied), 0o700);
+        assert_eq!(mode(&copied.join("pairbot.toml")), 0o600);
+        let probe_cat = envcloak_policy::AgentCatalog::load(&probe_data);
+        let person_cat = envcloak_policy::AgentCatalog::load(person.path());
+        let ids =
+            |c: &envcloak_policy::AgentCatalog| c.ids().map(str::to_owned).collect::<Vec<String>>();
+        assert!(ids(&probe_cat).iter().any(|i| i == "pairbot"));
+        assert_eq!(ids(&probe_cat), ids(&person_cat));
+        // The person's files are as they were.
+        assert_eq!(mode(&dir.join("shared.toml")), 0o664);
+    }
+
+    /// What a probe runs is found beside `envcloak`, or `envcloakd` in the
+    /// macOS app's helper; each of the three missing, or not executable, is
+    /// refused (never a probe with a surface left out). Mutation checked:
+    /// the MCP server made optional again (`locate_programs` without its
+    /// `mcp` check): the case without it is found and this fails.
+    #[test]
+    fn the_probe_programs_are_found_where_they_ship() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let put = |p: &Path, mode: u32| {
+            if let Some(d) = p.parent() {
+                std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
+            }
+            std::fs::write(p, "#!/bin/sh\n").unwrap_or_else(|e| panic!("{e}"));
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))
+                .unwrap_or_else(|e| panic!("{e}"));
+        };
+        // A build tree: all beside it.
+        let bin = root.path().join("bin");
+        let me = bin.join("envcloak");
+        for n in ["envcloak", "envcloakd", MODEL_PROGRAM, MCP_PROGRAM] {
+            put(&bin.join(n), 0o755);
+        }
+        assert_eq!(
+            locate_programs(&me),
+            Ok(ProbePrograms {
+                envcloakd: bin.join("envcloakd"),
+                model: bin.join(MODEL_PROGRAM),
+                mcp: bin.join(MCP_PROGRAM),
+            })
+        );
+        // Each one missing or not executable.
+        for n in ["envcloakd", MODEL_PROGRAM, MCP_PROGRAM] {
+            put(&bin.join(n), 0o644);
+            assert!(locate_programs(&me).is_err(), "{n} not executable");
+            std::fs::remove_file(bin.join(n)).unwrap_or_else(|e| panic!("{e}"));
+            assert!(locate_programs(&me).is_err(), "{n} missing");
+            put(&bin.join(n), 0o755);
+        }
+        // The macOS app: the daemon in its helper.
+        let app = root.path().join("EnvCloak.app").join("Contents");
+        let cli = app.join("MacOS").join("envcloak");
+        let daemon = app
+            .join("Helpers")
+            .join("EnvCloakAgent.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("envcloakd");
+        for p in [&cli, &daemon] {
+            put(p, 0o755);
+        }
+        for n in [MODEL_PROGRAM, MCP_PROGRAM] {
+            put(&app.join("MacOS").join(n), 0o755);
+        }
+        assert_eq!(
+            locate_programs(&cli).map(|p| p.envcloakd),
+            Ok(daemon.clone())
+        );
+        // The helper's daemon is looked for only in an app's layout.
+        let other = root.path().join("x").join("Contents").join("bin");
+        for n in ["envcloak", MODEL_PROGRAM, MCP_PROGRAM] {
+            put(&other.join(n), 0o755);
+        }
+        assert!(locate_programs(&other.join("envcloak")).is_err());
+    }
+
+    /// Each system or managed file a host loads whatever its home is
+    /// found, for its host only; none, nothing. Mutation checked: each
+    /// candidate taken out of `inherited_configuration` in turn: its case
+    /// below is then not found and this fails.
+    #[test]
+    fn a_hosts_system_and_managed_configuration_is_found() {
+        let root = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let home = root.path().join("home");
+        let system = root.path().join("etc-codex");
+        let prefs = root.path().join("managed-preferences");
+        let claude = root.path().join("claude-managed");
+        for d in [&home, &system, &prefs, &claude] {
+            std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let home_var = home.clone();
+        let l = crate::locations::Locations::new(&|k| {
+            (k == "HOME").then(|| home_var.as_os_str().to_owned())
+        })
+        .unwrap_or_else(|_| panic!("no home"))
+        .with_system_dirs(system.clone(), prefs.clone());
+        for host in [Host::ClaudeCode, Host::Codex] {
+            assert!(
+                inherited_configuration(host, &l, &claude).is_empty(),
+                "{host:?}"
+            );
+        }
+        let user = prefs.join("someone");
+        std::fs::create_dir(&user).unwrap_or_else(|e| panic!("{e}"));
+        let cases: [(Host, PathBuf); 10] = [
+            (Host::ClaudeCode, claude.join("managed-settings.json")),
+            (Host::ClaudeCode, claude.join("managed-settings.d")),
+            (Host::ClaudeCode, claude.join("managed-mcp.json")),
+            (
+                Host::ClaudeCode,
+                prefs.join("com.anthropic.claudecode.plist"),
+            ),
+            (
+                Host::ClaudeCode,
+                user.join("com.anthropic.claudecode.plist"),
+            ),
+            (Host::Codex, system.join("config.toml")),
+            (Host::Codex, system.join("hooks.json")),
+            (Host::Codex, system.join("managed_config.toml")),
+            (Host::Codex, system.join("requirements.toml")),
+            (Host::Codex, user.join("com.openai.codex.plist")),
+        ];
+        for (host, path) in cases {
+            std::fs::write(&path, "").unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                inherited_configuration(host, &l, &claude),
+                std::slice::from_ref(&path),
+                "{host:?}"
+            );
+            let other = match host {
+                Host::ClaudeCode => Host::Codex,
+                Host::Codex => Host::ClaudeCode,
+            };
+            assert!(
+                inherited_configuration(other, &l, &claude).is_empty(),
+                "{path:?}"
+            );
+            std::fs::remove_file(&path).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
     #[test]
     fn only_codex_gets_the_trust_bypass() {
         assert_eq!(
@@ -958,6 +1355,7 @@ mod tests {
             claims: Vec::new(),
             tmp: PathBuf::from("/nonexistent"),
             person_socket: None,
+            person_data: PathBuf::from("/nonexistent"),
             run_limit: RUN_LIMIT,
         };
         let r = probe_host(&host, &opts).unwrap();

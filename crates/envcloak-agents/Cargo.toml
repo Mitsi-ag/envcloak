@@ -53,6 +53,13 @@ zeroize.workspace = true
 name = "envcloak-probe-model"
 path = "src/bin/envcloak-probe-model.rs"
 
+# The probe's MCP server (M2 plan task M2-28): what `agents status --probe`
+# registers with a host in its probe home for the MCP surface. Its own
+# binary, never linked into `envcloak` or `envcloakd`.
+[[bin]]
+name = "envcloak-probe-mcp"
+path = "src/bin/envcloak-probe-mcp.rs"
+
 [dev-dependencies]
 # Enables the `testing` feature for this crate's own tests.
 envcloak-agents = { path = ".", features = ["testing"] }

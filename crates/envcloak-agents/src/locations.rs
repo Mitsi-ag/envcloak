@@ -241,6 +241,30 @@ impl Locations {
         Ok(out)
     }
 
+    /// The device profiles that may give Claude Code managed settings
+    /// (macOS): `com.anthropic.claudecode` in the managed preferences, for
+    /// every user and for each one, as [`Locations::codex_managed_preferences`]
+    /// lists Codex's.
+    ///
+    /// # Errors
+    /// The managed preferences are there and cannot be listed.
+    pub fn claude_managed_preferences(&self) -> std::io::Result<Vec<PathBuf>> {
+        const NAME: &str = "com.anthropic.claudecode.plist";
+        let mut out = vec![self.managed_preferences.join(NAME)];
+        let rd = match std::fs::read_dir(&self.managed_preferences) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e),
+        };
+        for e in rd {
+            let p = e?.path();
+            if p.file_name().is_some_and(|n| n != NAME) {
+                out.push(p.join(NAME));
+            }
+        }
+        Ok(out)
+    }
+
     /// Codex's cache of the configuration an organization's workspace
     /// sends it (business, education and enterprise accounts; pinned
     /// 0.159.2, `codex-rs/cloud-config/src/cache.rs`).

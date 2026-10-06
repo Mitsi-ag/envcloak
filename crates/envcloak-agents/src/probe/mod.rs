@@ -91,6 +91,7 @@ pub mod codex;
 pub mod controls;
 pub mod home;
 pub mod local;
+pub mod mcp;
 pub mod model;
 pub mod qualify;
 mod run;

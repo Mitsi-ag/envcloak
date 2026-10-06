@@ -326,6 +326,16 @@ pub struct CatalogProblem {
     pub error: CatalogError,
 }
 
+/// What [`AgentCatalog::extension_files`] read.
+#[derive(Debug)]
+pub struct ExtensionFiles {
+    /// Why the directory itself was not read (none when it is absent).
+    pub directory: Option<CatalogError>,
+    /// Each extension file by name, in name order: its bytes, or why it is
+    /// skipped.
+    pub files: Vec<(OsString, Result<Vec<u8>, CatalogError>)>,
+}
+
 /// One path component of a pattern.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Component {
@@ -519,6 +529,64 @@ impl AgentCatalog {
     /// skipped.
     pub fn load(data_dir: &Path) -> Self {
         let mut cat = Self::builtin();
+        let read = Self::extension_files(data_dir);
+        if let Some(e) = read.directory {
+            cat.problem(OsStr::new(AGENTS_DIR), e);
+            return cat;
+        }
+        for (name, bytes) in read.files {
+            match bytes.and_then(|b| parse_catalog(&b)) {
+                Ok(file) if cat.agents.len() + file.new_ids(&cat) > MAX_AGENTS => {
+                    cat.problem(&name, CatalogErrorKind::TooMany.into());
+                }
+                Ok(file) if file.agents.iter().any(FileAgent::has_builtin_only) => {
+                    let line = file
+                        .agents
+                        .iter()
+                        .find(|a| a.has_builtin_only())
+                        .and_then(|a| a.line);
+                    cat.problem(
+                        &name,
+                        CatalogError {
+                            kind: CatalogErrorKind::BuiltinOnly,
+                            line,
+                        },
+                    );
+                }
+                Ok(file) if file.unnamed_new(&cat).is_some() => {
+                    let line = file.unnamed_new(&cat);
+                    cat.problem(
+                        &name,
+                        CatalogError {
+                            kind: CatalogErrorKind::MissingKey,
+                            line: line.flatten(),
+                        },
+                    );
+                }
+                Ok(file) => cat.merge(file, CatalogSource::Extension),
+                Err(e) => cat.problem(&name, e),
+            }
+        }
+        cat
+    }
+
+    /// The extension files [`AgentCatalog::load`] reads from
+    /// `<data_dir>/agents.d/`, with every check it applies before parsing:
+    /// the directory opened without following a link, a directory of this
+    /// user's that no one else may write; each `*.toml` (not hidden) opened
+    /// beneath it without following a link, a regular file of this user's
+    /// that no one else may write, at most [`MAX_CATALOG_FILE`] bytes; at
+    /// most [`MAX_EXTENSION_FILES`] of them, by name. In name order, each
+    /// with its bytes or why it is skipped. For a probe daemon of
+    /// `envcloak agents status --probe` (M2 plan M2-28), which must know the
+    /// person's agents as their daemon does (the verifier's review: a probe
+    /// daemon with the builtin catalog alone judged an agent only an
+    /// extension names to be a terminal, and approved for it).
+    pub fn extension_files(data_dir: &Path) -> ExtensionFiles {
+        let none = |directory| ExtensionFiles {
+            directory,
+            files: Vec::new(),
+        };
         let dir_path = data_dir.join(AGENTS_DIR);
         let dir = match OpenOptions::new()
             .read(true)
@@ -526,25 +594,20 @@ impl AgentCatalog {
             .open(&dir_path)
         {
             Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return cat,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return none(None),
             Err(e) => {
                 let kind = match e.raw_os_error() {
                     Some(libc::ELOOP | libc::ENOTDIR) => CatalogErrorKind::UnsafeDirectory,
                     _ => CatalogErrorKind::Io(e.kind()),
                 };
-                cat.problem(OsStr::new(AGENTS_DIR), kind.into());
-                return cat;
+                return none(Some(kind.into()));
             }
         };
         let trusted = dir.metadata().is_ok_and(|m| {
             m.is_dir() && m.uid() == envcloak_sys::effective_uid() && m.mode() & 0o022 == 0
         });
         if !trusted {
-            cat.problem(
-                OsStr::new(AGENTS_DIR),
-                CatalogErrorKind::UnsafeDirectory.into(),
-            );
-            return cat;
+            return none(Some(CatalogErrorKind::UnsafeDirectory.into()));
         }
         // The listing goes by path; each file is then opened through the
         // checked directory's handle, so only files in it are read.
@@ -557,53 +620,25 @@ impl AgentCatalog {
                     b.ends_with(b".toml") && !b.starts_with(b".")
                 })
                 .collect(),
-            Err(e) => {
-                cat.problem(
-                    OsStr::new(AGENTS_DIR),
-                    CatalogErrorKind::Io(e.kind()).into(),
-                );
-                return cat;
-            }
+            Err(e) => return none(Some(CatalogErrorKind::Io(e.kind()).into())),
         };
         names.sort();
-        for (i, name) in names.iter().enumerate() {
-            if i >= MAX_EXTENSION_FILES {
-                cat.problem(name, CatalogErrorKind::TooMany.into());
-                continue;
-            }
-            match read_extension(&dir, name).and_then(|b| parse_catalog(&b)) {
-                Ok(file) if cat.agents.len() + file.new_ids(&cat) > MAX_AGENTS => {
-                    cat.problem(name, CatalogErrorKind::TooMany.into());
-                }
-                Ok(file) if file.agents.iter().any(FileAgent::has_builtin_only) => {
-                    let line = file
-                        .agents
-                        .iter()
-                        .find(|a| a.has_builtin_only())
-                        .and_then(|a| a.line);
-                    cat.problem(
-                        name,
-                        CatalogError {
-                            kind: CatalogErrorKind::BuiltinOnly,
-                            line,
-                        },
-                    );
-                }
-                Ok(file) if file.unnamed_new(&cat).is_some() => {
-                    let line = file.unnamed_new(&cat);
-                    cat.problem(
-                        name,
-                        CatalogError {
-                            kind: CatalogErrorKind::MissingKey,
-                            line: line.flatten(),
-                        },
-                    );
-                }
-                Ok(file) => cat.merge(file, CatalogSource::Extension),
-                Err(e) => cat.problem(name, e),
-            }
+        let files = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let bytes = if i >= MAX_EXTENSION_FILES {
+                    Err(CatalogErrorKind::TooMany.into())
+                } else {
+                    read_extension(&dir, &name)
+                };
+                (name, bytes)
+            })
+            .collect();
+        ExtensionFiles {
+            directory: None,
+            files,
         }
-        cat
     }
 
     fn problem(&mut self, file: &OsStr, error: CatalogError) {
