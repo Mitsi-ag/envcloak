@@ -28,6 +28,12 @@ and `/etc` aliases with their fixed `/private` targets. User-controlled links
 remain refused. Device checks apply both during discovery and at the actual
 read, including plain metadata files.
 
+Catalog entries retain distinct selectors and reader formats when their paths
+overlap. Failed filesystem reads are cached separately from parser outcomes.
+Database and credential omissions apply before readable sources in either
+catalog order, including indirect `envFile` reads; sibling logs remain eligible.
+Directory attempts consume the file budget even when empty.
+
 Profiles cover the seven conventional shell files, literal `source`/`.` paths
 within the supplied home root, at most four source edges and 64 attempted paths,
 including missing conventional profiles and failed includes. Attempts and their

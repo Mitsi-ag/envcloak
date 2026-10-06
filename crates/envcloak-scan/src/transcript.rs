@@ -629,16 +629,7 @@ fn scan_file(
         report.issue(path, "mount_point");
         return;
     }
-    let format = match source.format {
-        ConfigFormat::Mixed => {
-            if rel.extension().is_some_and(|s| s == "jsonl") {
-                ConfigFormat::Jsonl
-            } else {
-                ConfigFormat::Raw
-            }
-        }
-        f => f,
-    };
+    let format = crate::sources::effective_format(rel, source.format);
     let remaining = Budget {
         bytes: budget.bytes.saturating_sub(report.bytes),
         occurrences: budget.occurrences.saturating_sub(*occurrences),

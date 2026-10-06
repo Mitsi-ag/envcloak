@@ -341,3 +341,38 @@ fn missing_catalog_roots_consume_the_shared_file_budget() {
     assert!(!report.complete());
     assert_eq!(report.issues.len(), 1);
 }
+
+#[test]
+fn different_selectors_on_one_directory_keep_their_coverage() {
+    let d = dir();
+    for (name, value) in [
+        ("first.json", "fixtureZfirstSelector"),
+        ("second.json", "fixtureZsecondSelector"),
+    ] {
+        std::fs::write(
+            d.path().join(name),
+            format!("{{\"env\":{{\"A\":\"{value}\"}}}}"),
+        )
+        .unwrap();
+    }
+    let mut first = source(d.path().to_path_buf());
+    first.names = Some("first".into());
+    let mut second = first.clone();
+    second.names = Some("second".into());
+    let report =
+        scan_config_sources_with_budget(&[first.clone(), first, second], Budget::default())
+            .unwrap();
+    assert!(report.complete());
+    assert_eq!(report.files, 2);
+    for expected in [
+        b"fixtureZfirstSelector".as_slice(),
+        b"fixtureZsecondSelector",
+    ] {
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.value.as_ref().is_some_and(|v| v.ct_eq(expected)))
+        );
+    }
+}
