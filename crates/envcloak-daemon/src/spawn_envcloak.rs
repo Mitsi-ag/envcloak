@@ -26,7 +26,11 @@
 //! (the values go only after the resumption). Its client, whose request
 //! the dead daemon never answered, sees its connection end and exits; the
 //! stopped runner stays until it is killed or the machine restarts. A
-//! timer of its own cannot run while it is suspended. An
+//! timer of its own cannot run while it is suspended. Closing it is left
+//! to M2-25 (the hardening pass), recorded as an M2 residual: a durable
+//! record of suspended runner starts not yet resumed, which a restarted
+//! daemon ends through a fresh handle of its own (never by a number it
+//! read, D-34), tested by killing the daemon at `launch.anchor_resume`. An
 //! anchor that could not be taken, or a runner that could not be started
 //! from it, is `runner_unavailable`: nothing falls back to the file.
 //!
