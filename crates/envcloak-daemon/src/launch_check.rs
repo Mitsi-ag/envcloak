@@ -45,7 +45,7 @@ use envcloak_ipc::RpcError;
 use envcloak_ipc::control::Stamp;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_policy::managed::{
-    ArgvClass, CodeSelecting, DeclError, check_declaration, classify_argv,
+    ArgvClass, CodeSelecting, DeclError, check_declaration, classify_argv, refuse_disguised,
 };
 use envcloak_sys::codesign::{self, ExecutableFormat};
 use sha2::{Digest, Sha256};
@@ -83,6 +83,11 @@ impl ResolveError {
                     CodeSelecting::InterpreterOption => "interpreter_option",
                 },
             ),
+            // What a wrapper or a disguised launcher runs could not be
+            // checked: reported manual, as a code-selecting declaration is.
+            ResolveError::Decl(e @ (DeclError::Wrapper | DeclError::Disguised)) => {
+                RpcError::with_reason(ErrorKind::CodeSelectingEnv, e.word())
+            }
             ResolveError::Decl(DeclError::TooLarge) | ResolveError::TooLarge => {
                 RpcError::with_reason(ErrorKind::InvalidParams, "too_large")
             }
@@ -279,6 +284,11 @@ pub(crate) fn resolve(
         .unwrap_or_else(|| DEFAULT_PATH.to_owned());
     let program = find_program(&decl.argv[0], &path_env)?;
     let canonical = std::fs::canonicalize(&program).map_err(|_| ResolveError::NotFound)?;
+    // A launcher known by another name is classed by its file's name.
+    refuse_disguised(
+        &decl.argv,
+        canonical.file_name().and_then(|n| n.to_str()).unwrap_or(""),
+    )?;
     let file = open_file(&canonical)?;
     let meta = file.metadata().map_err(|_| ResolveError::NotFound)?;
     if meta.permissions().mode() & 0o111 == 0 {
