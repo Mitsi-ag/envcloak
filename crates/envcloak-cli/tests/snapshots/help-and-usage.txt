@@ -18,7 +18,7 @@ usage:
   envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
   envcloak ls [--long] [--json]
   envcloak show <slug> [--json]
-  envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest PATH] [--json]
+  envcloak ref (NAME=<slug>[#field] | --unset NAME) [--profile NAME] [--manifest PATH] [--json]
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
@@ -73,7 +73,7 @@ usage:
   envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
   envcloak ls [--long] [--json]
   envcloak show <slug> [--json]
-  envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest PATH] [--json]
+  envcloak ref (NAME=<slug>[#field] | --unset NAME) [--profile NAME] [--manifest PATH] [--json]
   envcloak check [--json]
   envcloak rotate <slug>[#field] [--stdin] [--passphrase-fd N] [--json]
   envcloak rm <slug> [--passphrase-fd N] [--json]
@@ -237,14 +237,14 @@ envcloak: usage: envcloak show <slug> [--json]
 $ envcloak ref --help
 exit: 0
 --- stdout
-usage: envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest /absolute/path/envcloak.toml] [--json]
+usage: envcloak ref (NAME=<slug>[#field] | --unset NAME) [--profile NAME] [--manifest /absolute/path/envcloak.toml] [--json]
 --- stderr
 $ envcloak ref
 exit: 2
 --- stdout
 --- stderr
-envcloak: ref needs NAME=<slug>[#field]
-envcloak: usage: envcloak ref NAME=<slug>[#field] [--profile NAME] [--manifest /absolute/path/envcloak.toml] [--json]
+envcloak: ref needs one binding or --unset NAME
+envcloak: usage: envcloak ref (NAME=<slug>[#field] | --unset NAME) [--profile NAME] [--manifest /absolute/path/envcloak.toml] [--json]
 $ envcloak check --bogus
 exit: 2
 --- stdout

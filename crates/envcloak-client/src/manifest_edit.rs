@@ -304,7 +304,8 @@ fn edited_text(
 /// was. See the module documentation for the steps.
 ///
 /// # Errors
-/// An [`EditError`]; the manifest is then as it was.
+/// An [`EditError`]. Refusals before replacement leave the manifest as
+/// it was. A failed parent sync can follow a completed rename.
 pub fn edit_manifest_ref(
     path: &Path,
     binding: &Binding,
