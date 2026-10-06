@@ -53,9 +53,9 @@ use envcloak_ipc::view::{
     ManagedUpdatePlanView, ManagedUpdatedView, UpdateStatementView,
 };
 use envcloak_policy::managed::{
-    ArgvClass, apply_changes, bridge_binding_suffix, class_word, classify_argv, launch_digest,
-    launch_id_text, new_launch_id, parse_launch_id, receipt_sentences, residual_sentence,
-    strength_word, update_digest,
+    ArgvClass, apply_changes, bridge_binding_suffix, bridge_headers, class_word, classify_argv,
+    launch_digest, launch_id_text, new_launch_id, parse_launch_id, receipt_sentences,
+    residual_sentence, strength_word, update_digest,
 };
 use envcloak_policy::{ManagedRequest, Project, SubjectEvidence, SubjectKind, load_project};
 use envcloak_sys::PeerIdentity;
@@ -471,6 +471,16 @@ pub fn register(
             if !bindings_carry_origin(names.iter().map(String::as_str), origin) {
                 return Err(RpcError::new(ErrorKind::InvalidParams));
             }
+            // Each header has its one binding (its name and the origin's
+            // digest), and the manifest binds exactly those: the relay is
+            // told which value goes in which header, and no binding goes
+            // in none.
+            let Some(headers) = bridge_headers(header_names, origin) else {
+                return Err(invalid("invalid_header"));
+            };
+            if !same_names(headers.iter().map(|(_, b)| b.as_str()), names.iter()) {
+                return Err(invalid("header_bindings"));
+            }
             ManagedTransport::Bridge {
                 origin: origin.clone(),
                 header_names: header_names.clone(),
@@ -783,8 +793,25 @@ pub(crate) enum Checked {
         launch: Box<RegisteredLaunch>,
         checked: CheckedLaunch,
     },
-    /// A bridged server: its origin.
-    Bridge { origin: String },
+    /// A bridged server: its origin, and each header with the binding
+    /// it carries ([`bridge_headers`]).
+    Bridge {
+        origin: String,
+        headers: Vec<(String, String)>,
+    },
+}
+
+/// Whether `a` and `b` name the same bindings: each once, in any order.
+fn same_names<'a>(
+    a: impl IntoIterator<Item = &'a str>,
+    b: impl IntoIterator<Item = impl AsRef<str>>,
+) -> bool {
+    let mut a: Vec<&str> = a.into_iter().collect();
+    let mut b: Vec<String> = b.into_iter().map(|n| n.as_ref().to_owned()).collect();
+    a.sort_unstable();
+    b.sort_unstable();
+    let distinct = a.windows(2).all(|w| w[0] != w[1]);
+    distinct && a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| *x == y.as_str())
 }
 
 /// What a request against a managed project carries into the grant
@@ -935,14 +962,22 @@ pub(crate) fn check_request(
             // Every binding the request resolves to, whatever layer chose
             // it: a profile, a reference or an env file can name bindings
             // the manifest's defaults do not.
+            // The request resolves to exactly the bindings of the record's
+            // headers, whatever layer chose them.
             if p.launch.is_some()
                 || p.bridge.as_ref() != Some(&declared)
                 || !bindings_carry_origin(requested.iter().copied(), origin)
             {
                 return Err(mismatch());
             }
+            let Some(headers) = bridge_headers(header_names, origin)
+                .filter(|h| same_names(h.iter().map(|(_, b)| b.as_str()), requested.iter()))
+            else {
+                return Err(mismatch());
+            };
             Ok(Some(Checked::Bridge {
                 origin: origin.clone(),
+                headers,
             }))
         }
     }

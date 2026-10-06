@@ -850,6 +850,29 @@ fn launch_spec(l: &envcloak_core::vault::RegisteredLaunch, exec: &CheckedExec) -
     }
 }
 
+/// The headers a relay inserts, from the record's (`headers`, each with
+/// its binding) and the bindings released (`env_name` first): `None`
+/// unless each header's binding is released exactly once and each binding
+/// released is a header's.
+fn relay_headers(
+    headers: &[(String, String)],
+    released: &[(String, String, bool)],
+) -> Option<Vec<envcloak_ipc::control::RelayHeader>> {
+    let once = |b: &str| released.iter().filter(|(n, _, _)| n == b).count() == 1;
+    if released.len() != headers.len() || !headers.iter().all(|(_, b)| once(b)) {
+        return None;
+    }
+    Some(
+        headers
+            .iter()
+            .map(|(name, binding)| envcloak_ipc::control::RelayHeader {
+                name: name.clone(),
+                binding: binding.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// How a covered managed request's delivery went ([`prepare_runner`]).
 enum Prepared {
     /// Delivered: the entry is on disk and the grant used; the values are
@@ -938,12 +961,20 @@ fn prepare_runner(
             let spec = launch_spec(launch, &checked.exec);
             (Some(text.clone()), Recipient::Runner { launch: text, spec })
         }
-        Checked::Bridge { origin } => (
-            None,
-            Recipient::Relay {
-                origin: origin.clone(),
-            },
-        ),
+        Checked::Bridge { origin, headers } => {
+            // Every value released goes in one header, and every header
+            // gets one: anything else was never registered.
+            let Some(headers) = relay_headers(headers, &c.released) else {
+                return Prepared::Done(Err(RpcError::new(ErrorKind::Internal)));
+            };
+            (
+                None,
+                Recipient::Relay {
+                    origin: origin.clone(),
+                    headers,
+                },
+            )
+        }
     };
     // The role follows the check's transport alone: a checked launch is
     // never started as a relay, whatever else holds.
@@ -1449,6 +1480,52 @@ mod tests {
             kind(route(false, Some(()), Some(()))),
             Err(ErrorKind::Internal)
         );
+    }
+
+    /// A relay's release names each header with the binding it carries,
+    /// as the record registered them, for any number of headers; a
+    /// release whose bindings are not exactly the headers' (one missing,
+    /// one extra, one twice, a header renamed so its binding is another)
+    /// has no relay headers and is refused. Mutation checked: the headers
+    /// left out of the release (the previous `Recipient::Relay { origin
+    /// }`): this does not compile; the binding check removed (any release
+    /// mapped): the refused cases pass, and this fails.
+    #[test]
+    fn a_relay_is_told_which_value_goes_in_which_header() {
+        let o = "https://api.example.test";
+        let headers = envcloak_policy::managed::bridge_headers(
+            &["Authorization".to_owned(), "X-Api-Key".to_owned()],
+            o,
+        )
+        .unwrap();
+        let rel = |names: &[&str]| -> Vec<(String, String, bool)> {
+            names
+                .iter()
+                .map(|n| ((*n).to_owned(), "acme/key".to_owned(), false))
+                .collect()
+        };
+        let auth = headers[0].1.as_str();
+        let key = headers[1].1.as_str();
+        let got = relay_headers(&headers, &rel(&[key, auth])).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|h| (h.name.as_str(), h.binding.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Authorization", auth), ("X-Api-Key", key)]
+        );
+        let renamed = envcloak_policy::managed::bridge_headers(
+            &["Authorization".to_owned(), "X-Other-Key".to_owned()],
+            o,
+        )
+        .unwrap();
+        for released in [
+            rel(&[auth]),
+            rel(&[auth, key, "PLAIN_KEY"]),
+            rel(&[auth, auth]),
+        ] {
+            assert!(relay_headers(&headers, &released).is_none(), "{released:?}");
+        }
+        assert!(relay_headers(&renamed, &rel(&[auth, key])).is_none());
     }
 
     /// Gate 27, the sweep's half: a root is alive only while its pid has

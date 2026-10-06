@@ -2369,6 +2369,11 @@ pub const REASONS: &[&str] = &[
     // A launch declaration's argument or variable value shaped like a key
     // (`invalid_params`, gate 13 in the daemon, M2-27).
     "key_shaped",
+    // A bridged server's registration whose headers cannot each have a
+    // binding of their own, or whose manifest does not bind exactly those
+    // (`invalid_params`, M2-27).
+    "invalid_header",
+    "header_bindings",
 ];
 
 /// An error response. Built from fixed tokens only.

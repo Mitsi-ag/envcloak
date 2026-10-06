@@ -827,7 +827,7 @@ fn an_edited_origin_is_refused_until_registered_again() {
         std::fs::write(
             &manifest,
             format!(
-                "[project]\nname = \"remote\"\n\n[env]\nAPI_KEY{suffix} = \"stripe/fixture\"\n"
+                "[project]\nname = \"remote\"\n\n[env]\nAUTHORIZATION{suffix} = \"stripe/fixture\"\n"
             ),
         )
         .unwrap();
@@ -989,6 +989,159 @@ fn launch_classes_and_their_receipts() {
     assert_eq!(reg["receipt"]["class"], "native", "{reg}");
     assert_eq!(reg["receipt"]["strength"], "checked_at_rest", "{reg}");
     w.h.assert_swept("after the classes");
+}
+
+/// What runs is the file checked (Codex review of M2-27): a script whose
+/// entry is named through a link runs the file the link named at
+/// registration, though the link points at another file since; a `#!`
+/// file whose line is `/usr/bin/env NAME` runs the `NAME` found on the
+/// declared `PATH` at registration, though a program of that name comes
+/// first on that `PATH` since; and a `#!` line whose option loads code is
+/// refused at registration. Each started launch is the positive control:
+/// it reports the key.
+///
+/// Mutations checked: the declared entry path kept in the argv (the link
+/// runs, now the other file, which reports nothing), and a `#!` file run
+/// by its path (the kernel's `env` finds the newer program, which reports
+/// nothing): each fails here.
+#[test]
+fn the_entry_and_interpreter_checked_are_the_ones_that_run() {
+    let mut w = World::new(&[]);
+    let fixture = envcloak_e2e::quoted(w.fixture.to_str().unwrap());
+    let real = w.project.join("server.sh");
+    envcloak_e2e::write_script(&real, &format!("#!/bin/sh\nexec {fixture} --var {KEY}\n"));
+    let other = w.project.join("other.sh");
+    envcloak_e2e::write_script(&other, "#!/bin/sh\nexit 7\n");
+    let link = w.project.join("link.sh");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let reg = w.register(json!({"argv": ["sh", link.to_str().unwrap()]}));
+    assert_eq!(reg["receipt"]["entry"], real.to_str().unwrap(), "{reg}");
+    let launch = reg["launch"].as_str().unwrap().to_owned();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    std::fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&other, &link).unwrap();
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    assert_eq!(report(&answer)["vars"][KEY], w.key_digest(), "{answer}");
+    // `#!/usr/bin/env NAME`, NAME found on the declared PATH once.
+    let early = w.project.join("early");
+    let late = w.project.join("late");
+    std::fs::create_dir(&early).unwrap();
+    std::fs::create_dir(&late).unwrap();
+    // A link `sh` to the system shell (a copy of a platform binary is
+    // killed on macOS by its launch constraints, and a link of another
+    // name would be a disguised launcher): the interpreter checked is the
+    // link's canonical file.
+    std::os::unix::fs::symlink("/bin/sh", late.join("sh")).unwrap();
+    let by_env = w.project.join("by-env.sh");
+    envcloak_e2e::write_script(
+        &by_env,
+        &format!("#!/usr/bin/env sh\nexec {fixture} --var {KEY}\n"),
+    );
+    let reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/by-env",
+            "manifest": w.project.join("envcloak.toml").to_str().unwrap(),
+            "argv": [by_env.to_str().unwrap()],
+            "path_env": format!("{}:{}:/usr/bin:/bin", early.display(), late.display()),
+        }),
+    );
+    assert_eq!(reg["receipt"]["class"], "script", "{reg}");
+    assert_eq!(
+        reg["receipt"]["executable"],
+        std::fs::canonicalize("/bin/sh").unwrap().to_str().unwrap(),
+        "{reg}"
+    );
+    let launch = reg["launch"].as_str().unwrap().to_owned();
+    envcloak_e2e::write_script(&early.join("sh"), "#!/bin/sh\nexit 7\n");
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    assert_eq!(report(&answer)["vars"][KEY], w.key_digest(), "{answer}");
+    // A `#!` line whose option loads code.
+    let loads = w.project.join("loads.sh");
+    envcloak_e2e::write_script(&loads, "#!/bin/sh -c\nexit 0\n");
+    let reg = w.register(json!({"argv": [loads.to_str().unwrap()]}));
+    assert_eq!(error_of(&reg), "code_selecting_env", "{reg}");
+    assert_eq!(reg["reason"], "interpreter_option", "{reg}");
+    w.h.assert_swept("after the entries");
+}
+
+/// D-18, Codex review of M2-27: each header of a bridged server has the
+/// one binding its name and the origin give, and the manifest binds
+/// exactly those. Two headers register with their two bindings (the
+/// positive control: the request is pending); a manifest missing a
+/// header's binding, or holding one no header carries, is refused at
+/// registration; a request naming other header names, or a header renamed
+/// so that its binding is another, is `managed_command_mismatch` before
+/// any pending request.
+///
+/// Mutation checked: registration not comparing the manifest's bindings
+/// with the headers' (the previous rule, origin digest only): the
+/// manifest missing `X-Api-Key`'s binding registers, and this fails.
+#[test]
+fn each_header_of_a_bridged_server_has_its_binding() {
+    let mut w = World::new(&[]);
+    let origin = "https://api.example.test";
+    let remote = w.h.home.root().join("remote");
+    std::fs::create_dir_all(&remote).unwrap();
+    let manifest = remote.join("envcloak.toml");
+    let suffix = envcloak_policy::managed::bridge_binding_suffix(origin);
+    let write = |names: &[&str]| {
+        let mut body = "[project]\nname = \"remote\"\n\n[env]\n".to_owned();
+        for n in names {
+            body.push_str(&format!("{n}{suffix} = \"stripe/fixture\"\n"));
+        }
+        std::fs::write(&manifest, body).unwrap();
+    };
+    let manifest_text = manifest.to_str().unwrap().to_owned();
+    let register = |w: &mut World, headers: Value| {
+        w.person(
+            "register",
+            json!({
+                "name": "claude-code/remote",
+                "manifest": manifest_text,
+                "origin": origin,
+                "headers": headers,
+            }),
+        )
+    };
+    let both = json!(["Authorization", "X-Api-Key"]);
+    for names in [
+        &["AUTHORIZATION"][..],
+        &["AUTHORIZATION", "X_API_KEY", "OTHER"],
+    ] {
+        write(names);
+        let reg = register(&mut w, both.clone());
+        assert_eq!(error_of(&reg), "invalid_params", "{names:?} {reg}");
+        assert_eq!(reg["reason"], "header_bindings", "{names:?} {reg}");
+    }
+    write(&["AUTHORIZATION", "X_API_KEY"]);
+    let reg = register(&mut w, both.clone());
+    assert_eq!(reg["receipt"]["transport"], "bridge", "{reg}");
+    let ask = |w: &mut World, headers: Value| {
+        w.agent(
+            "request",
+            &json!({"manifest": manifest_text, "origin": origin, "headers": headers}),
+        )
+    };
+    pending_id(&ask(&mut w, both));
+    let pending = w.pending_count();
+    for headers in [
+        json!(["Authorization"]),
+        json!(["Authorization", "X-Other-Key"]),
+    ] {
+        let answer = ask(&mut w, headers.clone());
+        assert_eq!(
+            error_of(&answer),
+            "managed_command_mismatch",
+            "{headers} {answer}"
+        );
+    }
+    assert_eq!(w.pending_count(), pending, "a pending request exists");
 }
 
 /// Writes `from`'s bytes over `to` in place: same inode, new contents.
@@ -1279,7 +1432,9 @@ fn removal_needs_a_terminal_proof_and_ends_what_the_record_covered() {
     let suffix = envcloak_policy::managed::bridge_binding_suffix(origin);
     std::fs::write(
         remote.join("envcloak.toml"),
-        format!("[project]\nname = \"remote\"\n\n[env]\nAPI_KEY{suffix} = \"stripe/fixture\"\n"),
+        format!(
+            "[project]\nname = \"remote\"\n\n[env]\nAUTHORIZATION{suffix} = \"stripe/fixture\"\n"
+        ),
     )
     .unwrap();
     let remote_manifest = remote.join("envcloak.toml");
@@ -1604,7 +1759,7 @@ fn a_bridged_request_is_checked_on_every_binding_it_names() {
     std::fs::write(
         remote.join("envcloak.toml"),
         format!(
-            "[project]\nname = \"remote\"\n\n[env]\nAPI_KEY{suffix} = \"stripe/fixture\"\n\n\
+            "[project]\nname = \"remote\"\n\n[env]\nAUTHORIZATION{suffix} = \"stripe/fixture\"\n\n\
              [env.extra]\nPLAIN_KEY = \"stripe/fixture\"\n"
         ),
     )

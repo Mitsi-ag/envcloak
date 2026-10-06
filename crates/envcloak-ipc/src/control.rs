@@ -87,8 +87,23 @@ pub enum Recipient {
     /// and the launch it starts with the values in its environment.
     Runner { launch: String, spec: LaunchSpec },
     /// `envcloak mcp-bridge --relay`: the origin the header values go to,
-    /// and to no other (M2 plan D-18; the relay's HTTP side is M2-18's).
-    Relay { origin: String },
+    /// and to no other, and each header the relay inserts with the
+    /// binding whose value it carries (M2 plan D-18; the relay's HTTP side
+    /// is M2-18's). The headers are the record's, as registered with a
+    /// proof; every released binding is one of theirs.
+    Relay {
+        origin: String,
+        headers: Vec<RelayHeader>,
+    },
+}
+
+/// One header a relay inserts: its name and the binding (`env_name` of a
+/// [`ReleasedValue`]) whose value it carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayHeader {
+    pub name: String,
+    pub binding: String,
 }
 
 /// The registered launch, as the runner starts it: its argv, the recorded
