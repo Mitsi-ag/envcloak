@@ -63,8 +63,12 @@ pub fn scan_reader(
     emit: &mut impl FnMut(Candidate) -> bool,
 ) -> Result<StreamReport, ScanError> {
     let mut report = StreamReport::default();
-    let json = format == ConfigFormat::Jsonl;
-    let cap = if json { MAX_LINE } else { MAX_CANDIDATE };
+    let json = matches!(format, ConfigFormat::Json | ConfigFormat::Jsonl);
+    let cap = match format {
+        ConfigFormat::Json => crate::MAX_DOTENV,
+        ConfigFormat::Jsonl => MAX_LINE,
+        _ => MAX_CANDIDATE,
+    };
     let mut buffer = SecretBuf::with_capacity(cap.min(8192));
     let mut chunk = Zeroizing::new([0u8; 32768]);
     let mut start = 0u64;
@@ -94,7 +98,11 @@ pub fn scan_reader(
         let chunk_start = report.bytes;
         report.bytes += n as u64;
         for (i, &b) in chunk[..n].iter().enumerate() {
-            let boundary = if json { b == b'\n' } else { delimiter(b) };
+            let boundary = if json {
+                format == ConfigFormat::Jsonl && b == b'\n'
+            } else {
+                delimiter(b)
+            };
             let (before, discard) = if json { (false, false) } else { utf8.step(b) };
             if before {
                 report.not_scanned += 1;
@@ -107,6 +115,7 @@ pub fn scan_reader(
                             buffer.expose_secret(),
                             start,
                             &source,
+                            format,
                             &mut report,
                             budget,
                             emit,
@@ -136,7 +145,9 @@ pub fn scan_reader(
                     report.not_scanned += 1;
                     report.issue(
                         &source,
-                        if json {
+                        if format == ConfigFormat::Json {
+                            "too_large"
+                        } else if json {
                             "line_too_large"
                         } else {
                             "token_too_large"
@@ -162,6 +173,7 @@ pub fn scan_reader(
                 buffer.expose_secret(),
                 start,
                 &source,
+                format,
                 &mut report,
                 budget,
                 emit,
@@ -237,6 +249,7 @@ fn json_line(
     bytes: &[u8],
     base: u64,
     source: &Source,
+    format: ConfigFormat,
     report: &mut StreamReport,
     budget: Budget,
     emit: &mut impl FnMut(Candidate) -> bool,
@@ -246,6 +259,27 @@ fn json_line(
         Err(()) => {
             report.not_scanned += 1;
             report.issue(source, "invalid_json");
+            // Damaged JSON backups still get a raw scan. Keep the parse issue
+            // visible and never charge these already-read bytes a second time.
+            if format == ConfigFormat::Json {
+                if let Ok(part) = scan_reader(
+                    &mut std::io::Cursor::new(bytes),
+                    ConfigFormat::Raw,
+                    source.clone(),
+                    Budget {
+                        bytes: bytes.len() as u64 + 1,
+                        occurrences: budget
+                            .occurrences
+                            .saturating_sub(report.candidates as usize),
+                        ..budget
+                    },
+                    emit,
+                ) {
+                    report.candidates += part.candidates;
+                    report.not_scanned += part.not_scanned;
+                    report.issues.extend(part.issues);
+                }
+            }
             return true;
         }
     };

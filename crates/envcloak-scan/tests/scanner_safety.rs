@@ -147,3 +147,59 @@ fn oversized_jsonl_line_is_counted_and_following_line_still_scans() {
     assert_eq!(report.not_scanned, 1);
     assert!(!report.complete());
 }
+
+#[test]
+fn json_backups_decode_escaped_values_and_report_raw_fallback() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let value = ["fixtureZbackup", "escaped", "value"].join("/");
+    let escaped = value
+        .bytes()
+        .map(|b| format!("\\u{b:04x}"))
+        .collect::<String>();
+    for (name, input, complete, encoding) in [
+        (
+            ".claude.json.backup.fixture",
+            format!("{{\n  \"text\":\"{escaped}\"\n}}"),
+            true,
+            envcloak_scan::candidates::Encoding::Json,
+        ),
+        (
+            "valid.json",
+            format!("{{\"text\":\"{}\"}}", value.replace('/', "\\/")),
+            true,
+            envcloak_scan::candidates::Encoding::Json,
+        ),
+        (
+            "broken.json",
+            format!("broken {value}"),
+            false,
+            envcloak_scan::candidates::Encoding::Raw,
+        ),
+    ] {
+        let path = d.path().join(name);
+        std::fs::write(&path, &input).unwrap();
+        let mut src = source(path);
+        src.format = ConfigFormat::Json;
+        src.source_kind = SourceKind::HostBackup;
+        let mut found = false;
+        let report = scan_transcript_sources(&[src], Budget::default(), &mut |c| {
+            if c.value.ct_eq(value.as_bytes()) {
+                found = true;
+                assert_eq!(c.occurrence.encoding, encoding);
+                let r = c.occurrence.range;
+                if complete {
+                    let fragment = &input[r.start as usize..r.end as usize];
+                    let decoded: String = serde_json::from_str(&format!("\"{fragment}\"")).unwrap();
+                    assert!(decoded == value);
+                }
+            }
+            true
+        })
+        .unwrap();
+        assert_eq!(report.complete(), complete, "{report:?}");
+        assert!(found, "backup candidate missing");
+        if !complete {
+            assert!(report.issues.iter().any(|i| i.reason == "invalid_json"));
+        }
+    }
+}
