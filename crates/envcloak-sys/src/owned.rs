@@ -433,20 +433,21 @@ impl<O: ProcessOps> OwnedChild<O> {
     /// leaves nothing to stop. Called for a child that already exited, it
     /// stops what the child left in its group.
     pub fn stop_group(&self, grace: Duration) -> io::Result<bool> {
-        let quiet = |r: io::Result<()>, exited: bool| match r {
+        // `EPERM` is asked about after the signal: the child may have
+        // exited between a check and the signal.
+        let quiet = |r: io::Result<()>| match r {
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::EPERM) && exited => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) && self.has_exited()? => Ok(()),
             other => other,
         };
-        let before = self.has_exited()?;
-        quiet(self.signal_group(libc::SIGTERM), before)?;
+        quiet(self.signal_group(libc::SIGTERM))?;
         let end = Instant::now() + grace;
-        let mut exited = before || self.has_exited()?;
+        let mut exited = self.has_exited()?;
         while !exited && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(10));
             exited = self.has_exited()?;
         }
-        quiet(self.signal_group(libc::SIGKILL), exited)?;
+        quiet(self.signal_group(libc::SIGKILL))?;
         Ok(exited)
     }
 
