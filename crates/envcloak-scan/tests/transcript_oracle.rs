@@ -229,3 +229,67 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
         assert!(observed.is_empty());
     }
 }
+
+/// M2-14 uses counts, not ranges. The independent Python generator is the
+/// oracle for both distinct identities and every physical occurrence.
+#[test]
+fn doctor_counts_match_the_independent_json_oracle() {
+    let d = bundle();
+    let output = generate(d.path());
+    assert!(output.status.success(), "count oracle generation failed");
+    let requests: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(d.path().join("requests.json")).unwrap()).unwrap();
+    let mut observed = BTreeMap::new();
+    for case in requests["cases"].as_array().unwrap() {
+        let digests: BTreeSet<_> = case["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["digest"].as_str().unwrap())
+            .collect();
+        let mut set = Candidates::counted(Budget::for_counts()).unwrap();
+        let mut file = std::fs::File::open(d.path().join(case["input"].as_str().unwrap())).unwrap();
+        let report = scan_reader(
+            &mut file,
+            ConfigFormat::Jsonl,
+            Default::default(),
+            Budget::for_counts(),
+            &mut |c| set.insert(c),
+        )
+        .unwrap();
+        assert!(report.complete() && !set.limited());
+        let mut count = 0;
+        let mut distinct = 0;
+        for entry in set.into_entries() {
+            assert!(entry.occurrences.is_empty(), "doctor retained offsets");
+            let digest = entry
+                .value
+                .sha256()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            if digests.contains(digest.as_str()) {
+                distinct += 1;
+                count += entry.counts.values().sum::<u64>();
+            }
+        }
+        observed.insert(case["id"].as_str().unwrap().to_owned(), (distinct, count));
+    }
+    let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(d.path().join("expected.json")).unwrap()).unwrap();
+    assert_eq!(observed.len(), 37);
+    assert_eq!(
+        observed.values().map(|(_, count)| count).sum::<u64>(),
+        100080
+    );
+    for case in expected["cases"].as_array().unwrap() {
+        assert_eq!(
+            observed.remove(case["id"].as_str().unwrap()).unwrap(),
+            (
+                case["distinct"].as_u64().unwrap(),
+                case["count"].as_u64().unwrap()
+            )
+        );
+    }
+    assert!(observed.is_empty());
+}

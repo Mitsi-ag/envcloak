@@ -240,6 +240,10 @@ impl Candidates {
     pub fn entries(&self) -> &[DistinctCandidate] {
         &self.entries
     }
+    /// Transfer wiping values to a bounded matching caller, then wipe the index.
+    pub fn into_entries(mut self) -> Vec<DistinctCandidate> {
+        std::mem::take(&mut self.entries)
+    }
     pub fn limited(&self) -> bool {
         self.limited
     }
