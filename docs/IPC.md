@@ -87,6 +87,8 @@ Response, one of:
 
 Each result is filled up to 768 KiB of encoded JSON, including `next`; the JSON-RPC envelope still fits the 1 MiB frame. No count cap silently drops entries. Continue with `next` until null. Each page checks the unlocked, verified vault again. Like `items.list`, this read observes idle locking without resetting the idle timer. A new or newly used project above the cursor is visible on a fresh listing, not a continuation; the cursor is an ordering boundary, not a snapshot. The index describes the last adoption, so a caller that edits a manifest refreshes its local file view separately until the next adoption.
 
+A covered run stages its adoption in the vault transaction, rechecks grant lifetime and root liveness, and durably audits the release before committing the row. An audit failure or lapsed grant rolls back both a new adoption and a refresh of an existing row. A delivery answer is returned only after commit. The index records admission to delivery, not proof that the client received the frame or that its command started.
+
 ## Methods (M1, client role)
 
 | Method | Params | Result |
