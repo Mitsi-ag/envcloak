@@ -25,6 +25,16 @@ const PROFILES: [&str; 7] = [
 fn blank(b: u8) -> bool {
     matches!(b, b' ' | b'\t')
 }
+// Shell token separators are blanks (space or tab), not arbitrary Unicode
+// whitespace. Requiring a separator also keeps command-name prefixes intact.
+fn command_arg<'a>(text: &'a [u8], command: &[u8]) -> Option<&'a [u8]> {
+    let rest = text.strip_prefix(command)?;
+    if !rest.first().is_some_and(|b| blank(*b)) {
+        return None;
+    }
+    let start = rest.iter().position(|b| !blank(*b)).unwrap_or(rest.len());
+    Some(&rest[start..])
+}
 fn name_end(b: &[u8]) -> usize {
     if !b
         .first()
@@ -98,35 +108,26 @@ fn parse(bytes: &[u8], shell: Shell) -> (ScanReport, Vec<Include>) {
         if text.is_empty() || text[0] == b'#' {
             continue;
         }
-        if let Some(path) = text
-            .strip_prefix(b"source ")
-            .or_else(|| text.strip_prefix(b". "))
-        {
+        if let Some(path) = command_arg(text, b"source").or_else(|| command_arg(text, b".")) {
             match source_path(path) {
                 Some(included) => includes.push(included),
                 None => report.issue("", "source_not_literal"),
             }
             continue;
         }
-        let exported = text.starts_with(b"export ");
-        if exported {
-            text = &text[7..];
-            while text.first().is_some_and(|b| blank(*b)) {
-                text = &text[1..];
-            }
-        }
+        let exported = if let Some(rest) = command_arg(text, b"export") {
+            text = rest;
+            true
+        } else {
+            false
+        };
         let fish = shell == Shell::Fish;
         if fish {
-            if let Some(rest) = [
-                b"set -x ".as_slice(),
-                b"set -gx ",
-                b"set -Ux ",
-                b"set -xg ",
-                b"set -xU ",
-            ]
-            .iter()
-            .find_map(|prefix| text.strip_prefix(*prefix))
-            {
+            if let Some(rest) = command_arg(text, b"set").and_then(|args| {
+                [b"-x".as_slice(), b"-gx", b"-Ux", b"-xg", b"-xU"]
+                    .iter()
+                    .find_map(|option| command_arg(args, option))
+            }) {
                 text = rest;
             } else {
                 report.issue("", "unsupported_syntax");

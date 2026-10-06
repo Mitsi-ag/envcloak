@@ -41,13 +41,24 @@ fn profiles_match_independent_bash_oracle_and_keep_removal_separate() {
     assert!(output.stderr.is_empty());
     let cases: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let cases = cases.as_array().unwrap();
-    assert_eq!(cases.len(), 76, "Bash oracle corpus is incomplete");
+    assert_eq!(cases.len(), 108, "Bash oracle corpus is incomplete");
     let mut policies = [0usize; 3];
     for case in cases {
         let bytes = SecretBytes::from_vec(
             std::fs::read(dir.path().join(case["source_file"].as_str().unwrap())).unwrap(),
         );
-        let result = parse_profile(&bytes, Shell::Posix);
+        let result = if let Some(included) = case["include_file"].as_str() {
+            let home = fixture();
+            std::fs::copy(
+                dir.path().join(case["source_file"].as_str().unwrap()),
+                home.path().join(".profile"),
+            )
+            .unwrap();
+            std::fs::copy(dir.path().join(included), home.path().join(included)).unwrap();
+            scan_profiles(&open_root(home.path()).unwrap()).unwrap()
+        } else {
+            parse_profile(&bytes, Shell::Posix)
+        };
         let a = result
             .findings
             .iter()
@@ -353,4 +364,42 @@ fn exhausted_profile_budget_keeps_diagnostics_bounded() {
             .count(),
         63
     );
+}
+
+#[test]
+fn fish_command_tokens_accept_shell_blanks_without_accepting_prefixes() {
+    // Grammar fixture only: Bash cannot qualify Fish syntax.
+    for option in ["-x", "-gx", "-Ux", "-xg", "-xU"] {
+        for blank in [" ", "\t", " \t "] {
+            let source = format!("set{blank}{option}{blank}VALUE{blank}fixtureZfishBlanks\n");
+            let report = parse_profile(&SecretBytes::copy_from(source.as_bytes()), Shell::Fish);
+            assert!(report.complete(), "valid Fish token separator refused");
+            assert_eq!(report.findings.len(), 1);
+            assert!(report.findings[0].name.ct_eq(b"VALUE"));
+            assert!(
+                report.findings[0]
+                    .value
+                    .as_ref()
+                    .unwrap()
+                    .ct_eq(b"fixtureZfishBlanks")
+            );
+        }
+    }
+    for source in [
+        b"set-x VALUE fixture\n".as_slice(),
+        b"set -xVALUE fixture\n",
+    ] {
+        let report = parse_profile(&SecretBytes::copy_from(source), Shell::Fish);
+        assert!(!report.complete());
+        assert!(report.findings.is_empty());
+    }
+    for source in [
+        b"exportVALUE=fixture\n".as_slice(),
+        b"sourceVALUE=fixture\n",
+    ] {
+        let report = parse_profile(&SecretBytes::copy_from(source), Shell::Posix);
+        assert!(report.complete());
+        assert_eq!(report.findings.len(), 1);
+        assert!(!report.findings[0].name.ct_eq(b"VALUE"));
+    }
 }
