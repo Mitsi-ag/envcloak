@@ -61,9 +61,11 @@ pub const PASSTHROUGH: [&str; 6] = ["HOME", "USER", "LOGNAME", "LANG", "TZ", "TM
 /// [`INTERPRETERS`] has its own here: a module or library path, a file run
 /// at start, a debugger, an ini or gem directory, a cache of compiled code,
 /// a configuration directory a shell reads.
-pub const CODE_SELECTING: [&str; 37] = [
+pub const CODE_SELECTING: [&str; 39] = [
     "NODE_OPTIONS",
     "NODE_PATH",
+    "npm_config_node_options",
+    "NPM_CONFIG_NODE_OPTIONS",
     "BUN_OPTIONS",
     "BUN_BE_BUN",
     "DENO_DIR",
@@ -552,13 +554,17 @@ fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
     }
     if let Some(label) = runner_label(name, argv) {
         // A Node package runner's own options that run other code (`npx
-        // -c`, `--call`).
+        // -c`, `--call`, `--node-options`).
         if matches!(name, "npx" | "pnpx" | "bunx" | "npm" | "pnpm" | "yarn") {
             for a in argv.iter().skip(1) {
                 if a == "--" {
                     break;
                 }
-                if is_code_loading_option(a) || a == "--call" || a.starts_with("--call=") {
+                if is_code_loading_option(a)
+                    || ["--call", "--node-options"]
+                        .iter()
+                        .any(|o| a == *o || a.strip_prefix(o).is_some_and(|r| r.starts_with('=')))
+                {
                     return Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
                 }
                 if !a.starts_with('-') && !label.split(' ').any(|w| w == a) {
@@ -1049,6 +1055,8 @@ mod tests {
             &["python3", "-Bc", "import x", "/srv/s.py"],
             &["bash", "-xc", "id", "/srv/s.sh"],
             &["npx", "-yc", "echo"],
+            &["npx", "--node-options=--require=/x.js", "pkg"],
+            &["npm", "--node-options", "--require=/x.js", "exec", "pkg"],
             // An interpreter's own way of taking code from elsewhere.
             &["python3", "-i", "/srv/s.py"],
             &["sh", "-s", "/srv/s.sh"],
@@ -1110,7 +1118,14 @@ mod tests {
                 "{argv:?}"
             );
         }
-        for name in ["LUA_INIT", "LUA_PATH_5_4", "PHPRC", "GEM_PATH", "PERL5DB"] {
+        for name in [
+            "LUA_INIT",
+            "LUA_PATH_5_4",
+            "PHPRC",
+            "GEM_PATH",
+            "PERL5DB",
+            "npm_config_node_options",
+        ] {
             let mut d = decl(&["/usr/bin/server"]);
             d.env.push((name.into(), "x".into()));
             assert_eq!(
