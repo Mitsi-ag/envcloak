@@ -733,6 +733,36 @@ fn daemon_install_refuses_a_daemon_it_cannot_pin() {
     }
 }
 
+/// `daemon install` writes the whole unit (M2-27): an older one, written
+/// before `KillMode=process`, is rewritten to the current template, so a
+/// restart of an upgraded installation leaves managed servers' runners
+/// running.
+///
+/// Mutation checked: `install` keeping a unit file that is there already:
+/// the old unit stays, without `KillMode=process`, and this fails.
+#[test]
+fn daemon_install_rewrites_an_older_unit() {
+    let home = TestHome::new();
+    let daemon = daemon_exe();
+    let (path, want) = expected_definition(&home, daemon.to_str().unwrap());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // Linux: the unit without the line; macOS: the plist with an extra
+    // comment (launchd's has no such line, but is rewritten the same way).
+    let old: String = if cfg!(target_os = "macos") {
+        format!("{want}<!-- older -->\n")
+    } else {
+        want.lines()
+            .filter(|l| !l.starts_with("KillMode="))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    assert_ne!(old, want);
+    std::fs::write(&path, &old).unwrap();
+    let out = run(&home, &["daemon", "install", "--no-start"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), want);
+}
+
 /// The CLI compiles in the packaging files: the source constants equal
 /// them byte for byte, for both platforms, and this platform's is in the
 /// binary.
@@ -748,6 +778,12 @@ fn the_compiled_in_templates_are_the_packaging_files() {
         assert!(unit.contains(p), "{p}");
     }
     assert!(unit.contains("ExecStart=@ENVCLOAKD@ --foreground\n"));
+    // M2-27, D-36: a restart stops the daemon only, so the runners and
+    // relays it started for managed servers keep serving.
+    assert!(
+        unit.contains("\nKillMode=process\n"),
+        "the unit lost KillMode=process"
+    );
 
     let src =
         std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd/daemon.rs"))

@@ -322,6 +322,21 @@ impl Person {
         steps: &[(&str, &str)],
         limit: Duration,
     ) -> Option<Human> {
+        let cli = self.cli.clone();
+        let mut argv = vec![cli.to_str().unwrap_or("")];
+        argv.extend_from_slice(args);
+        self.run_argv(cwd, &argv, steps, limit)
+    }
+
+    /// `argv` (a program and its arguments) in `cwd`, as [`Person::run`]
+    /// runs `envcloak`.
+    pub fn run_argv(
+        &self,
+        cwd: &Path,
+        argv: &[&str],
+        steps: &[(&str, &str)],
+        limit: Duration,
+    ) -> Option<Human> {
         let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let spec_path = self.files.join(format!("person-{n}.json"));
         let transcript = self.files.join(format!("person-{n}.tty"));
@@ -340,8 +355,7 @@ impl Person {
             .arg("-c")
             .arg(HUMAN)
             .arg(&spec_path)
-            .arg(&self.cli)
-            .args(args)
+            .args(argv)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

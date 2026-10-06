@@ -46,11 +46,6 @@ fn helper() {
 /// counter is 1 and the runner's 0, and this fails.
 #[test]
 fn a_registered_launch_runs_the_record_and_gives_the_client_nothing() {
-    if managed_common::release_run(
-        "a_registered_launch_runs_the_record_and_gives_the_client_nothing",
-    ) {
-        return;
-    }
     let mut w = World::new(&[]);
     let (launch, reg) = w.register_fixture();
     assert_eq!(reg["revision"], 1, "{reg}");
@@ -63,7 +58,7 @@ fn a_registered_launch_runs_the_record_and_gives_the_client_nothing() {
     );
     let first = w.request(&launch);
     let id = pending_id(&first);
-    assert_eq!(w.released(), (0, 0));
+    w.assert_released(0, 0, "nothing was released");
     w.approve(&id);
     let answer = w.request(&launch);
     assert!(started(&answer), "{answer}");
@@ -76,7 +71,7 @@ fn a_registered_launch_runs_the_record_and_gives_the_client_nothing() {
         "{r}"
     );
     assert_eq!(answer["runner_parent"], w.h.daemon.pid(), "{answer}");
-    assert_eq!(w.released(), (0, 1));
+    w.assert_released(0, 1, "values went to the runner once, to the client never");
     w.h.assert_swept("after the launch");
 }
 
@@ -136,9 +131,6 @@ json.dump({"response": resp.decode("utf-8", "replace"), "reply": reply.decode("u
 /// the key (base64), the sweep finds it, and this fails.
 #[test]
 fn a_foreign_client_gets_started_and_no_value() {
-    if managed_common::release_run("a_foreign_client_gets_started_and_no_value") {
-        return;
-    }
     let mut w = World::new(&[]);
     let (launch, _) = w.register_fixture();
     let socket = envcloak_testkit::daemon_socket(&w.h.home);
@@ -172,7 +164,7 @@ fn a_foreign_client_gets_started_and_no_value() {
     );
     let r: Value = serde_json::from_str(second["reply"].as_str().unwrap().trim()).unwrap();
     assert_eq!(r["vars"][KEY], w.key_digest(), "{r}");
-    assert_eq!(w.released(), (0, 1));
+    w.assert_released(0, 1, "values went to the runner once, to the client never");
     w.h.assert_swept("after the foreign client");
 }
 
@@ -267,9 +259,6 @@ fn dumper(dir: &Path) -> PathBuf {
 /// this fails at its sweep (checked before the answer is).
 #[test]
 fn an_injected_library_finds_no_value_in_the_client() {
-    if managed_common::release_run("an_injected_library_finds_no_value_in_the_client") {
-        return;
-    }
     let mut w = World::new(&[]);
     let lib = dumper(w.h.files());
     let (launch, _) = w.register_fixture();
@@ -337,9 +326,6 @@ fn an_injected_library_finds_no_value_in_the_client() {
 /// report never comes.
 #[test]
 fn the_runner_outlives_the_daemon() {
-    if managed_common::release_run("the_runner_outlives_the_daemon") {
-        return;
-    }
     let mut w = World::new(&[]);
     let (launch, reg) = w.register_fixture();
     let first = w.request(&launch);
@@ -383,9 +369,6 @@ fn the_runner_outlives_the_daemon() {
 /// end: the server's output stays open and this fails.
 #[test]
 fn the_lifeline_ending_stops_the_server() {
-    if managed_common::release_run("the_lifeline_ending_stops_the_server") {
-        return;
-    }
     let mut w = World::new(&[]);
     let (launch, _) = w.register_fixture();
     let first = w.request(&launch);
@@ -413,9 +396,6 @@ fn the_lifeline_ending_stops_the_server() {
 /// server is still there after 8 seconds, and this fails.
 #[test]
 fn the_client_killed_stops_the_server() {
-    if managed_common::release_run("the_client_killed_stops_the_server") {
-        return;
-    }
     let mut w = World::new(&[]);
     let mut argv = w.fixture_argv();
     argv.as_array_mut()
@@ -455,6 +435,117 @@ fn the_client_killed_stops_the_server() {
     assert!(ms <= 6000, "{ms} ms");
 }
 
+/// SPEC §6.1 step 7 for a managed server: what the server prints goes
+/// through the runner's redactor before its client sees it. The fixture
+/// prints its key on its standard output and error, raw, as base64, as
+/// hex, and raw again in two writes with a pause between; the client gets
+/// each in the redactor's marker, on both streams, and nothing of the key
+/// in any encoding (the client's result is swept). The fixture's report
+/// shows it holds the key (the positive control).
+///
+/// Mutation checked: the runner's pumps writing what they read unredacted
+/// (`pump` given a redactor of no value): the client's result holds the
+/// key and its sweep fails.
+#[test]
+fn the_runner_redacts_what_the_server_prints() {
+    let mut w = World::new(&[]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.agent(
+        "request",
+        &json!({
+            "launch": launch,
+            "send": ["report", format!("echo {KEY}")],
+            "stderr": true,
+            // Its standard error is still being written when its output's
+            // line arrives: the client stays until it is.
+            "hold_ms": 1500,
+        }),
+    );
+    assert!(started(&answer), "{answer}");
+    assert_eq!(report(&answer)["vars"][KEY], w.key_digest(), "{answer}");
+    let marker = "[envcloak:stripe/fixture]";
+    let echoed = answer["replies"][1].as_str().unwrap_or("");
+    assert_eq!(echoed.matches(marker).count(), 4, "{answer}");
+    let errors = answer["stderr"].as_str().unwrap_or("");
+    assert_eq!(errors.matches(marker).count(), 4, "{answer}");
+    // The server ended with its input, and the run with it: no failure.
+    assert!(!errors.contains("run_failed"), "{answer}");
+    w.h.assert_swept("after the server printed its key");
+}
+
+/// D-34, D-36: a server that exits on its own, while its client is still
+/// there, leaving a child behind in its process group (a descendant
+/// holding the key in its environment): the runner stops the group before
+/// it reaps the server, so the child is gone within seconds, not the
+/// minute it would sleep. The child ran under the server (the positive
+/// control: it was alive when the server answered).
+///
+/// Mutation checked: the group stopped only when the client or a signal
+/// ended the server (`stopped_by` set), as before: the child outlives the
+/// server and the runner, and this fails.
+#[test]
+fn a_server_that_exits_first_leaves_nothing_of_its_group() {
+    let mut w = World::new(&[]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let progress = w.h.files().join("progress.json");
+    let cont = w.h.files().join("continue");
+    let out = w.agent_background(
+        "request",
+        &json!({
+            "launch": launch,
+            "send": ["report", "orphan"],
+            "progress_file": progress.to_str().unwrap(),
+            "continue_file": cont.to_str().unwrap(),
+        }),
+    );
+    let progressed = w.wait_out(&progress, Duration::from_secs(60), "the orphan's report");
+    let left: Value =
+        serde_json::from_str(progressed["replies"][1].as_str().unwrap().trim()).unwrap();
+    let child = i32::try_from(left["child"].as_i64().unwrap()).unwrap();
+    let t = std::time::Instant::now();
+    while envcloak_sys::proc_info(child).is_ok_and(|p| p.comm == "sleep") {
+        assert!(
+            t.elapsed() < Duration::from_secs(8),
+            "the server's child outlived it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(&cont, b"go").unwrap();
+    let _ = w.wait_out(&out, Duration::from_secs(60), "the client");
+}
+
+/// The runner's drain is cancellable (D-36, review F-49): a client that
+/// stops reading, while the server floods its output past what a pipe
+/// holds, then ends its lifeline (its output's reading end still open and
+/// never read). The runner stops the server and gives up its blocked write
+/// at once: it exits within seconds. The client was served first (the
+/// positive control: the fixture's report).
+///
+/// Mutation checked: the runner's pumps joined directly after the cutoff
+/// is set, with no interruption (the previous drain): the write to the
+/// unread pipe never returns, the runner never exits, and this fails.
+#[test]
+fn a_client_that_stops_reading_does_not_hold_the_runner() {
+    let mut w = World::new(&[]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.agent(
+        "request",
+        &json!({"launch": launch, "send": ["report"], "stall": true}),
+    );
+    assert!(started(&answer), "{answer}");
+    assert_eq!(report(&answer)["vars"][KEY], w.key_digest(), "{answer}");
+    let ms = answer["runner_gone_ms"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the runner did not exit: {answer}"));
+    assert!(ms <= 8000, "{ms} ms");
+}
+
 /// A fake daemon's channel: Python makes a socket pair, puts one end at
 /// descriptor 3 (and a lifeline at 4, the project directory at 6) and
 /// starts `envcloak run --launch <id>` itself, writing a well-formed
@@ -490,9 +581,6 @@ sys.stdout.write(json.dumps({"code": p.returncode, "stderr": p.stderr.decode("ut
 /// marker appears, and this fails.
 #[test]
 fn a_runner_not_started_by_the_daemon_receives_nothing() {
-    if managed_common::release_run("a_runner_not_started_by_the_daemon_receives_nothing") {
-        return;
-    }
     let mut w = World::new(&[]);
     let (launch, _) = w.register_fixture();
     let value = format!("ec-not-a-key-{:016x}", envcloak_testkit::fresh_seed());
@@ -549,7 +637,55 @@ fn a_runner_that_cannot_start_releases_nothing() {
     w.approve(&pending_id(&first));
     let answer = w.request(&launch);
     assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
-    assert_eq!(w.released(), (0, 0));
+    w.assert_released(0, 0, "nothing was released");
+    assert!(!w.marker.exists());
+}
+
+/// macOS (D-34, D-36): the anchor's runner, started suspended, whose
+/// resumption fails is killed and reaped through its handle: the request
+/// is `runner_unavailable`, nothing is released, and no process the
+/// daemon started is left behind, suspended or unreaped (none has the
+/// daemon as its parent). The approved request reached the start (the
+/// positive control: the refusal is the start's, not the approval's).
+///
+/// Mutation checked: the failed resumption returned without the kill (the
+/// previous `resume().map_err(..)?`): the suspended runner stays, a child
+/// of the daemon, and this fails.
+#[test]
+fn a_runner_whose_start_fails_leaves_no_process() {
+    if managed_common::release_run("a_runner_whose_start_fails_leaves_no_process") {
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        eprintln!(
+            "a_runner_whose_start_fails_leaves_no_process: macOS only (Linux starts the sealed \
+             copy without suspending it)"
+        );
+        return;
+    }
+    let mut w = World::new(&[("ENVCLOAK_TEST_FAIL", "launch.anchor_resume")]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
+    w.assert_released(0, 0, "nothing was released");
+    let daemon = i64::from(w.h.daemon.pid());
+    let ps = std::process::Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .unwrap();
+    let left: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| {
+            l.split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<i64>().ok())
+                == Some(daemon)
+        })
+        .map(str::to_owned)
+        .collect();
+    assert!(left.is_empty(), "the daemon left children: {left:?}");
     assert!(!w.marker.exists());
 }
 
@@ -575,7 +711,7 @@ fn a_refused_sealed_copy_never_falls_back_to_the_file() {
     let answer = w.request(&launch);
     assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
     assert_eq!(w.pending_count(), pending, "a pending request exists");
-    assert_eq!(w.released(), (0, 0));
+    w.assert_released(0, 0, "nothing was released");
     assert!(!w.marker.exists());
 }
 
@@ -636,8 +772,9 @@ fn replace_with_script(path: &Path, marker: &Path) {
 }
 
 /// D-36's anchor: the `envcloak` beside `envcloakd` replaced after the
-/// daemon started. On Linux the daemon still starts the image it sealed
-/// at start (the launch succeeds and the replacement never runs); on
+/// daemon started. On Linux, rewritten in place and then renamed over, the
+/// daemon still starts the image it sealed at start (the launch succeeds
+/// and the replacement never runs); on
 /// macOS a replacement whose code directory hash is not the anchor's is
 /// refused before it runs (`runner_unavailable`, nothing released, the
 /// replacement never runs). A new daemon takes the new image: another
@@ -649,9 +786,6 @@ fn replace_with_script(path: &Path, marker: &Path) {
 /// appears, and this fails.
 #[test]
 fn the_anchor_is_the_image_taken_at_start() {
-    if managed_common::release_run("the_anchor_is_the_image_taken_at_start") {
-        return;
-    }
     let tmp = tempfile::Builder::new()
         .prefix("eca")
         .tempdir_in("/tmp")
@@ -662,6 +796,36 @@ fn the_anchor_is_the_image_taken_at_start() {
     let first = w.request(&launch);
     w.approve(&pending_id(&first));
     let wrong = w.h.files().join("wrong-runner-ran");
+    if cfg!(target_os = "linux") {
+        // Rewritten in place first: the same file, a script's bytes.
+        let anchor = bins.join("envcloak");
+        let kept = w.h.files().join("envcloak.kept");
+        std::fs::copy(&anchor, &kept).unwrap();
+        let script = w.h.files().join("script");
+        envcloak_e2e::write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\necho ran > {}\n",
+                envcloak_e2e::quoted(wrong.to_str().unwrap())
+            ),
+        );
+        let bytes = std::fs::read(&script).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&anchor)
+            .unwrap();
+        std::io::Write::write_all(&mut f, &bytes).unwrap();
+        drop(f);
+        let answer = w.request(&launch);
+        assert!(started(&answer), "{answer}");
+        assert_eq!(report(&answer)["vars"][KEY], w.key_digest());
+        assert!(
+            !appears(&wrong, Duration::from_secs(1)),
+            "the anchor rewritten in place ran"
+        );
+        std::fs::rename(&kept, &anchor).unwrap();
+    }
     replace_with_script(&bins.join("envcloak"), &wrong);
     let answer = w.request(&launch);
     if cfg!(target_os = "linux") {
@@ -669,7 +833,7 @@ fn the_anchor_is_the_image_taken_at_start() {
         assert_eq!(report(&answer)["vars"][KEY], w.key_digest());
     } else {
         assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
-        assert_eq!(w.released(), (0, 0));
+        w.assert_released(0, 0, "nothing was released");
     }
     assert!(
         !appears(&wrong, Duration::from_secs(1)),
@@ -710,7 +874,7 @@ fn the_anchor_is_the_image_taken_at_start() {
     if cfg!(target_os = "linux") {
         // The new daemon took the new file: its anchor's digest.
         let digest = sha256_hex(&std::fs::read(bins.join("envcloak")).unwrap());
-        w.h.expect_log(&format!("anchor sha256 {digest}"), Duration::from_secs(10));
+        w.expect_trace(&format!("anchor sha256 {digest}"));
     }
     let again = w.request(&launch);
     let id = pending_id(&again);
@@ -728,9 +892,6 @@ fn the_anchor_is_the_image_taken_at_start() {
 /// covers its request, which is pending as an unknown subject's.
 #[test]
 fn a_command_the_server_starts_is_unknown() {
-    if managed_common::release_run("a_command_the_server_starts_is_unknown") {
-        return;
-    }
     let mut w = World::new(&[]);
     // Another, unmanaged project binding the same key.
     let other = w.h.home.root().join("other");
@@ -801,4 +962,162 @@ fn a_command_the_server_starts_is_unknown() {
         .find(|r| r["project"] == other_dir.to_str().unwrap())
         .unwrap_or_else(|| panic!("no pending request for the other project: {listed}"));
     assert_eq!(request["kind"], "unknown", "{listed}");
+}
+
+/// The service manager's restart (D-36, spike (c)): with the daemon
+/// installed under the real service manager (`envcloak daemon install`:
+/// the systemd user unit with `KillMode=process`, or the launchd agent),
+/// a managed launch is served, the service is restarted (`systemctl
+/// --user restart`, `launchctl kickstart -k`), and the same fixture
+/// process, under the same runner, answers the client afterwards: the
+/// restart stopped the daemon only. It changes the user's service
+/// manager, so it runs only where `ENVCLOAK_TEST_SERVICE_MANAGER=1` (CI
+/// sets it on both systems), under a label of its own, uninstalled at the
+/// end whatever happens.
+///
+/// Mutation checked: `KillMode=process` removed from the unit (Linux):
+/// the restart kills the unit's whole control group, the runner and the
+/// fixture with it, the second report never comes, and this fails.
+#[test]
+fn the_runner_outlives_a_service_manager_restart() {
+    if std::env::var_os("ENVCLOAK_TEST_SERVICE_MANAGER").is_none() {
+        eprintln!(
+            "the_runner_outlives_a_service_manager_restart: skipped: set \
+             ENVCLOAK_TEST_SERVICE_MANAGER=1 to load a test service"
+        );
+        return;
+    }
+    // On Linux the user manager's runtime directory, which `systemctl
+    // --user` needs, is the run's: the daemon's socket goes there.
+    let runtime = std::env::var("ENVCLOAK_TEST_SERVICE_RUNTIME_DIR").ok();
+    let bus = runtime
+        .as_ref()
+        .map(|r| format!("unix:path={r}/bus"))
+        .filter(|_| {
+            runtime
+                .as_ref()
+                .is_some_and(|r| Path::new(r).join("bus").exists())
+        });
+    let mut env: Vec<(&str, &str)> = Vec::new();
+    if let Some(r) = &runtime {
+        env.push(("XDG_RUNTIME_DIR", r.as_str()));
+    }
+    if let Some(b) = &bus {
+        env.push(("DBUS_SESSION_BUS_ADDRESS", b.as_str()));
+    }
+    let mut w = World::new(&env);
+    let label = format!("ai.envcloak.test-m27-{}", std::process::id());
+    // The harness's own daemon gives way to the service manager's.
+    let _ = w.h.stop_daemon();
+    let cli = w.h.cli();
+    struct Uninstall {
+        cli: PathBuf,
+        label: String,
+        env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    }
+    impl Drop for Uninstall {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new(&self.cli)
+                .args(["daemon", "uninstall", "--label", &self.label])
+                .env_clear()
+                .envs(self.env.iter().map(|(k, v)| (k, v)))
+                .output();
+        }
+    }
+    let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        w.h.home
+            .vars()
+            .into_iter()
+            .map(|(k, v)| (std::ffi::OsString::from(k), v))
+            .collect();
+    vars.push(("PATH".into(), envcloak_testkit::TEST_PATH.into()));
+    for (k, v) in &env {
+        vars.push(((*k).into(), (*v).into()));
+    }
+    let _uninstall = Uninstall {
+        cli: cli.clone(),
+        label: label.clone(),
+        env: vars,
+    };
+    let installed =
+        w.h.program(&cli, &["daemon", "install", "--label", &label], None);
+    assert!(installed.status.success(), "{}", text(&installed));
+    let pass =
+        w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
+    let home = w.h.home.home();
+    let unlock = |w: &mut World| {
+        let unlocked = w.h.human(
+            &home,
+            &["unlock", "--passphrase-fd", "3"],
+            &[(3, &pass, true)],
+            &[],
+        );
+        assert_eq!(unlocked.code, 0, "{}", unlocked.all());
+    };
+    unlock(&mut w);
+    let (launch, reg) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let progress = w.h.files().join("progress.json");
+    let cont = w.h.files().join("continue");
+    let out = w.agent_background(
+        "request",
+        &json!({
+            "launch": launch,
+            "send": ["report"],
+            "progress_file": progress.to_str().unwrap(),
+            "continue_file": cont.to_str().unwrap(),
+            "send_after": ["report"],
+        }),
+    );
+    let progressed = w.wait_out(&progress, Duration::from_secs(60), "the first report");
+    let before: Value =
+        serde_json::from_str(progressed["replies"][0].as_str().unwrap().trim()).unwrap();
+    assert_eq!(reported_identity(&before), receipt_identity(&reg));
+    let daemon_pid = |w: &mut World| -> Option<String> {
+        let status = w.h.program(&cli, &["status"], None);
+        let said = String::from_utf8_lossy(&status.stdout).into_owned();
+        said.split("daemon: running (pid ")
+            .nth(1)
+            .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+            .map(str::to_owned)
+    };
+    let old = daemon_pid(&mut w).expect("the service's daemon is not running");
+    let mut restart = if cfg!(target_os = "macos") {
+        let id = std::process::Command::new("/usr/bin/id")
+            .arg("-u")
+            .output()
+            .unwrap();
+        let uid = String::from_utf8_lossy(&id.stdout).trim().to_owned();
+        let mut c = std::process::Command::new("/bin/launchctl");
+        c.args(["kickstart", "-k", &format!("gui/{uid}/{label}")]);
+        c
+    } else {
+        let mut c = std::process::Command::new("systemctl");
+        c.args(["--user", "restart", &format!("{label}.service")]);
+        c
+    };
+    for (k, v) in &env {
+        restart.env(k, v);
+    }
+    let restarted = restart.output().unwrap();
+    assert!(restarted.status.success(), "{}", text(&restarted));
+    let end = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match daemon_pid(&mut w) {
+            Some(p) if p != old => break,
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < end,
+            "the service did not come back"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    std::fs::write(&cont, b"go").unwrap();
+    let answer = w.wait_out(&out, Duration::from_secs(60), "the client");
+    let after = report_at(&answer, 1);
+    assert_eq!(after["pid"], before["pid"], "{answer}");
+    assert_eq!(after["ppid"], before["ppid"], "{answer}");
+    assert_eq!(after["vars"][KEY], w.key_digest());
 }
