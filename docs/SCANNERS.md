@@ -33,14 +33,17 @@ overlap. Failed filesystem reads are cached separately from parser outcomes.
 Database and credential omissions apply before readable sources in either
 catalog order, including indirect `envFile` reads; sibling logs remain eligible.
 Declared omissions also cover stores that appear later during the same scan.
-Directory attempts consume the file budget even when empty.
+Discovery, catalog reads, included files and leftover inspections share one
+attempt budget. Missing roots and empty directories consume it too.
 
 Profiles cover the seven conventional shell files, literal `source`/`.` paths
 within the supplied home root, at most four source edges and 64 attempted paths,
 including missing conventional profiles and failed includes. Attempts and their
 failures are reused within one run, and recomputed on the next run. Once a
 budget is exhausted, remaining includes do not create unbounded diagnostics.
-Only `$HOME` and `~` path prefixes expand. Assignments never execute. Dollar or
+Command tokens accept spaces and tabs, including `source`, `.`, `export`
+and the supported Fish `set` options. Only `$HOME` and `~` path prefixes expand.
+Assignments never execute. Dollar or
 backtick values contribute names only after syntax validation; comments do
 not affect value classification. POSIX quoting preserves Bash's ordinary
 double-quoted backslashes and CRLF bytes. Unquoted parentheses, including
@@ -142,29 +145,36 @@ working directory; bare repositories use the held root itself. Git never
 discovers a parent repository. A symlinked `.git` is refused. Replacing the
 pathname after opening the original Git directory cannot redirect the child.
 
-Gitfiles, including linked worktrees, retain their findings and report
+Gitfiles, including linked worktrees, are refused before Git starts, with
 `gitfile_indirection`. Nonempty `commondir` and `objects/info/alternates` files
-report `git_common_dir` and `git_alternates`. Each makes the scan partial:
-these pointers can reach stores outside the held root, including further
-indirections. Their target grammar is left to Git, so the warnings also apply
-to pointers whose targets happen to stay inside the root. Symlinks encountered
-while inspecting `commondir`, `objects`, `objects/info` or `alternates` are
-refused before Git starts. Pointer inspection checks metadata only, with a
-1 MiB size cap, ownership and device checks, and hard-link reporting.
+are also refused, with `git_common_dir` and `git_alternates`. Each reports a
+partial scan with no object reads. This conservative policy also refuses
+pointers whose targets happen to remain inside the root. A linked worktree's
+common repository can instead be scanned by naming that repository as the root.
+
+Before starting Git, the scanner checks `commondir`, `objects`, every loose
+object fanout and file, `objects/pack` and its entries, and `objects/info`
+including `alternates` and `commit-graphs`. The walk uses held descriptors,
+no-follow, nonblocking opens, ownership and device checks, and at most
+`MAX_DIR_ENTRIES` entries across the entire object store. Symlinks, unreadable
+entries and non-regular object files refuse the scan; hard links are reported.
+Pointer files have a 1 MiB metadata size cap.
 
 Bytes and objects are bounded, stderr is discarded, and an owned-child deadline caps the whole Git subprocess at
 30 seconds, including time spent making progress. Larger histories may therefore
 be incomplete. Blobs, commits and annotated tags are scanned; recoverable token
 issues are retained while later objects are still read. Object ranges
 are distinct from file ranges and never authorize rewriting history. Git owns
-the interpretation of the repository's object database. The reported
-indirections and subsequent changes inside an open store are not a claim of
-full filesystem confinement for Git's internal traversal.
+the interpretation of the repository's object database after this preflight;
+the scan is not a snapshot of a concurrently changing store.
 
 Possible restore leftovers match both `.<name>.envcloak-new-<hex>.tmp` and
 `.<name>.envcloak-swap-<hex>.tmp`, including non-env configs and transcripts.
-Discovery checks metadata only, reports unreadable/oversized/unsafe candidates,
-and never reads contents to infer ownership. Foreign files with the same shape
+Discovery includes approved `envFile` targets and their siblings, even when
+the target is missing. An explicitly selected leftover stays metadata-only;
+repeated discovery reuses its report. Unreadable, oversized and unsafe
+candidates are reported. Discovery never reads contents to infer ownership.
+Foreign files with the same shape
 are reported too. M2-20 and M2-22 consume this result after both successful and
 refused undo; cleanup and those command-level reports belong to those tasks.
 

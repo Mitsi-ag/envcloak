@@ -281,10 +281,9 @@ pub(crate) fn inspect_include_siblings(
             .map(|root| (root, name))
             .map_err(|e| crate::root::io_kind(&e))
     });
-    match parent {
-        Ok((parent, name)) => inspect_siblings(&parent, Some(&name), budget, attempts, report),
-        // The include read reports a missing or unsafe parent once.
-        Err(_) => {}
+    // The include read reports a missing or unsafe parent once.
+    if let Ok((parent, name)) = parent {
+        inspect_siblings(&parent, Some(&name), budget, attempts, report);
     }
 }
 

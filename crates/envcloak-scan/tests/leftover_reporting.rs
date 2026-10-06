@@ -207,16 +207,16 @@ fn included_envfile_leftovers_are_reported_even_when_target_is_missing() {
 
 #[test]
 fn explicit_leftover_sources_and_includes_remain_metadata_only() {
-    for include in [false, true] {
+    for via_envfile in [false, true] {
         let d = tempfile::tempdir_in("/tmp").unwrap();
         let name = ".values.env.envcloak-swap-ab.tmp";
-        let bytes = if include {
+        let bytes = if via_envfile {
             b"A=fixtureZdirectLeftoverRead\n".as_slice()
         } else {
             br#"{"env":{"A":"fixtureZdirectLeftoverRead"}}"#
         };
         std::fs::write(d.path().join(name), bytes).unwrap();
-        let descriptor = if include {
+        let descriptor = if via_envfile {
             let config = serde_json::json!({"mcpServers":{"s":{"envFile":name}}});
             std::fs::write(
                 d.path().join("config.json"),
