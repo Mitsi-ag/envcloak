@@ -376,3 +376,20 @@ fn different_selectors_on_one_directory_keep_their_coverage() {
         );
     }
 }
+
+#[test]
+fn repeated_config_interpretations_share_diagnostic_identity() {
+    let d = dir();
+    let path = d.path().join("store");
+    std::fs::write(&path, b"fixtureZunsupportedConfig").unwrap();
+    let sources = [ConfigFormat::Yaml, ConfigFormat::Raw].map(|format| {
+        let mut src = source(path.clone());
+        src.format = format;
+        src
+    });
+    let report = scan_config_sources_with_budget(&sources, Budget::default()).unwrap();
+    assert!(!report.complete());
+    assert_eq!(report.files, 2);
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].reason, "unsupported_format");
+}

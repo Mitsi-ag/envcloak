@@ -278,3 +278,22 @@ fn malformed_jsonl_fallback_keeps_offsets_and_stops_on_refusal() {
     assert_eq!(report.bytes, bytes.len() as u64);
     assert_eq!(report.not_scanned, 1);
 }
+
+#[test]
+fn repeated_malformed_jsonl_keeps_diagnostics_bounded() {
+    let bytes = b"{\xff}\n".repeat(10_000);
+    let report = envcloak_scan::transcript::scan_reader(
+        &mut std::io::Cursor::new(&bytes),
+        ConfigFormat::Jsonl,
+        Default::default(),
+        Budget::default(),
+        &mut |_| true,
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert_eq!(report.bytes, bytes.len() as u64);
+    assert!(report.not_scanned >= 10_000);
+    assert_eq!(report.issues.len(), 2);
+    assert!(report.issues.iter().any(|i| i.reason == "invalid_json"));
+    assert!(report.issues.iter().any(|i| i.reason == "invalid_text"));
+}
