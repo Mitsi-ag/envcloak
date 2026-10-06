@@ -454,12 +454,19 @@ fn run_by_an_agent_the_probe_gives_no_approval() {
     m.h.assert_swept("after the agent's probes");
 }
 
-/// A host that makes a request and approves it from its own session and
-/// terminal, as `HostSession` starts it, is refused (T9-3), and the
-/// command is not run; the same request approved from the person's
-/// terminal is granted (the control). Mutation checked: the host started
-/// with the session and terminal of the approver (`HostSession` without its
-/// new session, `the_probe_runs_beside...` above).
+/// An agent's request, made in a session and on a terminal `HostSession`
+/// made, approved by a process that is no agent's from that same session
+/// and terminal, is refused (T9-3: `requester_terminal` on Linux; on
+/// macOS that session has no terminal left, `no_terminal`), and the command
+/// is not run; the same request approved from the person's terminal is
+/// granted (the control). The requester is an agent (`fixture-agent`), as
+/// the probe's host is: a terminal subject's own request is the person's
+/// to approve on their terminal (measured on Linux, where a plain shell in
+/// such a session is one). Mutations checked: the agent taken out of the
+/// requester's chain (the approval is then given, on Linux, and this test
+/// fails); the host started with the session and terminal of the approver
+/// (`HostSession` without its new session, `the_probe_runs_beside...`
+/// above).
 #[test]
 fn an_approval_from_the_hosts_own_terminal_is_refused() {
     let mut m = machine(&json!({}));
@@ -485,12 +492,13 @@ fn an_approval_from_the_hosts_own_terminal_is_refused() {
     let refused = root.join("t93-approve");
     let code = root.join("t93-code");
     let cli = quoted(m.h.cli().to_str().unwrap());
+    let agent = quoted(testkit_bin("fixture-agent").to_str().unwrap());
     // In one session on one terminal: the request, then its approval.
     // The request's id, as the person's listing gives it: the host's own
     // listing shows it no request it may not approve.
     let id_file = root.join("t93-id");
     let body = format!(
-        "#!/bin/sh\n{cli} run --wait 2m -- /usr/bin/touch {ran} &\n\
+        "#!/bin/sh\n{agent} -- {cli} run --wait 2m -- /usr/bin/touch {ran} &\n\
          while [ ! -f {id} ]; do sleep 0.1; done\n\
          {cli} approve \"$(cat {id})\" --once --live T93_KEY --passphrase-fd 3 3<{pass} >/dev/null 2>{refused}\n\
          echo $? >{code}.tmp; mv {code}.tmp {code}\nwait\n",
@@ -534,7 +542,27 @@ fn an_approval_from_the_hosts_own_terminal_is_refused() {
     let said = std::fs::read_to_string(&refused).unwrap_or_default();
     m.h.assert_clean("the host's approval", said.as_bytes());
     assert_ne!(approve_code, 0, "the host approved its own request: {said}");
-    assert!(said.contains("proof_refused"), "{said}");
+    // The reason, as measured: on Linux the approver is a terminal
+    // subject sharing the agent's session and terminal (T9-3); on macOS
+    // the session has no terminal at all once only the runner holds the
+    // pty's master (no process has its slave open), so the approver is
+    // refused as having none. Refused either way, before any proof.
+    let want = if cfg!(target_os = "linux") {
+        "reason=requester_terminal"
+    } else {
+        "reason=no_terminal"
+    };
+    let log =
+        m.h.expect_log("proof refused method=", Duration::from_secs(30));
+    let refusals: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains("proof refused"))
+        .collect();
+    assert!(said.contains("proof_refused"), "{said}\n{refusals:#?}");
+    assert!(
+        refusals.iter().any(|l| l.contains(want)),
+        "{want}: {refusals:#?}"
+    );
     assert!(!ran.exists(), "the host's own approval ran the command");
     let pass_r = m.h.secret_file(labels::VAULT_PASSPHRASE, true);
     let approved = m.h.human(
