@@ -181,3 +181,65 @@ fn npm_configuration_names_match_without_case() {
         assert!(envcloak_policy::managed::is_code_selecting(name), "{name}");
     }
 }
+
+/// The environment spellings must obey the same code-loading policy as
+/// their corresponding attached options. Mutation: omit both names from
+/// the environment refusal predicate.
+#[test]
+#[ignore = "requires debug CPython 3.14.0; run scripts/check-managed-oracles.sh"]
+fn python_startup_environment_cannot_select_unchecked_code() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{
+        LaunchChanges, apply_changes, check_declaration, launch_environment,
+    };
+    let python = runtime("ENVCLOAK_PYTHON_DEBUG_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let entry = h.join("entry.py");
+    std::fs::write(&entry, "print('entry')\n").unwrap();
+    std::fs::write(
+        h.join("observer.py"),
+        "print('prelude')\nclass Notice(Warning): pass\n",
+    )
+    .unwrap();
+    let args = vec![entry.to_str().unwrap().to_owned()];
+    let base = [("PYTHONPATH", h.to_str().unwrap())];
+    assert_eq!(run(&python, h, &args, &base), "entry\n");
+    let declared = LaunchDecl {
+        argv: vec!["python3.14d".into(), args[0].clone()],
+        cwd: None,
+        env: Vec::new(),
+        path_env: None,
+    };
+    assert!(check_declaration(&declared).is_ok());
+    for (name, value) in [
+        ("PYTHON_PRESITE", "observer"),
+        ("PYTHONWARNINGS", "ignore::observer.Notice"),
+    ] {
+        let mut extra = base.to_vec();
+        extra.push((name, value));
+        assert_eq!(run(&python, h, &args, &extra), "prelude\nentry\n");
+        let mut d = declared.clone();
+        d.env.push((name.into(), value.into()));
+        let refusal = Err(DeclError::CodeSelecting(CodeSelecting::Variable));
+        assert_eq!(check_declaration(&d), refusal, "{name}");
+        let changes = LaunchChanges {
+            set_env: d.env.clone(),
+            ..LaunchChanges::default()
+        };
+        assert!(matches!(
+            apply_changes(&declared, &changes),
+            Err(DeclError::CodeSelecting(CodeSelecting::Variable))
+        ));
+        let environment = launch_environment(
+            [(name.as_bytes(), value.as_bytes())],
+            b"/bin",
+            &d.env,
+            &[(name, value.as_bytes())],
+        );
+        assert!(environment.iter().all(|(n, _)| n != name.as_bytes()));
+    }
+}
