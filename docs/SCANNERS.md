@@ -34,7 +34,8 @@ Database and credential omissions apply before readable sources in either
 catalog order, including indirect `envFile` reads; sibling logs remain eligible.
 Declared omissions also cover stores that appear later during the same scan.
 Discovery, catalog reads, included files and leftover inspections share one
-attempt budget. Missing roots and empty directories consume it too.
+attempt budget. Missing roots and empty directories consume it too. An include
+directory inspection failure stays partial even if a later file read succeeds.
 
 Profiles cover the seven conventional shell files, literal `source`/`.` paths
 within the supplied home root, at most four source edges and 64 attempted paths,
