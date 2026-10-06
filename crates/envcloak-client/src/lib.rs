@@ -23,6 +23,7 @@
 
 pub mod claims;
 pub mod connect;
+pub mod doctor_report;
 pub mod fail;
 pub mod gitignore;
 pub mod manifest_edit;
