@@ -11,15 +11,15 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Default)]
 struct Visits {
     files: std::collections::HashMap<PathBuf, ReadState>,
-    omitted_roots: Vec<PathBuf>,
+    omissions: Vec<ConfigSource>,
 }
 enum ReadState {
     Closed,
     Read(std::collections::HashSet<ConfigFormat>),
 }
 impl Visits {
-    fn omitted(&self, path: &Path) -> bool {
-        self.omitted_roots.iter().any(|p| path.starts_with(p))
+    fn omitted(&self, path: &Path, directory: bool) -> Option<&ConfigSource> {
+        omitted_source(&self.omissions, path, directory)
     }
 }
 
@@ -28,10 +28,18 @@ fn omitted_kind(kind: SourceKind) -> bool {
 }
 
 pub(crate) fn omitted_path(sources: &[ConfigSource], path: &Path) -> bool {
+    omitted_source(sources, path, false).is_some()
+}
+
+fn omitted_source<'a>(
+    sources: &'a [ConfigSource],
+    path: &Path,
+    directory: bool,
+) -> Option<&'a ConfigSource> {
     sources
         .iter()
-        .filter(|s| omitted_kind(s.source_kind))
-        .any(|s| {
+        .filter(|s| omitted_kind(s.source_kind) && (!directory || s.names.is_none()))
+        .find(|s| {
             let Ok(root) = system_path(&s.path) else {
                 return false;
             };
@@ -150,7 +158,14 @@ pub(crate) fn walk_sources(
     report: &mut ScanReport,
     mut read: impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
 ) {
-    let mut visited = Visits::default();
+    let mut visited = Visits {
+        omissions: sources
+            .iter()
+            .filter(|s| omitted_kind(s.source_kind))
+            .cloned()
+            .collect(),
+        ..Default::default()
+    };
     let mut attempts = 0usize;
     let mut source_paths = std::collections::HashSet::new();
     let mut failed_roots = std::collections::HashSet::new();
@@ -219,7 +234,6 @@ pub(crate) fn walk_sources(
                 };
                 if source.source_kind == SourceKind::Credentials && source.names.is_none() {
                     note_omitted(source, sub.path(), report);
-                    visited.omitted_roots.push(sub.path().to_path_buf());
                     continue;
                 }
                 walk(
@@ -328,9 +342,6 @@ fn walk(
     report: &mut ScanReport,
     read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
 ) {
-    if visited.omitted(&root.path().join(rel)) {
-        return;
-    }
     if depth > 12 {
         report.issue(root.path().join(rel), "too_deep");
         return;
@@ -349,6 +360,12 @@ fn walk(
             return;
         }
     };
+    if !omitted_kind(source.source_kind) {
+        if let Some(omission) = visited.omitted(&root.path().join(rel), true) {
+            note_omitted(omission, &root.path().join(rel), report);
+            return;
+        }
+    }
     let entries = match list_dir(&dir, envcloak_sys::MAX_DIR_ENTRIES) {
         Ok(v) => v,
         Err(_) => {
@@ -414,12 +431,10 @@ fn process(
 ) {
     let path = root.path().join(rel);
     let format = effective_format(rel, source.format);
-    if visited.omitted(&path)
-        || visited.files.get(&path).is_some_and(|state| match state {
-            ReadState::Closed => true,
-            ReadState::Read(formats) => formats.contains(&format),
-        })
-    {
+    if visited.files.get(&path).is_some_and(|state| match state {
+        ReadState::Closed => true,
+        ReadState::Read(formats) => formats.contains(&format),
+    }) {
         return;
     }
     if *attempts >= budget.files {
@@ -449,6 +464,13 @@ fn process(
     }
     if m.nlink() > 1 {
         report.issue(root.path().join(rel), "hard_link");
+    }
+    if !omitted_kind(source.source_kind) {
+        if let Some(omission) = visited.omitted(&path, false) {
+            note_omitted(omission, &path, report);
+            visited.files.insert(path, ReadState::Closed);
+            return;
+        }
     }
     if note_omitted(source, &root.path().join(rel), report) {
         visited.files.insert(path, ReadState::Closed);
