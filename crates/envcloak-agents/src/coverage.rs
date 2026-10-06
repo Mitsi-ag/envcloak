@@ -828,7 +828,40 @@ pub struct ConfigSet {
     pub sandboxed_shell: bool,
     pub server: ServerFacts,
     pub context: Context,
+    /// What EnvCloak installed for the host, entry by entry
+    /// ([`Installed`]): read with the rest, for [`ConfigSet::shape`]. Not
+    /// part of the facts the fingerprint serializes: the fingerprint
+    /// already holds every file it comes from, byte for byte.
+    #[serde(skip)]
+    pub installed: Installed,
 }
+
+/// EnvCloak's own entries in a host's configuration, each as the
+/// canonical JSON of what it says, with where it is said given relative to
+/// the session (the settings level, the folder's depth above the working
+/// directory), never as a path: so the same install reads the same in the
+/// person's home and in a probe home (M2-28), and an entry that differs in
+/// anything a host acts on (a hook's command, matcher or timeout, the
+/// server's command, arguments, environment names or timeout) reads
+/// differently. A hook is EnvCloak's by its command
+/// (`<program> hook --host <host> --event <event>`); a server by its name.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Installed {
+    /// EnvCloak's hook entries.
+    pub hooks: BTreeSet<String>,
+    /// EnvCloak's server registrations, and the person's settings about
+    /// it beside them.
+    pub servers: BTreeSet<String>,
+}
+
+impl Installed {
+    fn add(set: &mut BTreeSet<String>, v: &Value) {
+        set.insert(serde_json::to_string(&canonical(v)).unwrap_or_default());
+    }
+}
+
+/// The version of what [`ConfigSet::shape`] covers.
+pub const SHAPE_FORMAT: u32 = 1;
 
 /// The version of what [`ConfigSet::fingerprint`] covers: when it changes,
 /// a result kept under the old one is no longer current. 2 since the
@@ -865,6 +898,141 @@ impl ConfigSet {
         }))
         .ok()?;
         Some(hex(&Sha256::digest(&bytes)))
+    }
+
+    /// What a probe's result in one home says about another (M2-28, Codex
+    /// review: a result measured in a probe home was kept under the
+    /// person's configuration whatever it held): the SHA-256 of
+    /// [`SHAPE_FORMAT`] and everything a probe outcome rests on, said the
+    /// same way in any home. That is EnvCloak's own entries
+    /// ([`Installed`]), the facts the probes act out (which hooks are
+    /// there, the deny rules, a foreign prompt hook, the sandbox, the
+    /// server's registration and approval), the programs the hooks run by
+    /// their SHA-256, the host's stores by where they are relative to
+    /// `home` (outside it, by their label), and the `envcloak` build. Left
+    /// out: what is applied at display from the person's own files whatever
+    /// a probe found ([`degraders`]: the switches, managed-only, a moved
+    /// configuration folder, an override file, the managed hooks), and the
+    /// files' bytes, which differ by everything else they hold. Two homes
+    /// with the same shape run a probe the same way; a probe home's result
+    /// is kept for the person's configuration only when their shapes are
+    /// equal. `None` when the context is not complete, its stores are not
+    /// all known, or `envcloak` cannot be read.
+    pub fn shape(&self, home: &Path, envcloak: &Path) -> Option<String> {
+        if !self.context.complete || !self.context.stores_known {
+            return None;
+        }
+        let build = std::fs::canonicalize(envcloak)
+            .ok()
+            .and_then(|p| file_sha256(&p))?;
+        let mut programs: Vec<String> = self
+            .context
+            .programs
+            .iter()
+            .map(|p| p.sha256.clone().unwrap_or_else(|| "absent".to_owned()))
+            .collect();
+        programs.sort();
+        let mut stores: Vec<Value> = self
+            .context
+            .stores
+            .iter()
+            .map(|s| {
+                let at = under_home(Path::new(&s.path), home).map_or_else(
+                    || "outside_home".to_owned(),
+                    |rel| format!("~/{}", rel.to_string_lossy()),
+                );
+                serde_json::json!({ "label": s.label, "names": s.names, "at": at })
+            })
+            .collect();
+        stores.sort_by_key(ToString::to_string);
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "format": SHAPE_FORMAT,
+            "host": self.host,
+            "linux": self.linux,
+            "hooks": self.hooks,
+            "read_deny": self.read_deny,
+            "foreign_read_deny": self.foreign_read_deny,
+            "foreign_prompt_hook": self.foreign_prompt_hook,
+            "sandboxed_shell": self.sandboxed_shell,
+            "server": self.server,
+            "installed_hooks": self.installed.hooks,
+            "installed_servers": self.installed.servers,
+            "programs": programs,
+            "stores": stores,
+            "envcloak": build,
+        }))
+        .ok()?;
+        Some(hex(&Sha256::digest(&bytes)))
+    }
+}
+
+/// `path` relative to `home`, as given or with the folders that exist of
+/// each resolved (a store not made yet, a home given through a link such
+/// as macOS's `/tmp`), or `None` when it is not under it.
+fn under_home(path: &Path, home: &Path) -> Option<PathBuf> {
+    let resolved = |p: &Path| {
+        let mut rest = Vec::new();
+        let mut at = p;
+        loop {
+            if let Ok(real) = std::fs::canonicalize(at) {
+                let mut out = real;
+                for part in rest.iter().rev() {
+                    out.push(part);
+                }
+                return out;
+            }
+            match (at.parent(), at.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    at = parent;
+                }
+                _ => return p.to_path_buf(),
+            }
+        }
+    };
+    let (p, h) = (resolved(path), resolved(home));
+    for (p, h) in [(path, home), (p.as_path(), h.as_path())] {
+        if let Ok(rel) = p.strip_prefix(h) {
+            return Some(rel.to_path_buf());
+        }
+    }
+    None
+}
+
+/// EnvCloak's hook entries in `settings` (a host's settings or hook file,
+/// read at `level`), each with its event and its group's matcher, into
+/// `out` ([`Installed::hooks`]).
+fn installed_hooks(settings: &Value, host: Host, level: &str, out: &mut BTreeSet<String>) {
+    let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
+        return;
+    };
+    for (event, groups) in events {
+        let tail = format!(" hook --host {} --event {event}", host.id());
+        for group in groups.as_array().into_iter().flatten() {
+            let matcher = group.get("matcher").cloned().unwrap_or(Value::Null);
+            for h in group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let ours = h
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.ends_with(&tail));
+                if ours {
+                    Installed::add(
+                        out,
+                        &serde_json::json!({
+                            "level": level,
+                            "event": event,
+                            "matcher": matcher,
+                            "hook": h,
+                        }),
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1660,6 +1828,7 @@ fn read_claude(
                 // known: switched off at that level, conservatively.
                 Read::Unreadable | Read::Toml(_) => true,
                 Read::Json(v) => {
+                    installed_hooks(&v, Host::ClaudeCode, level, &mut cs.installed.hooks);
                     let h = hooks_of(
                         &v,
                         Host::ClaudeCode,
@@ -1747,6 +1916,10 @@ fn read_claude(
             mcp: HookState::Present,
         };
         cs.server.registered = true;
+        Installed::add(
+            &mut cs.installed.hooks,
+            &serde_json::json!({ "claude_plugin": true }),
+        );
         plugin_context(&mut cs.context, l, env, &mut programs);
     }
     cs.context.programs(programs);
@@ -1766,6 +1939,22 @@ fn read_claude(
         Some(v) => {
             let (part, found) = claude_registration(&v, &dirs);
             reg = found;
+            // The same, its folders by their depth above the working
+            // directory rather than by their paths.
+            let mut by_depth = serde_json::Map::new();
+            if let Some(p) = part.get("projects").and_then(Value::as_object) {
+                for (i, d) in dirs.iter().enumerate() {
+                    if let Some(e) = p.get(d.to_string_lossy().as_ref()) {
+                        by_depth.insert(i.to_string(), e.clone());
+                    }
+                }
+            }
+            Installed::add(
+                &mut cs.installed.servers,
+                &serde_json::json!({
+                    "claude_json": { "user": part.get("user"), "projects": by_depth },
+                }),
+            );
             let bytes = serde_json::to_vec(&part).unwrap_or_default();
             cs.context.parts.push(PartSeen {
                 role: "claude_registration".to_owned(),
@@ -1780,15 +1969,21 @@ fn read_claude(
     mcpjson.approved |= reg.mcpjson.approved;
     mcpjson.rejected |= reg.mcpjson.rejected;
     let mut project_server = false;
-    for d in &dirs {
+    for (depth, d) in dirs.iter().enumerate() {
         if let Read::Json(v) =
             cs.context
                 .json("claude_mcp_json", &d.join(".mcp.json"), MAX_SETTINGS)
         {
-            project_server |= v
+            if let Some(server) = v
                 .get(claude::MCP_SERVERS)
                 .and_then(|s| s.get(claude::SERVER))
-                .is_some();
+            {
+                project_server = true;
+                Installed::add(
+                    &mut cs.installed.servers,
+                    &serde_json::json!({ "mcp_json": depth, "server": server }),
+                );
+            }
         }
     }
     let organization = match cs.context.json(
@@ -1798,10 +1993,16 @@ fn read_claude(
     ) {
         Read::Absent => false,
         Read::Json(v) => {
-            cs.server.registered |= v
+            if let Some(server) = v
                 .get(claude::MCP_SERVERS)
                 .and_then(|s| s.get(claude::SERVER))
-                .is_some();
+            {
+                cs.server.registered = true;
+                Installed::add(
+                    &mut cs.installed.servers,
+                    &serde_json::json!({ "managed_mcp": server }),
+                );
+            }
             true
         }
         _ => true,
@@ -2269,6 +2470,27 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
             .iter()
             .any(|r| r.unreadable || r.sandbox_mode.as_deref() != Some("danger-full-access"));
     cs.server.registered = readings.iter().any(|r| r.registered);
+    // EnvCloak's server as each layer has it, the layer named by its
+    // place rather than its path.
+    let mut servers: Vec<(String, &CodexLayer)> = vec![
+        ("system".to_owned(), &system),
+        ("user".to_owned(), &user),
+        ("managed".to_owned(), &managed),
+    ];
+    for (i, p) in profiles.iter().enumerate() {
+        servers.push((format!("profile {i}"), p));
+    }
+    for (j, p) in projects.iter().enumerate() {
+        servers.push((format!("project {}", projects.len() - 1 - j), p));
+    }
+    for (role, layer) in servers {
+        if let Some(s) = layer.server() {
+            Installed::add(
+                &mut cs.installed.servers,
+                &serde_json::json!({ "codex_layer": role, "server": toml_json(s) }),
+            );
+        }
+    }
     if cs.server.registered {
         let first = readings.first().map(|r| r.approval.clone());
         let agreed = readings
@@ -2285,6 +2507,7 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
         .json("codex_hooks", &l.codex_hooks(), MAX_SETTINGS)
     {
         Read::Json(v) => {
+            installed_hooks(&v, Host::Codex, "user", &mut cs.installed.hooks);
             cs.hooks = hooks_of(&v, Host::Codex, "Bash", "mcp__.*", &mut programs);
             cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Codex);
         }
@@ -3401,6 +3624,129 @@ mod tests {
         assert_eq!(back.surfaces[2].skipped, [Case::AtMention]);
         // No other surface names it.
         assert!(c.surfaces.iter().filter(|s| !s.skipped.is_empty()).count() == 1);
+    }
+
+    /// Two homes with EnvCloak installed alike have one shape, wherever
+    /// they are and whatever else their files hold (another setting, a
+    /// switch, which is applied at display); an EnvCloak hook entry or a
+    /// server registration that differs in what a host acts on gives
+    /// another (Codex review of M2-28: a probe home's result was credited
+    /// to a configuration with another hook timeout or another server
+    /// named `envcloak`). Mutations checked: the hook entries left out of
+    /// the shape (the timeout case then has the same shape and this
+    /// fails); the server registrations left out (the command cases).
+    #[test]
+    fn the_shape_follows_envcloaks_entries_not_the_home() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let build = dir.path().join("bin").join("envcloak");
+        std::fs::create_dir_all(build.parent().unwrap_or(dir.path()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(&build, b"#!/bin/sh\n").unwrap_or_else(|e| panic!("{e}"));
+        std::fs::set_permissions(&build, std::fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let quoted = crate::hosts::shell_quote(&build.to_string_lossy());
+        let system = dir.path().join("system");
+        let write = |p: &Path, v: &str| {
+            std::fs::create_dir_all(p.parent().unwrap_or(dir.path()))
+                .unwrap_or_else(|e| panic!("{e}"));
+            std::fs::write(p, v).unwrap_or_else(|e| panic!("{e}"));
+        };
+        let settings = |timeout: u32, extra: &[(&str, Value)]| {
+            let mut v = json!({"hooks": {"UserPromptSubmit": [{"hooks": [{
+                "type": "command",
+                "command": format!("{quoted} hook --host claude-code --event UserPromptSubmit"),
+                "timeout": timeout,
+            }]}]}});
+            for (k, x) in extra {
+                v[*k] = x.clone();
+            }
+            v.to_string()
+        };
+        let server = |cmd: &str| {
+            json!({"mcpServers": {"envcloak": {"type": "stdio", "command": cmd, "args": ["mcp"]}}})
+                .to_string()
+        };
+        let ours = build.to_string_lossy().into_owned();
+        let shape = |name: &str, host: Host, files: &[(&str, String)]| {
+            let home = dir.path().join(name).join("home");
+            let cwd = home.join("work");
+            std::fs::create_dir_all(&cwd).unwrap_or_else(|e| panic!("{e}"));
+            for (rel, body) in files {
+                write(&home.join(rel), body);
+            }
+            let h = home.clone();
+            let env = move |k: &str| (k == "HOME").then(|| h.clone().into_os_string());
+            let l = Locations::new(&env)
+                .unwrap_or_else(|_| panic!("home"))
+                .with_system_dirs(system.join("codex"), system.join("prefs"));
+            let cs = ConfigSet::read(host, &l, &system.join("claude"), &cwd, &env);
+            cs.shape(&home, &build)
+                .unwrap_or_else(|| panic!("{name}: no shape"))
+        };
+        let a = shape(
+            "a",
+            Host::ClaudeCode,
+            &[
+                (".claude/settings.json", settings(10, &[])),
+                (".claude.json", server(&ours)),
+            ],
+        );
+        let b = shape(
+            "b-elsewhere",
+            Host::ClaudeCode,
+            &[
+                (
+                    ".claude/settings.json",
+                    settings(
+                        10,
+                        &[("model", json!("other")), ("disableAllHooks", json!(true))],
+                    ),
+                ),
+                (".claude.json", server(&ours)),
+            ],
+        );
+        assert_eq!(
+            a, b,
+            "the same install in another home, with other settings"
+        );
+        let timeout = shape(
+            "c",
+            Host::ClaudeCode,
+            &[
+                (".claude/settings.json", settings(20, &[])),
+                (".claude.json", server(&ours)),
+            ],
+        );
+        assert_ne!(a, timeout, "another hook timeout");
+        let command = shape(
+            "d",
+            Host::ClaudeCode,
+            &[
+                (".claude/settings.json", settings(10, &[])),
+                (".claude.json", server("/elsewhere/server")),
+            ],
+        );
+        assert_ne!(a, command, "another server named envcloak");
+
+        let codex =
+            |cmd: &str| format!("[mcp_servers.envcloak]\ncommand = \"{cmd}\"\nargs = [\"mcp\"]\n");
+        let x = shape("e", Host::Codex, &[(".codex/config.toml", codex(&ours))]);
+        let y = shape(
+            "f-elsewhere",
+            Host::Codex,
+            &[(
+                ".codex/config.toml",
+                format!("model = \"other\"\n{}", codex(&ours)),
+            )],
+        );
+        assert_eq!(x, y, "Codex: the same server in another home");
+        let z = shape(
+            "g",
+            Host::Codex,
+            &[(".codex/config.toml", codex("/elsewhere/server"))],
+        );
+        assert_ne!(x, z, "Codex: another server named envcloak");
     }
 
     #[test]

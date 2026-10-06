@@ -305,6 +305,7 @@ fn the_coverage_report_keeps_its_contract_over_the_whole_matrix() {
                         foreign_prompt_hook: false,
                         server: ServerFacts::default(),
                         context: Default::default(),
+                        installed: Default::default(),
                     };
                     for profile in 0..6 {
                         let receipt = record(host, profile);

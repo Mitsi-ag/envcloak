@@ -162,8 +162,17 @@ impl ProbeHome {
     /// # Errors
     /// See [`ProbeError`]; nothing is left behind.
     pub fn create_in(tmp: &Path, person_socket: Option<&Path>) -> Result<ProbeHome, ProbeError> {
+        ProbeHome::create_with(tmp, person_socket, &mut random_name)
+    }
+
+    /// [`ProbeHome::create_in`], its name's letters from `pick`.
+    fn create_with(
+        tmp: &Path,
+        person_socket: Option<&Path>,
+        pick: &mut dyn FnMut() -> Result<String, ProbeError>,
+    ) -> Result<ProbeHome, ProbeError> {
         let tmp = std::fs::canonicalize(tmp)?;
-        let root = make_private_dir(&tmp)?;
+        let root = make_private_dir(&tmp, pick)?;
         let mut home = ProbeHome {
             root,
             marker: None,
@@ -347,15 +356,24 @@ fn same_path(a: &Path, b: &Path) -> bool {
     matches!((resolved(a), resolved(b)), (Some(x), Some(y)) if x == y)
 }
 
-/// Makes `<tmp>/ecpXXXXXX`, mode 0700, and checks it.
-fn make_private_dir(tmp: &Path) -> Result<PathBuf, ProbeError> {
+/// [`SUFFIX_LEN`] random letters and digits.
+fn random_name() -> Result<String, ProbeError> {
+    let mut rnd = [0u8; SUFFIX_LEN];
+    getrandom::fill(&mut rnd).map_err(|_| ProbeError::Io(io::ErrorKind::Other))?;
+    Ok(rnd
+        .iter()
+        .map(|b| char::from(b"abcdefghijklmnopqrstuvwxyz0123456789"[usize::from(*b) % 36]))
+        .collect())
+}
+
+/// Makes `<tmp>/ecpXXXXXX` (the letters from `pick`), mode 0700, and
+/// checks it.
+fn make_private_dir(
+    tmp: &Path,
+    pick: &mut dyn FnMut() -> Result<String, ProbeError>,
+) -> Result<PathBuf, ProbeError> {
     for _ in 0..32 {
-        let mut rnd = [0u8; SUFFIX_LEN];
-        getrandom::fill(&mut rnd).map_err(|_| ProbeError::Io(io::ErrorKind::Other))?;
-        let suffix: String = rnd
-            .iter()
-            .map(|b| char::from(b"abcdefghijklmnopqrstuvwxyz0123456789"[usize::from(*b) % 36]))
-            .collect();
+        let suffix = pick()?;
         let root = tmp.join(format!("{PREFIX}{suffix}"));
         match std::fs::DirBuilder::new().mode(0o700).create(&root) {
             Ok(()) => {}
@@ -508,6 +526,29 @@ mod tests {
         let root = h.root().to_path_buf();
         drop(h);
         assert!(!root.exists(), "the dropped home was removed");
+    }
+
+    /// A probe home whose daemon's socket would be the person's is not
+    /// made: refused with `PersonsSocket`, and its directory taken away
+    /// (verifier's finding on M2-28: no test reached the refusal through
+    /// `create_in`). The home's name is fixed here so that its socket is
+    /// known before it is made. Mutation checked: the `refuse_persons`
+    /// call taken out of `create_with`: the home is made and this fails.
+    #[test]
+    fn a_home_whose_socket_is_the_persons_is_not_made() {
+        let t = tmp();
+        let mut fixed = || Ok("aaaaaa".to_owned());
+        let h = ProbeHome::create_with(t.path(), None, &mut fixed).unwrap();
+        let socket = h.socket_path();
+        let root = h.root().to_path_buf();
+        h.remove().unwrap();
+        let again = ProbeHome::create_with(t.path(), Some(&socket), &mut fixed);
+        assert_eq!(again.unwrap_err(), ProbeError::PersonsSocket);
+        assert!(!root.exists(), "the refused home was left");
+        // Another person's socket: made.
+        let other = t.path().join("elsewhere.sock");
+        let h = ProbeHome::create_with(t.path(), Some(&other), &mut fixed).unwrap();
+        h.remove().unwrap();
     }
 
     /// Everything the probe starts gets `HOME`, every `XDG_*` base

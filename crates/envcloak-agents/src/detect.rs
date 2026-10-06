@@ -145,7 +145,38 @@ pub fn detect(
             cmd.env(k, v);
         }
     }
-    let out = run_limited(&mut cmd, LIMIT).map_err(|timed_out| {
+    version_of(host, exe, &mut cmd)
+}
+
+/// Finds `host` on `path` and asks it for its version with `vars` and
+/// `PATH` alone in its environment: for `agents status --probe` (M2-28),
+/// whose `vars` are a probe home's (`probe::home::ProbeHome::env`), so the
+/// host, or a launcher in its place, reads and writes nothing of the
+/// person's while it answers (Codex review of M2-28: the version was asked
+/// with the person's `HOME`, `CODEX_HOME` and `CLAUDE_CONFIG_DIR`).
+pub fn detect_with(
+    host: Host,
+    path: &OsStr,
+    vars: &[(OsString, OsString)],
+) -> Result<Detected, DetectError> {
+    let exe = find_on_path(exe_name(host), path).ok_or(DetectError::NotFound)?;
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--version")
+        .env_clear()
+        .envs(vars.iter().map(|(k, v)| (k, v)))
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some((_, home)) = vars.iter().find(|(k, _)| k == "HOME") {
+        cmd.current_dir(home);
+    }
+    version_of(host, exe, &mut cmd)
+}
+
+/// Runs `cmd` (`exe --version`) and reads `host`'s version from it.
+fn version_of(host: Host, exe: PathBuf, cmd: &mut Command) -> Result<Detected, DetectError> {
+    let out = run_limited(cmd, LIMIT).map_err(|timed_out| {
         if timed_out {
             DetectError::Timeout
         } else {

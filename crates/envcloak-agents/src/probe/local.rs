@@ -28,6 +28,8 @@
 //!    EnvCloak's installed configuration, as it installs it, and never the
 //!    person's agent credentials or settings (the scripted model needs
 //!    none). Codex on macOS gets the socket allowance's consent, as in CI.
+//!    What was measured there is kept for the person's configuration only
+//!    when theirs has the same shape ([`keep_record`]).
 //! 5. The probes of every surface and of EnvCloak's server
 //!    ([`super::run_surfaces`]), the host started by the path the person's
 //!    `PATH` gives it, each run in a session of its own on a terminal of its
@@ -275,6 +277,7 @@ pub fn not_qualified(host: &ProbeHost) -> ProbeReport {
         flags: Vec::new(),
         exe_sha256: String::new(),
         config_digest: String::new(),
+        config_shape: String::new(),
     }
 }
 
@@ -294,6 +297,11 @@ pub enum NotKept {
     ProbeNotIdentified,
     /// The person's hooks run another `envcloak` than the one that probed.
     AnotherEnvcloak,
+    /// The person's configuration is not the one the probe measured: its
+    /// shape (`coverage::ConfigSet::shape`) differs from the probe home's,
+    /// EnvCloak's entries, the facts the probes act out or the host's
+    /// stores being other than this build installs and the probe ran with.
+    ConfigurationDiffers,
 }
 
 impl NotKept {
@@ -313,6 +321,12 @@ impl NotKept {
             NotKept::AnotherEnvcloak => {
                 "your hooks run another envcloak than this one, which the probe ran: run the \
                  probe with that one, or install EnvCloak again with this one"
+            }
+            NotKept::ConfigurationDiffers => {
+                "your configuration for this host is not the one the probe ran with (EnvCloak's \
+                 hooks or server entry, a setting the probes rest on, or where the host keeps \
+                 transcripts differs from EnvCloak as this envcloak installs it): install \
+                 EnvCloak again with this envcloak, then run the probe again"
             }
         }
     }
@@ -334,6 +348,9 @@ pub struct PersonIdentity<'a> {
     pub programs: &'a [crate::coverage::ProgramSeen],
     /// The SHA-256 of the `envcloak` that probed.
     pub envcloak_sha256: &'a str,
+    /// `coverage::ConfigSet::shape` of the person's configuration, relative
+    /// to their `HOME`, with this `envcloak`.
+    pub shape: Option<&'a str>,
 }
 
 /// The record the cache keeps for `run`, under the person's identity, or
@@ -344,9 +361,14 @@ pub struct PersonIdentity<'a> {
 /// files switch off is applied at display from those files (the
 /// fingerprint's facts). So the record is kept only when the binary the
 /// probe ran is the person's, neither it nor the configuration changed
-/// meanwhile, and the person's hooks run the same `envcloak`. A host
-/// version that is not qualified is kept as `not_qualified` under the same
-/// identity, so `agents status` says why it has no probe result.
+/// meanwhile, the person's hooks run the same `envcloak`, and the person's
+/// configuration has the probe home's shape (`coverage::ConfigSet::shape`:
+/// EnvCloak's hook and server entries as they are written, the facts the
+/// probes act out, the stores; Codex review of M2-28, a result measured on
+/// a fresh install was credited to a configuration that differed from it).
+/// A host version that is not qualified is kept as `not_qualified` under
+/// the same identity, so `agents status` says why it has no probe result:
+/// that outcome rests on the version alone.
 ///
 /// # Errors
 /// See [`NotKept`].
@@ -367,7 +389,10 @@ pub fn keep_record(
         return Err(NotKept::ChangedWhileProbing);
     }
     if run.qualification.is_qualified() {
-        if run.report.exe_sha256.is_empty() || run.report.config_digest.is_empty() {
+        if run.report.exe_sha256.is_empty()
+            || run.report.config_digest.is_empty()
+            || run.report.config_shape.is_empty()
+        {
             return Err(NotKept::ProbeNotIdentified);
         }
         if run.report.exe_sha256 != person.exe_sha256 {
@@ -383,6 +408,13 @@ pub fn keep_record(
             .any(|s| s != person.envcloak_sha256);
         if other {
             return Err(NotKept::AnotherEnvcloak);
+        }
+        match person.shape {
+            None | Some("") => return Err(NotKept::ConfigurationNotRead),
+            Some(s) if s != run.report.config_shape => {
+                return Err(NotKept::ConfigurationDiffers);
+            }
+            Some(_) => {}
         }
     }
     let mut record = run.report.record();
@@ -574,10 +606,11 @@ impl ProbeDaemon {
             if d.connect().is_ok() {
                 return Ok(d);
             }
+            // A state not known is no daemon to wait for: `stop` kills it.
             let gone = d
                 .child
                 .as_ref()
-                .is_none_or(|c| envcloak_sys::has_exited(pid_of(c)).unwrap_or(true));
+                .is_none_or(|c| !matches!(envcloak_sys::has_exited(pid_of(c)), Ok(false)));
             if gone || Instant::now() > end {
                 d.stop();
                 return Err(LocalError::Daemon);
@@ -684,11 +717,15 @@ impl ProbeDaemon {
             let pid = pid_of(&child);
             let _ = envcloak_sys::signal_process(pid, libc::SIGTERM);
             let end = Instant::now() + DAEMON_STOP;
-            while !envcloak_sys::has_exited(pid).unwrap_or(true) && Instant::now() < end {
+            while matches!(envcloak_sys::has_exited(pid), Ok(false)) && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(25));
             }
             let mut child = child;
-            if !envcloak_sys::has_exited(pid).unwrap_or(true) {
+            // Not seen to have exited (its state not known included): killed
+            // while it is still this process's unreaped child, so the wait
+            // below never waits on a daemon that does not stop (Codex
+            // cycle488 F144's class).
+            if !matches!(envcloak_sys::has_exited(pid), Ok(true)) {
                 let _ = child.kill();
             }
             let _ = child.wait();
@@ -725,6 +762,7 @@ mod tests {
         }
         report.exe_sha256 = "e".repeat(64);
         report.config_digest = "p".repeat(64);
+        report.config_shape = "s".repeat(64);
         LocalRun {
             report,
             qualification: Qualification::Qualified,
@@ -738,8 +776,8 @@ mod tests {
     /// when every condition holds; each one broken alone is refused with
     /// its reason. Mutation checked: each condition taken out in turn
     /// (the binary's comparison, the before/after comparison, the hook
-    /// programs' comparison): its case below then keeps the record and
-    /// fails.
+    /// programs' comparison, the shape's comparison): its case below then
+    /// keeps the record and fails.
     #[test]
     fn a_result_is_kept_only_for_what_it_measured() {
         let run = qualified_run();
@@ -758,6 +796,8 @@ mod tests {
         let exe = "e".repeat(64);
         let fp = "f".repeat(64);
         let me = "c".repeat(64);
+        let shape = "s".repeat(64);
+        let other_shape = "t".repeat(64);
         let programs = [ours.clone(), gone.clone()];
         let good = PersonIdentity {
             exe_sha256: &exe,
@@ -765,6 +805,7 @@ mod tests {
             after: Some(&fp),
             programs: &programs,
             envcloak_sha256: &me,
+            shape: Some(&shape),
         };
         let r = keep_record(&run, &good).unwrap();
         assert_eq!(r.exe_sha256, exe);
@@ -823,6 +864,22 @@ mod tests {
                 },
                 NotKept::AnotherEnvcloak,
             ),
+            (
+                "another configuration shape",
+                PersonIdentity {
+                    shape: Some(&other_shape),
+                    ..good
+                },
+                NotKept::ConfigurationDiffers,
+            ),
+            (
+                "no shape",
+                PersonIdentity {
+                    shape: None,
+                    ..good
+                },
+                NotKept::ConfigurationNotRead,
+            ),
         ] {
             assert_eq!(keep_record(&run, &person), Err(want), "{case}");
         }
@@ -830,6 +887,12 @@ mod tests {
         unidentified.report.config_digest.clear();
         assert_eq!(
             keep_record(&unidentified, &good),
+            Err(NotKept::ProbeNotIdentified)
+        );
+        let mut no_shape = qualified_run();
+        no_shape.report.config_shape.clear();
+        assert_eq!(
+            keep_record(&no_shape, &good),
             Err(NotKept::ProbeNotIdentified)
         );
 
