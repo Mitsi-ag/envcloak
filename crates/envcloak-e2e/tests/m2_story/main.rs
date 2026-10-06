@@ -15,6 +15,7 @@
 //!   person's approval without the tick refused, and with it one use.
 #![allow(clippy::unwrap_used)]
 
+mod doctor;
 mod install;
 mod live_guard;
 mod mcp;
