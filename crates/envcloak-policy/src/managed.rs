@@ -14,13 +14,21 @@
 //!   server is reported as manual. The names are compared as the dynamic
 //!   loader and the interpreters read them, byte for byte; case matters,
 //!   as it does to them.
-//! - [`classify_argv`]: a package runner (`npx`, `pnpm dlx`, `yarn dlx`,
-//!   `bunx`, `uvx`, `pipx run`, and the forms that do the same:
-//!   `npm exec`, `bun x`, `uv tool run`), an interpreter with an absolute
-//!   entry file as its first argument that is not an option, or a program
-//!   whose own file decides its class. An interpreter without such an
-//!   entry file (code from standard input, a relative path) is refused:
-//!   nothing of what it runs could be checked.
+//! - [`classify_argv`]: a package runner or another launcher whose code is
+//!   chosen when it starts ([`PACKAGE_RUNNERS`]: `npx`, `uv`, `docker`,
+//!   `java` and the rest, in any of their forms: `uv --directory d run`,
+//!   `npm start`, `docker run`, `java -jar`), an interpreter with an
+//!   absolute entry file as its first argument that is not an option
+//!   ([`INTERPRETERS`], by name with any version: `python3.12`, `node22`,
+//!   `ruby3.2`, `perl5.34`), or a program whose own file decides its
+//!   class. An interpreter without such an entry file (code from standard
+//!   input or an argument, a relative path) is refused, and so is a
+//!   program that starts another one its arguments name ([`WRAPPERS`]:
+//!   `env`, `nice`, `stdbuf`, a dynamic loader run as a program):
+//!   nothing of what they run could be checked. [`refuse_disguised`]
+//!   refuses a launcher known by another name (a link named `server` to
+//!   `node`), by the name of the file `argv[0]` resolves to. None of these
+//!   passes as a native program, whose class binds what runs.
 //! - [`apply_changes`]: the declaration stored in the record with the
 //!   person's explicit changes (CR-2): never a host config, which after
 //!   migration holds only the bridge.
@@ -49,7 +57,7 @@ pub const PASSTHROUGH: [&str; 6] = ["HOME", "USER", "LOGNAME", "LANG", "TZ", "TM
 /// The variables that select the code a program runs (SPEC §6.6), refused
 /// in a declaration and never passed to a server, besides every `LD_*`
 /// and `DYLD_*` ([`is_code_selecting`]).
-pub const CODE_SELECTING: [&str; 16] = [
+pub const CODE_SELECTING: [&str; 21] = [
     "NODE_OPTIONS",
     "NODE_PATH",
     "BUN_OPTIONS",
@@ -57,14 +65,19 @@ pub const CODE_SELECTING: [&str; 16] = [
     "PYTHONPATH",
     "PYTHONHOME",
     "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
     "PERL5LIB",
+    "PERLLIB",
     "PERL5OPT",
     "RUBYLIB",
     "RUBYOPT",
     "JAVA_TOOL_OPTIONS",
+    "JDK_JAVA_OPTIONS",
     "_JAVA_OPTIONS",
+    "CLASSPATH",
     "BASH_ENV",
     "ENV",
+    "ZDOTDIR",
     "GCONV_PATH",
 ];
 
@@ -82,10 +95,69 @@ pub fn is_code_selecting(name: &str) -> bool {
 /// script they run (SPEC §6.6 lists `node`, `python3`, `bun`, `deno`,
 /// `ruby`, `perl`, `sh` and `bash`; their common other names are taken
 /// too, so none passes as a native program running code nothing checks).
-const INTERPRETERS: [&str; 14] = [
-    "node", "nodejs", "python", "python3", "bun", "deno", "ruby", "perl", "sh", "bash", "dash",
-    "zsh", "ksh", "fish",
+/// [`VERSIONED`] ones count with a version after the name (`python3.12`,
+/// `node22`, `ruby3.2`, `perl5.34`).
+pub const INTERPRETERS: [&str; 17] = [
+    "node", "nodejs", "python", "pypy", "bun", "deno", "ruby", "perl", "php", "lua", "sh", "bash",
+    "dash", "zsh", "ksh", "mksh", "fish",
 ];
+
+/// The interpreters known by their name with a version after it.
+const VERSIONED: [&str; 10] = [
+    "node", "nodejs", "python", "pypy", "bun", "deno", "ruby", "perl", "php", "lua",
+];
+
+/// The launchers whose code is chosen when they start, from a package, a
+/// project, an image or a class path that EnvCloak does not check: each is
+/// a package runner in any form (`uv run`, `uv --directory d run`, `npm
+/// start`, `docker run`, `java -jar`), checked at rest, its label naming
+/// the form.
+pub const PACKAGE_RUNNERS: [&str; 24] = [
+    "npx", "pnpx", "bunx", "uvx", "pipx", "uv", "npm", "pnpm", "yarn", "poetry", "pdm", "hatch",
+    "pipenv", "rye", "conda", "mamba", "docker", "podman", "nerdctl", "java", "go", "cargo",
+    "dotnet", "mvn",
+];
+
+/// The programs that start another one their arguments name, with
+/// arguments or an environment of their own (`env FOO=1 node x.js`,
+/// `nice node x.js`), and the dynamic loaders run as programs: what they
+/// start could not be checked, so a declaration naming one is refused.
+pub const WRAPPERS: [&str; 22] = [
+    "env",
+    "nice",
+    "nohup",
+    "stdbuf",
+    "timeout",
+    "time",
+    "xargs",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "setsid",
+    "chrt",
+    "ionice",
+    "taskset",
+    "caffeinate",
+    "arch",
+    "unbuffer",
+    "flock",
+    "chroot",
+    "script",
+    "dyld",
+];
+
+/// Whether `name` is a dynamic loader's file run as a program (`ld.so`,
+/// `ld-linux-x86-64.so.2`, `ld-musl-aarch64.so.1`).
+fn dynamic_loader(name: &str) -> bool {
+    name == "ld.so" || name.starts_with("ld-linux") || name.starts_with("ld-musl")
+}
+
+/// Whether `name` starts another program its arguments name
+/// ([`WRAPPERS`]).
+pub fn is_wrapper(name: &str) -> bool {
+    WRAPPERS.contains(&name) || dynamic_loader(name)
+}
 
 /// The interpreter options that load other code (SPEC §6.6: `-e`, `-c`,
 /// `-m`, `-r`, `--require`, `--import`, `--loader`), with the forms the
@@ -94,7 +166,10 @@ const INTERPRETERS: [&str; 14] = [
 /// with its value attached (`-eCODE`, `-Mstrict`), and a long one with
 /// `=value`.
 const CODE_LOADING_SHORT: [&str; 8] = ["-e", "-E", "-c", "-m", "-M", "-r", "-I", "-p"];
-const CODE_LOADING_LONG: [&str; 9] = [
+const CODE_LOADING_LONG: [&str; 12] = [
+    "--inspect",
+    "--inspect-brk",
+    "--inspect-wait",
     "--require",
     "--import",
     "--loader",
@@ -139,6 +214,12 @@ pub enum DeclError {
     /// An interpreter without an absolute entry file: what it runs could
     /// not be checked.
     NoEntry,
+    /// A program that starts another one its arguments name
+    /// ([`WRAPPERS`]): what it starts could not be checked.
+    Wrapper,
+    /// A program named as one thing whose file is an interpreter, a
+    /// package runner or a wrapper ([`refuse_disguised`]).
+    Disguised,
 }
 
 /// Which of the two refusals of `code_selecting_env`.
@@ -160,6 +241,8 @@ impl DeclError {
             DeclError::BadName => "invalid_env_name",
             DeclError::NotAbsolute => "not_absolute",
             DeclError::NoEntry => "no_entry_file",
+            DeclError::Wrapper => "wrapper_program",
+            DeclError::Disguised => "disguised_launcher",
         }
     }
 }
@@ -250,50 +333,103 @@ fn base(arg: &str) -> &str {
     arg.rsplit('/').next().unwrap_or(arg)
 }
 
-/// Whether `name` is an interpreter's (`python3.12` is `python3`'s).
+/// Whether `name` is an interpreter's, by its name or, for
+/// [`VERSIONED`] ones, its name with a version (`python3.12`, `node22`).
 fn interpreter(name: &str) -> bool {
-    INTERPRETERS.contains(&name)
-        || name
-            .strip_prefix("python")
-            .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+    if INTERPRETERS.contains(&name) {
+        return true;
+    }
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    stem.len() < name.len()
+        && VERSIONED.contains(&stem)
+        && name[stem.len()..].starts_with(|c: char| c.is_ascii_digit())
 }
 
-/// Classes `argv` (see the module documentation).
+/// The first argument of `argv` after `from` that is not an option.
+fn first_word(argv: &[String], from: usize) -> Option<&str> {
+    argv.iter()
+        .skip(from)
+        .map(String::as_str)
+        .find(|a| !a.starts_with('-'))
+}
+
+/// The label of a package runner `name` with `argv` (see
+/// [`PACKAGE_RUNNERS`]), or `None` when `name` is not one.
+fn runner_label(name: &str, argv: &[String]) -> Option<String> {
+    let has = |w: &str| argv.iter().skip(1).any(|a| a == w);
+    let sub = |n: &str| match first_word(argv, 1) {
+        Some(w) => format!("{n} {w}"),
+        None => n.to_owned(),
+    };
+    Some(match name {
+        "npx" | "pnpx" | "bunx" | "uvx" => name.to_owned(),
+        "npm" => match first_word(argv, 1) {
+            Some("exec" | "x") => "npm exec".to_owned(),
+            _ => sub("npm"),
+        },
+        "uv" if argv.get(1).map(String::as_str) == Some("tool") && has("run") => {
+            "uv tool run".to_owned()
+        }
+        "uv" | "pipx" | "poetry" | "pdm" | "hatch" | "pipenv" | "rye" | "conda" | "mamba"
+            if has("run") =>
+        {
+            format!("{name} run")
+        }
+        "java" if has("-jar") => "java -jar".to_owned(),
+        _ if PACKAGE_RUNNERS.contains(&name) => sub(name),
+        _ => return None,
+    })
+}
+
+/// Classes `argv` (see the module documentation), by the name of its
+/// `argv[0]`.
 ///
 /// # Errors
-/// [`DeclError::Empty`] without argv; [`DeclError::CodeSelecting`] for an
+/// [`DeclError::Empty`] without argv; [`DeclError::Wrapper`] for a program
+/// that starts another one; [`DeclError::CodeSelecting`] for an
 /// interpreter or runner option that loads other code before the entry
 /// file; [`DeclError::NoEntry`] for an interpreter whose first argument
 /// that is not an option is missing; [`DeclError::NotAbsolute`] when it
 /// is not an absolute path.
 pub fn classify_argv(argv: &[String]) -> Result<ArgvClass, DeclError> {
     let first = argv.first().ok_or(DeclError::Empty)?;
-    let name = base(first);
-    let sub = argv.get(1).map(String::as_str);
-    let runner = match (name, sub) {
-        ("npx" | "bunx" | "uvx", _) => Some(name.to_owned()),
-        ("pnpm" | "yarn", Some("dlx")) => Some(format!("{name} dlx")),
-        ("pipx", Some("run")) => Some("pipx run".to_owned()),
-        ("npm", Some("exec" | "x")) => Some("npm exec".to_owned()),
-        ("bun", Some("x")) => Some("bun x".to_owned()),
-        ("uv", Some("tool")) if argv.get(2).map(String::as_str) == Some("run") => {
-            Some("uv tool run".to_owned())
-        }
-        _ => None,
-    };
-    if let Some(label) = runner {
-        // A runner's own options that run other code (`npx -c`, `--call`).
-        let skip = if label.contains(' ') {
-            label.matches(' ').count() + 1
-        } else {
-            1
-        };
-        for a in argv.iter().skip(skip) {
-            if a == "--" || !a.starts_with('-') {
-                break;
-            }
-            if is_code_loading_option(a) || a == "--call" || a.starts_with("--call=") {
-                return Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+    classify_named(argv, base(first))
+}
+
+/// Refuses a launcher known by another name: `argv` whose `argv[0]` is a
+/// program by its own name, but whose file, `resolved` (its canonical
+/// path), is named as an interpreter, a package runner or a wrapper (a
+/// link named `server` to `node`, to `uv` or to `env`). Such a launch
+/// would pass as a native program running code nothing checks.
+///
+/// # Errors
+/// [`DeclError::Disguised`]; [`classify_argv`]'s for `argv` itself.
+pub fn refuse_disguised(argv: &[String], resolved: &str) -> Result<ArgvClass, DeclError> {
+    let own = classify_argv(argv)?;
+    if own == ArgvClass::Program && classify_named(argv, base(resolved)) != Ok(ArgvClass::Program) {
+        return Err(DeclError::Disguised);
+    }
+    Ok(own)
+}
+
+fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
+    if is_wrapper(name) {
+        return Err(DeclError::Wrapper);
+    }
+    if let Some(label) = runner_label(name, argv) {
+        // A Node package runner's own options that run other code (`npx
+        // -c`, `--call`).
+        if matches!(name, "npx" | "pnpx" | "bunx" | "npm" | "pnpm" | "yarn") {
+            for a in argv.iter().skip(1) {
+                if a == "--" {
+                    break;
+                }
+                if is_code_loading_option(a) || a == "--call" || a.starts_with("--call=") {
+                    return Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+                }
+                if !a.starts_with('-') && !label.split(' ').any(|w| w == a) {
+                    break;
+                }
             }
         }
         return Ok(ArgvClass::PackageRunner { label });
@@ -302,10 +438,20 @@ pub fn classify_argv(argv: &[String]) -> Result<ArgvClass, DeclError> {
         return Ok(ArgvClass::Program);
     }
     // `deno run x.ts` and `bun run x.ts` name their entry after a
-    // subcommand.
+    // subcommand; any other subcommand of theirs (`bun x`, `deno task`)
+    // runs a package or a task: a package runner.
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     let mut i = 1;
-    if matches!(name, "deno" | "bun") && argv.get(1).map(String::as_str) == Some("run") {
-        i = 2;
+    if matches!(stem, "deno" | "bun") {
+        match argv.get(1).map(String::as_str) {
+            Some("run") => i = 2,
+            Some(w) if !w.starts_with('-') && !w.starts_with('/') => {
+                return Ok(ArgvClass::PackageRunner {
+                    label: format!("{name} {w}"),
+                });
+            }
+            _ => {}
+        }
     }
     while let Some(a) = argv.get(i) {
         if a == "--" {
@@ -794,6 +940,115 @@ mod tests {
                 }),
                 "{argv:?}"
             );
+        }
+    }
+
+    /// No launcher whose code is chosen when it starts passes as a native
+    /// program (whose class binds what runs): `uv run` in any form,
+    /// `docker run`, `podman run`, `java -jar` and `npm start` are package
+    /// runners; an interpreter with a version in its name (`ruby3.2`,
+    /// `perl5.34`, `node22`) is an interpreter; a program that starts
+    /// another one its arguments name (`env`, `nice`, a dynamic loader) is
+    /// refused; and a link named as a program to an interpreter, a runner
+    /// or a wrapper is refused by the name of its file. A native program,
+    /// and an interpreter-like name that is not one (`nodemon-server`),
+    /// stay programs (the positive controls).
+    ///
+    /// Mutation checked: the runner list cut back to `uv tool run` and the
+    /// interpreter match to exact names and `pythonN.N` (the previous
+    /// classification): `uv --directory /p run server.py` is a program,
+    /// and this fails.
+    #[test]
+    fn launchers_in_every_form_are_never_native() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let c = |a: &[&str]| classify_argv(&v(a));
+        for (argv, label) in [
+            (&["uv", "run", "server.py"][..], "uv run"),
+            (&["uv", "--directory", "/p", "run", "server.py"], "uv run"),
+            (
+                &["/usr/local/bin/uv", "run", "--with", "x", "s.py"],
+                "uv run",
+            ),
+            (&["docker", "run", "-i", "--rm", "img"], "docker run"),
+            (&["podman", "run", "img"], "podman run"),
+            (&["java", "-jar", "/srv/s.jar"], "java -jar"),
+            (&["npm", "start"], "npm start"),
+            (&["npm", "x", "pkg"], "npm exec"),
+            (&["poetry", "run", "server"], "poetry run"),
+            (&["bun", "x", "pkg"], "bun x"),
+            (&["go", "run", "."], "go run"),
+        ] {
+            assert_eq!(
+                c(argv),
+                Ok(ArgvClass::PackageRunner {
+                    label: label.to_owned()
+                }),
+                "{argv:?}"
+            );
+        }
+        for (argv, entry) in [
+            (&["ruby3.2", "/srv/s.rb"][..], 1),
+            (&["/usr/bin/perl5.34", "/srv/s.pl"], 1),
+            (&["node22", "/srv/s.js"], 1),
+            (&["python3", "/srv/s.py"], 1),
+            (&["python3.12", "/srv/s.py"], 1),
+            (&["php8.3", "/srv/s.php"], 1),
+        ] {
+            assert_eq!(c(argv), Ok(ArgvClass::Interpreter { entry }), "{argv:?}");
+        }
+        assert_eq!(c(&["ruby3.2", "s.rb"]), Err(DeclError::NotAbsolute));
+        assert_eq!(
+            c(&["node22", "--inspect=0.0.0.0:9229", "/srv/s.js"]),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+        assert_eq!(
+            c(&["node", "--inspect-brk", "/srv/s.js"]),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+        for argv in [
+            &["env", "FOO=1", "node", "/srv/s.js"][..],
+            &["/usr/bin/env", "node", "/srv/s.js"],
+            &["nice", "/srv/server"],
+            &["stdbuf", "-o0", "/srv/server"],
+            &["/lib64/ld-linux-x86-64.so.2", "/srv/server"],
+            &["ld.so", "/srv/server"],
+        ] {
+            assert_eq!(c(argv), Err(DeclError::Wrapper), "{argv:?}");
+        }
+        // Known by another name: refused by the name of its file.
+        for resolved in [
+            "/usr/bin/node",
+            "/opt/homebrew/bin/uv",
+            "/usr/bin/env",
+            "/usr/bin/ruby3.2",
+        ] {
+            assert_eq!(
+                refuse_disguised(&v(&["/srv/bin/server", "/srv/s.js"]), resolved),
+                Err(DeclError::Disguised),
+                "{resolved}"
+            );
+        }
+        // The positive controls.
+        assert_eq!(c(&["/srv/bin/server"]), Ok(ArgvClass::Program));
+        assert_eq!(c(&["nodemon-server"]), Ok(ArgvClass::Program));
+        assert_eq!(c(&["node-v2"]), Ok(ArgvClass::Program));
+        assert_eq!(
+            refuse_disguised(&v(&["/srv/bin/server"]), "/srv/bin/server-1.2"),
+            Ok(ArgvClass::Program)
+        );
+        assert_eq!(
+            refuse_disguised(&v(&["node", "/srv/s.js"]), "/usr/bin/node22"),
+            Ok(ArgvClass::Interpreter { entry: 1 })
+        );
+        // The variables beyond SPEC's list that select or load code.
+        for n in [
+            "PERLLIB",
+            "JDK_JAVA_OPTIONS",
+            "CLASSPATH",
+            "PYTHONUSERBASE",
+            "ZDOTDIR",
+        ] {
+            assert!(is_code_selecting(n), "{n}");
         }
     }
 
