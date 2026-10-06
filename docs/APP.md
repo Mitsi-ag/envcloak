@@ -41,6 +41,23 @@ As built by M3-02:
 
 ## The Swift client (M3-03)
 
+The client bounds connection setup to 10 seconds. After verification,
+`audit.verify` and `backup.create` have a 300-second budget for the whole
+request and response; the other EU-1 methods have 10 seconds. These are
+app budgets, tighter than IPC.md's ordinary per-read/per-write limit.
+The clock is monotonic and checked after readiness and before publishing
+a successful result. Connect expiry is `daemon_unavailable`; expiry after
+connection is `protocol_error`. The bundled CLI has a 30-second budget,
+also checked before publishing success. Queued RPCs hold no connection;
+lock uses the separate control slot and cancels obsolete calls.
+
+A timeout or cancellation after sending a request does not prove the
+daemon did no work. In particular, an add, revoke, deny, lock or backup
+may have committed before its response was lost. The client never retries
+automatically or reports success without a valid timely response. Callers
+must present an unknown outcome and reconcile the affected state before
+offering a retry; a connection failure before any send has no such effect.
+
 `EnvCloakKit` speaks the protocol of docs/IPC.md itself: 4-byte big-endian frames of at most 1 MiB, JSON-RPC 2.0 with `u64` ids and unknown fields refused, padded base64 values decoded straight into a `SecretBuffer`, fixed error tokens, and the client's peer checks before the first byte is sent (gates 20 and 21). No Rust is linked into the app: an FFI crate would need `unsafe` outside `envcloak-sys` (SPEC §5 "Process hardening"). Both sides stay equal through vectors written at test time: framing, base64 and escaping (Rust and a Python oracle), the canonical statement (`crates/envcloak-policy/tests/oracles/statement.py`, the Rust encoder and the Swift one), and HPKE (CryptoKit and the Rust `hpke` crate, SPEC §11).
 
 The P-256 signatures the app makes with its Secure Enclave key, and the daemon verifies with `p256` (SPEC §10b's signed proofs), get an independent signature-format gate when M3-09 lands the daemon's verifier and M3-11 the app's `ApprovalSigner`: an independently compiled consumer on the other side of each, so that a test in which both sides share a fault cannot pass. Three single changes must each fail it while a paired control on the same keys and bytes still passes: the statement's SHA-256 signed as `Data(digest)`, which CryptoKit hashes again, instead of as the typed `Digest`; the daemon's own digest checked with the plain verifier, which hashes again, instead of the prehash verifier; and a DER signature where the protocol carries the raw 64-byte `r || s`. Each of these faults makes every valid proof fail between CryptoKit and the Rust verifier.

@@ -1,6 +1,17 @@
 import Darwin
 import Foundation
 
+#if DEBUG
+final class CLITestHooks: Sendable {
+    let now: @Sendable () -> ContinuousClock.Instant
+    let beforeResult: @Sendable () -> Void
+    init(now: @escaping @Sendable () -> ContinuousClock.Instant, beforeResult: @escaping @Sendable () -> Void) {
+        self.now = now; self.beforeResult = beforeResult
+    }
+}
+enum CLIProbe { @TaskLocal static var hooks: CLITestHooks? }
+#endif
+
 public enum CLIError: Error, Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
     case invalidArguments, unavailable, failed(Int32), timedOut, outputLimit, invalidOutput
     public var description: String {
@@ -44,14 +55,27 @@ public struct CLIRunner: Sendable {
         guard let first = arguments.first, ["ref", "check", "agents", "daemon"].contains(first),
               workingDirectory.hasPrefix("/"), !workingDirectory.utf8.contains(0),
               arguments.allSatisfy({ !$0.utf8.contains(0) }) else { throw CLIError.invalidArguments }
-        let worker = Task.detached { try execute(arguments: arguments, directory: workingDirectory) }
+        let operation: @Sendable () throws -> CLIResult = { try execute(arguments: arguments, directory: workingDirectory) }
+        #if DEBUG
+        let hooks = CLIProbe.hooks
+        let worker = Task.detached { try CLIProbe.$hooks.withValue(hooks, operation: operation) }
+        #else
+        let worker = Task.detached(operation: operation)
+        #endif
         let result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
         guard !Task.isCancelled else { throw CLIError.timedOut }
         return result
     }
 
+    private static var now: ContinuousClock.Instant {
+        #if DEBUG
+        if let hooks = CLIProbe.hooks { return hooks.now() }
+        #endif
+        return ContinuousClock.now
+    }
+
     private func execute(arguments: [String], directory: String) throws -> CLIResult {
-        let deadline = ContinuousClock.now.advanced(by: timeout)
+        let deadline = Self.now.advanced(by: timeout)
         var out = [Int32](repeating: -1, count: 2)
         var err = [Int32](repeating: -1, count: 2)
         guard pipe(&out) == 0 else { throw CLIError.unavailable }
@@ -109,7 +133,7 @@ public struct CLIRunner: Sendable {
         var exited = false
         var status: Int32 = 0
         while !exited || open.contains(true) {
-            guard !Task.isCancelled, ContinuousClock.now < deadline else { throw CLIError.timedOut }
+            guard !Task.isCancelled, Self.now < deadline else { throw CLIError.timedOut }
             var pollers = [out[0], err[0]].enumerated().map {
                 pollfd(fd: open[$0.offset] ? $0.element : -1, events: Int16(POLLIN), revents: 0)
             }
@@ -142,6 +166,10 @@ public struct CLIRunner: Sendable {
             }
         } catch { throw CLIError.invalidOutput }
         guard let json = String(bytes: output, encoding: .utf8) else { throw CLIError.invalidOutput }
+        #if DEBUG
+        CLIProbe.hooks?.beforeResult()
+        #endif
+        guard !Task.isCancelled, Self.now < deadline else { throw CLIError.timedOut }
         return CLIResult(json: json)
     }
 }
