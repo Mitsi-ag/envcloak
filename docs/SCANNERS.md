@@ -32,6 +32,7 @@ Catalog entries retain distinct selectors and reader formats when their paths
 overlap. Failed filesystem reads are cached separately from parser outcomes.
 Database and credential omissions apply before readable sources in either
 catalog order, including indirect `envFile` reads; sibling logs remain eligible.
+Declared omissions also cover stores that appear later during the same scan.
 Directory attempts consume the file budget even when empty.
 
 Profiles cover the seven conventional shell files, literal `source`/`.` paths

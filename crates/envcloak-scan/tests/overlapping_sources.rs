@@ -237,3 +237,58 @@ fn incompatible_structured_readers_are_visibly_partial() {
         assert_eq!(report.files, 1);
     }
 }
+
+#[test]
+fn newly_appearing_omitted_stores_stay_unread() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let later = d.path().join("later");
+    std::fs::create_dir(&later).unwrap();
+    let trigger = d.path().join("trigger");
+    std::fs::write(&trigger, b"fixtureZcreateOmittedStores").unwrap();
+    let credentials = source(
+        later.join("private"),
+        ConfigFormat::Raw,
+        SourceKind::Credentials,
+    );
+    let mut database = source(later.clone(), ConfigFormat::Raw, SourceKind::Database);
+    database.names = Some(".sqlite".into());
+    let mut created = false;
+    let mut omitted = false;
+    let mut eligible = false;
+    let report = scan_transcript_sources(
+        &[
+            credentials,
+            database,
+            source(trigger, ConfigFormat::Raw, SourceKind::Log),
+            source(later.clone(), ConfigFormat::Raw, SourceKind::Log),
+        ],
+        Budget::default(),
+        &mut |c| {
+            if !created && c.value.ct_eq(b"fixtureZcreateOmittedStores") {
+                std::fs::create_dir(later.join("private")).unwrap();
+                std::fs::write(later.join("private/value"), b"fixtureZlateCredential").unwrap();
+                std::fs::write(later.join("state.sqlite"), b"fixtureZlateDatabase").unwrap();
+                std::fs::write(later.join("run.log"), b"fixtureZlateEligibleLog").unwrap();
+                created = true;
+            }
+            omitted |=
+                c.value.ct_eq(b"fixtureZlateCredential") || c.value.ct_eq(b"fixtureZlateDatabase");
+            eligible |= c.value.ct_eq(b"fixtureZlateEligibleLog");
+            true
+        },
+    )
+    .unwrap();
+    assert!(report.complete());
+    assert!(created && eligible);
+    assert!(
+        !omitted,
+        "declared omission depended on stale filesystem state"
+    );
+    assert!(report.notes.iter().any(|n| n.reason == "database"));
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.reason == "manual_credentials")
+    );
+}
