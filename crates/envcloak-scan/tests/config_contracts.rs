@@ -271,3 +271,73 @@ fn repeated_envfile_paths_are_read_once() {
     assert_eq!(report.files, 2);
     assert_eq!(report.findings.len(), 1);
 }
+
+#[test]
+fn exhausted_envfile_budget_keeps_diagnostics_bounded() {
+    let d = dir();
+    let servers = (0..5000)
+        .map(|n| {
+            (
+                format!("s{n:04}"),
+                serde_json::json!({"envFile":format!("missing{n}")}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    let path = d.path().join("mcp.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({"mcpServers":servers})).unwrap(),
+    )
+    .unwrap();
+    let report = scan_config_sources_with_budget(
+        &[source(path)],
+        Budget {
+            files: 64,
+            ..Budget::default()
+        },
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert!(
+        report.issues.len() <= 64,
+        "diagnostics grew after exhaustion"
+    );
+    assert_eq!(
+        report
+            .issues
+            .iter()
+            .filter(|i| i.reason == "not_found")
+            .count(),
+        63
+    );
+}
+
+#[test]
+fn missing_catalog_roots_consume_the_shared_file_budget() {
+    let d = dir();
+    let mut sources = (0..100)
+        .map(|n| source(d.path().join(format!("missing{n}/mcp.json"))))
+        .collect::<Vec<_>>();
+    let path = d.path().join("mcp.json");
+    std::fs::write(
+        &path,
+        br#"{"mcpServers":{"s":{"env":{"A":"fixtureZafterMissingRoots"}}}}"#,
+    )
+    .unwrap();
+    sources.push(source(path));
+    let budget = Budget {
+        files: 3,
+        ..Budget::default()
+    };
+    let report = scan_config_sources_with_budget(&sources, budget).unwrap();
+    assert!(!report.complete());
+    assert!(report.findings.is_empty());
+    assert_eq!(report.issues.len(), 1);
+    assert_eq!(report.issues[0].reason, "file_budget");
+    let report = envcloak_scan::transcript::scan_transcript_sources(&sources, budget, &mut |_| {
+        panic!("read beyond failed-root budget")
+    })
+    .unwrap();
+    assert!(!report.complete());
+    assert_eq!(report.issues.len(), 1);
+}

@@ -96,7 +96,18 @@ pub(crate) fn walk_sources(
 ) {
     let mut visited = std::collections::HashSet::new();
     let mut attempts = 0usize;
+    let mut source_paths = std::collections::HashSet::new();
     for source in sources {
+        if !source_paths.insert(&source.path) {
+            continue;
+        }
+        if attempts >= budget.files {
+            report.issue(&source.path, "file_budget");
+            break;
+        }
+        if report.issues.iter().any(|i| i.reason == "file_budget") {
+            break;
+        }
         let Some(parent) = source.path.parent() else {
             report.issue(&source.path, "invalid_path");
             continue;
@@ -107,8 +118,12 @@ pub(crate) fn walk_sources(
         };
         let root = match absolute_root(parent) {
             Ok(r) => r,
-            Err(ScanErrorKind::NotFound) => continue,
+            Err(ScanErrorKind::NotFound) => {
+                attempts += 1;
+                continue;
+            }
             Err(e) => {
+                attempts += 1;
                 report.issue(&source.path, e.token());
                 continue;
             }
@@ -118,6 +133,7 @@ pub(crate) fn walk_sources(
                 let dir = match root.open_subdir(root.dir(), name) {
                     Ok(d) => d,
                     Err(e) => {
+                        attempts += 1;
                         report.issue(&source.path, e.token());
                         continue;
                     }
@@ -125,6 +141,7 @@ pub(crate) fn walk_sources(
                 let sub = match crate::root::held_root(root.path().join(name), dir) {
                     Ok(r) => r,
                     Err(_) => {
+                        attempts += 1;
                         report.issue(&source.path, "io");
                         continue;
                     }
@@ -270,6 +287,9 @@ fn walk(
         }
     };
     for e in entries {
+        if report.issues.iter().any(|i| i.reason == "file_budget") {
+            break;
+        }
         if *attempts >= budget.files {
             report.issue(root.path().join(rel), "file_budget");
             break;
