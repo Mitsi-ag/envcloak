@@ -105,7 +105,7 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
         if end == bytes.len()
             || bytes[end].is_ascii_whitespace()
             || bytes[end] < 32
-            || matches!(bytes[end], b'?' | b'&' | b';')
+            || matches!(bytes[end], b'?' | b'&' | b';' | b'#')
         {
             if let Some(eq) = bytes[start..end].iter().position(|b| *b == b'=') {
                 out.raw(bytes, start + eq + 1, end);
