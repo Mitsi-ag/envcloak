@@ -134,7 +134,9 @@ keys are refused and nesting and node counts are bounded.
 
 Git history is opt-in. An absolute `/usr/bin/git` runs `cat-file
 --batch-all-objects --batch` with a cleared environment, global/system config
-disabled, replacement objects disabled and fsmonitor disabled. An explicit
+disabled, replacement objects disabled and fsmonitor disabled. Lazy fetching
+is disabled and all transports are denied, overriding repository allowances.
+Missing or corrupt objects report a partial scan without fetching. An explicit
 Git directory and work tree relative to the held root prevent discovery of a
 parent repository, including after a rename. Working trees and bare
 repositories are covered. The held root supplies the child's working directory.
