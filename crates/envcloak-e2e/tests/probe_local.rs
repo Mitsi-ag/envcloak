@@ -47,20 +47,52 @@ struct Machine {
     cwd: PathBuf,
 }
 
-/// The stand-in, as `claude` in a directory of its own with `mode` beside
-/// it (its home is a probe home, which holds no mode of its own).
-fn host_dir(root: &Path, mode: &Value) -> PathBuf {
+/// The stand-in in a directory of its own with `mode` beside it (its home
+/// is a probe home, which holds no mode of its own), started through a
+/// launcher named `claude` that, asked for the version, reaches into the
+/// home it is given as a launcher may (Codex review of M2-28): it appends
+/// to a file there and reads the home's mode-0000 sentinel. Run with the
+/// person's `HOME`, the person's home changes.
+///
+/// With `hang` (a file of process ids and a switch file), while the switch
+/// file is there, a run of the host (`-p`) is a host busy with a command
+/// that never ends: the launcher records its own pid and its command's (a
+/// `sleep` in its process group), then waits.
+fn host_dir(root: &Path, mode: &Value, hang: Option<(&Path, &Path)>) -> PathBuf {
     let bin = root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    std::fs::copy(testkit_bin("ec-fake-host"), bin.join("claude")).unwrap();
-    std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let real = bin.join("ec-fake-host");
+    std::fs::copy(testkit_bin("ec-fake-host"), &real).unwrap();
+    std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::write(bin.join("ec-fake-host.json"), mode.to_string()).unwrap();
+    let busy = hang.map_or_else(String::new, |(pids, switch)| {
+        format!(
+            "if [ \"$1\" = -p ] && [ -f {switch} ]; then\n  echo $$ >>{pids}\n  \
+             sleep 600 &\n  echo $! >>{pids}\n  wait\nfi\n",
+            switch = quoted(switch.to_str().unwrap()),
+            pids = quoted(pids.to_str().unwrap()),
+        )
+    });
+    write_script(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then\n  echo asked >>\"$HOME/.version-asked\" \
+             2>/dev/null\n  cat \"$HOME/.envcloak-probe-sentinel\" >/dev/null 2>&1\nfi\n{busy}\
+             exec {} \"$@\"\n",
+            quoted(real.to_str().unwrap())
+        ),
+    );
     bin
 }
 
 /// A person with a vault, their daemon tracing its connections, and the
 /// stand-in set to `mode`.
 fn machine(mode: &Value) -> Machine {
+    machine_with(mode, None)
+}
+
+/// The same, the stand-in busy as [`host_dir`] says with `hang`.
+fn machine_with(mode: &Value, hang: Option<(&Path, &Path)>) -> Machine {
     let trace: &[(&str, &str)] = &[("ENVCLOAK_TEST_TRACE", "1")];
     let mut h = Harness::start_with(trace);
     let home = h.home.home();
@@ -87,7 +119,7 @@ fn machine(mode: &Value) -> Machine {
         envcloak_e2e::RECOVERY_KIT,
         kit_text.trim_end().to_owned(),
     ));
-    let bin = host_dir(h.files(), mode);
+    let bin = host_dir(h.files(), mode, hang);
     let cwd = home.join("work");
     std::fs::create_dir_all(&cwd).unwrap();
     Machine { h, bin, cwd }
@@ -116,6 +148,27 @@ impl Machine {
         argv.extend_from_slice(extra);
         let cwd = self.cwd.clone();
         self.h.human_argv(&cwd, &argv, &[], &[])
+    }
+
+    /// `envcloak agents install --agent claude-code --yes` by the person,
+    /// on their terminal: EnvCloak installed as this build installs it, so
+    /// their configuration has the probe home's shape.
+    fn install(&mut self) {
+        let path = self.path();
+        let cli = self.h.cli();
+        let argv = [
+            "/usr/bin/env",
+            path.as_str(),
+            cli.to_str().unwrap(),
+            "agents",
+            "install",
+            "--agent",
+            "claude-code",
+            "--yes",
+        ];
+        let cwd = self.cwd.clone();
+        let out = self.h.human_argv(&cwd, &argv, &[], &[]);
+        assert_eq!(out.code, 0, "{}", out.all());
     }
 
     /// The same, with `--json`, by a process with no terminal (CI's runner,
@@ -304,6 +357,7 @@ fn assert_probed_and_approved(p: &Value) {
 #[test]
 fn the_probe_runs_beside_the_persons_daemon_and_touches_nothing_of_theirs() {
     let mut m = machine(&json!({}));
+    m.install();
     let data = m.h.data_dir();
     let vault_before = digests(&data);
     assert!(!vault_before.is_empty(), "the person has a vault");
@@ -371,6 +425,54 @@ fn the_probe_runs_beside_the_persons_daemon_and_touches_nothing_of_theirs() {
     m.h.assert_swept("after the probe");
 }
 
+/// A probe's result is kept for the person's configuration only when that
+/// configuration is the one the probe ran with (its shape,
+/// `ConfigSet::shape`): EnvCloak installed as this build installs it, it
+/// is kept; the same install with another timeout on EnvCloak's hooks, it
+/// is not, and the report says why (Codex review of M2-28: a result
+/// measured on a fresh install was credited to any configuration).
+/// Mutation checked: `keep_record` without its shape comparison: the
+/// second result is kept and this fails.
+#[test]
+fn a_result_is_kept_only_for_the_configuration_it_ran_with() {
+    let mut m = machine(&json!({}));
+    m.install();
+    let (v, code) = m.probe_without_terminal(&[]);
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(probe_of(&v)["kept"], true, "{v:#}");
+
+    let settings = m.h.home.home().join(".claude").join("settings.json");
+    let mut s: Value = serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+    let mut changed = 0;
+    for groups in s["hooks"].as_object_mut().unwrap().values_mut() {
+        for group in groups.as_array_mut().unwrap() {
+            for h in group["hooks"].as_array_mut().unwrap() {
+                let ours = h["command"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(" hook --host claude-code --event "));
+                if ours {
+                    h["timeout"] = json!(59);
+                    changed += 1;
+                }
+            }
+        }
+    }
+    assert!(changed > 0, "EnvCloak's hooks are in the settings: {s:#}");
+    std::fs::write(&settings, s.to_string()).unwrap();
+    let (v, code) = m.probe_without_terminal(&[]);
+    assert_eq!(code, 0, "{v:#}");
+    let p = probe_of(&v);
+    assert_eq!(p["kept"], false, "{p:#}");
+    assert!(
+        p["not_kept"]
+            .as_str()
+            .unwrap()
+            .contains("is not the one the probe ran with"),
+        "{p:#}"
+    );
+    m.h.assert_swept("after the probes");
+}
+
 /// On macOS, with `HOME` as long as `/Users/` and a 20-character name, the
 /// probe runs and its socket fits `sun_path` (the probe home is under
 /// `/tmp`). Mutation checked: the probe home made under EnvCloak's data
@@ -412,6 +514,9 @@ fn a_home_as_long_as_a_real_one_leaves_the_socket_room() {
 #[test]
 fn run_by_an_agent_the_probe_gives_no_approval() {
     let mut m = machine(&json!({}));
+    // Installed as the probe home is, so the result is kept and the report
+    // carries it.
+    m.install();
     let cli = m.h.cli();
     let cwd = m.cwd.clone();
     let path = m.path();
@@ -460,17 +565,17 @@ fn run_by_an_agent_the_probe_gives_no_approval() {
 
 /// An agent's request, made in a session and on a terminal `HostSession`
 /// made, approved by a process that is no agent's from that same session
-/// and terminal, is refused (T9-3: `requester_terminal` on Linux; on
-/// macOS that session has no terminal left, `no_terminal`), and the command
-/// is not run; the same request approved from the person's terminal is
-/// granted (the control). The requester is an agent (`fixture-agent`), as
-/// the probe's host is: a terminal subject's own request is the person's
-/// to approve on their terminal (measured on Linux, where a plain shell in
-/// such a session is one). Mutations checked: the agent taken out of the
-/// requester's chain (the approval is then given, on Linux, and this test
-/// fails); the host started with the session and terminal of the approver
-/// (`HostSession` without its new session, `the_probe_runs_beside...`
-/// above).
+/// and terminal, is refused (T9-3: `requester_terminal`, on macOS as on
+/// Linux), and the command is not run; the same request approved from the
+/// person's terminal is granted (the control). The requester is an agent
+/// (`fixture-agent`), as the probe's host is: a terminal subject's own
+/// request is the person's to approve on their terminal. Mutations
+/// checked: the agent taken out of the requester's chain (the approval is
+/// then given, and this test fails); `HostSession` without the terminal
+/// held open in the session (on macOS the refusal is then `no_terminal`,
+/// and this test fails); the host started with the session and terminal
+/// of the approver (`HostSession` without its new session,
+/// `the_probe_runs_beside...` above).
 #[test]
 fn an_approval_from_the_hosts_own_terminal_is_refused() {
     let mut m = machine(&json!({}));
@@ -521,8 +626,7 @@ fn an_approval_from_the_hosts_own_terminal_is_refused() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let session = envcloak_agents::probe::HostSession::spawn(cmd).unwrap();
-    let mut child = session.child;
+    let mut session = envcloak_agents::probe::HostSession::spawn(cmd).unwrap();
     let end = Instant::now() + Duration::from_secs(120);
     let id = loop {
         let listed = m.h.human(&project, &["pending", "--json"], &[], &[]);
@@ -546,16 +650,13 @@ fn an_approval_from_the_hosts_own_terminal_is_refused() {
     let said = std::fs::read_to_string(&refused).unwrap_or_default();
     m.h.assert_clean("the host's approval", said.as_bytes());
     assert_ne!(approve_code, 0, "the host approved its own request: {said}");
-    // The reason, as measured: on Linux the approver is a terminal
-    // subject sharing the agent's session and terminal (T9-3); on macOS
-    // the session has no terminal at all once only the runner holds the
-    // pty's master (no process has its slave open), so the approver is
-    // refused as having none. Refused either way, before any proof.
-    let want = if cfg!(target_os = "linux") {
-        "reason=requester_terminal"
-    } else {
-        "reason=no_terminal"
-    };
+    // The reason, on both systems: the approver is a terminal subject
+    // sharing the agent's session and terminal (T9-3), refused before any
+    // proof. The session keeps its terminal because `HostSession` holds
+    // it open there (macOS takes a terminal no process has open away from
+    // its session, and the approver would then be refused as having none,
+    // which says nothing of this rule: Codex review of M2-28).
+    let want = "reason=requester_terminal";
     let log =
         m.h.expect_log("proof refused method=", Duration::from_secs(30));
     let refusals: Vec<&str> = log
@@ -585,12 +686,12 @@ fn an_approval_from_the_hosts_own_terminal_is_refused() {
     );
     assert_eq!(approved.code, 0, "{}", approved.all());
     let end = Instant::now() + Duration::from_secs(60);
-    while child.try_wait().unwrap().is_none() && Instant::now() < end {
+    while session.child.try_wait().unwrap().is_none() && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    drop(session.terminal);
+    let _ = session.child.kill();
+    let _ = session.child.wait();
+    session.hang_up();
     assert!(ran.exists(), "the person's approval ran the command");
     m.h.assert_swept("after the approvals");
 }
@@ -687,13 +788,24 @@ fn a_version_outside_the_table_is_not_qualified() {
     m.h.assert_swept("after the probe");
 }
 
-/// The runner killed with SIGKILL mid-probe leaves its probe home; its
-/// daemon, whose terminal the runner held, hangs up and ends; the next run
-/// removes the home. Mutation checked: the sweep at the start of a run
-/// taken out: the home is left.
+/// The runner killed with SIGKILL while the host runs a command leaves its
+/// probe home; the host and its command, whose session's terminal the
+/// runner held, get the hang-up and end, as does the probe's daemon; the
+/// next run removes the home. Mutations checked: the sweep at the start of
+/// a run taken out: the home is left; `HostSession` without the terminal
+/// held open in the host's session: on macOS no hang-up comes, the host and
+/// its command run on, and this fails (Codex review of M2-28; on Linux the
+/// session keeps its terminal either way).
 #[test]
 fn the_probe_home_is_cleaned_after_kill_9() {
-    let mut m = machine(&json!({}));
+    let dir = tempfile::Builder::new()
+        .prefix("eck")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let pids = dir.path().join("pids");
+    let switch = dir.path().join("busy");
+    std::fs::write(&switch, b"").unwrap();
+    let mut m = machine_with(&json!({}), Some((&pids, &switch)));
     let before = probe_homes();
     let mut cmd = Command::new(m.h.cli());
     cmd.env_clear()
@@ -713,28 +825,83 @@ fn the_probe_home_is_cleaned_after_kill_9() {
         .stderr(Stdio::null());
     envcloak_sys::new_session_on_spawn(&mut cmd, None).unwrap();
     let mut child = cmd.spawn().unwrap();
-    let end = Instant::now() + Duration::from_secs(120);
-    let left = loop {
-        let new: Vec<PathBuf> = probe_homes()
-            .into_iter()
-            .filter(|p| !before.contains(p))
+    let end = Instant::now() + Duration::from_secs(180);
+    // The host and its command, once both run.
+    let busy: Vec<String> = loop {
+        let got: Vec<String> = std::fs::read_to_string(&pids)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
             .collect();
-        // Once the probe home has its daemon's socket, the run is going.
-        if let Some(p) = new.into_iter().find(|p| has_socket(p)) {
-            break p;
+        if got.len() >= 2 {
+            break got;
         }
-        assert!(Instant::now() < end, "no probe home appeared");
+        assert!(Instant::now() < end, "the host did not start its command");
         std::thread::sleep(Duration::from_millis(50));
     };
+    let left: Vec<PathBuf> = probe_homes()
+        .into_iter()
+        .filter(|p| !before.contains(p) && has_socket(p))
+        .collect();
+    assert_eq!(left.len(), 1, "{left:?}");
+    let left = left[0].clone();
     // This test's own unreaped child.
     child.kill().unwrap();
     let _ = child.wait();
+    std::fs::remove_file(&switch).unwrap();
+    let running = |pid: &str| {
+        Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let end = Instant::now() + Duration::from_secs(30);
+    while (busy.iter().any(|p| running(p)) || daemon_listens(&left)) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let still: Vec<&String> = busy.iter().filter(|p| running(p)).collect();
+    for p in &still {
+        // Left behind: ended here, so what follows runs clean.
+        let _ = Command::new("/bin/kill").args(["-9", p]).status();
+    }
+    assert!(
+        still.is_empty(),
+        "the host or its command outlived the runner: {still:?}"
+    );
+    assert!(
+        !daemon_listens(&left),
+        "the probe daemon outlived the runner"
+    );
     assert!(left.exists());
     let (v, code) = m.probe_without_terminal(&[]);
     assert_eq!(code, 0, "{v:#}");
     assert!(v["swept"]["removed"].as_u64().unwrap() >= 1, "{v:#}");
     assert!(!left.exists(), "the killed run's probe home is left");
     m.h.assert_swept("after the sweep");
+}
+
+/// Whether a daemon listens on a socket in a probe home: a connection to
+/// one is taken.
+fn daemon_listens(root: &Path) -> bool {
+    use std::os::unix::fs::FileTypeExt as _;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let Ok(t) = e.file_type() else { continue };
+            if t.is_socket() && std::os::unix::net::UnixStream::connect(e.path()).is_ok() {
+                return true;
+            }
+            if t.is_dir() {
+                stack.push(e.path());
+            }
+        }
+    }
+    false
 }
 
 /// Whether a probe home holds a socket yet (its daemon listens).
