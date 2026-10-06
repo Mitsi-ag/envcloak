@@ -158,6 +158,10 @@ fn main() {
                 raw_mode_refused_on_sigcont_ends_the_run,
             ),
             (
+                "background_continues_never_save_the_shells_line_editor_settings",
+                background_continues_never_save_the_shells_line_editor_settings,
+            ),
+            (
                 "a_stty_change_made_while_stopped_reaches_the_command_and_stays",
                 a_stty_change_made_while_stopped_reaches_the_command_and_stays,
             ),
@@ -2021,6 +2025,115 @@ fn raw_mode_refused_on_sigcont_ends_the_run() {
     assert_eq!(status.code(), Some(125), "{}", outer.text());
     assert_eq!(outer.count("GOT [two]"), 0, "{}", outer.text());
     assert!(outer.settings().same_as(&before), "the outer terminal");
+}
+
+/// A terminal-owning parent performs the shell's job-control steps. Unlike
+/// bash's fg, it does not repair the child's final settings. Both an
+/// outside stop and a monitor-reported stop must wait for the foreground
+/// before saving settings. The temporary line-editor mode is not raw:
+/// ISIG remains on, as at zsh's prompt.
+fn background_continues_never_save_the_shells_line_editor_settings() {
+    let case = Case::new();
+    let controller = case.script(
+        "foreground.py",
+        r"import copy, os, signal, subprocess, sys, termios, time
+ready, route, *argv = sys.argv[1:]
+end = time.monotonic() + 20
+before = termios.tcgetattr(0)
+parent = os.getpgrp()
+signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+def child_setup():
+    os.setpgid(0, 0)
+    signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+p = subprocess.Popen(argv, preexec_fn=child_setup)
+reaped = False
+def stopped():
+    global reaped
+    while time.monotonic() < end:
+        pid, status = os.waitpid(p.pid, os.WUNTRACED | os.WNOHANG)
+        if pid:
+            if os.WIFSTOPPED(status): return
+            reaped = True
+            raise AssertionError('runner exited before stop')
+    raise AssertionError('runner did not stop')
+try:
+    os.tcsetpgrp(0, p.pid)
+    # A background start may have stopped at its first terminal write.
+    os.kill(p.pid, signal.SIGCONT)
+    while not os.path.exists(ready):
+        assert time.monotonic() < end, 'command never ready'
+    os.kill(p.pid, getattr(signal, 'SIG' + route))
+    stopped()
+    os.tcsetpgrp(0, parent)
+    editor = copy.deepcopy(before)
+    editor[3] &= ~(termios.ICANON | termios.ECHO)
+    editor[3] |= termios.ISIG
+    editor[6][termios.VSUSP] = bytes([os.fpathconf(0, 'PC_VDISABLE')])
+    termios.tcsetattr(0, termios.TCSANOW, editor)
+    editor = termios.tcgetattr(0)
+    os.kill(p.pid, signal.SIGCONT)
+    stopped()
+    # The editor's settings stay its own while the job is in background.
+    assert termios.tcgetattr(0) == editor, 'background job changed editor'
+    termios.tcsetattr(0, termios.TCSANOW, before)
+    os.tcsetpgrp(0, p.pid)
+    os.kill(p.pid, signal.SIGCONT)
+    while termios.tcgetattr(0)[3] & (termios.ICANON | termios.ECHO | termios.ISIG):
+        assert time.monotonic() < end, 'foreground job never took raw mode'
+    os.write(1, b'FOREGROUND\n')
+    assert p.wait(timeout=max(0.1, end-time.monotonic())) == 0
+    reaped = True
+    os.tcsetpgrp(0, parent)
+    os.write(1, b'CHECK-SETTINGS\n')
+    # Like a shell reading the next stty command, consume pending input.
+    # Darwin clears its transient PENDIN bit on this read.
+    assert os.read(0, 100) == b'check\n'
+    assert termios.tcgetattr(0) == before, 'saved the line editor settings'
+    os.write(1, b'RESTORED\n')
+finally:
+    if not reaped:
+        os.killpg(p.pid, signal.SIGKILL)
+        p.wait(timeout=5)
+    os.tcsetpgrp(0, parent)
+    termios.tcsetattr(0, termios.TCSANOW, before)
+",
+    );
+    let cat = case.script(
+        "cat.py",
+        &format!(
+            "import pathlib\npathlib.Path({:?}).touch()\n{RETRY_CAT}",
+            case.path("ready").to_str().unwrap()
+        ),
+    );
+    let python = python3();
+    let mut outcomes = Vec::new();
+    for route in ["STOP", "TSTP"] {
+        let ready = case.path("ready");
+        if ready.exists() {
+            std::fs::remove_file(&ready).unwrap();
+        }
+        let runner = case.runner_argv(&[], &[], &[python.as_os_str(), cat.as_os_str()]);
+        let mut argv = vec![
+            python.clone().into_os_string(),
+            controller.clone().into_os_string(),
+            ready.into_os_string(),
+            route.into(),
+        ];
+        argv.extend(runner);
+        let mut outer = Outer::new(24, 80);
+        let mut run = Running {
+            child: lead(&case, &outer, &argv, &[]),
+        };
+        outer.expect("FOREGROUND", 1, "the job regained its terminal");
+        outer.type_bytes(b"after-fg\r");
+        outer.expect("after-fg", 2, "the echo and resumed cat");
+        outer.type_bytes(b"\x04");
+        outer.expect("CHECK-SETTINGS", 1, "the terminal owner regained control");
+        outer.type_bytes(b"check\r");
+        let status = outer.wait_exit(&mut run.child, DEADLINE);
+        outcomes.push((route, status.code(), outer.count("RESTORED")));
+    }
+    assert_eq!(outcomes, vec![("STOP", Some(0), 1), ("TSTP", Some(0), 1)]);
 }
 
 /// The verifier's review of M2-19 (L-09): what the person changes on
