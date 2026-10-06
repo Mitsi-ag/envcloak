@@ -362,3 +362,18 @@ fn assignment_words_keep_internal_punctuation_in_raw_and_json() {
         }
     }
 }
+
+#[test]
+fn overlapping_unclosed_password_fields_report_a_work_limit() {
+    let input = "pwd={".repeat(64);
+    let report = scan_reader(
+        &mut std::io::Cursor::new(input.as_bytes()),
+        ConfigFormat::Raw,
+        Default::default(),
+        Budget::default(),
+        &mut |_| true,
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "reading_budget"));
+}

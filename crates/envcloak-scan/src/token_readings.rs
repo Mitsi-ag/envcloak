@@ -5,6 +5,34 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 const MAX_READINGS: usize = 256;
+#[derive(Default)]
+struct Padding {
+    end: usize,
+    #[cfg(test)]
+    inspected: usize,
+}
+impl Padding {
+    fn at(&mut self, bytes: &[u8], at: usize) -> bool {
+        if at >= self.end {
+            self.end = at;
+            while self.end < bytes.len() && bytes[self.end] == b'=' {
+                #[cfg(test)]
+                {
+                    self.inspected += 1;
+                }
+                self.end += 1;
+            }
+        }
+        bytes.get(self.end).is_none_or(|b| {
+            b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b'.' | b'`' | b')' | b']' | b'}' | b'"' | b'\'' | b',' | b';'
+                )
+        })
+    }
+}
+
 struct Readings {
     ranges: Vec<(Range<usize>, Form)>,
     seen: HashSet<(usize, usize, Form)>,
@@ -60,18 +88,12 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
         out.raw(bytes, eq + 1, bytes.len());
     }
     let mut start = 0;
+    let mut padding = Padding::default();
     for end in 0..=bytes.len() {
         if end == bytes.len()
             || bytes[end].is_ascii_whitespace()
             || (bytes[end].is_ascii_punctuation()
-                && !(bytes[end] == b'='
-                    && bytes[end..].iter().find(|b| **b != b'=').is_none_or(|b| {
-                        b.is_ascii_whitespace()
-                            || matches!(
-                                b,
-                                b'.' | b'`' | b')' | b']' | b'}' | b'"' | b'\'' | b',' | b';'
-                            )
-                    })))
+                && !(bytes[end] == b'=' && padding.at(bytes, end)))
         {
             out.push(start, end, Form::Raw);
             start = end + 1;
@@ -131,7 +153,10 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
             }
         }
     }
-    for at in 0..bytes.len() {
+    // Ambiguous, unclosed fields can overlap. Bound total lookahead work as
+    // well as retained readings; reaching either limit is visibly incomplete.
+    let mut password_work = 0;
+    'passwords: for at in 0..bytes.len() {
         if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
             continue;
         }
@@ -164,6 +189,11 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
             }
             let mut end = a;
             while end < bytes.len() {
+                password_work += 1;
+                if password_work > bytes.len().saturating_mul(8) {
+                    out.limited = true;
+                    break 'passwords;
+                }
                 if bytes[end] == b'\\' && end + 1 < bytes.len() {
                     end += 2;
                     continue;
@@ -208,4 +238,25 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
         seen.insert((range.start, range.end, *form))
     });
     (out.ranges, out.limited)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn padding_lookahead_visits_each_byte_once() {
+        for suffix in [b"".as_slice(), b" ", b"x", b";"] {
+            let mut input = vec![b'='; crate::transcript::MAX_CANDIDATE - 1];
+            input.extend_from_slice(suffix);
+            let mut padding = Padding::default();
+            for at in 0..crate::transcript::MAX_CANDIDATE - 1 {
+                assert_eq!(padding.at(&input, at), suffix != b"x");
+            }
+            assert!(
+                padding.inspected <= input.len(),
+                "repeated suffix inspections"
+            );
+        }
+    }
 }
