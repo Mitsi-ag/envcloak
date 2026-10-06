@@ -40,8 +40,11 @@
 #    in the build's own DerivedSources/). So a Swift file referenced from
 #    outside apps/macos, linked in from elsewhere or written by a build phase
 #    is refused. What each target is comes from what its linker wrote (a
-#    .xctest bundle is a test bundle; a prelinked object in Build/Products
-#    or a file in an app ships), never from its name: one that ships may
+#    .xctest bundle is a test bundle; a file in an app ships) and which
+#    targets link its output, never from its name. A prelinked object in
+#    Build/Products is test support only if reached exclusively from test
+#    bundles; objects also reached from apps or unreferenced objects keep
+#    product rules, including transitive dependencies. One that ships may
 #    compile only files check-swift.sh holds to the product rules, so a test
 #    file compiled into the app, or into any library linked into it, is
 #    refused. What was linked is read from each target's link list, output

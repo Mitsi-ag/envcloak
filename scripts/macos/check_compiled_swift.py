@@ -18,10 +18,13 @@ never passes):
   of the one file it wrote and every file it read, whether it came from
   the file list, a library search, a framework or a flag.
 
-What a target is comes from what its linker wrote, never from its name: an
-output inside a `.xctest` bundle is a test bundle; a prelinked object
-`Build/Products/<config>/<name>.o` (how a local package's library reaches
-the app) and an executable or dylib inside a `.app` ship; any other output
+What a target is comes from what its linker wrote and which targets link
+it, never from its name: an output inside a `.xctest` bundle is a test
+bundle; an executable or dylib inside a `.app` ships. A prelinked object
+`Build/Products/<config>/<name>.o` is test support only when reached from a
+test bundle and not from an app or an unreferenced object, including all
+transitive dependencies. Shared and unreferenced objects keep the product
+rules. Any other output, or more than one target writing the same output,
 is a finding. A target that ships may compile only files check-swift.sh
 holds to the product rules, so a test file compiled into the app, or into a
 library linked into it whatever the library is called, fails here even
@@ -205,6 +208,40 @@ def read_target(derived, base, problems):
     return t
 
 
+def target_roles(targets, problems):
+    """Only proven test-only dependencies may compile test sources.
+    Unknown consumers fail elsewhere; objects with no test consumer and
+    everything they link keep product rules, even if also used by tests.
+    XCTest and host-app linker allowances still require a test bundle."""
+    outputs = {}
+    for t in targets:
+        if t.output in outputs:
+            problems.append("more than one target writes %s (%s and %s)" % (t.output, outputs[t.output].where, t.where))
+        outputs[t.output] = t
+
+    def reached(roots):
+        found = set()
+        pending = list(roots)
+        while pending:
+            t = pending.pop()
+            if t in found:
+                continue
+            found.add(t)
+            for path in t.links:
+                other = outputs.get(path)
+                if other is not None and other.kind == "object":
+                    pending.append(other)
+        return found
+
+    tested = reached(t for t in targets if t.kind == "test")
+    shipped = reached(t for t in targets if t.kind == "app" or (t.kind == "object" and t not in tested))
+    return {
+        t.base: ("test bundle" if t.kind == "test" else
+                 "test support" if t in tested and t not in shipped else "ships")
+        for t in targets
+    }
+
+
 def check_links(derived, targets, problems, dev):
     """Each object a target links, and each file its linker read, is
     accounted for. Returns the number of link list entries checked."""
@@ -296,14 +333,15 @@ def main(argv):
         t = read_target(derived, base, problems)
         if t is not None:
             targets.append(t)
-    kinds = {t.base: t.kind for t in targets}
+    roles = target_roles(targets, problems)
     compiled = generated = 0
     for base in sorted(lists):
         name = os.path.basename(base)
         where = os.path.relpath(base + SUFFIX, derived)
         # A target whose record could not be read is held to the product
-        # rules: only a test bundle's linker output lets it compile tests.
-        ships = kinds.get(base) != "test"
+        # rules: only a test bundle or its proven exclusive dependencies
+        # may compile test sources.
+        ships = roles.get(base) not in ("test bundle", "test support")
         for path in read_list(base + SUFFIX):
             compiled += 1
             real = os.path.realpath(path)
@@ -330,7 +368,7 @@ def main(argv):
         " %d linked objects, each from them; every file the linker read accounted for)"
         % (
             len(targets),
-            ", ".join("%s (%s)" % (t.name, "test bundle" if t.kind == "test" else "ships") for t in targets),
+            ", ".join("%s (%s)" % (t.name, roles[t.base]) for t in targets),
             compiled,
             compiled - generated,
             generated,

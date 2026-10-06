@@ -2,9 +2,9 @@
 """Tests for scripts/check-sources.sh --swift (scripts/macos/
 check_compiled_swift.py): every Swift file a build compiled is one
 scripts/macos/check-swift.sh reads; a target that ships, which the linker's
-output says and the target's name never does, compiles only files
-check-swift.sh holds to the product rules; and every file the linker read
-is accounted for.
+output and its consumers say and the target's name never does, compiles
+only files check-swift.sh holds to the product rules; and every file the
+linker read is accounted for.
 
 Each case writes a derived-data tree shaped as xcodebuild writes it (per
 target under Build/Intermediates.noindex: <T>.SwiftFileList,
@@ -122,6 +122,11 @@ class Fixture:
     def output(self, target):
         return self.outputs.get(target, self.product_object(target))
 
+    def test_support(self, target="EnvCloakKitTestSupport"):
+        self.lists[target] = [self.test]
+        self.extra_links["EnvCloakTests"].append(self.product_object(target))
+        return self.product_object(target)
+
     def object(self, target, path):
         return self.objects.get(target, {}).get(path, os.path.join(self.objects_dir(target), os.path.splitext(os.path.basename(path))[0] + ".o"))
 
@@ -166,7 +171,7 @@ class Fixture:
 class CompiledSources(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base = tempfile.mkdtemp(prefix="eccc", dir="/tmp")
+        cls.base = tempfile.mkdtemp(prefix="eccc", dir=tempfile.gettempdir())
 
     @classmethod
     def tearDownClass(cls):
@@ -193,6 +198,62 @@ class CompiledSources(unittest.TestCase):
         fx = Fixture(self.base)
         fx.lists["EnvCloakKitTestSupport"] = [fx.test]
         self.refused(fx, "into EnvCloakKitTestSupport, which ships")
+
+    def test_a_package_linked_only_into_tests_is_test_support(self):
+        for name in ("EnvCloakKitTestSupport", "FixtureLibrary"):
+            with self.subTest(target=name):
+                fx = Fixture(self.base)
+                fx.test_support(name)
+                code, out = fx.check()
+                self.assertEqual(code, 0, out)
+                self.assertIn(name + " (test support)", out)
+                self.assertIn("EnvCloakKit (ships)", out)
+
+    def test_a_transitive_package_dependency_of_tests_is_test_support(self):
+        fx = Fixture(self.base)
+        fx.test_support("HelperBridge")
+        fx.lists["EnvCloakKitTestSupport"] = [fx.test]
+        fx.extra_links["HelperBridge"] = [fx.product_object("EnvCloakKitTestSupport")]
+        code, out = fx.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("HelperBridge (test support)", out)
+        self.assertIn("EnvCloakKitTestSupport (test support)", out)
+
+    def test_test_support_shared_with_the_app_still_ships(self):
+        for transitive in (False, True):
+            with self.subTest(transitive=transitive):
+                fx = Fixture(self.base)
+                support = fx.test_support()
+                if transitive:
+                    fx.lists["ProductBridge"] = [fx.kit]
+                    fx.extra_links["ProductBridge"] = [support]
+                    support = fx.product_object("ProductBridge")
+                fx.extra_links["EnvCloak"].append(support)
+                self.refused(fx, "into EnvCloakKitTestSupport, which ships")
+
+    def test_test_support_used_by_an_unreferenced_library_still_ships(self):
+        fx = Fixture(self.base)
+        support = fx.test_support()
+        fx.lists["Orphan"] = [fx.kit]
+        fx.extra_links["Orphan"] = [support]
+        self.refused(fx, "into EnvCloakKitTestSupport, which ships")
+
+    def test_test_support_requires_a_complete_test_consumer(self):
+        fx = Fixture(self.base)
+        fx.test_support()
+        fx.missing.add(("EnvCloakTests", "_dependency_info.dat"))
+        self.refused(fx, "into EnvCloakKitTestSupport, which ships")
+
+    def test_test_support_hidden_in_shipping_linker_inputs_is_refused(self):
+        fx = Fixture(self.base)
+        fx.extra_inputs["EnvCloak"] = [fx.test_support()]
+        self.refused(fx, "which is not in its link list")
+
+    def test_duplicate_linker_outputs_are_refused(self):
+        fx = Fixture(self.base)
+        fx.outputs["Duplicate"] = fx.test_support()
+        fx.lists["Duplicate"] = [fx.kit]
+        self.refused(fx, "more than one target writes")
 
     def test_a_library_named_for_tests_linked_into_the_app_ships(self):
         # A library target whose name ends in Tests is still a library: its
@@ -444,7 +505,7 @@ class Stopped(unittest.TestCase):
     confirmed gone (procgroup.py)."""
 
     def setUp(self):
-        self.base = tempfile.mkdtemp(prefix="eccc", dir="/tmp")
+        self.base = tempfile.mkdtemp(prefix="eccc", dir=tempfile.gettempdir())
         self.fx = Fixture(self.base)
         self.fx.check()
         stubs = os.path.join(self.base, "stubs")
@@ -593,7 +654,7 @@ class RealBuild(unittest.TestCase):
         return dd, bases[0]
 
     def refused(self, change, needle):
-        with tempfile.TemporaryDirectory(prefix="eccc", dir="/tmp") as copy:
+        with tempfile.TemporaryDirectory(prefix="eccc", dir=tempfile.gettempdir()) as copy:
             dd, app = self.clone(copy)
             change(dd, app)
             code, out = run(["bash", CHECK_SOURCES, "--swift", dd])
