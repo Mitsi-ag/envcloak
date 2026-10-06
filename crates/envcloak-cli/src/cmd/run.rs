@@ -1034,11 +1034,7 @@ fn run_launch(launch: &str) -> ExitCode {
     match envcloak_exec::launch::serve(server, io, signals, confirm) {
         Ok(exit) => ExitCode::from(exit.shell_code()),
         Err(envcloak_exec::launch::LaunchError::Refused) => changed(),
-        Err(e) => Failure::new(
-            e.token(),
-            "the managed server could not be started or followed",
-        )
-        .report(RUN_FAILURE),
+        Err(e) => Failure::new(e.token(), e.describe()).report(RUN_FAILURE),
     }
 }
 
