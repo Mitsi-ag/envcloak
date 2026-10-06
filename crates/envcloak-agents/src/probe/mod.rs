@@ -77,14 +77,22 @@
 //!
 //! The probe home is the caller's: in CI an isolated test home with
 //! EnvCloak installed by `envcloak agents install` (`crates/envcloak-e2e/
-//! tests/probes.rs`); on a person's machine, M2-28's. The probe writes
+//! tests/probes.rs`); on a person's machine, [`local`]'s ([`home`], with a
+//! probe-only daemon and the [`approve`] path, M2-28). The probe writes
 //! only into it: its project's `README.md` and `.env` fixtures, a
-//! sentinel directory and an MCP configuration file.
+//! sentinel directory and an MCP configuration file. Each run of the host
+//! leads a session of its own on a terminal of its own ([`HostSession`]),
+//! so nothing it does shares a session or a terminal with whoever approves
+//! its requests (T9-3).
 
+pub mod approve;
 pub mod claude;
 pub mod codex;
 pub mod controls;
+pub mod home;
+pub mod local;
 pub mod model;
+pub mod qualify;
 mod run;
 
 use std::ffi::OsString;
@@ -100,7 +108,7 @@ use crate::coverage::{
 };
 use crate::hook::Host;
 
-pub use run::{run, run_surfaces};
+pub use run::{HostSession, run, run_surfaces};
 
 /// The host a probe drives.
 #[derive(Debug, Clone, PartialEq, Eq)]
