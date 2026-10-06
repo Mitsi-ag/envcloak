@@ -314,3 +314,51 @@ fn binary_boundaries_keep_unicode_across_read_chunks() {
     assert!(report.complete());
     assert_eq!(found, 1);
 }
+
+#[test]
+fn assignment_words_keep_internal_punctuation_in_raw_and_json() {
+    let value = ["fixtureZword", "with", "punctuation"].join("-_");
+    for (case, text) in [
+        format!("KEY={value} python app.py"),
+        format!("export A=1 B={value}"),
+        format!("curl -d token={value} https://h"),
+        format!("run --key={value} now"),
+        format!("see https://h/?k={value} ok"),
+        format!("API_KEY={value}\nOTHER=1"),
+        format!("prefix KEY={value}\tNEXT={value} suffix"),
+        format!("see https://h/?k={value}&next=1 now"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for format in [ConfigFormat::Raw, ConfigFormat::Jsonl] {
+            let input = if format == ConfigFormat::Jsonl {
+                serde_json::to_vec(&text).unwrap()
+            } else {
+                text.as_bytes().to_vec()
+            };
+            let mut matches = std::collections::BTreeSet::new();
+            let report = scan_reader(
+                &mut std::io::Cursor::new(&input),
+                format,
+                Default::default(),
+                Budget::default(),
+                &mut |c| {
+                    if c.value.ct_eq(value.as_bytes()) {
+                        let r = c.occurrence.range;
+                        assert!(&input[r.start as usize..r.end as usize] == value.as_bytes());
+                        matches.insert((r.start, r.end));
+                    }
+                    true
+                },
+            )
+            .unwrap();
+            assert!(report.complete(), "case {case}: {report:?}");
+            assert_eq!(
+                matches.len(),
+                text.matches(&value).count(),
+                "case {case}: {format:?}"
+            );
+        }
+    }
+}

@@ -44,8 +44,13 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
     out.raw(bytes, 0, bytes.len());
     let mut word = 0;
     for end in 0..=bytes.len() {
-        if end == bytes.len() || bytes[end].is_ascii_whitespace() {
+        if end == bytes.len() || bytes[end].is_ascii_whitespace() || bytes[end] < 32 {
             out.raw(bytes, word, end);
+            // A JSON string or decoded run may contain several shell words.
+            // Keep each assignment RHS intact before punctuation alternatives.
+            if let Some(eq) = bytes[word..end].iter().position(|b| *b == b'=') {
+                out.raw(bytes, word + eq + 1, end);
+            }
             word = end + 1;
         }
     }
@@ -75,7 +80,11 @@ pub(crate) fn ranges(bytes: &[u8]) -> (Vec<(Range<usize>, Form)>, bool) {
     // Query and connection fields retain punctuation inside each value.
     let mut start = 0;
     for end in 0..=bytes.len() {
-        if end == bytes.len() || matches!(bytes[end], b'?' | b'&' | b';') {
+        if end == bytes.len()
+            || bytes[end].is_ascii_whitespace()
+            || bytes[end] < 32
+            || matches!(bytes[end], b'?' | b'&' | b';')
+        {
             if let Some(eq) = bytes[start..end].iter().position(|b| *b == b'=') {
                 out.raw(bytes, start + eq + 1, end);
             }
