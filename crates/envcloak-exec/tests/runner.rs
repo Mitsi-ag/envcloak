@@ -1986,18 +1986,10 @@ fn exit_codes_pass_through() {
     }
 }
 
-/// A prompt without a newline shows while the child waits for its
-/// answer (the answer is only typed once it has): the idle flush releases
-/// it. Each is timed from a marker the child prints just before it, in the
-/// same write, followed by more than any value's longest encoding, so the
-/// redactor releases the marker at once and holds the prompt until the
-/// idle flush. Five prompts, the fastest shown within 100 ms of its marker
-/// (SPEC's bound for the 40 ms flush): a load spike can delay one, never
-/// the flush itself; a 110 ms flush fails (review T12-4, and the
-/// verifier's and Codex's reviews of M2-19, which found the bound of
-/// 400 ms this had let a 300 ms flush pass). The first bytes of a value,
-/// written without a newline, are held while the pipe is quiet, and
-/// released as they were once what follows shows they are not the value.
+/// Each prompt is emitted only after the test acknowledges a ready marker.
+/// Time starts before that acknowledgement, so buffered marker and prompt
+/// output cannot hide latency. Every sample must meet the 100 ms bound;
+/// the exact 40 ms idle deadline is checked separately in the relay units.
 fn a_prompt_shows_and_the_start_of_a_value_waits() {
     let seed = fresh_seed();
     let cs = all_canaries(seed);
@@ -2010,7 +2002,9 @@ fn a_prompt_shows_and_the_start_of_a_value_waits() {
     };
     let script = r#"i=0
 while [ $i -lt 5 ]; do
-  printf 'mark-%d%8192sPassword-%d: ' $i '' $i
+  printf 'mark-%d\n' $i
+  read ready
+  printf 'Password-%d: ' $i
   read answer
   printf 'got-%d %s\n' $i "$answer"
   i=$((i+1))
@@ -2023,6 +2017,7 @@ printf '!\n'"#;
     for i in 0..5 {
         assert!(p.wait_for(0, format!("mark-{i}").as_bytes(), Duration::from_secs(60)));
         let t0 = Instant::now();
+        p.write(b"ready\n");
         assert!(
             p.wait_for(
                 0,
@@ -2039,9 +2034,11 @@ printf '!\n'"#;
             Duration::from_secs(10)
         ));
     }
-    let fastest = took.iter().min().copied().unwrap();
-    println!("prompt: shown {took:?} after the marker before it (fastest {fastest:?})");
-    assert!(fastest <= Duration::from_millis(100), "{took:?}");
+    println!("prompt: shown {took:?} after acknowledgement");
+    assert!(
+        took.iter().all(|t| *t <= Duration::from_millis(100)),
+        "{took:?}"
+    );
     let prefix = &by_label(&cs, labels::OPENAI_API_KEY).value()[..12];
     assert!(
         !p.wait_for(0, prefix, Duration::from_millis(300)),

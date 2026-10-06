@@ -93,6 +93,16 @@ impl TerminalSettings {
         TerminalSettings(t)
     }
 
+    /// Keeps only the output processing the PTY redactor covers: OPOST
+    /// and its LF-to-CR-LF mapping. Other inherited translations can
+    /// change a value before the redactor sees it (tabs, case, CR, EOT).
+    /// Input, local flags, control characters and speeds stay as they are.
+    pub fn pty_output(&self) -> Self {
+        let mut t = self.0;
+        t.c_oflag &= libc::OPOST | libc::ONLCR;
+        TerminalSettings(t)
+    }
+
     /// Whether these settings are raw: no line editing, no echo and no
     /// signal characters.
     pub fn is_raw(&self) -> bool {
@@ -704,6 +714,19 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_output_keeps_only_supported_translations_and_other_settings() {
+        for flags in [0, libc::OPOST, libc::ONLCR, !0] {
+            let mut source = settings(123);
+            source.c_oflag = flags;
+            source.c_lflag = libc::ISIG | libc::ECHO;
+            source.c_cc[libc::VSUSP] = 0x18;
+            let actual = TerminalSettings(source).pty_output();
+            source.c_oflag = flags & (libc::OPOST | libc::ONLCR);
+            assert!(actual.same_as(&TerminalSettings(source)));
+        }
+    }
 
     #[test]
     fn a_descriptor_that_is_not_a_terminal_is_refused() {

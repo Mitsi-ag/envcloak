@@ -196,7 +196,8 @@ pub(crate) fn run(
     let guard =
         TerminalGuard::enter_raw(terminal.input.as_fd()).map_err(|e| ExecError::Setup(e.kind()))?;
     let size = window_size(terminal.input.as_fd()).ok();
-    let started = crate::start_pty(argv, &injected, size, Some(guard.saved()));
+    let settings = guard.saved().pty_output();
+    let started = crate::start_pty(argv, &injected, size, Some(&settings));
     // The values are in the command's environment now; the redactor holds
     // the only other copies.
     drop(injected);
@@ -615,9 +616,12 @@ impl Relay<'_, '_> {
     /// Releases what the redactor held back once the master side has been
     /// quiet for the idle interval.
     fn idle_flush(&mut self) {
-        if self.flush_at.is_some_and(|d| d <= Instant::now()) {
-            self.flush_at = None;
-            self.stream.flush_idle(&mut self.out);
+        if flush_idle_at(
+            Instant::now(),
+            &mut self.flush_at,
+            &mut self.stream,
+            &mut self.out,
+        ) {
             self.write_out();
         }
     }
@@ -821,6 +825,23 @@ impl Suspension for Relay<'_, '_> {
     }
 }
 
+/// The idle deadline is independent of reader scheduling. An explicit time
+/// lets tests exercise the deadline and a subsequent read without sleeps.
+fn flush_idle_at(
+    now: Instant,
+    deadline: &mut Option<Instant>,
+    stream: &mut StreamRedactor<'_>,
+    out: &mut Vec<u8>,
+) -> bool {
+    if deadline.is_some_and(|d| d <= now) {
+        *deadline = None;
+        stream.flush_idle(out);
+        true
+    } else {
+        false
+    }
+}
+
 /// A signal ends the drain, keeping a monitor loss distinct from an exit.
 fn signal_end(lost: bool, sig: i32) -> End {
     if lost {
@@ -857,6 +878,64 @@ fn write_keys_to(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_deadline_releases_at_40_ms_and_restarts_after_a_read() {
+        let value =
+            SecretBytes::copy_from(format!("pending-{:032x}", std::process::id()).as_bytes());
+        let slug = envcloak_core::vault::Slug::new("fixture/t").unwrap();
+        let (redactor, _) = crate::build_pty_redactor(&[crate::Label {
+            slug: &slug,
+            value: &value,
+            short: crate::ShortPolicy::Refuse,
+        }])
+        .unwrap();
+        let mut stream = redactor.stream();
+        let mut out = Vec::new();
+        let start = Instant::now();
+        let mut deadline = Some(start + crate::IDLE_FLUSH);
+        stream.push(b"Prompt: ", &mut out);
+        assert!(out.is_empty());
+        assert!(!flush_idle_at(
+            start + Duration::from_millis(39),
+            &mut deadline,
+            &mut stream,
+            &mut out
+        ));
+        assert!(out.is_empty());
+        assert!(flush_idle_at(
+            start + Duration::from_millis(40),
+            &mut deadline,
+            &mut stream,
+            &mut out
+        ));
+        assert_eq!(out, b"Prompt: ");
+        assert!(!flush_idle_at(
+            start + Duration::from_millis(80),
+            &mut deadline,
+            &mut stream,
+            &mut out
+        ));
+        out.clear();
+        stream.push(b"Next", &mut out);
+        deadline = Some(start + Duration::from_millis(100) + crate::IDLE_FLUSH);
+        stream.push(b": ", &mut out);
+        deadline.replace(start + Duration::from_millis(120) + crate::IDLE_FLUSH);
+        assert!(!flush_idle_at(
+            start + Duration::from_millis(140),
+            &mut deadline,
+            &mut stream,
+            &mut out
+        ));
+        assert!(out.is_empty());
+        assert!(flush_idle_at(
+            start + Duration::from_millis(160),
+            &mut deadline,
+            &mut stream,
+            &mut out
+        ));
+        assert_eq!(out, b"Next: ");
+    }
 
     #[test]
     fn a_partial_input_write_wipes_only_sent_bytes_before_backpressure() {
