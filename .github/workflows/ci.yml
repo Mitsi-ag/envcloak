@@ -845,6 +845,19 @@ jobs:
         run: |
           python3 scripts/macos/tests/test_sign_check.py --app "$RUNNER_TEMP/app/EnvCloak.app" BuiltApp
           python3 scripts/macos/tests/test_sign_check.py --app "$RUNNER_TEMP/Applications/EnvCloak.app" BuiltApp
+      # The app ships exactly three executables (gate 19), so not the
+      # probe's programs: `agents status --probe` from its CLI finds the
+      # daemon in the helper and says, before anything is made, what it
+      # lacks (M2 plan M2-28; docs/INSTALLERS.md).
+      - name: agents status --probe from the app names what it lacks
+        run: |
+          cli="$RUNNER_TEMP/Applications/EnvCloak.app/Contents/MacOS/envcloak"
+          code=0
+          "$cli" agents status --probe --json >"$RUNNER_TEMP/probe.out" 2>"$RUNNER_TEMP/probe.err" || code=$?
+          cat "$RUNNER_TEMP/probe.out" "$RUNNER_TEMP/probe.err"
+          test "$code" = 1
+          grep -q probe_unavailable "$RUNNER_TEMP/probe.out" "$RUNNER_TEMP/probe.err"
+          grep -q 'envcloak-probe-model and envcloak-probe-mcp' "$RUNNER_TEMP/probe.out" "$RUNNER_TEMP/probe.err"
       - name: The app's hosted tests
         run: |
           xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloak -destination 'platform=macOS' \
