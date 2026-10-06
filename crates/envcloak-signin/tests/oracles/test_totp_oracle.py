@@ -2,6 +2,7 @@
 import importlib.util
 from pathlib import Path
 import subprocess
+import re
 import unittest
 from unittest.mock import patch
 
@@ -11,6 +12,24 @@ spec.loader.exec_module(oracle)
 
 
 class NodeRunnerTests(unittest.TestCase):
+    def test_ci_runs_independent_oracle_with_isolation(self):
+        workflow = Path(".github/workflows/ci.yml").read_text()
+        self.assertIn("        run: scripts/check-totp-oracle.sh\n", workflow)
+        script = Path("scripts/check-totp-oracle.sh").read_text()
+        self.assertIn("env -i", script)
+        self.assertIn('TMPDIR="$scratch"', script)
+        self.assertIn("python3 -I -B crates/envcloak-signin/tests/oracles/totp_oracle.py", script)
+        node_setup = workflow.split("- uses: actions/setup-node@v4", 1)[1].split("- uses:", 1)[0]
+        self.assertNotIn("if:", node_setup)
+
+    def test_receipt_commit_references_survive_rebase(self):
+        receipt = Path("docs/M2B-03A-VALIDATION.md").read_text()
+        section = receipt.split("## Commits\n", 1)[1].split("\n## ", 1)[0]
+        references = re.findall(r"(?m)^- `([^`]+)`", section)
+        self.assertGreaterEqual(len(references), 6)
+        self.assertTrue(all(subject.startswith("M2 M2b-03a: ") for subject in references))
+        self.assertFalse(re.search(r"\b[0-9a-f]{7,40}\b", section))
+
     def test_every_node_call_has_a_deadline(self):
         result = subprocess.CompletedProcess(["node"], 0, b"{}", b"")
         with patch.object(oracle.subprocess, "run", return_value=result) as run:
