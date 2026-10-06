@@ -111,13 +111,13 @@ const HELP: &str = "usage:
   envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
   envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
   envcloak agents status [--json]
+  envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents status --probe
   envcloak agents migrate-mcp
   envcloak mcp-bridge
   envcloak standing
@@ -204,10 +204,9 @@ fn main() -> ExitCode {
 }
 
 /// The refusal of an M2 or M2b command this build does not have, or of
-/// `run --pty` or `agents status --probe`, chosen by the words that select
-/// it (the first, and for `agents` the second; for `run`, `--pty` anywhere
-/// before `--`; for `agents status`, `--probe` anywhere); `None` for any
-/// other command line. No other argument is read.
+/// `run --pty`, chosen by the words that select it (the first, and for
+/// `agents` the second; for `run`, `--pty` anywhere before `--`); `None`
+/// for any other command line. No other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
@@ -219,11 +218,6 @@ fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Opti
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
         "agents" if word(1)? == "migrate-mcp" => cmd::agents::run(&["migrate-mcp"]),
-        "agents"
-            if word(1)? == "status" && args[2..].iter().any(|a| a.as_os_str() == "--probe") =>
-        {
-            cmd::agents::status_probe()
-        }
         "run"
             if args[1..]
                 .iter()

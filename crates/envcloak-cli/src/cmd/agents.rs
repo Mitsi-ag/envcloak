@@ -38,9 +38,30 @@
 //!   directory's project or local settings) while EnvCloak's own hooks
 //!   (in one of those files) or an MCP server named `envcloak` (in
 //!   `.claude.json`) are there too, so each hook runs twice; the message
-//!   names both (M2-08). `--probe`, which runs the probes on this machine
-//!   in a probe home of their own (M2-28), is not in this build: exit 125
-//!   with `not_in_this_build`.
+//!   names both (M2-08).
+//! - `status --probe [--agent ID]... [--json]` (M2 plan M2-28) runs the
+//!   coverage probes on this machine first, for each tier-1 host found on
+//!   `PATH` (or those named), and then prints the report above, which
+//!   rests on what they found. Each host is probed in a probe home of its
+//!   own (`envcloak_agents::probe::local`): a short private directory under
+//!   `/tmp`, a probe-only daemon and throwaway vault, EnvCloak installed
+//!   there by this build, the person's own host binary run there against
+//!   the scripted model, and the probe's requests approved from this
+//!   process's own terminal with the probe passphrase (with no terminal,
+//!   or run by an agent, nothing is approved and the output probe reads
+//!   `probe_needs_terminal`). The person's own daemon is never connected
+//!   to, and their files are only read: the switches that degrade a
+//!   surface are read from them, as `status` reads them. A host version
+//!   the scripted model is not qualified for is not probed: every outcome
+//!   is `not_qualified`, and the line says which versions CI results are
+//!   published for. A result is kept (`<data>/agents/coverage.json`) only
+//!   under the identity it measured: the binary the person's `PATH` leads
+//!   to and the person's configuration, unchanged while the probe ran, with
+//!   their hooks running this `envcloak`; otherwise the report says why it
+//!   was not kept. Exit 0 once the report is printed; 1 with
+//!   `probe_unavailable` when a host's probe could not be set up (the
+//!   programs it needs are not beside this `envcloak`, or its probe home,
+//!   daemon, vault or install could not be made), after the report.
 //! - `migrate-mcp` (M2-20) is not in this build: it exits 125 with
 //!   `not_in_this_build`, reading no argument.
 //!
@@ -62,6 +83,7 @@ use envcloak_agents::install::{
     self, Context, HostReport, Note, Options, Plan, Report, Step, StepKind, StepResult, host_name,
 };
 use envcloak_agents::locations::Locations;
+use envcloak_agents::probe;
 use envcloak_agents::writer::{DaemonBackups, Journal, Outcome, StateFile, Writer};
 use envcloak_client::claims::claims;
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
@@ -74,7 +96,8 @@ use super::require_unlocked;
 const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe | migrate-mcp (not in this build)";
+       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents migrate-mcp (not in this build)";
 
 #[derive(Debug, Default)]
 struct Args {
@@ -144,10 +167,8 @@ pub fn run(args: &[&str]) -> ExitCode {
 /// sets and both servers, and nothing said so), then the coverage report
 /// (M2-09).
 fn run_status(args: &[&str]) -> ExitCode {
-    // `--probe` is registered ahead of M2-28 and refuses whatever else is
-    // there (M2-02's rule), as `run --pty` does.
     if args.contains(&"--probe") {
-        return status_probe();
+        return status_probe(args);
     }
     let json = match args {
         [] => false,
@@ -174,12 +195,400 @@ fn run_status(args: &[&str]) -> ExitCode {
     }
 }
 
-/// `agents status --probe`'s refusal: probes on the person's machine are
-/// M2-28's.
-pub fn status_probe() -> ExitCode {
-    super::not_in_this_build(
-        "`envcloak agents status --probe` (probes on this machine, in a probe home of their own)",
-    )
+/// The parsed options of `status --probe`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ProbeArgs {
+    hosts: Vec<Host>,
+    json: bool,
+}
+
+fn parse_probe(args: &[&str]) -> Option<ProbeArgs> {
+    let mut a = ProbeArgs::default();
+    let mut probe = false;
+    let mut it = args.iter();
+    while let Some(&arg) = it.next() {
+        match arg {
+            "--probe" if !probe => probe = true,
+            "--json" if !a.json => a.json = true,
+            "--agent" => {
+                let h = Host::from_id(it.next()?)?;
+                if a.hosts.contains(&h) {
+                    return None;
+                }
+                a.hosts.push(h);
+            }
+            _ => return None,
+        }
+    }
+    probe.then_some(a)
+}
+
+/// `agents status --probe [--agent ID]... [--json]`: see the module
+/// documentation.
+pub fn status_probe(args: &[&str]) -> ExitCode {
+    let Some(a) = parse_probe(args) else {
+        return usage(USAGE_TEXT);
+    };
+    // The settings it reads can hold literal keys, and it holds the probe
+    // passphrase (SPEC §5).
+    if let Err(f) = refuse_if_traced() {
+        return f.report(FAILURE);
+    }
+    if let Some(text) = double_install() {
+        return Failure::new("double_install", text).report(FAILURE);
+    }
+    match run_probe(&a) {
+        Ok(code) => code,
+        Err(f) => f.report(FAILURE),
+    }
+}
+
+/// What `--probe` did for one host.
+struct HostProbe {
+    host: Host,
+    version: Option<String>,
+    /// The probe's run, or why it could not be set up.
+    run: Result<probe::local::LocalRun, &'static str>,
+    /// Whether its result is kept, or why not.
+    kept: Result<(), &'static str>,
+}
+
+fn unavailable(message: &'static str) -> Failure {
+    Failure::new("probe_unavailable", message)
+}
+
+fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
+    let me = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| Failure::new("io", "the path of this envcloak could not be read"))?;
+    let dir = me
+        .parent()
+        .ok_or_else(|| Failure::new("io", "the path of this envcloak could not be read"))?;
+    let envcloakd = dir.join("envcloakd");
+    let model = dir.join("envcloak-probe-model");
+    if !envcloakd.is_file() || !model.is_file() {
+        return Err(unavailable(
+            "the probes need envcloakd and envcloak-probe-model installed beside this envcloak; \
+             nothing was probed",
+        ));
+    }
+    let mcp = Some(dir.join("envcloak-probe-mcp")).filter(|p| p.is_file());
+    let me_sha = coverage::file_sha256(&me).unwrap_or_default();
+    // Probe homes earlier runs left (a run killed before it removed its
+    // own), whose runs have ended.
+    let swept = probe::home::sweep(Path::new(probe::home::TMP));
+    let locations = Locations::from_env().map_err(|_| {
+        Failure::new(
+            "no_home",
+            "HOME is not set to an absolute path, so the agents' files cannot be found",
+        )
+    })?;
+    let data_dir = envcloak_core::vault::VaultPaths::for_user()
+        .map_err(|_| {
+            Failure::new(
+                "no_home",
+                "HOME is not set to an absolute path, so EnvCloak's data directory cannot be found",
+            )
+        })?
+        .data_dir;
+    let cache_path = Cache::path(&data_dir);
+    let path = env("PATH").unwrap_or_default();
+    let cwd = working_dir()?;
+    let claims = claims();
+    let markers: Vec<(OsString, OsString)> = claims
+        .iter()
+        .filter_map(|m| env(m).map(|v| (OsString::from(m), v)))
+        .collect();
+    let person_socket = envcloak_ipc::RunPaths::for_user().ok().map(|p| p.socket);
+    let hosts: Vec<Host> = if a.hosts.is_empty() {
+        install::TIER_1.to_vec()
+    } else {
+        a.hosts.clone()
+    };
+    let read = |host: Host| {
+        ConfigSet::read(
+            host,
+            &locations,
+            &coverage::claude_managed_dir(),
+            &cwd,
+            &env,
+        )
+    };
+    let mut done: Vec<HostProbe> = Vec::new();
+    let mut kept_any = false;
+    let mut cache = Cache::load(&cache_path);
+    for host in hosts {
+        let d = match detect::detect(host, &path, &env) {
+            Ok(d) => d,
+            Err(DetectError::NotFound) if a.hosts.is_empty() => continue,
+            Err(e) => {
+                done.push(HostProbe {
+                    host,
+                    version: None,
+                    run: Err(e.message()),
+                    kept: Err("the host was not probed"),
+                });
+                continue;
+            }
+        };
+        let exe_sha = std::fs::canonicalize(&d.exe)
+            .ok()
+            .and_then(|p| coverage::file_sha256(&p))
+            .unwrap_or_default();
+        let before = read(host).fingerprint(&me);
+        let opts = probe::local::LocalOptions {
+            envcloak: me.clone(),
+            envcloakd: envcloakd.clone(),
+            model_exe: model.clone(),
+            mcp_fixture: mcp.clone(),
+            path: probe_path(&d.exe, &me, &path),
+            markers: markers.clone(),
+            claims: claims.clone(),
+            tmp: PathBuf::from(probe::home::TMP),
+            person_socket: person_socket.clone(),
+            run_limit: probe::local::RUN_LIMIT,
+        };
+        let host_exe = probe::ProbeHost {
+            host,
+            exe: d.exe.clone(),
+            version: d.version.clone(),
+        };
+        let run = probe::local::probe_host(&host_exe, &opts);
+        let after_set = read(host);
+        let after = after_set.fingerprint(&me);
+        let (run, kept) = match run {
+            Ok(r) => {
+                let person = probe::local::PersonIdentity {
+                    exe_sha256: &exe_sha,
+                    before: before.as_deref(),
+                    after: after.as_deref(),
+                    programs: &after_set.context.programs,
+                    envcloak_sha256: &me_sha,
+                };
+                let kept = match probe::local::keep_record(&r, &person) {
+                    Ok(record) => {
+                        cache.put(record);
+                        kept_any = true;
+                        Ok(())
+                    }
+                    Err(why) => Err(why.message()),
+                };
+                (Ok(r), kept)
+            }
+            Err(e) => (Err(e.message()), Err("the host was not probed")),
+        };
+        done.push(HostProbe {
+            host,
+            version: Some(d.version),
+            run,
+            kept,
+        });
+    }
+    if kept_any && cache.store(&cache_path).is_err() {
+        for h in &mut done {
+            if h.kept.is_ok() {
+                h.kept = Err("the result could not be written to EnvCloak's data directory");
+            }
+        }
+    }
+    let rows = coverage_report()?;
+    print_probes(&done, &swept, &rows, a.json);
+    if done.iter().any(|h| h.run.is_err()) {
+        return Err(unavailable(
+            "a host's probe could not be set up, so it was not probed; the lines above say which \
+             and why",
+        ));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `PATH` in the probe home: the directory the host was found in (where
+/// its own commands, `claude mcp` and the like, are), this `envcloak`'s,
+/// then the person's own absolute entries, in their order, each once.
+fn probe_path(host: &Path, me: &Path, person: &std::ffi::OsStr) -> OsString {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for d in [host.parent(), me.parent()].into_iter().flatten() {
+        dirs.push(d.to_path_buf());
+    }
+    dirs.extend(
+        std::env::split_paths(person)
+            .filter(|d| d.is_absolute())
+            .collect::<Vec<_>>(),
+    );
+    let mut seen: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !seen.contains(&d) {
+            seen.push(d);
+        }
+    }
+    std::env::join_paths(seen).unwrap_or_default()
+}
+
+/// One probe outcome as `--probe` prints it.
+fn outcome_text(
+    outcome: coverage::Outcome,
+    why: &[coverage::Reason],
+    skipped: &[coverage::Case],
+) -> String {
+    let mut out = outcome.name().to_owned();
+    let mut parts: Vec<String> = why.iter().map(|r| r.name().to_owned()).collect();
+    parts.extend(skipped.iter().map(|c| format!("{} skipped", c.name())));
+    if !parts.is_empty() {
+        out.push_str(&format!(" ({})", parts.join(", ")));
+    }
+    out
+}
+
+fn print_probes(done: &[HostProbe], swept: &probe::home::Swept, rows: &[Row], json: bool) {
+    if json {
+        let probes: Vec<Value> = done.iter().map(probe_json).collect();
+        let home = Locations::from_env()
+            .map(|l| l.home().to_path_buf())
+            .unwrap_or_default();
+        let agents: Vec<Value> = rows.iter().map(|r| row_json(&home, r)).collect();
+        print_json(&json!({
+            "probes": probes,
+            "swept": {
+                "removed": swept.removed,
+                "in_use": swept.in_use,
+                "failed": swept.failed.len(),
+            },
+            "agents": agents,
+        }));
+        return;
+    }
+    if swept.removed > 0 {
+        println!(
+            "Removed {} probe home(s) earlier runs that were stopped had left in {}.",
+            swept.removed,
+            probe::home::TMP
+        );
+    }
+    for p in &swept.failed {
+        println!(
+            "Could not remove {}, a probe home an earlier run left: remove it yourself.",
+            escape_for_display(&p.display().to_string())
+        );
+    }
+    let width = Surface::ALL
+        .iter()
+        .map(|s| s.shown().len())
+        .chain(["EnvCloak server".len()])
+        .max()
+        .unwrap_or(0);
+    for h in done {
+        let name = host_name(h.host);
+        let version = h.version.as_deref().map(escape_for_display);
+        match (&h.run, version) {
+            (Err(why), Some(v)) => println!("{name} {v}: not probed: {why}"),
+            (Err(why), None) => println!("{name}: not probed: {why}"),
+            (Ok(r), Some(v)) if !r.qualification.is_qualified() => println!(
+                "{name} {v}: {}",
+                escape_for_display(&probe::qualify::not_qualified_line(
+                    h.host,
+                    &r.report.version,
+                    &r.qualification
+                ))
+            ),
+            (Ok(r), v) => {
+                println!(
+                    "{name} {}: probed on this machine, in a probe home of its own (your files \
+                     were only read)",
+                    v.unwrap_or_default()
+                );
+                for s in &r.report.surfaces {
+                    println!(
+                        "  {:width$}  {}",
+                        s.surface.shown(),
+                        outcome_text(s.outcome, &s.why, &s.skipped)
+                    );
+                }
+                let server = &r.report.server;
+                let sentinel = match server.sentinel {
+                    coverage::Sentinel::NotRun => String::new(),
+                    s => format!(" (sentinel {})", s.name().replace('_', " ")),
+                };
+                println!(
+                    "  {:width$}  {}{sentinel}",
+                    "EnvCloak server",
+                    server.outcome.name()
+                );
+                if r.needs_terminal {
+                    println!(
+                        "  No approval was given: the probe needs a terminal of yours, with no \
+                         agent in it, to approve its requests (probe_needs_terminal)."
+                    );
+                }
+            }
+        }
+        match &h.kept {
+            Ok(()) => println!("  Kept for this binary, version and configuration."),
+            Err(why) => println!("  Not kept: {why}."),
+        }
+    }
+    print_coverage(rows, false);
+}
+
+fn probe_json(h: &HostProbe) -> Value {
+    let mut v = json!({
+        "agent": h.host.id(),
+        "name": host_name(h.host),
+        "version": h.version,
+        "kept": h.kept.is_ok(),
+        "not_kept": h.kept.err(),
+    });
+    match &h.run {
+        Err(why) => {
+            v["probed"] = json!(false);
+            v["not_probed"] = json!(why);
+        }
+        Ok(r) => {
+            let q = &r.qualification;
+            v["probed"] = json!(q.is_qualified());
+            v["qualified"] = json!(q.is_qualified());
+            v["qualified_versions"] = json!(q.qualified_versions());
+            if !q.is_qualified() {
+                v["message"] = json!(probe::qualify::not_qualified_line(
+                    h.host,
+                    &r.report.version,
+                    q
+                ));
+            }
+            v["surfaces"] = Value::Array(
+                r.report
+                    .surfaces
+                    .iter()
+                    .map(|s| {
+                        json!({
+                            "surface": s.surface,
+                            "probe": s.outcome,
+                            "why": s.why,
+                            "skipped": s.skipped,
+                            "checks": s.checks.iter().map(|c| json!({
+                                "name": c.name,
+                                "control": c.control,
+                                "passed": c.passed,
+                                "why": c.why,
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect(),
+            );
+            v["server"] = json!({
+                "probe": r.report.server.outcome,
+                "sentinel": r.report.server.sentinel,
+                "control_ran": r.report.server.control_ran,
+                "allowed_write": r.report.server.allowed_write,
+                "control_denied": r.report.server.control_denied,
+            });
+            v["flags"] = json!(r.report.flags);
+            v["runs"] = json!(r.report.runs.len());
+            v["approvals"] = json!(r.approvals);
+            v["needs_terminal"] = json!(r.needs_terminal);
+            v["home_removed"] = json!(r.home_removed);
+        }
+    }
+    v
 }
 
 /// One host's row of the coverage report.
@@ -318,18 +727,7 @@ fn print_coverage(rows: &[Row], json: bool) {
         .map(|l| l.home().to_path_buf())
         .unwrap_or_default();
     if json {
-        let agents: Vec<Value> = rows
-            .iter()
-            .map(|r| {
-                let mut v = serde_json::to_value(&r.coverage).unwrap_or(Value::Null);
-                v["name"] = json!(r.name);
-                v["tier"] = json!(r.tier);
-                v["exe"] = json!(r.exe.as_ref().map(|p| shown(&home, p)));
-                v["probed"] = json!(r.probed.name());
-                v["identified_by"] = json!(r.identified_by.name());
-                v
-            })
-            .collect();
+        let agents: Vec<Value> = rows.iter().map(|r| row_json(&home, r)).collect();
         print_json(&json!({ "agents": agents }));
         return;
     }
@@ -383,6 +781,17 @@ fn print_coverage(rows: &[Row], json: bool) {
             ),
         }
     }
+}
+
+/// One host's row of the report, as `--json` has it.
+fn row_json(home: &Path, r: &Row) -> Value {
+    let mut v = serde_json::to_value(&r.coverage).unwrap_or(Value::Null);
+    v["name"] = json!(r.name);
+    v["tier"] = json!(r.tier);
+    v["exe"] = json!(r.exe.as_ref().map(|p| shown(home, p)));
+    v["probed"] = json!(r.probed.name());
+    v["identified_by"] = json!(r.identified_by.name());
+    v
 }
 
 /// What makes a double install, said as the refusal says it, or `None`:
