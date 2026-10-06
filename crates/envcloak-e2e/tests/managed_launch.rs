@@ -714,6 +714,124 @@ fn registration_needs_a_terminal_proof() {
     assert_eq!(launch.len(), 26);
 }
 
+/// Gate 23 for a managed server's proofs (F-70, T9-3): on a terminal
+/// where an agent known only by its markers waits for an approval (its
+/// request comes from a shell's child carrying `CLAUDECODE`), a sibling
+/// in that shell is a terminal subject by its own chain, yet what is
+/// typed there may be the agent's. The agent's process runs on while it
+/// waits. Its `managed.register`, `.update` and
+/// `.unregister` are refused `proof_refused` (`requester_terminal`) and
+/// audited, before the passphrase is checked, and its `.update_plan` is
+/// answered nothing. The positive controls: the person's registration on
+/// a terminal of their own before, and their plan once the agent's shell
+/// is gone (the request still waits, no process of its requester's runs).
+///
+/// Mutation checked: the registration's proof checked on the caller alone
+/// (`refuse_unless_prover` before it, as before, and no look at the
+/// waiting requests once the passphrase is verified): the sibling's
+/// registration is stored, and this fails.
+#[test]
+fn a_proof_is_refused_beside_a_waiting_agent_on_its_terminal() {
+    let mut w = World::new(&[]);
+    let (launch, _) = w.register_fixture();
+    // Another project, not managed, for the agent's waiting request.
+    let other = w.h.home.root().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(
+        other.join("envcloak.toml"),
+        format!("[project]\nname = \"other\"\n\n[env]\n{KEY} = \"stripe/fixture\"\n"),
+    )
+    .unwrap();
+    let pass =
+        w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
+    let pass = pass.to_str().unwrap().to_owned();
+    let manifest = w.project.join("envcloak.toml").to_str().unwrap().to_owned();
+    let steps = [
+        (
+            "request",
+            json!({
+                "manifest": other.join("envcloak.toml").to_str().unwrap(),
+                "fds": "none",
+                "claims": ["CLAUDECODE"],
+            }),
+        ),
+        (
+            "register",
+            json!({
+                "name": "claude-code/sibling",
+                "manifest": manifest,
+                "argv": w.fixture_argv(),
+                "passphrase_file": pass,
+            }),
+        ),
+        ("plan", json!({"launch": launch})),
+        (
+            "update",
+            json!({"launch": launch, "digest": "00".repeat(32), "passphrase_file": pass}),
+        ),
+        (
+            "unregister",
+            json!({"id": "claude-code/fixture", "passphrase_file": pass}),
+        ),
+    ];
+    let mut outputs = Vec::new();
+    let mut line = Vec::new();
+    for (action, input) in &steps {
+        let (i, o) = w.io_paths();
+        std::fs::write(&i, input.to_string()).unwrap();
+        let argv = World::helper_argv(action, &i, &o);
+        let quoted: Vec<String> = argv.iter().map(|a| envcloak_e2e::quoted(a)).collect();
+        line.push(quoted.join(" "));
+        outputs.push(o);
+    }
+    // The agent's request in the background, its process kept running (as
+    // an agent waits) until the end; the sibling's calls once it waits.
+    let first = envcloak_e2e::quoted(outputs[0].to_str().unwrap());
+    let line = format!(
+        "( {} ; exec sleep 600 ) & bg=$!; i=0; \
+         while [ ! -s {first} ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i+1)); done; \
+         {}; kill $bg; wait $bg; true",
+        line[0],
+        line[1..].join("; ")
+    );
+    let home = w.h.home.home();
+    let ran = w.h.human_argv(&home, &["/bin/sh", "-c", &line], &[], &[]);
+    assert_eq!(ran.code, 0, "{}", ran.all());
+    let answers: Vec<Value> = outputs
+        .iter()
+        .zip(&steps)
+        .map(|(o, (action, _))| w.read_out(o, &format!("the sibling's {action}")))
+        .collect();
+    pending_id(&answers[0]);
+    for (n, method) in [
+        (1, "managed.register"),
+        (3, "managed.update"),
+        (4, "managed.unregister"),
+    ] {
+        assert_eq!(
+            error_of(&answers[n]),
+            "proof_refused",
+            "{method}: {}",
+            answers[n]
+        );
+        assert_eq!(answers[n]["reason"], "requester_terminal", "{}", answers[n]);
+        let logs = w.logs();
+        assert!(
+            logs.contains(&format!(
+                "proof refused method={method} reason=requester_terminal "
+            )),
+            "{method}: {logs}"
+        );
+    }
+    // The plan: answered, with no statement (nothing, not a refusal).
+    assert!(answers[2]["error"].is_null(), "{}", answers[2]);
+    assert!(answers[2]["statement"].is_null(), "{}", answers[2]);
+    // Nothing was stored: the record is the person's, at revision 1.
+    let plan = w.person("plan", json!({"launch": launch}));
+    assert_eq!(plan["statement"]["revision"], 1, "{plan}");
+    assert_eq!(w.pending_count(), 1, "the agent's request waits");
+}
+
 /// CR-2: an update is built from the declaration stored in the record.
 /// After the fixture's executable is replaced (the launch is then
 /// refused), `managed.update_plan` with no changes shows the old and the
@@ -888,10 +1006,10 @@ fn an_edited_origin_is_refused_until_registered_again() {
 /// D-33's classes and receipts: a `script` launch (`sh /abs/server.sh`)
 /// registers `checked_at_rest` with its entry file's identity and a
 /// receipt that says what is not checked, runs, and is refused once its
-/// entry file changed; a `package_runner` launch (`npx -y <package>`)
-/// registers `checked_at_rest` with its label; a native file whose image
-/// cannot be bound (an `$ORIGIN` run path on Linux; no code directory on
-/// macOS) registers `checked_at_rest`.
+/// entry file changed; a native file whose image cannot be bound (an
+/// `$ORIGIN` run path on Linux; no code directory on macOS) registers
+/// `checked_at_rest`. The `package_runner` class runs real `npx`:
+/// [`a_package_runner_launch_runs_its_package_from_a_registry`].
 ///
 /// Mutation checked: the entry file's check removed: the changed script
 /// starts, and this fails.
@@ -937,25 +1055,6 @@ fn launch_classes_and_their_receipts() {
     let answer = w.request(&launch);
     assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
     w.expect_trace("managed launch refused reason=managed_launch_changed part=entry_file");
-    // A package runner: a stand-in `npx` on the declared PATH.
-    let tools = w.project.join("tools");
-    std::fs::create_dir(&tools).unwrap();
-    envcloak_e2e::write_script(&tools.join("npx"), "#!/bin/sh\nexit 0\n");
-    let reg = w.person(
-        "register",
-        json!({
-            "name": "claude-code/packaged",
-            "manifest": w.project.join("envcloak.toml").to_str().unwrap(),
-            "argv": ["npx", "-y", "ec-fixture-server"],
-            "path_env": tools.to_str().unwrap(),
-        }),
-    );
-    assert_eq!(reg["receipt"]["class"], "package_runner", "{reg}");
-    assert_eq!(reg["receipt"]["strength"], "checked_at_rest", "{reg}");
-    assert!(
-        reg["receipt"]["sentences"].to_string().contains("npx"),
-        "{reg}"
-    );
     // A native file whose image cannot be bound.
     let unbound = w.project.join("bin").join("unbound");
     if cfg!(target_os = "linux") {
@@ -989,6 +1088,153 @@ fn launch_classes_and_their_receipts() {
     assert_eq!(reg["receipt"]["class"], "native", "{reg}");
     assert_eq!(reg["receipt"]["strength"], "checked_at_rest", "{reg}");
     w.h.assert_swept("after the classes");
+}
+
+/// A local npm registry for [`a_package_runner_launch_runs_its_package_from_a_registry`]:
+/// `python3 -c REGISTRY <dir> <port file>` packs the package
+/// `ec-fixture-server` (a Node server answering `report` with its pid and
+/// the SHA-256 of `FIXTURE_KEY`, as the fixture does), serves its
+/// metadata and tarball on 127.0.0.1, logs each path asked for to
+/// `<dir>/requests.log`, and writes its port to the port file once
+/// listening.
+const REGISTRY: &str = r##"import base64, hashlib, http.server, io, json, os, sys, tarfile
+root, port_file = sys.argv[1:3]
+server_js = b"""#!/usr/bin/env node
+const crypto = require('crypto');
+const rl = require('readline').createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (line.trim() !== 'report') return;
+  const v = process.env.FIXTURE_KEY;
+  const vars = { FIXTURE_KEY: v === undefined ? null : crypto.createHash('sha256').update(v).digest('hex') };
+  process.stdout.write(JSON.stringify({ pid: process.pid, ppid: process.ppid, via: 'npx', vars }) + '\\n');
+});
+"""
+manifest = {"name": "ec-fixture-server", "version": "1.0.0", "bin": {"ec-fixture-server": "server.js"}}
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w:gz") as t:
+    for name, data, mode in (("package/package.json", json.dumps(manifest).encode(), 0o644),
+                             ("package/server.js", server_js, 0o755)):
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = mode
+        t.addfile(info, io.BytesIO(data))
+tgz = buf.getvalue()
+log = open(os.path.join(root, "requests.log"), "a")
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def do_GET(self):
+        log.write(self.path + "\n"); log.flush()
+        port = self.server.server_address[1]
+        if self.path.rstrip("/") == "/ec-fixture-server":
+            v = dict(manifest)
+            v["dist"] = {"tarball": "http://127.0.0.1:%d/ec-fixture-server/-/ec-fixture-server-1.0.0.tgz" % port,
+                "shasum": hashlib.sha1(tgz).hexdigest(),
+                "integrity": "sha512-" + base64.b64encode(hashlib.sha512(tgz).digest()).decode()}
+            body, kind = json.dumps({"name": "ec-fixture-server", "dist-tags": {"latest": "1.0.0"},
+                "versions": {"1.0.0": v}}).encode(), "application/json"
+        elif self.path.endswith(".tgz"):
+            body, kind = tgz, "application/octet-stream"
+        else:
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+tmp = port_file + ".tmp"
+open(tmp, "w").write(str(srv.server_address[1]))
+os.rename(tmp, port_file)
+srv.serve_forever()
+"##;
+
+/// The local registry's process, stopped when dropped.
+struct Registry(std::process::Child);
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// D-33's `package_runner` class with the real Node package runner (the
+/// plan's local-registry case): `npx -y ec-fixture-server`, with `npx`
+/// found on the declared `PATH` and its registry declared, registers
+/// `checked_at_rest` with the label `npx` and a receipt saying only once
+/// and session approvals apply; once approved, the daemon's runner starts
+/// `npx`, which fetches the package from the local registry (its tarball
+/// is asked for) and runs it, and the package's server has the key (its
+/// digest) while the client got no value.
+///
+/// Mutation checked: the runner's argv cut to the declared program alone
+/// (the arguments after `npx` dropped in `launch_check::resolve`): `npx`
+/// runs no package, no report comes, and this fails.
+#[test]
+fn a_package_runner_launch_runs_its_package_from_a_registry() {
+    let npx = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("npx"))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| panic!("npx is needed on PATH (Node.js)"));
+    let mut w = World::new(&[]);
+    let reg_dir = w.h.files().join("registry");
+    std::fs::create_dir_all(&reg_dir).unwrap();
+    let port_file = reg_dir.join("port");
+    let child = std::process::Command::new(python3())
+        .args(["-c", REGISTRY])
+        .arg(&reg_dir)
+        .arg(&port_file)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let _registry = Registry(child);
+    assert!(
+        appears(&port_file, Duration::from_secs(30)),
+        "the registry did not start"
+    );
+    let port = std::fs::read_to_string(&port_file).unwrap();
+    let cache = w.h.files().join("npm-cache");
+    let path_env = format!("{}:/usr/bin:/bin", npx.parent().unwrap().display());
+    let reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/packaged",
+            "manifest": w.project.join("envcloak.toml").to_str().unwrap(),
+            "argv": ["npx", "-y", "ec-fixture-server"],
+            "path_env": path_env,
+            "env": [
+                ["NPM_CONFIG_REGISTRY", format!("http://127.0.0.1:{}/", port.trim())],
+                ["NPM_CONFIG_CACHE", cache.to_str().unwrap()],
+                ["NPM_CONFIG_UPDATE_NOTIFIER", "false"],
+                ["NPM_CONFIG_FUND", "false"],
+                ["NPM_CONFIG_AUDIT", "false"],
+            ],
+        }),
+    );
+    let receipt = &reg["receipt"];
+    assert_eq!(receipt["class"], "package_runner", "{reg}");
+    assert_eq!(receipt["strength"], "checked_at_rest", "{reg}");
+    assert!(receipt["sentences"].to_string().contains("npx"), "{reg}");
+    let launch = reg["launch"]
+        .as_str()
+        .unwrap_or_else(|| panic!("not registered: {reg}"))
+        .to_owned();
+    let first = w.request(&launch);
+    w.assert_released(0, 0, "nothing was released before the approval");
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    let r = report(&answer);
+    assert_eq!(r["via"], "npx", "{answer}");
+    assert_eq!(r["vars"][KEY], w.key_digest(), "{answer}");
+    w.assert_released(0, 1, "the runner alone got the value");
+    let asked = std::fs::read_to_string(reg_dir.join("requests.log")).unwrap();
+    assert!(
+        asked.contains("/ec-fixture-server/-/ec-fixture-server-1.0.0.tgz"),
+        "npx did not fetch the package from the registry: {asked}"
+    );
+    w.h.assert_swept("after the package runner");
 }
 
 /// What runs is the file checked (Codex review of M2-27): a script whose
@@ -1712,7 +1958,8 @@ fn an_update_statement_shows_every_change_of_the_declaration() {
 
 /// Gate 13 in the daemon (behind the client's own check, which lane B's
 /// typed helpers do not run): a registration or an update plan whose
-/// argument or variable value looks like a key is refused `invalid_params`
+/// argument, variable value, working directory, `PATH` or (bridged) header
+/// name looks like a key is refused `invalid_params`
 /// (`key_shaped`) before anything is stored, and the key is in no
 /// answer; the project stays unmanaged.
 ///
@@ -1730,6 +1977,14 @@ fn a_key_in_a_declaration_is_refused_by_the_daemon() {
     assert_eq!(error_of(&reg), "invalid_params", "{reg}");
     assert_eq!(reg["reason"], "key_shaped", "{reg}");
     let reg = w.register(json!({"argv": w.fixture_argv(), "env": [["TOKEN", key]]}));
+    assert_eq!(reg["reason"], "key_shaped", "{reg}");
+    // The working directory, `PATH`, and a bridged server's header name.
+    let reg = w.register(json!({"argv": w.fixture_argv(), "cwd": format!("/srv/{key}")}));
+    assert_eq!(reg["reason"], "key_shaped", "{reg}");
+    let reg =
+        w.register(json!({"argv": w.fixture_argv(), "path_env": format!("/usr/bin:/opt/{key}")}));
+    assert_eq!(reg["reason"], "key_shaped", "{reg}");
+    let reg = w.register(json!({"origin": "https://api.example.test", "headers": [key]}));
     assert_eq!(reg["reason"], "key_shaped", "{reg}");
     let (launch, _) = w.register_fixture();
     let plan = w.person(

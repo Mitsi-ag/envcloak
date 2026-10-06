@@ -198,7 +198,8 @@ fn helper_request(input: &Value) -> Value {
         refs: serde_json::from_value(input["refs"].clone()).unwrap_or_default(),
         env_file: None,
         argv: vec!["mcp-bridge".to_owned()],
-        claims: Vec::new(),
+        // With `claims`, an agent's markers (an agent known only by them).
+        claims: serde_json::from_value(input["claims"].clone()).unwrap_or_default(),
         launch: input["launch"].as_str().map(str::to_owned),
         bridge: input.get("origin").and_then(Value::as_str).map(|o| {
             envcloak_ipc::proto::BridgeDecl {
@@ -493,7 +494,9 @@ impl World {
         std::fs::copy(fixture_bin(), &fixture).unwrap();
         let project = std::fs::canonicalize(project).unwrap();
         let fixture = std::fs::canonicalize(fixture).unwrap();
-        let marker = h.files().join("fixture-ran");
+        // Where the fixture's `--marker-here` writes, in the launch's
+        // default working directory.
+        let marker = project.join("fixture-ran");
         World {
             h,
             project,
@@ -648,8 +651,7 @@ impl World {
     pub fn fixture_argv_for(&self, program: &str) -> Value {
         json!([
             program,
-            "--marker",
-            self.marker.to_str().unwrap(),
+            "--marker-here",
             "--var",
             KEY,
             "--var",
