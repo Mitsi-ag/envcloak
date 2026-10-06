@@ -327,6 +327,7 @@ fn assignment_words_keep_internal_punctuation_in_raw_and_json() {
         format!("API_KEY={value}\nOTHER=1"),
         format!("prefix KEY={value}\tNEXT={value} suffix"),
         format!("see https://h/?k={value}&next=1 now"),
+        format!("see https://h/?k={value}#section ok"),
     ]
     .into_iter()
     .enumerate()
