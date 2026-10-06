@@ -280,6 +280,25 @@ jobs:
           sudo sysctl -w kern.coredump=1
           sudo sysctl -w kern.corefile=/cores/core.%P
           echo "ENVCLOAK_TEST_CORE_DIR=/cores" >> "$GITHUB_ENV"
+      # The service manager's restart (crates/envcloak-e2e/tests/
+      # managed_runner.rs) runs on the shipped binaries too: a systemd user
+      # manager on Linux, launchd on macOS. The test fails on Actions
+      # without it.
+      - name: Start a systemd user manager (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 1 100); do
+            [ -S "/run/user/$uid/bus" ] && break
+            sleep 0.1
+          done
+          XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show-environment >/dev/null
+          echo "ENVCLOAK_TEST_SERVICE_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
+      - name: Allow the launchd test (macOS)
+        if: runner.os == 'macOS'
+        run: echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

@@ -689,6 +689,37 @@ fn a_runner_whose_start_fails_leaves_no_process() {
     assert!(!w.marker.exists());
 }
 
+/// macOS (D-36, Codex review of M2-27): a daemon that cannot read its own
+/// signature takes no anchor, so it cannot tell an ad hoc build from a
+/// Developer ID one and never treats the failed read as the former: the
+/// approved request is `runner_unavailable`, nothing is released and the
+/// fixture never starts.
+///
+/// Mutation checked: the failed read taken as an ad hoc build (the
+/// previous `team: None` on any failure, which turned the Team ID check
+/// off): the runner starts, and this fails.
+#[test]
+fn a_daemon_that_cannot_read_its_own_signature_starts_no_runner() {
+    if managed_common::release_run("a_daemon_that_cannot_read_its_own_signature_starts_no_runner") {
+        return;
+    }
+    if !cfg!(target_os = "macos") {
+        eprintln!(
+            "a_daemon_that_cannot_read_its_own_signature_starts_no_runner: macOS only (Linux \
+             starts its sealed copy, by digest)"
+        );
+        return;
+    }
+    let mut w = World::new(&[("ENVCLOAK_TEST_FAIL", "launch.own_signature")]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
+    w.assert_released(0, 0, "nothing was released");
+    assert!(!w.marker.exists());
+}
+
 /// Linux (D-33, D-36): a sealed copy the system refuses (the executable
 /// memory file refused) is `runner_unavailable` before any pending
 /// request, never the file instead: nothing is released and the fixture
@@ -971,16 +1002,28 @@ fn a_command_the_server_starts_is_unknown() {
 /// --user restart`, `launchctl kickstart -k`), and the same fixture
 /// process, under the same runner, answers the client afterwards: the
 /// restart stopped the daemon only. It changes the user's service
-/// manager, so it runs only where `ENVCLOAK_TEST_SERVICE_MANAGER=1` (CI
-/// sets it on both systems), under a label of its own, uninstalled at the
-/// end whatever happens.
+/// manager, so it runs only where `ENVCLOAK_TEST_SERVICE_MANAGER=1`, under
+/// a label of its own, uninstalled at the end whatever happens. CI sets it
+/// in every job that runs this file, the release job's shipped binaries
+/// included, and on GitHub Actions (or with
+/// `ENVCLOAK_TEST_REQUIRE_SERVICE_MANAGER=1`) a run without it fails
+/// instead of skipping: the qualification is required there, never
+/// silently narrowed.
 ///
-/// Mutation checked: `KillMode=process` removed from the unit (Linux):
+/// Mutations checked: `KillMode=process` removed from the unit (Linux):
 /// the restart kills the unit's whole control group, the runner and the
-/// fixture with it, the second report never comes, and this fails.
+/// fixture with it, the second report never comes, and this fails; the
+/// service manager left unset in a CI job: this fails there.
 #[test]
 fn the_runner_outlives_a_service_manager_restart() {
     if std::env::var_os("ENVCLOAK_TEST_SERVICE_MANAGER").is_none() {
+        let required = std::env::var_os("ENVCLOAK_TEST_REQUIRE_SERVICE_MANAGER").is_some()
+            || std::env::var("GITHUB_ACTIONS").is_ok_and(|v| v == "true");
+        assert!(
+            !required,
+            "the service manager restart is required here: set \
+             ENVCLOAK_TEST_SERVICE_MANAGER=1 with a service manager to load a test service"
+        );
         eprintln!(
             "the_runner_outlives_a_service_manager_restart: skipped: set \
              ENVCLOAK_TEST_SERVICE_MANAGER=1 to load a test service"

@@ -9,15 +9,22 @@
 //! here, on the declared `PATH` (absolute entries only), the executable is
 //! canonicalized and opened (`O_NOFOLLOW`), and its identity read through
 //! that descriptor: on Linux its SHA-256, on macOS the hash of the code
-//! directory the kernel uses (cdhash, [`envcloak_sys::codesign`]) or, for a
-//! file without one, its SHA-256. Its class: `native` for an ELF or Mach-O
-//! file, `script` for an interpreter with an absolute entry file or a
-//! `#!` file (whose interpreter is then the executable checked), and
-//! `package_runner` for `npx` and its kin. Its strength: `bound` for a
-//! native file whose image can be bound (Linux: no `$ORIGIN` in its run
-//! path; macOS: a code directory), `checked_at_rest` otherwise. The
-//! working directory is the declared one, else the managed directory,
-//! canonicalized and identified by device and inode.
+//! directory the kernel uses (cdhash, [`envcloak_sys::codesign`], with its
+//! signing identifier and Team ID) or, for a file without one or without a
+//! signing identifier, its SHA-256. Its class: `native` for an ELF or
+//! Mach-O file, `script` for an interpreter with an absolute entry file or a
+//! `#!` file, and `package_runner` for `npx` and its kin. What runs is
+//! what was checked: the argv names an entry file by its canonical path,
+//! and a `#!` file (a script's, or a package runner's own) is run by its
+//! interpreter explicitly, the line read once here, its option checked
+//! as the interpreter's own and an `env NAME` line's interpreter found
+//! once on the declared `PATH`; an interpreter that is itself a `#!` file
+//! is refused. Its strength: `bound` for a native file whose image can be
+//! bound (Linux: no `$ORIGIN` in its run path; macOS: a code directory)
+//! and that is given no file to run (no argument names an existing
+//! regular file), `checked_at_rest` otherwise. The working directory is
+//! the declared one, else the managed directory, canonicalized and
+//! identified by device and inode.
 //!
 //! **The check before release** ([`check`]): the recorded executable is
 //! opened again and its device, inode and identity compared with the
@@ -46,6 +53,7 @@ use envcloak_ipc::control::Stamp;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_policy::managed::{
     ArgvClass, CodeSelecting, DeclError, check_declaration, classify_argv, refuse_disguised,
+    shebang_argv,
 };
 use envcloak_sys::codesign::{self, ExecutableFormat};
 use sha2::{Digest, Sha256};
@@ -211,7 +219,13 @@ fn identity(f: &File) -> Result<CodeDigest, ResolveError> {
     );
     if cfg!(target_os = "macos") && mach_o {
         let cd = codesign::code_directory(f).map_err(|_| ResolveError::Unsupported)?;
-        if let Some((cd, cdhash)) = cd.and_then(|cd| cdhash_of(&cd).map(|h| (cd, h))) {
+        // A code directory without a signing identifier the kernel would
+        // report is not an identity the suspended start can compare in
+        // full: such a file is checked by its SHA-256, at rest.
+        if let Some((cd, cdhash)) = cd
+            .filter(|cd| cd.identifier.is_some())
+            .and_then(|cd| cdhash_of(&cd).map(|h| (cd, h)))
+        {
             return Ok(CodeDigest::CdHash {
                 cdhash,
                 team: cd.team,
@@ -236,33 +250,126 @@ fn file_identity(path: &Path) -> Result<FileIdentity, ResolveError> {
     })
 }
 
-/// The interpreter a `#!` file names, resolved: an absolute path, or
-/// `/usr/bin/env NAME` with `NAME` found on `path_env`. A line EnvCloak
-/// cannot read (no interpreter, a relative one, `env` with options) is
-/// [`ResolveError::Unsupported`].
-fn shebang_interpreter(f: &File, path_env: &str) -> Result<PathBuf, ResolveError> {
+/// What a `#!` line names: the interpreter as the line writes it (or, for
+/// `/usr/bin/env NAME`, as `NAME` was found on the declared `PATH`), and
+/// the line's one option, if any.
+struct Shebang {
+    interp: PathBuf,
+    opt: Option<String>,
+}
+
+/// Reads the `#!` line of `f`: an absolute interpreter and at most one
+/// word after it (the kernel hands the rest of the line over as one
+/// argument), or `/usr/bin/env NAME` with `NAME` found once, here, on
+/// `path_env`. A line EnvCloak cannot read (no interpreter, a relative
+/// one, more than one word after it, `env` with options or a second word,
+/// a line longer than the read) is [`ResolveError::Unsupported`]. The
+/// interpreter found is the one the launch runs, explicitly: nothing looks
+/// it up again when the server starts.
+fn read_shebang(f: &File, path_env: &str) -> Result<Shebang, ResolveError> {
     let mut head = [0u8; 256];
     let n = envcloak_sys::launch::read_at(f.as_fd(), &mut head, 0)
         .map_err(|_| ResolveError::Unsupported)?;
-    let line = head[..n]
-        .split(|b| *b == b'\n')
-        .next()
-        .and_then(|l| l.strip_prefix(b"#!"))
+    let head = &head[..n];
+    let end = head
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or(ResolveError::Unsupported)?;
+    let line = head[..end]
+        .strip_prefix(b"#!")
         .ok_or(ResolveError::Unsupported)?;
     let line = std::str::from_utf8(line).map_err(|_| ResolveError::Unsupported)?;
     let mut words = line.split_ascii_whitespace();
     let interp = words.next().ok_or(ResolveError::Unsupported)?;
-    if !interp.starts_with('/') {
+    let opt = words.next().map(str::to_owned);
+    if !interp.starts_with('/') || words.next().is_some() {
         return Err(ResolveError::Unsupported);
     }
     if Path::new(interp).file_name().and_then(|n| n.to_str()) == Some("env") {
-        let name = words.next().ok_or(ResolveError::Unsupported)?;
-        if name.starts_with('-') || name.contains('=') || words.next().is_some() {
+        let name = opt.ok_or(ResolveError::Unsupported)?;
+        if name.starts_with('-') || name.contains('=') || name.contains('/') {
             return Err(ResolveError::Unsupported);
         }
-        return find_program(name, path_env);
+        return Ok(Shebang {
+            interp: find_program(&name, path_env)?,
+            opt: None,
+        });
     }
-    Ok(PathBuf::from(interp))
+    Ok(Shebang {
+        interp: PathBuf::from(interp),
+        opt,
+    })
+}
+
+/// The identity of a native interpreter at `path` (canonicalized): a
+/// regular, executable ELF or Mach-O file. An interpreter that is itself a
+/// `#!` file (a version manager's shim) would choose its own interpreter
+/// when it starts: [`ResolveError::Unsupported`], reported manual.
+fn native_interpreter(path: &Path) -> Result<(PathBuf, FileIdentity), ResolveError> {
+    let canonical = std::fs::canonicalize(path).map_err(|_| ResolveError::NotFound)?;
+    let f = open_file(&canonical)?;
+    let m = f.metadata().map_err(|_| ResolveError::NotFound)?;
+    if m.permissions().mode() & 0o111 == 0 {
+        return Err(ResolveError::NotExecutable);
+    }
+    match codesign::executable_format(&f).map_err(|_| ResolveError::Unsupported)? {
+        ExecutableFormat::Elf | ExecutableFormat::MachO | ExecutableFormat::MachOUniversal => {}
+        ExecutableFormat::Script | ExecutableFormat::Other => {
+            return Err(ResolveError::Unsupported);
+        }
+    }
+    let id = file_identity(&canonical)?;
+    Ok((canonical, id))
+}
+
+/// A `#!` file at `canonical` run explicitly: its interpreter, checked as
+/// native, the explicit argv ([`shebang_argv`]: the line's option checked,
+/// the file's canonical path as the entry) and the file's identity.
+fn through_shebang(
+    file: &File,
+    canonical: &Path,
+    args: &[String],
+    path_env: &str,
+) -> Result<(FileIdentity, Vec<String>, FileIdentity), ResolveError> {
+    let sb = read_shebang(file, path_env)?;
+    let (interp_canonical, interp) = native_interpreter(&sb.interp)?;
+    let written = sb.interp.to_str().ok_or(ResolveError::Unsupported)?;
+    let script = canonical.to_str().ok_or(ResolveError::Unsupported)?;
+    let argv = shebang_argv(
+        written,
+        sb.opt.as_deref(),
+        script,
+        args,
+        interp_canonical.to_str().unwrap_or(""),
+    )?;
+    Ok((interp, argv, file_identity(canonical)?))
+}
+
+/// Whether an argument of a native launch names an existing regular file
+/// (absolute, or relative to the working directory `cwd`), itself or as
+/// the value of an `--option=value`: a program given a file may run what
+/// it holds (a script, a plug-in, a configuration that loads one), which
+/// nothing binds. Such a launch is `checked_at_rest`.
+fn names_a_file(args: &[String], cwd: &Path) -> bool {
+    args.iter().any(|a| {
+        let candidates = [
+            Some(a.as_str()),
+            a.strip_prefix('-')
+                .and_then(|o| o.split_once('='))
+                .map(|(_, v)| v),
+        ];
+        candidates.into_iter().flatten().any(|c| {
+            if c.is_empty() || c.starts_with('-') {
+                return false;
+            }
+            let p = if c.starts_with('/') {
+                PathBuf::from(c)
+            } else {
+                cwd.join(c)
+            };
+            std::fs::metadata(p).is_ok_and(|m| m.is_file())
+        })
+    })
 }
 
 /// Resolves `decl` into the registered launch `launch_id` at `revision`
@@ -295,35 +402,49 @@ pub(crate) fn resolve(
         return Err(ResolveError::NotExecutable);
     }
     let format = codesign::executable_format(&file).map_err(|_| ResolveError::Unsupported)?;
-    let (class, executable, entry) = match argv_class {
-        ArgvClass::PackageRunner { .. } => {
-            (LaunchClass::PackageRunner, file_identity(&canonical)?, None)
-        }
-        ArgvClass::Interpreter { entry } => (
-            LaunchClass::Script,
-            file_identity(&canonical)?,
-            Some(file_identity(Path::new(&decl.argv[entry]))?),
-        ),
-        ArgvClass::Program => match format {
-            ExecutableFormat::Elf | ExecutableFormat::MachO | ExecutableFormat::MachOUniversal => {
-                (LaunchClass::Native, file_identity(&canonical)?, None)
-            }
+    // What runs is what was checked: every path the launch runs is the
+    // canonical one identified here (an entry file named through a link
+    // runs by the file's own path), and a `#!` file is never handed to the
+    // kernel, which would read its line, and look its interpreter up,
+    // again: its interpreter, checked, runs it explicitly.
+    let (class, executable, argv, entry) = match argv_class {
+        ArgvClass::PackageRunner { .. } => match format {
             ExecutableFormat::Script => {
-                // The interpreter is the executable checked; the `#!` file
-                // is the entry the kernel hands it.
-                let interp = shebang_interpreter(&file, &path_env)?;
-                (
-                    LaunchClass::Script,
-                    file_identity(&interp)?,
-                    Some(file_identity(&canonical)?),
-                )
+                let (interp, argv, runner) =
+                    through_shebang(&file, &canonical, &decl.argv[1..], &path_env)?;
+                (LaunchClass::PackageRunner, interp, argv, Some(runner))
+            }
+            ExecutableFormat::Elf | ExecutableFormat::MachO | ExecutableFormat::MachOUniversal => (
+                LaunchClass::PackageRunner,
+                file_identity(&canonical)?,
+                decl.argv.clone(),
+                None,
+            ),
+            ExecutableFormat::Other => return Err(ResolveError::Unsupported),
+        },
+        ArgvClass::Interpreter { entry } => {
+            let (_, interp) = native_interpreter(&canonical)?;
+            let script = file_identity(Path::new(&decl.argv[entry]))?;
+            let mut argv = decl.argv.clone();
+            argv[entry] = std::str::from_utf8(&script.path)
+                .map_err(|_| ResolveError::Unsupported)?
+                .to_owned();
+            (LaunchClass::Script, interp, argv, Some(script))
+        }
+        ArgvClass::Program => match format {
+            ExecutableFormat::Elf | ExecutableFormat::MachO | ExecutableFormat::MachOUniversal => (
+                LaunchClass::Native,
+                file_identity(&canonical)?,
+                decl.argv.clone(),
+                None,
+            ),
+            ExecutableFormat::Script => {
+                let (interp, argv, script) =
+                    through_shebang(&file, &canonical, &decl.argv[1..], &path_env)?;
+                (LaunchClass::Script, interp, argv, Some(script))
             }
             ExecutableFormat::Other => return Err(ResolveError::Unsupported),
         },
-    };
-    let strength = match class {
-        LaunchClass::Native => native_strength(&file, &executable.digest)?,
-        LaunchClass::Script | LaunchClass::PackageRunner => BindingStrength::CheckedAtRest,
     };
     let cwd_path = match &decl.cwd {
         Some(c) => PathBuf::from(c),
@@ -332,12 +453,19 @@ pub(crate) fn resolve(
     let cwd_canonical = std::fs::canonicalize(&cwd_path).map_err(|_| ResolveError::NotFound)?;
     let dir = open_dir(&cwd_canonical)?;
     let dm = dir.metadata().map_err(|_| ResolveError::NotFound)?;
+    let strength = match class {
+        LaunchClass::Native if names_a_file(&argv[1..], &cwd_canonical) => {
+            BindingStrength::CheckedAtRest
+        }
+        LaunchClass::Native => native_strength(&file, &executable.digest)?,
+        LaunchClass::Script | LaunchClass::PackageRunner => BindingStrength::CheckedAtRest,
+    };
     Ok(RegisteredLaunch {
         launch_id,
         revision,
         class,
         executable,
-        argv: decl.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        argv: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
         cwd: DirIdentity {
             path: cwd_canonical.as_os_str().as_bytes().to_vec(),
             dev: dm.dev(),
@@ -439,11 +567,42 @@ pub(crate) enum CheckedExec {
     Descriptor { file: File, stamp: Stamp },
     /// The registered path; with `confirm` (macOS, a code directory hash
     /// recorded) the runner starts it suspended and the daemon compares
-    /// the started program's cdhash with `cdhash` before it runs.
+    /// the started program's code identity with `confirm` before it runs.
+    /// macOS only: on Linux every launch runs from a descriptor.
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
     Path {
         path: PathBuf,
-        confirm: Option<Vec<u8>>,
+        confirm: Option<ExpectedCode>,
     },
+}
+
+/// The code identity a suspended server must show the kernel before it
+/// runs (macOS): the record's cdhash, signing identifier and Team ID, each
+/// compared exactly. A Team ID of `None` is an ad hoc or platform
+/// signature, which the started program must have too; an identifier of
+/// `None` (a record that has none) matches no program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    all(not(test), any(target_os = "linux", target_os = "android")),
+    allow(dead_code)
+)]
+pub(crate) struct ExpectedCode {
+    pub cdhash: Vec<u8>,
+    pub identifier: Option<String>,
+    pub team: Option<String>,
+}
+
+impl ExpectedCode {
+    /// Whether the kernel's view of a started program, `sig`, is this.
+    #[cfg_attr(
+        all(not(test), any(target_os = "linux", target_os = "android")),
+        allow(dead_code)
+    )]
+    pub(crate) fn matches(&self, sig: &envcloak_sys::CodeSignature) -> bool {
+        sig.cdhash.is_some_and(|h| h[..] == self.cdhash[..])
+            && self.identifier.as_deref() == Some(sig.identifier.as_str())
+            && self.team == sig.team_id
+    }
 }
 
 /// A launch that passed the check: how to run it, and the working
@@ -504,10 +663,19 @@ fn recheck(rec: &FileIdentity, part: Part) -> Result<File, CheckError> {
 /// [`CheckError`].
 pub(crate) fn check(l: &RegisteredLaunch) -> Result<CheckedLaunch, CheckError> {
     let file = recheck(&l.executable, Part::Executable)?;
-    // A `#!` file: its interpreter was the executable checked, the file
-    // the entry, and the kernel runs the file by its path.
-    let shebang = l.class == LaunchClass::Script
-        && matches!(classify_argv(&l.declaration.argv), Ok(ArgvClass::Program));
+    // The executable runs itself, never through a `#!` line the kernel
+    // would read again: registration ran a `#!` file through its checked
+    // interpreter, so one here was not what was registered.
+    if !matches!(
+        codesign::executable_format(&file),
+        Ok(ExecutableFormat::Elf | ExecutableFormat::MachO | ExecutableFormat::MachOUniversal)
+    ) {
+        return Err(CheckError::Changed {
+            part: Part::Executable,
+            old: meta_of(&l.executable),
+            new: None,
+        });
+    }
     if let Some(entry) = &l.entry {
         drop(recheck(entry, Part::EntryFile)?);
     }
@@ -529,31 +697,6 @@ pub(crate) fn check(l: &RegisteredLaunch) -> Result<CheckedLaunch, CheckError> {
             ino: dm.ino(),
             digest_prefix: None,
         })));
-    }
-    if shebang {
-        let entry = l.entry.as_ref().map(|e| e.path.clone()).unwrap_or_default();
-        return Ok(CheckedLaunch {
-            exec: CheckedExec::Path {
-                path: PathBuf::from(std::ffi::OsStr::from_bytes(&entry)),
-                confirm: None,
-            },
-            cwd,
-        });
-    }
-    // An executable that is itself a `#!` file (a package runner such as
-    // `npx` is one) is run by its path: the kernel opens it again to read
-    // its interpreter line, which a descriptor cannot give it.
-    if matches!(
-        codesign::executable_format(&file),
-        Ok(ExecutableFormat::Script)
-    ) {
-        return Ok(CheckedLaunch {
-            exec: CheckedExec::Path {
-                path: PathBuf::from(std::ffi::OsStr::from_bytes(&l.executable.path)),
-                confirm: None,
-            },
-            cwd,
-        });
     }
     let exec = exec_for(l, file)?;
     Ok(CheckedLaunch { exec, cwd })
@@ -625,9 +768,17 @@ pub(crate) fn sha256_of_image(
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn exec_for(l: &RegisteredLaunch, file: File) -> Result<CheckedExec, CheckError> {
     drop(file);
-    let confirm = match (&l.executable.digest, l.strength) {
-        (CodeDigest::CdHash { cdhash, .. }, _) => Some(cdhash.clone()),
-        (CodeDigest::Sha256(_), _) => None,
+    let confirm = match &l.executable.digest {
+        CodeDigest::CdHash {
+            cdhash,
+            team,
+            identifier,
+        } => Some(ExpectedCode {
+            cdhash: cdhash.clone(),
+            identifier: identifier.clone(),
+            team: team.clone(),
+        }),
+        CodeDigest::Sha256(_) => None,
     };
     if confirm.is_some() {
         // As on Linux: after the check, before the runner starts.
@@ -698,6 +849,200 @@ mod tests {
             ResolveError::NotFound
         );
         assert!(resolve(&decl(&["./x"]), &dir, vec![], [5; 16], 1).is_err());
+    }
+
+    fn script(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn argv_of(l: &RegisteredLaunch) -> Vec<String> {
+        l.argv
+            .iter()
+            .map(|a| String::from_utf8(a.clone()).unwrap())
+            .collect()
+    }
+
+    /// What runs is what was checked: an entry file named through a link
+    /// runs by the file's own path, so the link pointed elsewhere changes
+    /// nothing that runs; a `#!` file runs through its interpreter,
+    /// checked, with the line's option checked as the interpreter's own,
+    /// and an `env` line's interpreter found once, at registration; a
+    /// package runner that is a `#!` file runs the same way; an
+    /// interpreter that is itself a `#!` file (a shim) is refused.
+    ///
+    /// Mutations checked: the declared entry path kept in the argv (the
+    /// previous `argv: decl.argv`): the argv names the link, and this
+    /// fails; a `#!` file run by its path (the previous `CheckedExec::Path`
+    /// of the entry): the executable is not the interpreter, and this
+    /// fails; the line's option not checked: `#!/bin/sh -c` registers, and
+    /// this fails.
+    #[test]
+    fn what_runs_is_the_file_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let sh = std::fs::canonicalize("/bin/sh").unwrap();
+        let real = dir.join("server.sh");
+        script(&real, "#!/bin/sh\nexit 0\n");
+        let link = dir.join("link.sh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let l = resolve(
+            &decl(&["sh", link.to_str().unwrap(), "--port"]),
+            &dir,
+            vec![],
+            [7; 16],
+            1,
+        )
+        .unwrap();
+        assert_eq!(argv_of(&l), vec!["sh", real.to_str().unwrap(), "--port"]);
+        assert_eq!(l.entry.as_ref().unwrap().path, real.as_os_str().as_bytes());
+        let other = dir.join("other.sh");
+        script(&other, "#!/bin/sh\nexit 9\n");
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        check(&l).unwrap();
+        // A `#!` file, directly: its interpreter runs it, explicitly.
+        let direct = dir.join("direct.sh");
+        script(&direct, "#!/bin/sh -u\nexit 0\n");
+        let l = resolve(
+            &decl(&[direct.to_str().unwrap(), "x"]),
+            &dir,
+            vec![],
+            [8; 16],
+            1,
+        )
+        .unwrap();
+        assert_eq!(l.class, LaunchClass::Script);
+        assert_eq!(l.executable.path, sh.as_os_str().as_bytes());
+        assert_eq!(
+            argv_of(&l),
+            vec!["/bin/sh", "-u", direct.to_str().unwrap(), "x"]
+        );
+        check(&l).unwrap();
+        // The line's option, checked.
+        let loads = dir.join("loads.sh");
+        script(&loads, "#!/bin/sh -c\nexit 0\n");
+        assert_eq!(
+            resolve(&decl(&[loads.to_str().unwrap()]), &dir, vec![], [9; 16], 1).unwrap_err(),
+            ResolveError::Decl(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+        let two = dir.join("two.sh");
+        script(&two, "#!/bin/sh -u -x\nexit 0\n");
+        assert_eq!(
+            resolve(&decl(&[two.to_str().unwrap()]), &dir, vec![], [9; 16], 1).unwrap_err(),
+            ResolveError::Unsupported
+        );
+        // `env NAME`: NAME found once, on the declared PATH.
+        let tools = dir.join("tools");
+        std::fs::create_dir(&tools).unwrap();
+        std::fs::copy(&sh, tools.join("myinterp")).unwrap();
+        let via_env = dir.join("env.sh");
+        script(&via_env, "#!/usr/bin/env myinterp\nexit 0\n");
+        let mut d = decl(&[via_env.to_str().unwrap()]);
+        d.path_env = Some(format!("{}:/usr/bin:/bin", tools.display()));
+        let l = resolve(&d, &dir, vec![], [10; 16], 1).unwrap();
+        assert_eq!(
+            l.executable.path,
+            tools.join("myinterp").as_os_str().as_bytes()
+        );
+        assert_eq!(argv_of(&l)[0], tools.join("myinterp").to_str().unwrap());
+        // A package runner that is a `#!` file.
+        script(&tools.join("npx"), "#!/bin/sh\nexit 0\n");
+        let mut d = decl(&["npx", "-y", "pkg"]);
+        d.path_env = Some(tools.to_str().unwrap().to_owned());
+        let l = resolve(&d, &dir, vec![], [11; 16], 1).unwrap();
+        assert_eq!(l.class, LaunchClass::PackageRunner);
+        assert_eq!(l.executable.path, sh.as_os_str().as_bytes());
+        assert_eq!(
+            argv_of(&l),
+            vec!["/bin/sh", tools.join("npx").to_str().unwrap(), "-y", "pkg"]
+        );
+        check(&l).unwrap();
+        // An interpreter that is a shim: refused.
+        script(&tools.join("node"), "#!/bin/sh\nexit 0\n");
+        let js = dir.join("s.js");
+        std::fs::write(&js, "1\n").unwrap();
+        let mut d = decl(&["node", js.to_str().unwrap()]);
+        d.path_env = Some(tools.to_str().unwrap().to_owned());
+        assert_eq!(
+            resolve(&d, &dir, vec![], [12; 16], 1).unwrap_err(),
+            ResolveError::Unsupported
+        );
+    }
+
+    /// A native program given a file (an argument, an `--option=value`,
+    /// absolute or relative to its working directory) may run what the
+    /// file holds: `checked_at_rest`, never `bound`. The positive control:
+    /// the same program with no file argument is `bound`.
+    ///
+    /// Mutation checked: the file arguments not looked at (the previous
+    /// strength rule): the launch given a script file is `bound`, and this
+    /// fails.
+    #[test]
+    fn a_native_program_given_a_file_is_checked_at_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let prog = dir.join("prog");
+        std::fs::copy("/bin/ls", &prog).unwrap();
+        let file = dir.join("plugin.conf");
+        std::fs::write(&file, "x\n").unwrap();
+        let p = prog.to_str().unwrap();
+        let bound = resolve(&decl(&[p, "--port", "1"]), &dir, vec![], [13; 16], 1).unwrap();
+        assert_eq!(bound.class, LaunchClass::Native);
+        assert_eq!(bound.strength, BindingStrength::Bound);
+        let conf = format!("--config={}", file.display());
+        for argv in [
+            vec![p, file.to_str().unwrap()],
+            vec![p, conf.as_str()],
+            vec![p, "plugin.conf"],
+        ] {
+            let l = resolve(&decl(&argv), &dir, vec![], [14; 16], 1).unwrap();
+            assert_eq!(l.strength, BindingStrength::CheckedAtRest, "{argv:?}");
+        }
+    }
+
+    /// A started program is the expected code only when its cdhash, its
+    /// signing identifier and its Team ID are each the expected one: an
+    /// ad hoc build (no Team ID) is not a Developer ID one, nor the other
+    /// way round, and an expectation without an identifier matches
+    /// nothing. Mutations checked: the Team ID compared only when one is
+    /// expected (the previous `team.is_none() || ...`): the Developer ID
+    /// program passes for an ad hoc expectation, and this fails; the
+    /// identifier not compared: the renamed identity passes, and this
+    /// fails.
+    #[test]
+    fn the_expected_code_is_compared_in_full() {
+        let sig = |id: &str, team: Option<&str>| envcloak_sys::CodeSignature {
+            identifier: id.to_owned(),
+            team_id: team.map(str::to_owned),
+            cdhash: Some([7; envcloak_sys::CDHASH_LEN]),
+        };
+        let adhoc = ExpectedCode {
+            cdhash: vec![7; 20],
+            identifier: Some("envcloak".to_owned()),
+            team: None,
+        };
+        assert!(adhoc.matches(&sig("envcloak", None)));
+        assert!(!adhoc.matches(&sig("envcloak", Some("TEAM123456"))));
+        assert!(!adhoc.matches(&sig("other", None)));
+        let mut other_hash = sig("envcloak", None);
+        other_hash.cdhash = Some([8; envcloak_sys::CDHASH_LEN]);
+        assert!(!adhoc.matches(&other_hash));
+        let mut unread = sig("envcloak", None);
+        unread.cdhash = None;
+        assert!(!adhoc.matches(&unread));
+        let team = ExpectedCode {
+            team: Some("TEAM123456".to_owned()),
+            ..adhoc.clone()
+        };
+        assert!(team.matches(&sig("envcloak", Some("TEAM123456"))));
+        assert!(!team.matches(&sig("envcloak", None)));
+        assert!(!team.matches(&sig("envcloak", Some("OTHER12345"))));
+        let none = ExpectedCode {
+            identifier: None,
+            ..adhoc
+        };
+        assert!(!none.matches(&sig("envcloak", None)));
     }
 
     /// The check passes for the file as registered and is
