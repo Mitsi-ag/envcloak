@@ -324,23 +324,27 @@ fn the_probe_runs_beside_the_persons_daemon_and_touches_nothing_of_theirs() {
     assert_eq!(p["kept"], true, "{p:#}");
 
     // The person's daemon saw no connection; then one command of theirs
-    // is counted (positive control).
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        m.connections(),
-        opened_before,
-        "the probe connected to the person's daemon"
-    );
-    let listed = m.h.human(&home, &["pending", "--json"], &[], &[]);
-    assert_eq!(listed.code, 0, "{}", listed.all());
-    let end = Instant::now() + Duration::from_secs(30);
-    while m.connections() == opened_before && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(50));
+    // is counted (positive control). The trace is the test build's
+    // (release binaries have none: the release job runs this test on
+    // them, where this check is left to the test build's run).
+    if m.h.test_build() {
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            m.connections(),
+            opened_before,
+            "the probe connected to the person's daemon"
+        );
+        let listed = m.h.human(&home, &["pending", "--json"], &[], &[]);
+        assert_eq!(listed.code, 0, "{}", listed.all());
+        let end = Instant::now() + Duration::from_secs(30);
+        while m.connections() == opened_before && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            m.connections() > opened_before,
+            "the trace counts connections"
+        );
     }
-    assert!(
-        m.connections() > opened_before,
-        "the trace counts connections"
-    );
 
     // The vault and everything in the home, the mode-0000 sentinels
     // included, as they were; the only new file is the result cache.
