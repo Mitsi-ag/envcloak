@@ -47,7 +47,7 @@ The P-256 signatures the app makes with its Secure Enclave key, and the daemon v
 
 The app never waits on an open connection: it polls `status` once a second, each call on its own connection, at most two open at once (D3-09).
 
-Every string the daemon sends reaches a view escaped (M3 plan §5 rule 4). The rule M3-02's `check-swift.sh` enforces for this (`daemon-text`) expects the client to hold such text as a `DaemonText`, whose escaped form (`Escape.display`) is what views show and whose raw form, `.unescaped`, only the files listed for `daemon-text` in `apps/macos/security/check-swift-allowlist.txt` read. M3-03 defines the type to that contract; until it does, nothing in the tree reads `.unescaped`.
+Every string the daemon sends reaches a view escaped (M3 plan §5 rule 4). The rule M3-02's `check-swift.sh` enforces for this (`daemon-text`) expects the client to hold such text as a `DaemonText`, whose escaped form (`Escape.display`) is what views show and whose raw form, `.unescaped`, only the files listed for `daemon-text` in `apps/macos/security/check-swift-allowlist.txt` read. M3-03 defines the type to that contract. The client has no product call sites that read `.unescaped`; later request-building surfaces add reviewed entries when needed. The implemented scope, mutations, oracle limits and test command are recorded in [M3-03 evidence](M3-03.md).
 
 ## Signing tiers (D3-05)
 

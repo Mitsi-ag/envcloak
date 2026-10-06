@@ -29,7 +29,7 @@ public actor DaemonClient {
     #endif
 
     public func cancelPending() {
-        generation &+= 1
+        if generation < UInt64.max { generation += 1 }
         for cancel in cancellations.values { cancel() }
     }
 
@@ -50,7 +50,7 @@ public actor DaemonClient {
             if waiting[slot].isEmpty { busy[slot] = false }
             else { waiting[slot].removeFirst().resume() }
         }
-        guard !Task.isCancelled, generation == captured, serial < UInt64.max else { throw .protocolError }
+        guard !Task.isCancelled, generation == captured, generation < UInt64.max, serial < UInt64.max else { throw .protocolError }
         serial += 1
         let id = serial
         let box = MethodBox(consume method)

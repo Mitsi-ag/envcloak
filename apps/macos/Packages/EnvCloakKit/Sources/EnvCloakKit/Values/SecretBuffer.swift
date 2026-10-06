@@ -23,6 +23,9 @@ public struct SecretBuffer: ~Copyable, @unchecked Sendable {
               p != MAP_FAILED else { throw .protocolError }
         allocation = allocated
         region = p
+        #if DEBUG
+        observer = BufferProbe.observer?.callback
+        #endif
         // Best effort: failure to lock pages is a documented limit.
         _ = mlock(region, allocation)
     }
@@ -97,3 +100,14 @@ private enum MemoryHardening {
         return setrlimit(RLIMIT_CORE, &limit) == 0
     }()
 }
+
+#if DEBUG
+// Task-local, so one parallel test never observes another test's buffers.
+final class BufferObserver: Sendable {
+    let callback: @Sendable (UnsafeRawBufferPointer) -> Void
+    init(_ callback: @escaping @Sendable (UnsafeRawBufferPointer) -> Void) { self.callback = callback }
+}
+enum BufferProbe {
+    @TaskLocal static var observer: BufferObserver?
+}
+#endif
