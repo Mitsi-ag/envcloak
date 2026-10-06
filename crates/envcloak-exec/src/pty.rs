@@ -481,6 +481,9 @@ impl Relay<'_, '_> {
     /// is drained until its end or the cutoff.
     fn monitor_lost(&mut self) {
         self.lost = true;
+        // A test writer can produce its next batch after loss is known,
+        // before the drain starts. No pause exists in a release build.
+        envcloak_sys::pause_point("exec.pty.monitor-lost");
         self.deadline = Some(Instant::now() + DRAIN_LIMIT);
         self.raw_wanted = false;
         if let Some(g) = self.guard.as_ref() {
@@ -693,10 +696,7 @@ impl Relay<'_, '_> {
 
     /// Wipes the key buffer and forgets what it held.
     fn drop_keys(&mut self) {
-        // The slice, not the vector: its length stays INPUT_CHUNK.
-        self.keys.as_mut_slice().zeroize();
-        self.keys_at = 0;
-        self.keys_len = 0;
+        discard_keys(&mut self.keys, &mut self.keys_at, &mut self.keys_len);
     }
 
     /// Ends the run: the outer terminal back as it was, the master side
@@ -875,6 +875,14 @@ fn write_keys_to(
     Ok(())
 }
 
+/// Discards unread input on every end path, including bytes never sent.
+fn discard_keys(keys: &mut [u8], at: &mut usize, len: &mut usize) {
+    // The slice, not the vector: its length stays INPUT_CHUNK for reuse.
+    keys.zeroize();
+    *at = 0;
+    *len = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,6 +975,23 @@ mod tests {
         write_keys_to(&mut rest, &mut keys, &mut at, original.len()).unwrap();
         assert_eq!(rest, original[2..]);
         assert_eq!(keys, [0; 6]);
+    }
+
+    #[test]
+    fn discarding_input_wipes_unsent_bytes_and_resets_both_cursors() {
+        for (mut at, mut len) in [(0, 6), (2, 6), (0, 0), (6, 6), (0, 3)] {
+            let mut keys = Zeroizing::new(vec![0x61, 0xff, 0, 0x1b, 0xe2, 0x82]);
+            keys[..at].zeroize();
+            discard_keys(&mut keys, &mut at, &mut len);
+            assert_eq!(&keys[..], &[0; 6], "discard retained input");
+            assert_eq!((at, len), (0, 0), "discard retained a cursor");
+            // The allocation remains writable at its original size.
+            keys.copy_from_slice(&[0x62, 0x1a, 0x7f, 0xc3, 0xa9, 0]);
+            len = keys.len();
+            discard_keys(&mut keys, &mut at, &mut len);
+            assert_eq!(&keys[..], &[0; 6]);
+            assert_eq!((at, len), (0, 0));
+        }
     }
 
     #[test]
