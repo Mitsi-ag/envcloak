@@ -3,7 +3,7 @@
 /// cancellation/lock discards earlier completions, even if already queued.
 public actor DaemonClient {
     private let directory: String
-    private let timeout: Duration
+    private let timeout: Duration?
     private var serial: UInt64 = 0
     private var generation: UInt64 = 0
     private var busy = [false, false]
@@ -14,14 +14,21 @@ public actor DaemonClient {
     private var cancellations: [UInt64: @Sendable () -> Void] = [:]
 
     public init() throws(EnvCloakError) {
-        do { directory = try UserPaths.runtime(); timeout = .seconds(10) }
+        do { directory = try UserPaths.runtime(); timeout = nil }
         catch let error as EnvCloakError { throw error }
         catch { throw .protocolError }
     }
 
     // The fixture path is deliberately not a public runtime override.
-    init(directory: String, timeout: Duration = .seconds(2)) {
+    init(directory: String, timeout: Duration? = .seconds(2)) {
         self.directory = directory; self.timeout = timeout
+    }
+
+    nonisolated static func methodTimeout(_ name: String) -> Duration {
+        switch name {
+        case "audit.verify", "backup.create": .seconds(300)
+        default: .seconds(10)
+        }
     }
 
     #if DEBUG
@@ -55,15 +62,26 @@ public actor DaemonClient {
         let id = serial
         let box = MethodBox(consume method)
         let directory = directory
-        let timeout = timeout
-        let worker = Task.detached { () throws -> M.Output in
+        let timeout = timeout ?? Self.methodTimeout(M.name)
+        let operation: @Sendable () throws -> M.Output = {
             let connection = try Connection(directory: directory, timeout: timeout)
             guard !Task.isCancelled else { throw EnvCloakError.protocolError }
             let request = try box.method.request(id: id)
             try request.write(using: connection.write)
             let response = try Frame.read(using: connection.read)
-            return try M.response(response, id: id)
+            let result = try M.response(response, id: id)
+            #if DEBUG
+            PeerProbe.hooks?.beforeResult()
+            #endif
+            try connection.checkDeadline()
+            return result
         }
+        #if DEBUG
+        let hooks = PeerProbe.hooks
+        let worker = Task.detached { try PeerProbe.$hooks.withValue(hooks, operation: operation) }
+        #else
+        let worker = Task.detached(operation: operation)
+        #endif
         cancellations[id] = { worker.cancel() }
         defer { cancellations[id] = nil }
         do {

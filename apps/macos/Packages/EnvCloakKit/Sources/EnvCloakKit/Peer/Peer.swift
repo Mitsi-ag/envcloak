@@ -21,6 +21,28 @@ struct PeerSnapshot {
     let socket: stat
 }
 
+#if DEBUG
+enum PeerNode: Sendable { case directory, parent, socket }
+// Boxed task-local hooks never exist in Release. DaemonClient carries the
+// current hooks explicitly into its detached worker; no global overrides.
+final class PeerTestHooks: Sendable {
+    let peerUID: uid_t?
+    let metadata: @Sendable (PeerNode, inout stat) -> Void
+    let afterConnect: @Sendable () throws -> Void
+    let beforeResult: @Sendable () -> Void
+    let now: (@Sendable () -> ContinuousClock.Instant)?
+    init(peerUID: uid_t? = nil,
+         metadata: @escaping @Sendable (PeerNode, inout stat) -> Void = { _, _ in },
+         afterConnect: @escaping @Sendable () throws -> Void = {},
+         beforeResult: @escaping @Sendable () -> Void = {},
+         now: (@Sendable () -> ContinuousClock.Instant)? = nil) {
+        self.peerUID = peerUID; self.metadata = metadata
+        self.afterConnect = afterConnect; self.beforeResult = beforeResult; self.now = now
+    }
+}
+enum PeerProbe { @TaskLocal static var hooks: PeerTestHooks? }
+#endif
+
 enum Peer {
     static func check(directory: String, uid: uid_t) throws -> PeerSnapshot {
         guard directory.hasPrefix("/"), !directory.utf8.contains(0),
@@ -31,19 +53,28 @@ enum Peer {
         guard path.utf8.count < 104 else { throw EnvCloakError.daemonUnverified(.path) }
         var dir = stat()
         guard lstat(directory, &dir) == 0 else { throw failure(.directoryType) }
+        #if DEBUG
+        PeerProbe.hooks?.metadata(.directory, &dir)
+        #endif
         guard dir.st_mode & S_IFMT == S_IFDIR else { throw EnvCloakError.daemonUnverified(.directoryType) }
         guard dir.st_uid == uid else { throw EnvCloakError.daemonUnverified(.directoryOwner) }
         guard dir.st_mode & 0o022 == 0 else { throw EnvCloakError.daemonUnverified(.directoryMode) }
         let parent = String(directory.prefix(upTo: directory.lastIndex(of: "/")!))
         var p = stat()
-        guard stat(parent.isEmpty ? "/" : parent, &p) == 0,
-              p.st_mode & S_IFMT == S_IFDIR,
+        guard stat(parent.isEmpty ? "/" : parent, &p) == 0 else { throw EnvCloakError.daemonUnverified(.parent) }
+        #if DEBUG
+        PeerProbe.hooks?.metadata(.parent, &p)
+        #endif
+        guard p.st_mode & S_IFMT == S_IFDIR,
               p.st_uid == uid || p.st_uid == 0,
               p.st_mode & 0o022 == 0 || p.st_mode & S_ISVTX != 0 else {
             throw EnvCloakError.daemonUnverified(.parent)
         }
         var sock = stat()
         guard lstat(path, &sock) == 0 else { throw failure(.socketType) }
+        #if DEBUG
+        PeerProbe.hooks?.metadata(.socket, &sock)
+        #endif
         guard sock.st_mode & S_IFMT == S_IFSOCK else { throw EnvCloakError.daemonUnverified(.socketType) }
         guard sock.st_uid == uid else { throw EnvCloakError.daemonUnverified(.socketOwner) }
         guard sock.st_mode & 0o777 == 0o600 else { throw EnvCloakError.daemonUnverified(.socketMode) }
@@ -58,8 +89,8 @@ enum Peer {
         }
     }
 
-    static func failure(_ check: PeerCheck) -> EnvCloakError {
-        errno == ENOENT || errno == ECONNREFUSED ? .daemonUnavailable : .daemonUnverified(check)
+    static func failure(_ check: PeerCheck, code: Int32 = errno) -> EnvCloakError {
+        code == ENOENT || code == ECONNREFUSED || code == ETIMEDOUT ? .daemonUnavailable : .daemonUnverified(check)
     }
 
     static func unchanged(_ a: PeerSnapshot, _ b: PeerSnapshot) -> Bool {
@@ -70,20 +101,35 @@ enum Peer {
     }
 }
 
-/// Owned descriptor, confined to a worker. All I/O shares one monotonic
-/// deadline; poll also observes cancellation, including during connect.
+/// Owned descriptor, confined to a worker. Connect has its own bound;
+/// request/response I/O shares a method deadline and observes cancellation.
 final class Connection {
     let fd: Int32
-    let deadline: ContinuousClock.Instant
+    private(set) var deadline: ContinuousClock.Instant
+
+    private static var now: ContinuousClock.Instant {
+        #if DEBUG
+        if let now = PeerProbe.hooks?.now { return now() }
+        #endif
+        return ContinuousClock.now
+    }
+
+    private static func expectedPeerUID(_ uid: uid_t) -> uid_t {
+        #if DEBUG
+        return PeerProbe.hooks?.peerUID ?? uid
+        #else
+        return uid
+        #endif
+    }
 
     init(directory: String, timeout: Duration, uid: uid_t = geteuid()) throws {
-        deadline = ContinuousClock.now.advanced(by: timeout)
+        deadline = Self.now.advanced(by: min(timeout, .seconds(10)))
         let before = try Peer.check(directory: directory, uid: uid)
         fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw EnvCloakError.daemonUnavailable }
         do {
             var noSignal: Int32 = 1
-            var time = timeval(tv_sec: 10, tv_usec: 0)
+            var time = timeval(tv_sec: 300, tv_usec: 0)
             guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0,
                   fcntl(fd, F_SETFL, O_NONBLOCK) == 0,
                   setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, socklen_t(MemoryLayout.size(ofValue: noSignal))) == 0,
@@ -105,18 +151,22 @@ final class Connection {
                     Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
                 }
             }
-            if result != 0 {
-                guard errno == EINPROGRESS else { throw Peer.failure(.socketType) }
-                try ready(POLLOUT)
-                var error: Int32 = 0
-                var size = socklen_t(MemoryLayout.size(ofValue: error))
-                guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0, error == 0 else {
-                    throw EnvCloakError.daemonUnavailable
-                }
+            let connectError = errno
+            #if DEBUG
+            try PeerProbe.hooks?.afterConnect()
+            #endif
+            guard result == 0 || connectError == EINPROGRESS else { throw Peer.failure(.socketType, code: connectError) }
+            try ready(POLLOUT, timeoutError: .daemonUnavailable)
+            var error: Int32 = 0
+            var size = socklen_t(MemoryLayout.size(ofValue: error))
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0, error == 0 else {
+                throw EnvCloakError.daemonUnavailable
             }
-            try Peer.verifyUID(fd: fd, expected: uid)
+            try Peer.verifyUID(fd: fd, expected: Self.expectedPeerUID(uid))
             let after = try Peer.check(directory: directory, uid: uid)
             guard Peer.unchanged(before, after) else { throw EnvCloakError.daemonUnverified(.changed) }
+            guard Self.now < deadline else { throw EnvCloakError.daemonUnavailable }
+            deadline = Self.now.advanced(by: timeout)
             // M3-10 adds the pinned audit-token code-identity check here,
             // before this connection can be used by any method.
         } catch {
@@ -128,14 +178,21 @@ final class Connection {
 
     deinit { Darwin.close(fd) }
 
-    func ready(_ event: Int32) throws {
+    func checkDeadline() throws {
+        guard !Task.isCancelled, Self.now < deadline else { throw EnvCloakError.protocolError }
+    }
+
+    func ready(_ event: Int32, timeoutError: EnvCloakError = .protocolError) throws {
         while true {
-            guard !Task.isCancelled, ContinuousClock.now < deadline else { throw EnvCloakError.protocolError }
-            let left = ContinuousClock.now.duration(to: deadline).components
+            guard !Task.isCancelled else { throw EnvCloakError.protocolError }
+            guard Self.now < deadline else { throw timeoutError }
+            let left = Self.now.duration(to: deadline).components
             let millis = max(1, min(50, left.seconds * 1000 + left.attoseconds / 1_000_000_000_000_000))
             var descriptor = pollfd(fd: fd, events: Int16(event), revents: 0)
             let result = poll(&descriptor, 1, Int32(millis))
             if result > 0 {
+                guard !Task.isCancelled else { throw EnvCloakError.protocolError }
+                guard Self.now < deadline else { throw timeoutError }
                 guard descriptor.revents & Int16(POLLNVAL) == 0 else { throw EnvCloakError.protocolError }
                 return
             }
