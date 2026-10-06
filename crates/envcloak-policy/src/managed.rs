@@ -13,7 +13,7 @@
 //!   ([`is_code_loading_option`]) is [`DeclError::CodeSelecting`], and the
 //!   server is reported as manual. The names are compared as the dynamic
 //!   loader and the interpreters read them, byte for byte; case matters,
-//!   as it does to them.
+//!   as it does to them. npm configuration names are case insensitive.
 //! - [`classify_argv`]: a package runner or another launcher whose code is
 //!   chosen when it starts ([`PACKAGE_RUNNERS`]: `npx`, `uv`, `docker`,
 //!   `java` and the rest, in any of their forms: `uv --directory d run`,
@@ -67,8 +67,6 @@ pub const PASSTHROUGH: [&str; 6] = ["HOME", "USER", "LOGNAME", "LANG", "TZ", "TM
 pub const CODE_SELECTING: &[&str] = &[
     "NODE_OPTIONS",
     "NODE_PATH",
-    "npm_config_node_options",
-    "NPM_CONFIG_NODE_OPTIONS",
     "BUN_OPTIONS",
     "BUN_BE_BUN",
     "DENO_DIR",
@@ -152,6 +150,16 @@ pub const CODE_SELECTING_PREFIXES: [&str; 3] = ["LUA_INIT", "LUA_PATH", "LUA_CPA
 /// of [`CODE_SELECTING`], or one of [`CODE_SELECTING_PREFIXES`] in any
 /// version.
 pub fn is_code_selecting(name: &str) -> bool {
+    // npm normalizes both the prefix and the key without regard to case.
+    // Unknown configuration may select code in a newer npm release.
+    if let Some(key) = name.get(11..).filter(|_| {
+        name.get(..11)
+            .is_some_and(|p| p.eq_ignore_ascii_case("npm_config_"))
+    }) {
+        return !["registry", "cache", "fund", "audit", "update_notifier"]
+            .iter()
+            .any(|allowed| key.eq_ignore_ascii_case(allowed));
+    }
     LOADER_PREFIXES
         .iter()
         .chain(CODE_SELECTING_PREFIXES.iter())
@@ -176,6 +184,9 @@ pub const INTERPRETERS: &[&str] = &[
     "nodejs",
     "python",
     "pypy",
+    "graalpy",
+    "micropython",
+    "truffleruby",
     "bun",
     "deno",
     "ruby",
@@ -207,8 +218,22 @@ pub const INTERPRETERS: &[&str] = &[
 
 /// The interpreters known by their name with a version after it.
 const VERSIONED: &[&str] = &[
-    "node", "nodejs", "python", "pypy", "bun", "deno", "ruby", "perl", "php", "lua", "tclsh",
-    "wish", "guile",
+    "node",
+    "nodejs",
+    "python",
+    "pypy",
+    "bun",
+    "deno",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "tclsh",
+    "wish",
+    "guile",
+    "graalpy",
+    "micropython",
+    "truffleruby",
 ];
 
 /// The launchers whose code is chosen when they start, from a package, a
@@ -304,6 +329,7 @@ const INTERPRETER_LOADING_SHORT: [char; 7] = ['i', 's', 'd', 'l', 'z', 'C', 'L']
 fn stem_loading_short(stem: &str) -> &'static [char] {
     match stem {
         "julia" => &['J'],
+        "php" => &['f', 'F', 'B', 'R', 'S', 'a'],
         "racket" => &['t', 'f', 'u', 'k'],
         "elixir" => &['S'],
         "swift" => &['F'],
@@ -411,7 +437,7 @@ fn value_short(stem: &str) -> &'static [char] {
         "python" | "pypy" => &['W', 'X'],
         "ruby" => &['F', 'K', 'T'],
         "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish" => &['o', 'O'],
-        "php" => &['f', 't'],
+        "php" => &['t'],
         "julia" => &['t', 'p', 'O', 'g'],
         _ => &[],
     }
@@ -460,7 +486,7 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
     let cluster = arg.strip_prefix('-').unwrap_or(arg);
     let values = value_short(stem);
     let own = stem_loading_short(stem);
-    let mut letters = cluster.chars().peekable();
+    let mut letters = cluster.chars();
     while let Some(c) = letters.next() {
         if CODE_LOADING_SHORT.contains(&c)
             || INTERPRETER_LOADING_SHORT.contains(&c)
@@ -471,11 +497,23 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
         if values.contains(&c) {
             // The rest of the cluster is the value; none, and the next
             // argument is.
-            return if letters.peek().is_some() {
-                Ok(())
-            } else {
-                Err(DeclError::NoEntry)
+            let value: String = letters.collect();
+            if value.is_empty() {
+                return Err(DeclError::NoEntry);
+            }
+            // Python's -X may import presite code; a dotted -W category
+            // imports its module. Accept only these fixed harmless forms.
+            let safe = match (stem, c) {
+                ("python" | "pypy", 'X') => {
+                    matches!(value.as_str(), "dev" | "utf8" | "utf8=0" | "utf8=1")
+                }
+                ("python" | "pypy", 'W') => matches!(
+                    value.as_str(),
+                    "default" | "error" | "ignore" | "always" | "module" | "once"
+                ),
+                _ => true,
             };
+            return if safe { Ok(()) } else { loads };
         }
     }
     Ok(())
@@ -620,31 +658,50 @@ fn base(arg: &str) -> &str {
     arg.rsplit('/').next().unwrap_or(arg)
 }
 
-/// CPython's ABI flags, which its executables' names end in after the
-/// version (`sys.abiflags`): `t` free-threaded (3.13 and later), `d` a
-/// debug build, `m` pymalloc (up to 3.7), `u` wide Unicode (up to 3.2).
-const ABI_FLAGS: &str = "tdmu";
-
 /// The interpreter family `name` is, by its name: one of [`INTERPRETERS`],
 /// or one of [`VERSIONED`] with a version after it (`python3.12`,
-/// `node22`), which may end in CPython's ABI flags ([`ABI_FLAGS`]:
+/// `node22`), which may end in CPython's ABI flags (for example
 /// `python3.14t`, a free-threaded build; `python3.13d`, a debug build;
 /// `python3.13td`; `python3.7m`) and in Debian's `-dbg`
-/// (`python3.12-dbg`). `None` for any other name. The match leans towards
+/// (`python3.12-dbg`). Architecture suffixes, pythonw, alternate Python
+/// and Ruby implementations, and PHP SAPI launchers use the same policy.
+/// Once a version starts, unknown build suffixes also count. The match leans towards
 /// an interpreter: a name it missed would pass as a native program, whose
 /// class binds what runs, while the interpreter's code is chosen by its
 /// arguments (review of M2-27: `python3.14t` was a program).
 fn interpreter_family(name: &str) -> Option<&str> {
+    let name = ["-intel64", "-arm64", "-universal2", "-x86_64"]
+        .iter()
+        .find_map(|suffix| name.strip_suffix(suffix))
+        .unwrap_or(name);
+    let name = name.strip_suffix("-dbg").unwrap_or(name);
+    // PHP distributions put the SAPI name on either side of the version.
+    let name = name
+        .strip_suffix("-cgi")
+        .or_else(|| name.strip_suffix("-fpm"))
+        .filter(|n| n.starts_with("php"))
+        .unwrap_or(name);
+    for (alias, family) in [
+        ("pythonw", "python"),
+        ("php-cgi", "php"),
+        ("php-fpm", "php"),
+        ("graalpy", "python"),
+        ("micropython", "python"),
+        ("truffleruby", "ruby"),
+    ] {
+        if let Some(version) = name.strip_prefix(alias) {
+            if version.is_empty() || version.starts_with(|c: char| c.is_ascii_digit()) {
+                return Some(family);
+            }
+        }
+    }
     if INTERPRETERS.contains(&name) {
         return Some(name);
     }
-    let versioned = name.strip_suffix("-dbg").unwrap_or(name);
-    let versioned = versioned.trim_end_matches(|c: char| ABI_FLAGS.contains(c));
-    let stem = versioned.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    (stem.len() < versioned.len()
-        && VERSIONED.contains(&stem)
-        && versioned[stem.len()..].starts_with(|c: char| c.is_ascii_digit()))
-    .then_some(stem)
+    VERSIONED.iter().copied().find(|stem| {
+        name.strip_prefix(stem)
+            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 /// The first argument of `argv` after `from` that is not an option.
@@ -1313,6 +1370,7 @@ mod tests {
             &["perl", "-d:Trace", "/srv/s.pl"],
             &["lua", "-l", "mod", "/srv/s.lua"],
             &["php", "-d", "auto_prepend_file=/x.php", "/srv/s.php"],
+            &["php", "-f", "/srv/s.php"],
             &["node", "-C", "dev", "/srv/s.js"],
             &["node", "--env-file", "/srv/.env", "/srv/s.js"],
             &["deno", "run", "--config", "/srv/c.json", "/srv/s.ts"],
@@ -1334,7 +1392,6 @@ mod tests {
             &["python3", "-uW", "/srv/other.py", "/srv/s.py"],
             &["node", "--title", "/srv/other.js", "/srv/s.js"],
             &["bash", "-o", "/srv/other.sh", "/srv/s.sh"],
-            &["php", "-f", "/srv/s.php"],
             &["ruby", "--encoding", "/srv/other.rb", "/srv/s.rb"],
         ] {
             assert_eq!(
@@ -1383,6 +1440,158 @@ mod tests {
                 Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
                 "{name}"
             );
+        }
+    }
+
+    /// Mutation: accept every attached short value without checking its meaning.
+    #[test]
+    fn attached_values_cannot_select_unchecked_code() {
+        for (name, option) in [
+            ("php", "-f/other.php"),
+            ("php", "-nf/other.php"),
+            ("php", "-F/other.php"),
+            ("php", "-Bprint(1);"),
+            ("php", "-Rprint(1);"),
+            ("python3", "-Xpresite=observer"),
+            ("python3", "-uXpresite=observer"),
+            ("python3", "-Xfuture_option=x"),
+            ("python3", "-Wignore::observer.Warning"),
+        ] {
+            assert_eq!(
+                classify_argv(&decl(&[name, option, "/srv/entry"]).argv),
+                Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+                "{name} {option}"
+            );
+        }
+        for (name, option) in [
+            ("python3", "-Xdev"),
+            ("python3", "-Xutf8=1"),
+            ("python3", "-Wignore"),
+            ("ruby", "-F:"),
+            ("bash", "-oposix"),
+            ("julia", "-O2"),
+        ] {
+            assert_eq!(
+                classify_argv(&decl(&[name, option, "/srv/entry"]).argv),
+                Ok(ArgvClass::Interpreter { entry: 2 }),
+                "{name} {option}"
+            );
+        }
+    }
+
+    /// Mutation: omit alternate, architecture and build launcher names.
+    #[test]
+    fn native_interpreter_aliases_keep_interpreter_policy() {
+        for name in [
+            "python3.12-intel64",
+            "python3-intel64",
+            "python3.14t-arm64",
+            "python3.13td-universal2",
+            "python3.12-x86_64",
+            "pythonw",
+            "pythonw3",
+            "pythonw3.12",
+            "graalpy",
+            "graalpy3.12",
+            "micropython",
+            "truffleruby",
+            "truffleruby24.1",
+            "php-cgi",
+            "php-fpm",
+            "php8.4-cgi",
+            "php-cgi8.4",
+            "php8.4-fpm",
+            "php-fpm8.4",
+            "pypy3.11-v7.3.19",
+            "ruby3.4.0-preview1",
+            "node22-nightly",
+        ] {
+            for option in ["-m", "-c"] {
+                assert_eq!(
+                    classify_argv(&decl(&[name, option, "module"]).argv),
+                    Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+                    "{name} {option}"
+                );
+            }
+            assert_eq!(
+                classify_argv(&decl(&[name, "/srv/entry"]).argv),
+                Ok(ArgvClass::Interpreter { entry: 1 }),
+                "{name}"
+            );
+            assert_eq!(
+                refuse_disguised(
+                    &decl(&["server", "/srv/entry"]).argv,
+                    &format!("/opt/bin/{name}")
+                ),
+                Err(DeclError::Disguised),
+                "{name}"
+            );
+        }
+        for name in [
+            "pythond",
+            "python-server",
+            "nodemon",
+            "php-server",
+            "pythonwrench",
+        ] {
+            assert_eq!(
+                classify_argv(&decl(&[name]).argv),
+                Ok(ArgvClass::Program),
+                "{name}"
+            );
+        }
+    }
+
+    /// Mutation: compare npm configuration names only in the two exact cases.
+    #[test]
+    fn npm_configuration_is_case_insensitive_at_every_boundary() {
+        for name in [
+            "npm_config_node_options",
+            "NpM_cOnFiG_NoDe_OpTiOnS",
+            "npm_config_script_shell",
+            "NPM_CONFIG_USERCONFIG",
+            "Npm_Config_GlobalConfig",
+            "npm_config_prefix",
+            "npm_config_future_loader",
+        ] {
+            let mut d = decl(&["npx", "package"]);
+            d.env.push((name.into(), "fixture".into()));
+            assert_eq!(
+                check_declaration(&d),
+                Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
+                "{name}"
+            );
+            let changes = LaunchChanges {
+                set_env: d.env.clone(),
+                ..LaunchChanges::default()
+            };
+            assert_eq!(
+                apply_changes(&decl(&["npx", "package"]), &changes),
+                Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
+                "{name}"
+            );
+            assert!(
+                launch_environment(
+                    [(name.as_bytes(), b"fixture".as_slice())],
+                    b"/bin",
+                    &d.env,
+                    &[(name, b"fixture")]
+                )
+                .iter()
+                .all(|(n, _)| n != name.as_bytes())
+            );
+        }
+        let d = decl(&["server"]);
+        assert!(check_declaration(&d).is_ok());
+        for name in [
+            "NPM_CONFIG_REGISTRY",
+            "npm_config_cache",
+            "NpM_cOnFiG_FuNd",
+            "npm_config_audit",
+            "npm_config_update_notifier",
+            "MY_npm_config_userconfig",
+        ] {
+            assert!(!is_code_selecting(name), "{name}");
         }
     }
 
