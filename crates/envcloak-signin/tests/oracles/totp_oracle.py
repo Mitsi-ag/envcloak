@@ -150,6 +150,23 @@ def run_node(payload, env):
         raise RuntimeError("Node oracle unavailable") from None
 
 
+def decoding_cases():
+    # Independent standard-library encoding for every short seed length.
+    # Nonzero, non-ASCII bytes make even one-byte wipe observations useful.
+    alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    seed = bytes(128 + (111 + i * 37) % 128 for i in range(32))
+    rows = []
+    for length in range(1, 33):
+        value = seed[:length]
+        encoded = base64.b32encode(value).rstrip(b"=")
+        bad_tail = b""
+        if length % 5:
+            bad_tail = encoded[:-1] + bytes([alphabet[alphabet.index(encoded[-1]) + 1]])
+        rows.append(dict(seed=list(value), base32=list(encoded), bad_tail=list(bad_tail),
+                         percent=list(b"".join(f"%{b:02X}".encode() for b in value))))
+    return rows
+
+
 def main():
     rows, refs = cases()
     controls = mutation_checks(rows)
@@ -181,6 +198,12 @@ def main():
     else:
         assert not sys.argv[1:], "invalid argument"
         assert target.read_bytes() == data, "fixture drift"
+    decoding = (json.dumps(decoding_cases(), separators=(",", ":")) + "\n").encode()
+    target = HERE / "totp-decoding-cases.json"
+    if sys.argv[1:] == ["--write"]:
+        target.write_bytes(decoding)
+    else:
+        assert target.read_bytes() == decoding, "decoding fixture drift"
     print(f"TOTP oracle: {refs} RFC checks; {len(rows)} Python/Node comparisons; {len(controls)} mutant controls; {invalid} invalid controls; wrong-code positive control passed")
 
 if __name__ == "__main__":
