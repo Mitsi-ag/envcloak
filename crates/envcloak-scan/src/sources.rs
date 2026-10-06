@@ -281,9 +281,11 @@ pub(crate) fn inspect_include_siblings(
             .map(|root| (root, name))
             .map_err(|e| crate::root::io_kind(&e))
     });
-    // The include read reports a missing or unsafe parent once.
-    if let Ok((parent, name)) = parent {
-        inspect_siblings(&parent, Some(&name), budget, attempts, report);
+    match parent {
+        Ok((parent, name)) => inspect_siblings(&parent, Some(&name), budget, attempts, report),
+        // A later include read can succeed after this parent changes. Retain
+        // the discovery failure independently; duplicate issues are coalesced.
+        Err(e) => report.issue(root.path().join(rel), e.token()),
     }
 }
 
@@ -672,6 +674,56 @@ mod tests {
             assert_eq!(report.leftovers[0].inspection, expected);
             assert!(!report.complete());
             root.model_other_device();
+        }
+    }
+    #[test]
+    fn include_discovery_failure_survives_a_successful_later_read() {
+        use std::os::unix::fs::PermissionsExt;
+        for state in ["ready", "missing", "unreadable"] {
+            let d = tempfile::tempdir_in("/tmp").expect("fixture");
+            let root = crate::open_root(d.path()).expect("root");
+            let parent = d.path().join("nested");
+            if state != "missing" {
+                std::fs::create_dir(&parent).expect("parent");
+            }
+            if state == "unreadable" {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+                    .expect("permissions");
+            }
+            let mut report = ScanReport::default();
+            inspect_include_siblings(
+                &root,
+                Path::new("nested/values.env"),
+                Budget::default(),
+                &mut 1,
+                &mut report,
+            );
+            // Deterministic boundary between sibling discovery and include read:
+            // the previously missing or unreadable parent becomes readable.
+            if state == "missing" {
+                std::fs::create_dir(&parent).expect("late parent");
+            }
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+                .expect("restore permissions");
+            std::fs::write(parent.join("values.env"), b"A=fixtureZlateIncludeParent\n")
+                .expect("include");
+            let (bytes, _) =
+                crate::read_capped(&root, Path::new("nested/values.env"), crate::MAX_DOTENV)
+                    .expect("later read succeeds");
+            assert!(bytes.ct_eq(b"A=fixtureZlateIncludeParent\n"));
+            assert_eq!(
+                report.complete(),
+                state == "ready",
+                "include discovery failure disappeared after parent recovery"
+            );
+            if state != "ready" {
+                let reason = if state == "missing" {
+                    "not_found"
+                } else {
+                    "unreadable"
+                };
+                assert!(report.issues.iter().any(|i| i.reason == reason));
+            }
         }
     }
 }
