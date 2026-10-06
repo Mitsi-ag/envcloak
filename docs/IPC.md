@@ -646,7 +646,7 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 <!-- reservations:exit_token -->
 | Token | Task | Status | Use |
 |---|---|---|---|
-| `binding_absent` | M3-04 | reserved | `envcloak ref --unset NAME` for a name the manifest does not bind; exit 1, and nothing is changed |
+| `binding_absent` | M3-04 | landed | `envcloak ref --unset NAME` for a name the manifest does not bind; exit 1, and nothing is changed |
 | `declined` | M3-19 | reserved | `envcloak add --ask`: the person declined the paste sheet; exit 125. J5's `envcloak reveal` uses it again for a declined reveal |
 | `expired` | M3-19 | reserved | `envcloak add --ask`: the ask expired unanswered; exit 125. J5's `envcloak reveal` uses it again |
 <!-- /reservations -->
