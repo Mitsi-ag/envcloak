@@ -173,6 +173,11 @@ fn main() {
                 "a_monitor_that_dies_hangs_the_command_up_and_the_run_fails_monitor_lost",
                 a_monitor_that_dies_hangs_the_command_up_and_the_run_fails_monitor_lost,
             ),
+            #[cfg(target_os = "linux")]
+            (
+                "output_written_after_monitor_loss_is_still_redacted",
+                output_written_after_monitor_loss_is_still_redacted,
+            ),
             (
                 "a_monitor_that_dies_after_the_exit_report_keeps_the_commands_status",
                 a_monitor_that_dies_after_the_exit_report_keeps_the_commands_status,
@@ -2436,6 +2441,93 @@ fn a_monitor_that_dies_hangs_the_command_up_and_the_run_fails_monitor_lost() {
     );
     assert!(outer.settings().same_as(&before), "the outer terminal");
     assert!(outer.count(&marker(labels::OPENAI_API_KEY)) >= 3);
+    case.assert_clean(&outer.seen);
+}
+
+/// Linux keeps the slave writable after its session leader dies. macOS
+/// revokes it instead, so the existing hangup gate covers that platform.
+/// The writer ignores HUP and emits numbered values only after the relay
+/// has marked its monitor lost. A write receipt precedes releasing the
+/// relay's drain, so a pre-loss redaction cannot satisfy this gate.
+#[cfg(target_os = "linux")]
+fn output_written_after_monitor_loss_is_still_redacted() {
+    let case = Case::new();
+    let writer = case.script(
+        "after-loss.py",
+        r"import os, pathlib, select, signal, sys, time
+root = pathlib.Path(sys.argv[1])
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+value = os.environ['OPENAI_API_KEY'].encode()
+def emit(line):
+    while line:
+        line = line[os.write(1, line):]
+emit(b'BEFORE-LOSS ' + value + b'\n')
+end = time.monotonic() + 15
+while not (root / 'write-after-loss').exists():
+    if not root.exists() or time.monotonic() >= end:
+        sys.exit(2)
+    select.select([], [], [], 0.01)
+for n in range(1, 4):
+    emit(b'AFTER-LOSS %d ' % n + value + b' \xff\x00\n')
+(root / 'written-after-loss').write_text('3\n')",
+    );
+    let mut outer = Outer::new(24, 80);
+    let before = outer.settings();
+    let python = python3();
+    let release = case.path("drain");
+    let argv = case.runner_argv(
+        &["OPENAI_API_KEY:OPENAI_API_KEY"],
+        &[],
+        &[
+            python.as_os_str(),
+            writer.as_os_str(),
+            case.dir.path().as_os_str(),
+        ],
+    );
+    let mut run = Running {
+        child: detach(
+            &case,
+            &outer,
+            &argv,
+            &[
+                ("ENVCLOAK_TEST_FAIL", OsStr::new("exec.pty.keys")),
+                ("ENVCLOAK_TEST_PAUSE", OsStr::new("exec.pty.monitor-lost")),
+                ("ENVCLOAK_TEST_PAUSE_RELEASE", release.as_os_str()),
+            ],
+        ),
+    };
+    let masked = marker(labels::OPENAI_API_KEY);
+    outer.expect(
+        &format!("BEFORE-LOSS {masked}"),
+        1,
+        "the writer's first value",
+    );
+    outer.type_bytes(b"k");
+    outer.expect(
+        "envcloak test: paused at exec.pty.monitor-lost",
+        1,
+        "the relay has observed the monitor's loss",
+    );
+    let after_loss = outer.seen.len();
+    std::fs::write(case.path("write-after-loss"), b"").unwrap();
+    assert!(
+        outer.wait_for_within(DEADLINE, |_| case.path("written-after-loss").exists()),
+        "the surviving writer did not finish its post-loss writes"
+    );
+    std::fs::write(&release, b"").unwrap();
+    let status = outer.wait_exit(&mut run.child, DEADLINE);
+    assert_eq!(status.code(), Some(125), "{}", outer.text());
+    assert_eq!(
+        outer.count("envcloak: pty_monitor_lost: "),
+        1,
+        "{}",
+        outer.text()
+    );
+    for n in 1..=3 {
+        let line = format!("AFTER-LOSS {n} {masked} ");
+        assert_eq!(outer.count_since(after_loss, &line), 1, "{}", outer.text());
+    }
+    assert!(outer.settings().same_as(&before), "the outer terminal");
     case.assert_clean(&outer.seen);
 }
 
