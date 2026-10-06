@@ -114,6 +114,23 @@ pub enum LaunchError {
 }
 
 impl LaunchError {
+    /// What failed, for the failure's message: the step and the system's
+    /// error kind, never a path, an argument or a value.
+    pub fn describe(&self) -> String {
+        match self {
+            LaunchError::Refused => "the started server was not the registered program".to_owned(),
+            LaunchError::Start(e) => {
+                format!("the managed server could not be started ({})", e.kind())
+            }
+            LaunchError::Setup(e) => format!("the runner could not be set up ({})", e.kind()),
+            LaunchError::Followed(e) => format!(
+                "the managed server could not be followed ({}, os error {})",
+                e.kind(),
+                e.raw_os_error().unwrap_or(0)
+            ),
+        }
+    }
+
     /// The token printed with the failure.
     pub fn token(&self) -> &'static str {
         match self {

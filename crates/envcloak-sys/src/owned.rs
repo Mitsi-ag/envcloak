@@ -434,10 +434,26 @@ impl<O: ProcessOps> OwnedChild<O> {
     /// stops what the child left in its group.
     pub fn stop_group(&self, grace: Duration) -> io::Result<bool> {
         // `EPERM` is asked about after the signal: the child may have
-        // exited between a check and the signal.
+        // exited between a check and the signal, and macOS refuses the
+        // signal to a group of exiting processes a moment before `waitid`
+        // reports the exit (measured: a release-built runner saw `EPERM`
+        // with the exit not yet reported), so the exit is waited for,
+        // briefly.
+        let exiting = || -> io::Result<bool> {
+            let end = Instant::now() + Duration::from_secs(1);
+            loop {
+                if self.has_exited()? {
+                    return Ok(true);
+                }
+                if Instant::now() >= end {
+                    return Ok(false);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
         let quiet = |r: io::Result<()>| match r {
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(libc::EPERM) && self.has_exited()? => Ok(()),
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) && exiting()? => Ok(()),
             other => other,
         };
         quiet(self.signal_group(libc::SIGTERM))?;
