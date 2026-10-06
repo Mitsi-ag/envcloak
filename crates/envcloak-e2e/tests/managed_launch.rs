@@ -1671,22 +1671,32 @@ fn a_suspended_server_runs_nothing_until_the_daemon_confirms() {
 }
 
 /// The kernel's child list is an observation only, never a signal target.
-fn children_of(parent: i32) -> Vec<i32> {
+fn process_parents() -> Vec<(i32, i32)> {
     let ps = std::process::Command::new("/bin/ps")
         .env_clear()
         .args(["-A", "-o", "pid=,ppid="])
         .output()
         .unwrap();
     assert!(ps.status.success());
-    String::from_utf8(ps.stdout)
+    let rows: Vec<_> = String::from_utf8(ps.stdout)
         .unwrap()
         .lines()
-        .filter_map(|line| {
+        .map(|line| {
             let mut fields = line.split_whitespace();
-            let pid = fields.next()?.parse().ok()?;
-            let ppid: i32 = fields.next()?.parse().ok()?;
-            (ppid == parent).then_some(pid)
+            let pid = fields.next().unwrap().parse().unwrap();
+            let ppid = fields.next().unwrap().parse().unwrap();
+            assert!(fields.next().is_none());
+            (pid, ppid)
         })
+        .collect();
+    assert!(!rows.is_empty());
+    rows
+}
+
+fn children_of(parent: i32) -> Vec<i32> {
+    process_parents()
+        .into_iter()
+        .filter_map(|(pid, ppid)| (ppid == parent).then_some(pid))
         .collect()
 }
 
@@ -1718,20 +1728,26 @@ fn failed_confirmation(fault: &str) {
         1,
         "the failure must follow the suspended spawn"
     );
-    let server = envcloak_sys::proc_info(servers[0]).unwrap();
-    let runner = envcloak_sys::proc_info(runners[0]).unwrap();
+    let watched = [servers[0], runners[0]];
     assert!(!w.marker.exists());
     std::fs::write(&release, b"").unwrap();
     let answer = w.wait_out(&out, Duration::from_secs(60), "failed confirmation");
     assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
     assert!(!w.marker.exists(), "an unconfirmed server ran");
-    for process in [server, runner] {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let table = process_parents();
+        if watched
+            .iter()
+            .all(|pid| table.iter().all(|(seen, _)| seen != pid))
+        {
+            break;
+        }
         assert!(
-            envcloak_sys::proc_info(process.pid)
-                .map_or(true, |now| now.start_time != process.start_time),
-            "failed launch left process {}",
-            process.pid
+            std::time::Instant::now() < deadline,
+            "failed launch left a watched process"
         );
+        std::thread::sleep(Duration::from_millis(20));
     }
     w.assert_released(0, 0, "the failed handshake records no completed release");
     // The same record works after restarting without the injected fault.
