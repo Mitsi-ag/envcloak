@@ -120,7 +120,7 @@ fn main() {
 /// - `stop`: SIGTSTP: restores the terminal and stops; on SIGCONT takes
 ///   raw mode again, prints `RAW-AGAIN`, waits for SIGUSR1 and exits 0;
 /// - `refresh`: as `stop`, but on SIGCONT reads the terminal's settings
-///   again (`TerminalGuard::refresh`) before raw mode, and on SIGUSR1
+///   again (`TerminalGuard::refresh`) before raw mode, and on SIGTERM
 ///   panics inside an `extern "C"` function, so the process aborts after
 ///   the panic hook's restore, without the guard's drop;
 /// - `final`: SIGUSR1, then the panic hook's restore
@@ -187,7 +187,12 @@ fn guarded() {
                     guard.refresh()?;
                 }
                 guard.reenter_raw()?;
-                let relay = SignalRelay::install(&[libc::SIGUSR1]).unwrap();
+                let done = if scenario == "refresh" {
+                    libc::SIGTERM
+                } else {
+                    libc::SIGUSR1
+                };
+                let relay = SignalRelay::install(&[done]).unwrap();
                 put(stdout.as_fd(), b"RAW-AGAIN\n");
                 relay.next()?;
                 if scenario == "refresh" {
@@ -449,14 +454,29 @@ fn the_settings_read_again_after_a_stop_are_what_comes_back() {
         };
         let (master, slave, before) = outer();
         let stty_before = stty_g(slave.as_fd());
-        let (child, mut screen) = start_guarded("refresh", master, &slave);
-        let pid = i32::try_from(child.id()).unwrap();
-        // SAFETY: kill on this process's own, unreaped child.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0);
+        // A refresh now requires a foreground owner. Give the guard an
+        // actual controlling terminal under the monitor, with an owned
+        // group for the stop and resume, rather than an unattached tty.
+        let exe = std::env::current_exe().unwrap();
+        let mut monitor = spawn_session(
+            &[exe.as_os_str()],
+            &[
+                (OsStr::new("PATH"), OsStr::new("/usr/bin:/bin")),
+                (OsStr::new(ROLE), OsStr::new("guarded")),
+                (OsStr::new(SCENARIO), OsStr::new("refresh")),
+            ],
+            slave.try_clone().unwrap(),
+        )
+        .unwrap();
+        let mut screen = Screen::new(master);
+        screen.expect("RAW\n", 1, what);
+        monitor
+            .send(envcloak_sys::pty::MonitorCommand::Suspend)
+            .unwrap();
         assert_eq!(
-            wait_child(pid, libc::WSTOPPED),
-            Some((libc::CLD_STOPPED, libc::SIGTSTP)),
-            "{what}: the program did not stop"
+            monitor.next_event(Some(DEADLINE)).unwrap(),
+            Some(MonitorEvent::Stopped(libc::SIGTSTP)),
+            "{what}"
         );
         let changed = if leave_raw {
             before.raw()
@@ -465,28 +485,33 @@ fn the_settings_read_again_after_a_stop_are_what_comes_back() {
         };
         changed.apply(slave.as_fd()).unwrap();
         let stty_changed = stty_g(slave.as_fd());
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+        monitor
+            .send(envcloak_sys::pty::MonitorCommand::Resume)
+            .unwrap();
+        assert_eq!(
+            monitor.next_event(Some(DEADLINE)).unwrap(),
+            Some(MonitorEvent::Continued)
+        );
         screen.expect("RAW-AGAIN\n", 1, what);
         assert!(
             TerminalSettings::read(slave.as_fd()).unwrap().is_raw(),
             "{what}"
         );
-        // SAFETY: as above.
-        assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+        monitor
+            .send(envcloak_sys::pty::MonitorCommand::Signal(libc::SIGTERM))
+            .unwrap();
         let (want, stty_want) = if leave_raw {
             (&before, &stty_before)
         } else {
             (&changed, &stty_changed)
         };
-        assert_restored(
-            child,
-            &slave,
-            want,
-            stty_want,
-            |s| s.signal() == Some(libc::SIGABRT),
-            what,
+        let event = screen.next_event(&mut monitor);
+        assert!(
+            matches!(event, Some(MonitorEvent::Exited(s)) if s.signal() == Some(libc::SIGABRT)),
+            "{what}: {event:?}"
         );
+        assert_as_before(&slave, want, stty_want, what);
+        monitor.finish().unwrap();
     }
 }
 
