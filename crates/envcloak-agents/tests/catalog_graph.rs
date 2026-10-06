@@ -81,6 +81,32 @@ fn catalog_settings_and_project_servers_produce_values() {
 }
 
 #[test]
+fn moved_codex_logs_share_a_root_with_database_descriptors() {
+    let home = fixture_home();
+    std::fs::write(home.path().join(".codex/config.toml"), b"log_dir = '.'\n").unwrap();
+    std::fs::write(
+        home.path().join(".codex/state.sqlite"),
+        b"fixtureZdatabaseNotRead",
+    )
+    .unwrap();
+    std::fs::write(home.path().join(".codex/run.log"), b"fixtureZmovedLogValue").unwrap();
+    let mut found = false;
+    let report = envcloak_scan::transcript::scan_transcript_sources(
+        &catalog(home.path()).transcript_sources(),
+        Default::default(),
+        &mut |c| {
+            assert!(!c.value.ct_eq(b"fixtureZdatabaseNotRead"));
+            found |= c.value.ct_eq(b"fixtureZmovedLogValue");
+            true
+        },
+    )
+    .unwrap();
+    assert!(report.complete(), "{:?}", report.issues);
+    assert!(found, "moved log hidden by a different selector");
+    assert!(report.notes.iter().any(|n| n.reason == "database"));
+}
+
+#[test]
 fn absent_catalog_stores_are_complete_and_present_omissions_are_notes() {
     let d = fixture_home();
     let locations = catalog(d.path());

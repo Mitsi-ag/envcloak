@@ -1,12 +1,68 @@
 //! Descriptor-relative discovery shared by configs and transcript stores.
 use crate::candidates::{Budget, Leftover, ScanReport, Source};
-use crate::source::{ConfigSource, SourceKind};
+use crate::source::{ConfigFormat, ConfigSource, SourceKind};
 use crate::{FileStamp, ScanErrorKind, ScanRoot};
 use envcloak_sys::{DirEntryKind, list_dir, open_dir_beneath};
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+
+#[derive(Default)]
+struct Visits {
+    files: std::collections::HashMap<PathBuf, ReadState>,
+    omitted_roots: Vec<PathBuf>,
+}
+enum ReadState {
+    Closed,
+    Read(std::collections::HashSet<ConfigFormat>),
+}
+impl Visits {
+    fn omitted(&self, path: &Path) -> bool {
+        self.omitted_roots.iter().any(|p| path.starts_with(p))
+    }
+}
+
+fn omitted_kind(kind: SourceKind) -> bool {
+    matches!(kind, SourceKind::Database | SourceKind::Credentials)
+}
+
+pub(crate) fn omitted_path(sources: &[ConfigSource], path: &Path) -> bool {
+    sources
+        .iter()
+        .filter(|s| omitted_kind(s.source_kind))
+        .any(|s| {
+            let Ok(root) = system_path(&s.path) else {
+                return false;
+            };
+            if path == root {
+                return true;
+            }
+            match &s.names {
+                None => path.starts_with(root),
+                Some(name) => {
+                    path.parent() == Some(root.as_path())
+                        && path.file_name().is_some_and(|n| {
+                            n.as_bytes()
+                                .windows(name.len().max(1))
+                                .any(|w| w == name.as_bytes())
+                        })
+                }
+            }
+        })
+}
+
+pub(crate) fn effective_format(path: &Path, format: ConfigFormat) -> ConfigFormat {
+    if format == ConfigFormat::Mixed {
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
+            ConfigFormat::Jsonl
+        } else {
+            ConfigFormat::Raw
+        }
+    } else {
+        format
+    }
+}
 
 /// Opens a catalog-selected directory without following any user-controlled
 /// component. Only root-owned, fixed-target macOS system aliases are resolved.
@@ -94,11 +150,23 @@ pub(crate) fn walk_sources(
     report: &mut ScanReport,
     mut read: impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
 ) {
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = Visits::default();
     let mut attempts = 0usize;
     let mut source_paths = std::collections::HashSet::new();
-    for source in sources {
-        if !source_paths.insert(&source.path) {
+    let mut failed_roots = std::collections::HashSet::new();
+    // Omissions are policy, independent of catalog order or reader format.
+    for source in sources
+        .iter()
+        .filter(|s| omitted_kind(s.source_kind))
+        .chain(sources.iter().filter(|s| !omitted_kind(s.source_kind)))
+    {
+        if !source_paths.insert((
+            &source.path,
+            &source.names,
+            source.format,
+            source.source_kind,
+        )) || failed_roots.contains(&source.path)
+        {
             continue;
         }
         if attempts >= budget.files {
@@ -120,20 +188,23 @@ pub(crate) fn walk_sources(
             Ok(r) => r,
             Err(ScanErrorKind::NotFound) => {
                 attempts += 1;
+                failed_roots.insert(source.path.clone());
                 continue;
             }
             Err(e) => {
                 attempts += 1;
+                failed_roots.insert(source.path.clone());
                 report.issue(&source.path, e.token());
                 continue;
             }
         };
         match envcloak_sys::kind_beneath(root.dir(), name) {
             Ok(DirEntryKind::Dir) => {
+                attempts += 1;
                 let dir = match root.open_subdir(root.dir(), name) {
                     Ok(d) => d,
                     Err(e) => {
-                        attempts += 1;
+                        failed_roots.insert(source.path.clone());
                         report.issue(&source.path, e.token());
                         continue;
                     }
@@ -141,18 +212,14 @@ pub(crate) fn walk_sources(
                 let sub = match crate::root::held_root(root.path().join(name), dir) {
                     Ok(r) => r,
                     Err(_) => {
-                        attempts += 1;
+                        failed_roots.insert(source.path.clone());
                         report.issue(&source.path, "io");
                         continue;
                     }
                 };
                 if source.source_kind == SourceKind::Credentials && source.names.is_none() {
-                    if attempts >= budget.files {
-                        report.issue(&source.path, "file_budget");
-                    } else {
-                        attempts += 1;
-                        note_omitted(source, sub.path(), report);
-                    }
+                    note_omitted(source, sub.path(), report);
+                    visited.omitted_roots.push(sub.path().to_path_buf());
                     continue;
                 }
                 walk(
@@ -257,10 +324,13 @@ fn walk(
     source: &ConfigSource,
     budget: Budget,
     attempts: &mut usize,
-    visited: &mut std::collections::HashSet<PathBuf>,
+    visited: &mut Visits,
     report: &mut ScanReport,
     read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
 ) {
+    if visited.omitted(&root.path().join(rel)) {
+        return;
+    }
     if depth > 12 {
         report.issue(root.path().join(rel), "too_deep");
         return;
@@ -337,13 +407,19 @@ fn process(
     source: &ConfigSource,
     budget: Budget,
     attempts: &mut usize,
-    visited: &mut std::collections::HashSet<PathBuf>,
+    visited: &mut Visits,
     report: &mut ScanReport,
     read: &mut impl FnMut(&ScanRoot, &Path, &ConfigSource, &mut ScanReport),
     optional: bool,
 ) {
     let path = root.path().join(rel);
-    if visited.contains(&path) {
+    let format = effective_format(rel, source.format);
+    if visited.omitted(&path)
+        || visited.files.get(&path).is_some_and(|state| match state {
+            ReadState::Closed => true,
+            ReadState::Read(formats) => formats.contains(&format),
+        })
+    {
         return;
     }
     if *attempts >= budget.files {
@@ -351,19 +427,23 @@ fn process(
         return;
     }
     *attempts += 1;
-    visited.insert(path);
     let file = root
         .open_parent(rel)
         .and_then(|(d, n)| crate::root::open_file(&d, &n, usize::MAX));
     let (_, m) = match file {
         Ok(v) => v,
-        Err(ScanErrorKind::NotFound) if optional => return,
+        Err(ScanErrorKind::NotFound) if optional => {
+            visited.files.insert(path, ReadState::Closed);
+            return;
+        }
         Err(e) => {
+            visited.files.insert(path, ReadState::Closed);
             report.issue(root.path().join(rel), e.token());
             return;
         }
     };
     if m.dev() != root.dev() {
+        visited.files.insert(path, ReadState::Closed);
         report.issue(root.path().join(rel), "mount_point");
         return;
     }
@@ -371,7 +451,15 @@ fn process(
         report.issue(root.path().join(rel), "hard_link");
     }
     if note_omitted(source, &root.path().join(rel), report) {
+        visited.files.insert(path, ReadState::Closed);
         return;
+    }
+    if let ReadState::Read(formats) = visited
+        .files
+        .entry(path)
+        .or_insert_with(|| ReadState::Read(Default::default()))
+    {
+        formats.insert(format);
     }
     let stamp = FileStamp::of(&m);
     let before = report.findings.len();
@@ -492,7 +580,7 @@ mod tests {
             );
         }
         assert_eq!(attempts, 1);
-        assert_eq!(visited.len(), 1);
+        assert_eq!(visited.files.len(), 1);
         assert!(!report.complete());
     }
 
