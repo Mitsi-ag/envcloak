@@ -33,13 +33,13 @@ usage:
   envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
   envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
   envcloak agents status [--json]
+  envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents status --probe
   envcloak agents migrate-mcp
   envcloak mcp-bridge
   envcloak standing
@@ -89,13 +89,13 @@ usage:
   envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
   envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
   envcloak agents status [--json]
+  envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
 Not in this build (each exits 125 with not_in_this_build):
   envcloak run --pty
   envcloak reveal
   envcloak doctor
   envcloak scrub
-  envcloak agents status --probe
   envcloak agents migrate-mcp
   envcloak mcp-bridge
   envcloak standing
@@ -328,7 +328,8 @@ exit: 0
 usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe | migrate-mcp (not in this build)
+       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents migrate-mcp (not in this build)
 --- stderr
 $ envcloak agents install --bogus
 exit: 2
@@ -337,7 +338,8 @@ exit: 2
 envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe | migrate-mcp (not in this build)
+       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents migrate-mcp (not in this build)
 $ envcloak agents uninstall --consent-sandbox-sockets
 exit: 2
 --- stdout
@@ -345,7 +347,8 @@ exit: 2
 envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe | migrate-mcp (not in this build)
+       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents migrate-mcp (not in this build)
 $ envcloak agents install --agent cursor
 exit: 2
 --- stdout
@@ -353,7 +356,8 @@ exit: 2
 envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe | migrate-mcp (not in this build)
+       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents migrate-mcp (not in this build)
 $ envcloak hook
 exit: 1
 --- stdout
