@@ -127,6 +127,10 @@ fn damaged_partial_clone_never_uses_its_transport() {
     std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(loose, b"damaged loose object").unwrap();
 
+    // Git 2.43 (Ubuntu 24.04) exercises GIT_ALLOW_PROTOCOL because it lacks
+    // GIT_NO_LAZY_FETCH. Apple Git 2.50 honors both; removing both guards is
+    // the cross-version mutation. protocol.file.allow also defeats the general
+    // protocol.allow setting, so the empty environment allowlist is required.
     // The remote is local and its transport only records an attempt. No
     // network service or external repository participates in this gate.
     let remote = dir.path().join("remote");
@@ -364,7 +368,7 @@ fn symlinked_git_directory_is_refused() {
 }
 
 #[test]
-fn external_gitfile_store_is_reported() {
+fn external_gitfile_store_is_refused() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let project = d.path().join("project");
     std::fs::create_dir(&project).unwrap();
@@ -385,7 +389,8 @@ fn external_gitfile_store_is_reported() {
         true
     })
     .unwrap();
-    assert!(found);
+    assert!(!found, "unconfined Git store was read");
+    assert_eq!(report.bytes, 0, "unconfined Git store was read");
     assert!(
         !report.complete(),
         "external gitfile store was not reported"
@@ -399,7 +404,7 @@ fn external_gitfile_store_is_reported() {
 }
 
 #[test]
-fn invalid_gitfile_still_reports_the_child_failure() {
+fn invalid_gitfile_is_refused_before_spawning() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::write(d.path().join(".git"), b"invalid gitfile\n").unwrap();
     let report = scan_git_history(
@@ -409,13 +414,17 @@ fn invalid_gitfile_still_reports_the_child_failure() {
     )
     .unwrap();
     assert!(!report.complete());
-    for reason in ["gitfile_indirection", "git_failed"] {
-        assert!(report.issues.iter().any(|i| i.reason == reason), "{reason}");
-    }
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.reason == "gitfile_indirection")
+    );
+    assert!(!report.issues.iter().any(|i| i.reason == "git_failed"));
 }
 
 #[test]
-fn external_alternate_store_is_reported() {
+fn external_alternate_store_is_refused() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let other = d.path().join("other");
     std::fs::create_dir(&other).unwrap();
@@ -441,7 +450,8 @@ fn external_alternate_store_is_reported() {
         true
     })
     .unwrap();
-    assert!(found);
+    assert!(!found, "unconfined Git store was read");
+    assert_eq!(report.bytes, 0, "unconfined Git store was read");
     assert!(
         !report.complete(),
         "external alternate store was not reported"
@@ -450,7 +460,7 @@ fn external_alternate_store_is_reported() {
 }
 
 #[test]
-fn external_common_directory_is_reported() {
+fn external_common_directory_is_refused() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let project = d.path().join("project");
     let other = d.path().join("other");
@@ -472,7 +482,8 @@ fn external_common_directory_is_reported() {
         true
     })
     .unwrap();
-    assert!(found);
+    assert!(!found, "unconfined Git store was read");
+    assert_eq!(report.bytes, 0, "unconfined Git store was read");
     assert!(
         !report.complete(),
         "external common directory was not reported"
@@ -487,38 +498,100 @@ fn git_store_symlinks_are_refused_before_object_reads() {
         "objects/info",
         "objects/info/alternates",
         "commondir",
+        "loose",
+        "pack_entry",
+        "info_entry",
     ] {
-        let d = tempfile::tempdir_in("/tmp").unwrap();
-        let project = d.path().join("project");
-        std::fs::create_dir(&project).unwrap();
-        git(&project, &["init", "-q"]);
-        object(&project, "blob", b"fixtureZlinkedStoreValue");
-        let path = project.join(".git").join(relative);
-        if relative == "commondir" {
-            std::fs::write(&path, b".\n").unwrap();
-        } else if relative == "objects/info/alternates" {
-            std::fs::write(&path, b"").unwrap();
-        }
-        let moved = d.path().join("moved");
-        std::fs::rename(&path, &moved).unwrap();
-        std::os::unix::fs::symlink(&moved, &path).unwrap();
-        let report = scan_git_history(
-            &open_root(&project).unwrap(),
-            Budget::default(),
-            &mut |_| panic!("followed a symlinked Git store"),
-        )
-        .unwrap();
-        assert!(!report.complete());
-        assert_eq!(report.bytes, 0);
-        assert!(
-            report.issues.iter().any(|i| i.reason == "symlink"),
-            "{relative}"
-        );
+        refuse_store_symlink(relative);
     }
 }
 
 #[test]
-fn linked_worktree_uses_its_explicit_git_file() {
+fn git_pack_directory_symlink_is_refused_before_object_reads() {
+    refuse_store_symlink("objects/pack");
+}
+
+#[test]
+fn git_fanout_symlink_is_refused_before_object_reads() {
+    refuse_store_symlink("fanout");
+}
+
+fn refuse_store_symlink(relative: &str) {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    let project = d.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    git(&project, &["init", "-q"]);
+    let oid = object(&project, "blob", b"fixtureZlinkedStoreValue");
+    let store = project.join(".git/objects");
+    if relative == "objects/pack" || relative == "pack_entry" {
+        std::fs::write(project.join("fixture"), b"fixtureZlinkedStoreValue").unwrap();
+        git(&project, &["add", "fixture"]);
+        git(
+            &project,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        );
+        git(&project, &["repack", "-ad"]);
+    }
+    let path = match relative {
+        "fanout" => store.join(&oid[..2]),
+        "loose" => store.join(&oid[..2]).join(&oid[2..]),
+        "pack_entry" | "info_entry" => {
+            let dir = if relative == "pack_entry" {
+                "pack"
+            } else {
+                "info"
+            };
+            let path = store.join(dir).join("fixture");
+            std::fs::write(&path, b"").unwrap();
+            path
+        }
+        _ => project.join(".git").join(relative),
+    };
+    if relative == "commondir" {
+        std::fs::write(&path, b".\n").unwrap();
+    } else if relative == "objects/info/alternates" {
+        std::fs::write(&path, b"").unwrap();
+    }
+    let mut found = false;
+    let control = scan_git_history(&open_root(&project).unwrap(), Budget::default(), &mut |c| {
+        found |= c.value.ct_eq(b"fixtureZlinkedStoreValue");
+        true
+    })
+    .unwrap();
+    if relative != "commondir" {
+        assert!(
+            control.complete(),
+            "regular Git store control failed: {relative}"
+        );
+        assert!(found);
+    }
+    let moved = d.path().join("moved");
+    std::fs::rename(&path, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &path).unwrap();
+    let report = scan_git_history(
+        &open_root(&project).unwrap(),
+        Budget::default(),
+        &mut |_| panic!("followed a symlinked Git store"),
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert_eq!(report.bytes, 0);
+    assert!(
+        report.issues.iter().any(|i| i.reason == "symlink"),
+        "{relative}"
+    );
+}
+
+#[test]
+fn linked_worktree_reports_its_unconfined_git_file() {
     let d = tempfile::tempdir_in("/tmp").unwrap();
     git(d.path(), &["init", "-q"]);
     git(
@@ -560,5 +633,98 @@ fn linked_worktree_uses_its_explicit_git_file() {
             .iter()
             .any(|i| i.reason == "gitfile_indirection")
     );
-    assert!(found);
+    assert!(!found, "unconfined Git store was read");
+    assert_eq!(report.bytes, 0, "unconfined Git store was read");
+}
+
+#[test]
+fn git_store_nonregular_entries_are_refused_before_object_reads() {
+    for directory in ["pack", "info", "ab"] {
+        for kind in ["fifo", "directory", "unreadable"] {
+            let d = tempfile::tempdir_in("/tmp").unwrap();
+            git(d.path(), &["init", "-q"]);
+            object(d.path(), "blob", b"fixtureZsafeStoreControl");
+            let parent = d.path().join(".git/objects").join(directory);
+            std::fs::create_dir_all(&parent).unwrap();
+            let path = parent.join("fixture");
+            if kind == "fifo" {
+                assert!(
+                    Command::new("/usr/bin/mkfifo")
+                        .arg(&path)
+                        .env_clear()
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+            } else if kind == "directory" {
+                std::fs::create_dir(&path).unwrap();
+            } else {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::write(&path, b"").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            let report = scan_git_history(
+                &open_root(d.path()).unwrap(),
+                Budget::default(),
+                &mut |_| panic!("unsafe Git entry was admitted"),
+            )
+            .unwrap();
+            assert_eq!(report.bytes, 0);
+            assert!(!report.complete());
+            let reason = if kind == "unreadable" {
+                "unreadable"
+            } else {
+                "not_regular"
+            };
+            assert!(report.issues.iter().any(|i| i.reason == reason));
+        }
+    }
+}
+
+#[test]
+fn git_failure_is_retained_after_metadata_warning() {
+    let d = tempfile::tempdir_in("/tmp").unwrap();
+    git(d.path(), &["init", "-q"]);
+    // Empty commondir cannot name an external store, but Git rejects it.
+    // The hard-link warning must not suppress that child failure at EOF.
+    let pointer = d.path().join(".git/commondir");
+    std::fs::write(&pointer, b"").unwrap();
+    std::fs::hard_link(&pointer, d.path().join("linked")).unwrap();
+    let report = scan_git_history(
+        &open_root(d.path()).unwrap(),
+        Budget::default(),
+        &mut |_| panic!("damaged object was read"),
+    )
+    .unwrap();
+    assert!(!report.complete());
+    assert!(report.issues.iter().any(|i| i.reason == "hard_link"));
+    assert!(report.issues.iter().any(|i| i.reason == "git_failed"));
+}
+
+#[test]
+fn git_commit_graph_directories_are_only_allowed_under_info() {
+    for parent in ["info", "pack", "ab"] {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        git(d.path(), &["init", "-q"]);
+        object(d.path(), "blob", b"fixtureZcommitGraphLayout");
+        std::fs::create_dir_all(
+            d.path()
+                .join(".git/objects")
+                .join(parent)
+                .join("commit-graphs"),
+        )
+        .unwrap();
+        let mut found = false;
+        let report = scan_git_history(&open_root(d.path()).unwrap(), Budget::default(), &mut |c| {
+            found |= c.value.ct_eq(b"fixtureZcommitGraphLayout");
+            true
+        })
+        .unwrap();
+        assert_eq!(report.complete(), parent == "info");
+        assert_eq!(found, parent == "info");
+        if parent != "info" {
+            assert_eq!(report.bytes, 0);
+            assert!(report.issues.iter().any(|i| i.reason == "not_regular"));
+        }
+    }
 }
