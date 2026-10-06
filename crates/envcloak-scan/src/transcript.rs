@@ -268,9 +268,16 @@ fn json_line(
         Err(()) => {
             report.not_scanned += 1;
             report.issue(source, "invalid_json");
-            // Damaged JSON backups still get a raw scan. Keep the parse issue
+            // Damaged documents and lines still get a raw scan. Keep the parse issue
             // visible and never charge these already-read bytes a second time.
-            if format == ConfigFormat::Json {
+            let mut accepted = true;
+            if matches!(format, ConfigFormat::Json | ConfigFormat::Jsonl) {
+                let mut fallback: &mut dyn FnMut(Candidate) -> bool = &mut |mut c| {
+                    c.occurrence.range.start += base;
+                    c.occurrence.range.end += base;
+                    accepted = emit(c);
+                    accepted
+                };
                 if let Ok(part) = scan_reader(
                     &mut std::io::Cursor::new(bytes),
                     ConfigFormat::Raw,
@@ -282,14 +289,18 @@ fn json_line(
                             .saturating_sub(report.candidates as usize),
                         ..budget
                     },
-                    emit,
+                    &mut fallback,
                 ) {
+                    accepted &= !part
+                        .issues
+                        .iter()
+                        .any(|i| matches!(i.reason, "occurrence_budget" | "candidate_budget"));
                     report.candidates += part.candidates;
                     report.not_scanned += part.not_scanned;
                     report.issues.extend(part.issues);
                 }
             }
-            return true;
+            return accepted;
         }
     };
     json_tokens(&node, base, source, report, budget, emit)
@@ -579,18 +590,43 @@ pub fn scan_transcript_sources(
     let mut report = crate::candidates::ScanReport::default();
     let mut occurrences = 0usize;
     let mut stopped = false;
-    crate::sources::walk_sources(sources, budget, &mut report, |root, rel, source, report| {
-        scan_file(
-            root,
-            rel,
-            source,
-            budget,
-            report,
-            &mut occurrences,
-            &mut stopped,
-            emit,
-        );
+    let mut ordered = sources.to_vec();
+    // Known structured stores win over broader raw catalog coverage. One
+    // reader per leaf preserves physical counts without retaining every range.
+    ordered.sort_by_key(|s| match s.format {
+        ConfigFormat::Json => 0,
+        ConfigFormat::Jsonl => 1,
+        ConfigFormat::Mixed => 2,
+        _ => 3,
     });
+    let mut scanned = std::collections::HashMap::new();
+    crate::sources::walk_sources(
+        &ordered,
+        budget,
+        &mut report,
+        |root, rel, source, report| {
+            let path = root.path().join(rel);
+            let format = crate::sources::effective_format(rel, source.format);
+            if let Some(previous) = scanned.get(&path) {
+                if *previous != format && matches!(format, ConfigFormat::Json | ConfigFormat::Jsonl)
+                {
+                    report.issue(path, "conflicting_formats");
+                }
+                return;
+            }
+            scanned.insert(path, format);
+            scan_file(
+                root,
+                rel,
+                source,
+                budget,
+                report,
+                &mut occurrences,
+                &mut stopped,
+                emit,
+            );
+        },
+    );
     Ok(report)
 }
 
