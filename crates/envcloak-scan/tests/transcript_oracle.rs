@@ -121,11 +121,17 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
     assert_eq!(counts["ranges"], 100080);
     let requests: serde_json::Value =
         serde_json::from_slice(&std::fs::read(d.path().join("requests.json")).unwrap()).unwrap();
+    let requests = requests["cases"].as_array().unwrap();
+    assert_eq!(
+        requests.len(),
+        37,
+        "range oracle request corpus is incomplete"
+    );
     for chunk in [32768, 7] {
         let mut observed = BTreeMap::new();
         // Produce observations from requests and inputs only, before loading
         // the generator's independent expected ranges. No preview is invented.
-        for case in requests["cases"].as_array().unwrap() {
+        for case in requests {
             let matches = case["matches"]
                 .as_array()
                 .unwrap()
@@ -181,10 +187,22 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
                 (distinct, matching_occurrences, spans),
             );
         }
+        assert_eq!(observed.len(), 37, "range oracle case IDs are not distinct");
+        assert_eq!(
+            observed.values().map(|(_, count, _)| count).sum::<usize>(),
+            100080,
+            "range oracle did not exercise the expected occurrences"
+        );
         let expected: serde_json::Value =
             serde_json::from_slice(&std::fs::read(d.path().join("expected.json")).unwrap())
                 .unwrap();
-        for case in expected["cases"].as_array().unwrap() {
+        let expected = expected["cases"].as_array().unwrap();
+        assert_eq!(
+            expected.len(),
+            37,
+            "range oracle expected corpus is incomplete"
+        );
+        for case in expected {
             let (distinct, matching_occurrences, spans) =
                 observed.remove(case["id"].as_str().unwrap()).unwrap();
             let wanted = case["occurrences"]
