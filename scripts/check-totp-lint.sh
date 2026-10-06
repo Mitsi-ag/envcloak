@@ -4,15 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 python3 - <<'PY'
-import json, os, pathlib, re, subprocess
+import json, os, pathlib, subprocess, sys
 
 root = pathlib.Path.cwd()
-for path in root.joinpath('crates').rglob('*.rs'):
-    if path == root / 'crates/envcloak-signin/src/totp.rs':
-        continue
-    for attr in re.findall(r'#!?\[.*?\]', path.read_text(), re.S):
-        if re.search(r'\b(?:allow|expect)\b', attr) and 'disallowed_types' in attr:
-            raise SystemExit('check-totp-lint: exception outside totp.rs')
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(root / 'scripts'))
+from totp_sources import check_sources
+check_sources(root)
 
 canary = root / 'crates/envcloak-signin/tests/sha1_canary.rs'
 expected = {i for i,line in enumerate(canary.read_text().splitlines(), 1) if line.endswith('// EXPECT-SHA1-REFUSAL')}

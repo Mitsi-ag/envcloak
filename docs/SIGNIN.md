@@ -89,3 +89,23 @@ fixtures. `tests/otpauth.rs` also provides bounded arbitrary-byte and
 mutated-valid-input fuzzing. This checkout has no `fuzz/` workspace;
 M2-25 owns its libFuzzer infrastructure because its entry macro conflicts
 with the workspace's unsafe-code boundary. No libFuzzer run is claimed.
+M2-25/M2b fuzz handoff: add an `otpauth::parse` target taking arbitrary
+bytes through `SecretBytes`, seeded with valid and damaged enrollments.
+Keep fixed error/formatter checks, isolated process output checks and
+the existing independent byte fixtures in that target's regression suite.
+
+The heap probe also loads Python-generated encodings for seed lengths
+1 through 32. It checks every base32 failure position, nonzero tail bits,
+and partial percent decoding in the label and all five parameter values.
+Each nonempty decoded prefix gets its own exact-length needle and an
+unwiped positive control. Empty prefixes test refusal only. The test-only
+allocator permits one-byte needles; these probes run in single-test
+binaries so other probe tests cannot contaminate their counts. These are
+heap-release observations, not stack or live-memory erasure claims.
+
+SHA-1 source confinement is independent of secret-exposure lint exceptions.
+The checker reserves the `sha1` identifier outside `totp.rs` and the
+cfg-guarded compile-refusal canary, including aliases and inactive cfgs.
+Only the tests' exact algorithm string literals are exempt. Cargo may
+declare the dependency only in the root and sign-in manifests, without a
+package alias. Clippy additionally requires all six canary sites to fail.

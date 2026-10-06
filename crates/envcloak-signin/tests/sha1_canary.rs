@@ -1,6 +1,6 @@
+#![cfg(envcloak_lint_canary)]
 //! Deliberately uses SHA-1 outside totp.rs. check-totp-lint.sh requires
 //! clippy to refuse every marked line. Ordinary tests compile no items.
-#![cfg(envcloak_lint_canary)]
 #![deny(clippy::disallowed_types)]
 
 pub fn direct(_: sha1::Sha1) {} // EXPECT-SHA1-REFUSAL
