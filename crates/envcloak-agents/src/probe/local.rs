@@ -575,7 +575,7 @@ impl ProbeDaemon {
             .stderr(Stdio::piped());
         envcloak_sys::new_session_on_spawn(&mut cmd, Some(pty.slave.as_fd()))
             .map_err(|_| LocalError::Daemon)?;
-        let mut child = cmd.spawn().map_err(|_| LocalError::Daemon)?;
+        let mut child = crate::detect::spawn_unreaped(&mut cmd).map_err(|_| LocalError::Daemon)?;
         drop(cmd);
         drop(pty.slave);
         let log = Arc::new(Mutex::new(Vec::new()));
@@ -715,17 +715,23 @@ impl ProbeDaemon {
                 let _ = c.lock();
             }
             let pid = pid_of(&child);
-            let _ = envcloak_sys::signal_process(pid, libc::SIGTERM);
+            // Signalled only while it is still this process's own unreaped
+            // child (`has_exited` answers only for one; it was started by
+            // `spawn_unreaped`): a pid not known to be its own may be
+            // another process's by now, and gets nothing.
+            if matches!(envcloak_sys::has_exited(pid), Ok(false)) {
+                let _ = envcloak_sys::signal_process(pid, libc::SIGTERM);
+            }
             let end = Instant::now() + DAEMON_STOP;
             while matches!(envcloak_sys::has_exited(pid), Ok(false)) && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(25));
             }
             let mut child = child;
-            // Not seen to have exited (its state not known included): killed
-            // while it is still this process's unreaped child, so the wait
-            // below never waits on a daemon that does not stop (Codex
-            // cycle488 F144's class).
-            if !matches!(envcloak_sys::has_exited(pid), Ok(true)) {
+            // Still running and still its own: killed while unreaped, so the
+            // wait below never waits on a daemon that does not stop (Codex
+            // cycle488 F144's class). A state not known is no child of this
+            // process's to signal; the wait then returns at once.
+            if matches!(envcloak_sys::has_exited(pid), Ok(false)) {
                 let _ = child.kill();
             }
             let _ = child.wait();

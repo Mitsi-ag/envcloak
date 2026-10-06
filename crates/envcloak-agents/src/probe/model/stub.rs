@@ -60,14 +60,15 @@ impl ModelStub {
         serde_json::to_writer(&mut *line, &value).map_err(io::Error::other)?;
         line.push(b'\n');
         drop(value);
-        let mut child = Command::new(exe)
-            .arg("--time-limit")
+        let mut cmd = Command::new(exe);
+        cmd.arg("--time-limit")
             .arg(time_limit.as_secs().max(1).to_string())
             .env_clear()
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+            .stderr(Stdio::inherit());
+        // Killed by number later: kept this process's own until it waits.
+        let mut child = crate::detect::spawn_unreaped(&mut cmd)?;
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             let _ = child.kill();
             let _ = child.wait();

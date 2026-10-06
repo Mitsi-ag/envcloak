@@ -616,9 +616,16 @@ impl Prober<'_, '_> {
                 s.spawn(move || a.approve(deadline, stop).is_ok())
             });
             let mut timed_out = false;
+            let mut own = true;
             loop {
                 match envcloak_sys::has_exited(pid) {
-                    Ok(true) | Err(_) => break,
+                    Ok(true) => break,
+                    // Not known to be this process's child any more: its
+                    // numbers may name another's, so nothing is sent.
+                    Err(_) => {
+                        own = false;
+                        break;
+                    }
                     Ok(false) if Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(25));
                     }
@@ -628,9 +635,12 @@ impl Prober<'_, '_> {
                     }
                 }
             }
-            // The host is this process's unreaped child: its group's number
-            // is still its own (D-34). What is left there goes now.
-            let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+            // The host is this process's unreaped child (it was started by
+            // `spawn_unreaped`, and nothing has waited for it): its group's
+            // number is still its own (D-34). What is left there goes now.
+            if own {
+                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+            }
             let status = child.wait().ok();
             stop.store(true, Ordering::SeqCst);
             let approved = approval.map(|h| h.join().unwrap_or(false));
@@ -1510,7 +1520,7 @@ impl HostSession {
         let pty = envcloak_sys::pty::open_pty(None, None)?;
         envcloak_sys::new_session_on_spawn(&mut cmd, Some(pty.slave.as_fd()))?;
         envcloak_sys::inherit_on_spawn(&mut cmd, pty.slave.as_fd())?;
-        let child = cmd.spawn()?;
+        let child = crate::detect::spawn_unreaped(&mut cmd)?;
         // `cmd` holds copies of the slave side until it goes: the
         // terminal is then open in the session alone.
         drop(cmd);

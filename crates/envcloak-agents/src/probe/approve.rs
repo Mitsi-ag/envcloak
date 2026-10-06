@@ -114,7 +114,7 @@ pub fn approve_pending(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     envcloak_sys::inherit_on_spawn(&mut cmd, read.as_fd()).map_err(|_| ApproveError::Spawn)?;
-    let spawned = cmd.spawn();
+    let spawned = crate::detect::spawn_unreaped(&mut cmd);
     // `cmd` and this process's read side go now: the command holds the
     // only read side, so the pipe ends for it once the passphrase is in.
     drop(cmd);
@@ -181,9 +181,17 @@ fn await_child(
             Ok(false) if Instant::now() < end && !stop.load(Ordering::SeqCst) => {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // Past its time, told to stop, or its state not known: still
-            // this process's own unreaped child, so the signal is its.
-            _ => {
+            // Its state not known: not known to be this process's own child
+            // any more (its pid may be another process's), so nothing is
+            // sent; the wait below returns at once for a child not there.
+            Err(_) => {
+                stopped = true;
+                break;
+            }
+            // Past its time or told to stop: still this process's own
+            // unreaped child (started by `spawn_unreaped`), so the signal
+            // is its.
+            Ok(false) => {
                 stopped = true;
                 let _ = child.kill();
                 break;
