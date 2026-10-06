@@ -738,7 +738,8 @@ impl World {
 
     /// How many requests were left pending: on the test build, as the
     /// daemons' audit trace says (every one ever made); on a release
-    /// build, as the person's `envcloak pending --json` lists them now.
+    /// build, as the person's `envcloak pending --json` lists them now
+    /// (none while the vault is tampered: nothing is evaluated from it).
     /// Either way, a request that made none leaves it unchanged.
     pub fn pending_count(&mut self) -> usize {
         if self.traced() {
@@ -746,6 +747,10 @@ impl World {
         }
         let home = self.h.home.home();
         let listed = self.h.human(&home, &["pending", "--json"], &[], &[]);
+        // A tampered vault evaluates nothing: no request can be pending.
+        if listed.code != 0 && listed.err().contains("envcloak: vault_tampered: ") {
+            return 0;
+        }
         assert_eq!(listed.code, 0, "{}", listed.all());
         let listed: Value = serde_json::from_str(&listed.out()).unwrap();
         listed["requests"].as_array().map_or(0, Vec::len)
