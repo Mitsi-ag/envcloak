@@ -245,17 +245,17 @@ fn review_cloud_selection_covers_case_aliases_in_every_reader() {
         std::fs::write(cloud.join(".env"), &content).unwrap();
         std::fs::write(cloud.join("fixture.env"), &content).unwrap();
         let lowercase = name.to_ascii_lowercase();
-        let include = if home.join(&lowercase).is_dir() {
+        let referenced_dir = if home.join(&lowercase).is_dir() {
             &lowercase
         } else {
             name
         };
         std::fs::write(
             home.join(".zshrc"),
-            format!("source '{include}/fixture.env'\n"),
+            format!("source '{referenced_dir}/fixture.env'\n"),
         )
         .unwrap();
-        std::fs::write(home.join(".mcp.json"), serde_json::to_vec(&json!({"mcpServers":{"fixture":{"command":"fixture","envFile":format!("{include}/fixture.env")}}})).unwrap()).unwrap();
+        std::fs::write(home.join(".mcp.json"), serde_json::to_vec(&json!({"mcpServers":{"fixture":{"command":"fixture","envFile":format!("{referenced_dir}/fixture.env")}}})).unwrap()).unwrap();
         let out = f.scan(&["--dry-run"]);
         f.clean(&out);
         assert!(out.status.success());
