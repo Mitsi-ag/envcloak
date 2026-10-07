@@ -1439,7 +1439,7 @@ fn a_run_that_fails_after_its_command_started_may_have_run() {
         s["stderr"]
             .as_str()
             .unwrap()
-            .contains("envcloak: run_failed: the command was started"),
+            .contains("envcloak: run_failed: the command may have started"),
         "{s}"
     );
 
