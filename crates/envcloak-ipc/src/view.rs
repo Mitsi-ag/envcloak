@@ -661,6 +661,9 @@ pub struct ItemView {
     pub updated_secs: u64,
     pub rotated_secs: Option<u64>,
     pub expires_secs: Option<u64>,
+    /// Recorded use in long inventories, without the inspector's full detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_secs: Option<u64>,
     /// Who owns or pays for the key: personal, so filled only for
     /// `ls --long` and `show`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -799,6 +802,7 @@ impl ItemView {
             updated_secs: m.updated_at,
             rotated_secs: d.rotated_at,
             expires_secs: d.expires_at,
+            last_used_secs: (detail != ItemDetail::Summary).then_some(d.last_used_at).flatten(),
             account,
             detail: full,
             exposed: m.exposure.as_ref().map(|e| ExposedView {

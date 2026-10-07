@@ -117,3 +117,36 @@ fn response_vectors() -> serde_json::Value {
         "backup.create": response::<BackupView>(json!({"path": "/fixture/backup", "file_name": "backup", "items": 1, "bytes": 1024, "created_secs": 3}))
     })
 }
+
+#[test]
+fn long_inventory_carries_last_use_without_full_details() {
+    use envcloak_core::crypto::ItemClass;
+    use envcloak_core::vault::{ItemDetails, ItemId, ItemMeta, Slug};
+    use envcloak_ipc::view::{ItemDetail, ItemView};
+    let meta = ItemMeta {
+        id: ItemId::generate(),
+        class: ItemClass::Secret,
+        slug: Slug::new("fixture").unwrap(),
+        details: ItemDetails {
+            last_used_at: Some(123),
+            notes: "inspector only".into(),
+            ..ItemDetails::default()
+        },
+        created_at: 1,
+        updated_at: 2,
+        fields: vec![],
+        classification_changed_at: None,
+        exposure: None,
+        rotate_recommended: false,
+        login: None,
+    };
+    let long = serde_json::to_value(ItemView::from_meta(&meta, ItemDetail::Long)).unwrap();
+    assert_eq!(long["last_used_secs"], 123);
+    assert!(long.get("detail").is_none());
+    let full = serde_json::to_value(ItemView::from_meta(&meta, ItemDetail::Full)).unwrap();
+    assert_eq!(full["last_used_secs"], 123);
+    assert_eq!(full["detail"]["last_used_secs"], 123);
+    assert_eq!(full["detail"]["notes"], "inspector only");
+    let summary = serde_json::to_value(ItemView::from_meta(&meta, ItemDetail::Summary)).unwrap();
+    assert!(summary.get("last_used_secs").is_none());
+}

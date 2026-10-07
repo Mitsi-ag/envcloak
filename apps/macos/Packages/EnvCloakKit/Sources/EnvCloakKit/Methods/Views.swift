@@ -455,13 +455,14 @@ public struct ItemView: Sendable, WireDecodable, CustomStringConvertible, Custom
     public let `updated_secs`: UInt64
     public let `rotated_secs`: UInt64?
     public let `expires_secs`: UInt64?
+    public let `last_used_secs`: UInt64?
     public let `account`: AccountView?
     public let `detail`: ItemDetailView?
     public let `exposed`: ExposedView?
     public var description: String { "[ItemView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
-        let o = try wire.object(["id", "slug", "class", "title", "provider", "classification", "env_hint", "allow_short", "fields", "created_secs", "updated_secs", "rotated_secs", "expires_secs", "account", "detail", "exposed"])
+        let o = try wire.object(["id", "slug", "class", "title", "provider", "classification", "env_hint", "allow_short", "fields", "created_secs", "updated_secs", "rotated_secs", "expires_secs", "last_used_secs", "account", "detail", "exposed"])
         self.`id` = try o.decode("id")
         self.`slug` = try o.decode("slug")
         self.`class` = try o.decode("class")
@@ -475,6 +476,7 @@ public struct ItemView: Sendable, WireDecodable, CustomStringConvertible, Custom
         self.`updated_secs` = try o.decode("updated_secs")
         self.`rotated_secs` = try o.optional("rotated_secs")
         self.`expires_secs` = try o.optional("expires_secs")
+        self.`last_used_secs` = try o.optional("last_used_secs")
         self.`account` = try o.optional("account")
         self.`detail` = try o.optional("detail")
         self.`exposed` = try o.optional("exposed")

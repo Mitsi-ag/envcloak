@@ -100,6 +100,14 @@ import XCTest
         XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
+    func testInspectorFetchesAndEscapesFullMetadata() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client); await session.poll()
+        let window = host(KeyInspector(session: session, slug: session.items.rows.first?.slug, route: .constant(.keys(.all))))
+        await assertVisible("Notes 1\\u{202e}", in: window)
+        await assertVisible("api.example.invalid", in: window)
+        XCTAssertFalse(labels(window).contains { $0.contains("\u{202e}") })
+    }
+
     func testHiddenProjectsAndFailedProjectSearchAreExplicit() async {
         let client = ScriptedClient(); await client.pages("hidden-one-page")
         let session = VaultSession(client: client); await session.poll()
