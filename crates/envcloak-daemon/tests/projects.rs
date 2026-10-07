@@ -92,6 +92,9 @@ fn projects_screen_key_shaped_metadata_after_adoption_and_on_the_socket() {
             profile: None,
             refs: vec![],
             env_file: None,
+            bridge: None,
+            launch: None,
+            fds: vec![],
             argv: vec!["/usr/bin/true".into()],
             claims: vec![],
         },
@@ -168,6 +171,9 @@ fn projects_adopt_a_near_limit_manifest_and_keep_only_manifest_bindings() {
         }),
         argv: vec!["/usr/bin/true".into()],
         claims: vec![],
+        bridge: None,
+        launch: None,
+        fds: vec![],
     };
     approved_run(&mut c, &params, &cs);
     let rows = c.projects_list(None).unwrap();
@@ -216,6 +222,9 @@ fn projects_adopted_by_run_are_listed_with_current_bindings_and_hashes() {
             profile: None,
             refs: vec![],
             env_file: None,
+            bridge: None,
+            launch: None,
+            fds: vec![],
             argv: vec!["/usr/bin/true".into()],
             claims: vec![],
         };
@@ -273,6 +282,9 @@ fn projects_adopted_by_run_are_listed_with_current_bindings_and_hashes() {
         profile: None,
         refs: vec![],
         env_file: None,
+        bridge: None,
+        launch: None,
+        fds: vec![],
         argv: vec!["/usr/bin/true".into()],
         claims: vec![],
     };
@@ -447,6 +459,9 @@ fn projects_worst_case_pages_fit_and_cursor_survives_a_new_adoption() {
         profile: None,
         refs: vec![],
         env_file: None,
+        bridge: None,
+        launch: None,
+        fds: vec![],
         argv: vec!["/usr/bin/true".into()],
         claims: vec![],
     };
