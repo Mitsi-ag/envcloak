@@ -282,6 +282,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `result_unrecorded`, `created_by_agent` | `restore_refused` |
 | `substituted` | `files_backup_failed` |
 | `limited` | `too_many_checks` (from `scan.match`) |
+| `code_identity` | client-side `daemon_unverified`; the daemon's identity or runtime policy failed before sending |
 
 ## Lock
 
