@@ -142,7 +142,10 @@ final class SessionTests: XCTestCase {
         for query in ["", "provider:example", "project", "unknown:project:fixture"] {
             XCTAssertFalse(session.keysUnavailable(query: query, scope: nil))
         }
-        XCTAssertEqual(session.filteredKeys(query: "provider:example", filter: .all, scope: nil).count, 1)
+        for query in ["provider:example", "account:fixture@example.invalid", "class:test", "Fixture"] {
+            XCTAssertFalse(session.keysUnavailable(query: query, scope: nil))
+            XCTAssertEqual(session.filteredKeys(query: query, filter: .all, scope: nil).count, 1)
+        }
         await client.configure()
         await session.poll()
         XCTAssertFalse(session.keysUnavailable(query: "project:project", scope: nil))
