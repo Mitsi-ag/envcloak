@@ -63,7 +63,8 @@ struct ProjectInventoryRow: Identifiable {
         return result
     }
     func title(_ directory: DaemonText) -> String {
-        opened?.directory == directory ? opened!.title : MetadataRequest.basename(directory)
+        if let opened, opened.directory == directory || opened.check.project_dir == directory { return opened.title }
+        return MetadataRequest.basename(directory)
     }
     func canonicalDirectory(_ directory: DaemonText) -> DaemonText? {
         opened?.directory == directory ? opened!.check.project_dir : directory
@@ -115,6 +116,7 @@ struct ProjectInventoryRow: Identifiable {
             if let openedDirectory { await open(openedDirectory) }
         } catch {
             guard captured == revision else { return }
+            openRevision += 1
             rows = []; opened = nil; failure = error as? EnvCloakError ?? .protocolError; dirty = true
         }
     }
@@ -127,6 +129,7 @@ struct ProjectInventoryRow: Identifiable {
         guard let client else { return }
         openRevision += 1
         guard let url = MetadataRequest.directoryURL(directory) else {
+            openedDirectory = nil; manifestSignal = nil
             opened = nil; checkFailure = .protocolError; return
         }
         manifestSignal = ManifestSignal(directory: url)

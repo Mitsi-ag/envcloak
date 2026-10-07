@@ -100,6 +100,21 @@ import XCTest
         XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
+    func testAliasProjectShowsGrantsAndBindingAccess() async throws {
+        let root = URL(fileURLWithPath: "/tmp/ec05-alias-" + UUID().uuidString.prefix(8))
+        let project = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try Data("fixture".utf8).write(to: project.appendingPathComponent("envcloak.toml"))
+        let alias = root.appendingPathComponent("alias")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: project)
+        let client = ScriptedClient(); await client.plainSlugs(); await client.configure(grants: 1)
+        let session = VaultSession(client: client); await session.poll()
+        let window = host(ProjectDetail(session: session, directory: DaemonText(alias.path), selectedKey: .constant(nil)))
+        await assertVisible("Revoke", in: window)
+        XCTAssertTrue(labels(window).contains { $0.hasPrefix("Grant recorded for Fixture grant") })
+        XCTAssertFalse(labels(window).contains("No grants in force"))
+    }
+
     func testInspectorActionsAreUnavailableOrFieldQualified() async throws {
         let client = ScriptedClient(); await client.plainSlugs()
         let session = VaultSession(client: client); await session.poll()

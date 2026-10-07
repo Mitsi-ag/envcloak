@@ -78,9 +78,12 @@ actor ScriptedClient: WorkspaceClient {
             result = ["projects": ["hidden-one-page", "duplicate-real"].contains(pageMode) ? [row, row] : [row], "next": next]
 
         case "items.check": result = ["project_dir": "/tmp/project", "project_name": "project\u{202e}\u{1b}[31m", "bindings": [
-            ["env_name": "VARIABLE", "reference": "envcloak://fixture", "status": "ok"],
+            ["env_name": "VARIABLE", "reference": hostileSlugs ? "envcloak://fixture" : "envcloak://fixture-0", "status": "ok"],
             ["profile": "test", "env_name": "VARIABLE", "reference": "envcloak://second", "status": "unknown_item"]], "refs": []]
-        case "grants.list": result = ["grants": []]
+        case "grants.list": result = ["grants": grants == 0 ? [] : [[
+            "id": "fixture-grant", "kind": "terminal", "label": "Fixture grant", "root_pid": 42,
+            "project_dir": "/tmp/project", "bindings": [["env_name": "VARIABLE", "slug": "fixture-0", "live": false]],
+            "mode": "inject", "uses": "session", "created_secs": 1, "remaining_secs": 3600]]]
         case "grants.revoke":
             if revokeFailure { throw EnvCloakError.protocolError }
             result = ["revoked": 1]
@@ -124,6 +127,7 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(session.projects.opened?.directory, DaemonText("/tmp/selected-alias"))
         XCTAssertEqual(session.projects.opened?.grantDirectory, DaemonText("/tmp/project"))
         XCTAssertEqual(session.projects.canonicalDirectory(DaemonText("/tmp/selected-alias")), DaemonText("/tmp/project"))
+        XCTAssertEqual(session.projects.title(DaemonText("/tmp/project")), "project\\u{202e}\\u{1b}[31m")
     }
 
     @MainActor func testProjectSearchDependencyNeverReportsFalseAbsence() async {
@@ -195,6 +199,33 @@ final class SessionTests: XCTestCase {
         await barrier.release(); await load.value
         XCTAssertNil(store.opened)
         XCTAssertEqual(store.checkFailure, .protocolError)
+        XCTAssertNil(store.openedDirectory)
+        await store.refetch(.projects)
+        XCTAssertNil(store.opened)
+    }
+
+    @MainActor func testFailedInventoryInvalidatesConcurrentDetailReads() async throws {
+        let check = ItemBarrierClient(method: "items.check")
+        let projects = ProjectsStore(client: check, folders: nil)
+        let opening = Task { await projects.open(DaemonText("/tmp/project")) }
+        await check.arrived()
+        await check.client.configure(projectFailure: true)
+        await projects.refetch(.projects)
+        await check.release(); await opening.value
+        XCTAssertNotNil(projects.failure)
+        XCTAssertNil(projects.opened)
+
+        let client = FailingRefreshClient()
+        let items = ItemsStore(client: client); await items.refetch(.items)
+        let slug = try XCTUnwrap(items.rows.first?.slug)
+        let refreshing = Task { await items.refetch(.items) }
+        await client.arrived()
+        await items.select(slug)
+        XCTAssertNotNil(items.selectedItem)
+        await client.release(); await refreshing.value
+        XCTAssertNotNil(items.failure)
+        XCTAssertTrue(items.rows.isEmpty)
+        XCTAssertNil(items.selectedItem)
     }
 
     @MainActor func testReadOnlyHonorsDaemonRefusalAndLockedWins() async {
@@ -516,6 +547,31 @@ actor ItemBarrierClient: WorkspaceClient {
         if M.name == methodName && !entered {
             await withCheckedContinuation {
                 waiter = $0; entered = true; arrival?.resume(); arrival = nil
+            }
+        }
+        return try await client.call(method)
+    }
+}
+
+actor FailingRefreshClient: WorkspaceClient {
+    let client = ScriptedClient()
+    var lists = 0
+    var entered = false
+    var arrival: CheckedContinuation<Void, Never>?
+    var waiter: CheckedContinuation<Void, Never>?
+    func arrived() async {
+        if entered { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
+    func release() { waiter?.resume(); waiter = nil }
+    func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
+        if M.name == "items.list" {
+            lists += 1
+            if lists > 1 {
+                await withCheckedContinuation {
+                    waiter = $0; entered = true; arrival?.resume(); arrival = nil
+                }
+                throw EnvCloakError.protocolError
             }
         }
         return try await client.call(method)
