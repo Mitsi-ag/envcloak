@@ -291,6 +291,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `code_selecting_variable`, `interpreter_option`, `wrapper_program`, `disguised_launcher` | `code_selecting_env` (from `managed.register`, `managed.update_plan` and `managed.update`; their `invalid_params` carries `not_found`, `not_regular_file`, `too_large`, `invalid_env_name` and `invalid_path` from the rows above, ) |
 | `key_shaped` | `invalid_params` from `managed.register`, `managed.update_plan` and `managed.update`: a launch argument, variable value, working directory or `PATH`, or a bridged server's origin or header name, shaped like a key (gate 13 in the daemon) |
 | `invalid_header`, `header_bindings` | `invalid_params` from `managed.register` for a bridged server: a header whose name cannot name a binding (letters, digits, `-` and `_`, a letter first), or two headers that would share one; a manifest that does not bind exactly its headers' bindings (docs/MIGRATE-MCP.md) |
+| `code_identity` | client-side `daemon_unverified`; the daemon's identity or runtime policy failed before sending |
 
 ## Lock
 
