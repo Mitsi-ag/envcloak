@@ -128,3 +128,30 @@ The final run at `ba2dbedb` used Node v26.7.0, the detached empty-environment la
 | `scripts/check-expose-lint.sh` | Pass, all 8 exposure call sites reported |
 
 The final run rebuilt the test-enabled binaries before testing and did not overlap a plain daemon build. Raw results are `m27-npx-final-results.json`, `m27-npx-final-*.log` and `m27-npx-mutation-results.json` under `/Volumes/KeenShiftDev/tmp/envcloak-target/A`. The older M2-25 residual and other tasks' plan ownership above are unchanged. No push was performed by this lane.
+
+
+## M2-14 integration and doctor grammar receipt
+
+Main merged without conflicts in `5bfb82b5`. The extra `unknown openai` is a seed-dependent M2-14 test defect. The runtime-generated OpenAI canary can end in `-` or `_`; the scanner deliberately emits both the full token and a punctuation-trimmed reading. The full token matches the stored item twice, while the trimmed candidate matches OpenAI's registry pattern but is absent from the vault, so it is correctly reported as unknown twice. Those scanner, provider, canary and daemon matching sources are unchanged from main. No timing, order or M2-27 behavior change is needed to explain the failure.
+
+Commit `92bff9e2` makes the fixture endings explicit: alphanumeric as the control, then hyphen and underscore. The hyphen fixture reproduced the original CI assertion before the repair. The corrected gate requires exact JSON findings and exact ordered human lines, including multiplicity. It no longer assumes only one unknown provider or collapses repeated path/count and rotation-URL lines across distinct finding sections. Production doctor output and matching behavior are unchanged.
+
+Class sweep: the CLI doctor grammar gate was the only flat unique-line oracle among the merged CLI, client report and doctor story tests. The client report test checks schema, masking and canaries; the story checks typed JSON findings and exposure counts. The 1 GiB fixture already has its independent candidate-cardinality control and is unchanged. The full scanner suite, including `deleted_history_is_found_and_limits_are_partial`, passed locally; no change was made for the separate Ubuntu Git-history report.
+
+Three named mutations of the human renderer were compiled and observed failing the corrected gate: `add-line-number`, `omit-unknown-openai-heading`, and `duplicate-item-heading`. Each was restored, and the full suffix matrix passed before and after the mutations. Thus legitimate repeated lines are accepted only in their expected sections, while missing, extra and duplicated grammar entries still fail.
+
+Final validation used the required target directory, no incremental compilation, three Cargo build jobs and three test threads with `--no-fail-fast`. Everything ran detached from agent ancestry, with private short `/tmp` HOME/XDG/TMPDIR roots. Test-enabled daemon and CLI fixture binaries were built first. Three complete doctor-suite runs used separate private roots, each including the unmodified 1 GiB gate with its terminal and two same-agent-root scans. No full workspace test command was run.
+
+| Check | Result |
+| --- | --- |
+| Complete doctor suite, including every local gate 36 case | 12/12 pass in each of three runs |
+| Remaining CLI coverage, with the large case qualified above | 233 pass |
+| Client and scanner suites | 37 and 208 pass |
+| Policy and daemon suites | 210 and 258 pass |
+| Managed launch and runner suites | 29 and 19 pass |
+| Doctor story | 1 pass |
+| Formatting and strict workspace/all-target Clippy | Pass |
+| Unsafe, expose lint and compiler-source checks | Pass |
+| Crate graph, reservations and SPEC decisions | Pass |
+
+Raw results are `m27-doctor-final-results.json`, `m27-doctor-final-*.log`, `m27-doctor-repro.log` and `m27-doctor-mutation-results.json` under `/Volumes/KeenShiftDev/tmp/envcloak-target/A`. These are macOS measurements; no Linux execution is claimed. No push was performed by this lane.
