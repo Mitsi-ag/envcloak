@@ -53,8 +53,8 @@ pub use integrity::{AuditHead, HeaderState, Integrity, TamperKind};
 pub use items::{
     Account, COVER_BITS, COVER_HASHES, Classification, Exposure, ExposureCover, ExposureSource,
     FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId, ItemMeta, Links, LoginMeta,
-    LoginTier, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectBinding, ProjectId,
-    ProjectKey, ProjectRecord, Slug,
+    LoginTier, MAX_FIELD, MAX_PRIOR, MAX_PROJECT, MAX_ROW, NewItem, PolicyId, ProjectBinding,
+    ProjectId, ProjectKey, ProjectRecord, Slug,
 };
 pub use login::{
     AttemptLease, LoginFieldReader, LoginFieldValue, LoginValue, NewLogin, TotpAlgorithm,

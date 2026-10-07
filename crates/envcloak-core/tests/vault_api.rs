@@ -289,7 +289,7 @@ fn size_caps_hold() {
         .transact(|t| {
             t.upsert_project(ProjectRecord {
                 key: ProjectKey::new(b"k").unwrap(),
-                display_path: "p".repeat(MAX_FIELD),
+                display_path: "p".repeat(envcloak_core::vault::MAX_PROJECT),
                 manifest_sha256: [0; 32],
                 bindings: Vec::new(),
                 last_seen: 0,
@@ -548,4 +548,31 @@ fn a_foreign_or_newer_file_is_refused() {
         LockedVault::open(&f.paths).unwrap_err().kind(),
         VaultErrorKind::Damaged
     );
+}
+
+#[test]
+fn project_metadata_capacity_is_separate_from_secret_field_capacity() {
+    let (f, mut v) = Fixture::create();
+    let mut record = ProjectRecord {
+        key: ProjectKey::new(b"capacity").unwrap(),
+        display_path: String::new(),
+        manifest_sha256: [0; 32],
+        bindings: vec![],
+        last_seen: 1,
+    };
+    // Version 1 layout: version, length-prefixed key and path, hash,
+    // binding count and timestamp. Check the serialized boundary itself.
+    let overhead = 1 + 4 + 8 + 4 + 32 + 4 + 8;
+    record.display_path = "p".repeat(128 * 1024 - overhead);
+    let id = v.transact(|t| t.upsert_project(record.clone())).unwrap();
+    let mut over = record.clone();
+    over.display_path.push('p');
+    assert_eq!(
+        v.transact(|t| t.upsert_project(over)).unwrap_err().kind(),
+        VaultErrorKind::TooLarge
+    );
+    assert_eq!(v.find_project(&record.key).unwrap(), Some((id, &record)));
+    let v = v.lock().unlock(f.vmk()).map_err(|(_, e)| e).unwrap();
+    assert_eq!(v.find_project(&record.key).unwrap(), Some((id, &record)));
+    assert_eq!(MAX_FIELD, 65536);
 }

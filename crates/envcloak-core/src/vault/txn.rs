@@ -23,8 +23,8 @@ use super::integrity::{
 };
 use super::items::{
     Exposure, ExposureCover, ExposureSource, FieldId, FieldKind, FieldName, FieldRecord,
-    ItemDetails, ItemExtra, ItemId, MAX_FIELD, MAX_PRIOR, MAX_ROW, NewItem, PolicyId, ProjectId,
-    ProjectKey, ProjectRecord, Slug, encode_field, encode_item, encode_project,
+    ItemDetails, ItemExtra, ItemId, MAX_FIELD, MAX_PRIOR, MAX_PROJECT, MAX_ROW, NewItem, PolicyId,
+    ProjectId, ProjectKey, ProjectRecord, Slug, encode_field, encode_item, encode_project,
 };
 use super::login::{LoginFieldValue, NewLogin};
 use super::policies::{PolicyRecord, StandingSetHeader};
@@ -754,7 +754,7 @@ impl<'v> Txn<'v> {
     /// Adds or replaces the record for `p.key`'s project.
     pub fn upsert_project(&mut self, p: ProjectRecord) -> Result<ProjectId, VaultError> {
         let record = encode_project(&p);
-        if record.len() > MAX_FIELD {
+        if record.len() > MAX_PROJECT {
             return Err(VaultErrorKind::TooLarge.into());
         }
         let hash = dir_hash(self.keys, p.key.as_bytes());

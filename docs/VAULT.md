@@ -114,9 +114,10 @@ A kind or version this build does not know, a record that does not decode whole,
 
 ## Size caps
 
-- 64 KiB for a value, and for the plaintext of every other sealed record except the prior list and the item record.
+- 64 KiB for a value, and for the plaintext of every other sealed record except the prior list, item record and project record.
 - An item record holds 64 KiB of what its writer gives: its bytes up to `notes`, which is version 1 whole, the limit version 1 had. After them come at most 304 bytes the vault keeps itself (`classification_changed_at` 9, `exposure` at most 284, `rotate_recommended` 1, `login` 10). So the migration, which adds those parts to every record version 1 held, and a later classification change or exposure mark never take a record that was within the limit over a limit a later write enforces. The check is in the item record's encoder, which every writer goes through, the migration's rewrite included.
 - The prior list packs up to three prior values into one sealed column. Each was a value, so each is at most 64 KiB; the list is at most 2 + 3 × (4 + 64 KiB) bytes, about 192 KiB.
+- 128 KiB for a project record: the resolved manifest names plus binary length prefixes, directory, identity, hash and timestamp. Secret values remain capped at 64 KiB. A 64 KiB manifest can expand past 64 KiB when its bindings are encoded. The metadata cap also bounds a maximally escaped project below the 768 KiB projects-list page budget.
 - 1 MiB per row. A field row with a full-size value and three full-size prior values stays under it.
 
 ## State digest
