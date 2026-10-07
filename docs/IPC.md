@@ -455,7 +455,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `invalid_text` | M2-12 | landed | a scanner encountered invalid UTF-8; bounded raw text runs on either side are still inspected and the report is incomplete |
 | `token_too_large` | M2-12 | landed | a transcript or Git text token exceeded the 4 KiB candidate cap; the token is skipped and the report is incomplete |
 | `reading_budget` | M2-12 | landed | a token exceeded the bounded alternative-reading allowance; accepted readings remain and the report is incomplete |
-| `incomplete` | M2-14 | reserved | doctor, import, scrub or `migrate-mcp` did not finish the whole job (a cap, a budget, an item reported as manual); a non-zero exit with the reason |
+| `incomplete` | M2-14 | landed | doctor, import, scrub or `migrate-mcp` did not finish the whole job (a cap, a budget, an item reported as manual); a non-zero exit with the reason |
 | `value_on_argv` | M2-18 | reuse | a value given as a command-line argument; `mcp-bridge` takes slugs only |
 | `output_stalled` | M2-06 | landed | `envcloak mcp`: the host went on sending but stopped reading the answers, and the answers waiting for it reached their bound; the session ends and the calls in hand are stopped |
 | `not_started_by_daemon` | M2-27 | reserved | `envcloak run --launch`, `mcp-bridge --relay` or `mcp --browser-supervisor` started by anything but the daemon; exit 125, and nothing is received (SPEC §4); distinct from the error kind `runner_unavailable`, the daemon unable to start one |
@@ -471,6 +471,20 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `agents_incomplete` | M2-08 | landed | `envcloak agents install` or `uninstall` (or `init --agents-note`) left a file as it was (refused, with the reason on its line of the report), a host named with `--agent` is not installed, or a file an earlier write left beside a config under EnvCloak's temporary name is still there (named in the report); exit 1 |
 | `double_install` | M2-08 | landed | `envcloak agents status`: EnvCloak's Claude Code plugin is enabled while EnvCloak's own hooks or an `envcloak` MCP server are installed too, so each hook runs twice; the message names the files on both sides; exit 1 |
 | `probe_unavailable` | M2-28 | landed | `envcloak agents status --probe`: a host's probe could not be set up (the programs it needs are not beside this `envcloak`, or its probe home, probe daemon, throwaway vault or install could not be made), so it was not probed; after the report; exit 1 |
+| `binding` | M2-22 | landed | a scrub range lacks its source stamp or no longer fits the bytes read; the file is refused |
+| `bounds` | M2-22 | landed | a scrub range is out of bounds or splits a decoded character or JSON escape; the file is refused |
+| `candidate_too_large` | M2-22 | landed | a scrub candidate cannot fit the bounded daemon comparison request |
+| `invalid_home` | M2-22 | landed | scrub cannot construct its source locations from the home and XDG paths |
+| `invalid_json` | M2-22 | landed | the source or rewritten JSON document does not parse; nothing is published |
+| `invalid_response` | M2-22 | landed | scrub undo received an invalid SHA-256 representation |
+| `invalid_slug` | M2-22 | landed | a scrub marker would contain an invalid item slug; the file is refused |
+| `items_changed` | M2-22 | landed | scrub confirmation or publication revalidation no longer matches the displayed item associations |
+| `line_too_large` | M2-22 | landed | a scrub JSON document or JSONL line exceeds the bounded rewrite buffer |
+| `overlap` | M2-22 | landed | confirmed scrub edits overlap without being exact duplicates; the file is refused |
+| `refused` | M2-22 | landed | a scrub plan already contains a refusal and cannot be applied |
+| `scan_failed` | M2-22 | landed | scrub could not finish source discovery or candidate collection |
+| `statement_changed` | M2-22 | landed | the scrub undo statement changed before the restore proof was used |
+| `unsupported` | M2-22 | landed | a scrub occurrence lacks rewrite authority, including a match inside a longer encoded run |
 <!-- /reservations -->
 
 **Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):
