@@ -302,3 +302,70 @@ command was run. Logs, mutation receipts and final statuses are in
 M2-19's scope, requirement ids and gates listed above remain covered. The
 only follow-up implementation belongs to M2-28, explicitly tracked above;
 fresh merged-head GitHub CI remains with the driver. No finding is rejected.
+
+## Release-binary restore gate correction
+
+Manual run `37547853061` on `1c48bad8` exposed a test capability mismatch:
+the real-CLI gate unconditionally awaited `termios.restored`, although
+production release binaries deliberately contain no testing hooks. The
+earlier local PTY receipts used testing binaries and did not cover this
+release-binary invocation.
+
+The gate now uses the harness's existing binary mode, `Harness::test_build`.
+With the target's testing binaries, the actual-restore barrier is mandatory:
+its absence fails within the 30-second observation window with the captured
+terminal in the diagnostic. It still requires stopped kernel state and
+restored settings before releasing the barrier. With external release
+artifacts selected by `ENVCLOAK_E2E_BIN_DIR`, the test prints why that
+internal observation is unavailable. Both modes still require the outer
+prompt, stopped command, `jobs` status, restored `stty -g`, `fg`, resumed
+ticks, input and successful exit. All the other job-control, redaction and
+direct/nested signal receipt assertions still run. No timeout or missing
+marker can select release mode.
+
+The class sweep covered all 33 task files against the current merge base,
+including every changed test and CI's external-binary invocations. The
+instances are the e2e restore barrier (fixed), the same gate's injected
+panic (already conditional on `test_build`), exec's PTY pause/failure/panic
+hooks and pipe-runner pause (their runner is `current_exe`, always the
+testing executable), and sys's terminal/topology helpers (also their own
+testing executable). CLI snapshot/stub tests, the allocation probe,
+emitter and reservation tests have no external-release seam dependency.
+There is no second affected test. The production hook definitions retain
+their feature guards; release artifacts acquire no testing capability.
+The sweep receipt is `.collab/m2-19/review5/seam-sweep.txt`.
+
+All three mutations failed the intended assertion with Cargo exit 101,
+and all sources were restored:
+
+- `missing-testing-restore-barrier`: remove the `termios.restored` pause
+  from the testing binary. The real-CLI gate fails with "testing binary
+  missed the actual outer-terminal restore barrier".
+- `restore-before-stop`: restore the guard in SIGTSTP dispatch before
+  asking the monitor to stop the command. The gate fails at the actual
+  restore with the command still in kernel state `S+`.
+- `require-restore-hook-in-release`: force the testing-only branches on
+  when using external release binaries. This reproduces the missing
+  barrier failure, so the release run guards the reported regression too.
+
+The restored macOS testing build passes both PTY cases, with stopped state
+`T` and restored settings observed at the barrier. A fresh
+`cargo build --release --offline --locked` using the workspace's default
+members, without testing features, also passes both PTY cases with
+`ENVCLOAK_E2E_BIN_DIR=/Volumes/KeenShiftDev/tmp/envcloak-target/C/release`.
+`release_artifacts_carry_no_test_hook` passes on those same release
+artifacts. Direct and nested signal receipts in both modes remain job
+`[1,1,1,1]`, shell `[0,0,0,0]`. The release gate completes in 18 seconds;
+its explicit no-barrier message accompanies the user-visible assertions.
+The mutation and release receipts are `review5/mutations.json` and
+`review5/release.json` under `.collab/m2-19/`.
+
+Final checks pass: all 133 `envcloak-e2e` tests, `cargo fmt --all --check`,
+strict workspace/all-target Clippy, unsafe, expose-lint, unsafe-lint,
+reservations, spec-decisions, crate-graph and sources. The final receipt
+is `.collab/m2-19/review5/final.json`. All builds retained target C,
+incremental compilation off and three jobs. Tests ran detached with
+private short HOME/XDG directories and `--no-fail-fast -- --test-threads 3`.
+The scope and requirement ids above remain covered; this correction
+defers no implementation. Both-platform CI on this commit remains the
+driver's check under the no-push instruction.
