@@ -232,8 +232,9 @@ fn take() -> Result<Image, AnchorError> {
 
 /// The pipe ends a managed request handed over, checked: each role once,
 /// in the order the request names them ([`FdRole::well_formed`]), standard
-/// input and the lifeline readable, standard output and error writable,
-/// each a pipe or a socket.
+/// input readable, standard output and error writable, each a pipe or a
+/// byte-stream socket. The lifeline is a read-only pipe: closing the
+/// client's write end must deliver EOF to the runner.
 #[derive(Debug)]
 pub(crate) struct ClientEnds {
     stdin: OwnedFd,
@@ -270,7 +271,8 @@ impl ClientEnds {
                 return Err(bad());
             }
             let fits = match role {
-                FdRole::Stdin | FdRole::Lifeline => readable(access),
+                FdRole::Stdin => readable(access),
+                FdRole::Lifeline => kind == DescriptorKind::Pipe && access == Access::Read,
                 FdRole::Stdout | FdRole::Stderr => writable(access),
             };
             if !fits {
@@ -678,6 +680,58 @@ mod tests {
         };
         assert!(ClientEnds::from_request(mk(), &four, true).is_ok());
         assert!(ClientEnds::from_request(mk(), &four, false).is_err());
+    }
+
+    /// Datagram peers do not promise EOF on close (notably on Linux).
+    /// Every stream role is checked, and the lifeline must be a read-only
+    /// pipe even when a stream socket would otherwise be supported.
+    #[test]
+    fn managed_descriptors_require_streams_and_a_read_only_pipe_lifeline() {
+        use std::os::unix::net::UnixDatagram;
+
+        for launch in [false, true] {
+            let mut roles = vec![FdRole::Stdin, FdRole::Stdout];
+            if launch {
+                roles.push(FdRole::Stderr);
+            }
+            roles.push(FdRole::Lifeline);
+            let ends = || {
+                roles
+                    .iter()
+                    .map(|role| {
+                        let (r, w) = pipe();
+                        if matches!(role, FdRole::Stdin | FdRole::Lifeline) {
+                            r
+                        } else {
+                            w
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert!(ClientEnds::from_request(ends(), &roles, launch).is_ok());
+            for (i, role) in roles.iter().enumerate() {
+                let (socket, _peer) = UnixDatagram::pair().unwrap();
+                let mut fds = ends();
+                fds[i] = socket.into();
+                assert!(
+                    ClientEnds::from_request(fds, &roles, launch).is_err(),
+                    "datagram {role:?}"
+                );
+
+                let (socket, _peer) = UnixStream::pair().unwrap();
+                let mut fds = ends();
+                fds[i] = socket.into();
+                assert_eq!(
+                    ClientEnds::from_request(fds, &roles, launch).is_ok(),
+                    *role != FdRole::Lifeline,
+                    "stream {role:?}"
+                );
+            }
+            let mut fds = ends();
+            let (_r, w) = pipe();
+            *fds.last_mut().unwrap() = w;
+            assert!(ClientEnds::from_request(fds, &roles, launch).is_err());
+        }
     }
 
     /// No anchor, no runner: `runner_unavailable`, and nothing is started.

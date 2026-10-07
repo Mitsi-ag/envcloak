@@ -220,9 +220,9 @@ pub fn recv_with_fds(
 pub enum DescriptorKind {
     /// A pipe or FIFO.
     Pipe,
-    /// A socket.
+    /// A byte-stream socket (`SOCK_STREAM`), with EOF when its peer closes.
     Socket,
-    /// Anything else: a regular file, a directory, a device.
+    /// Anything else, including datagram and sequenced-packet sockets.
     Other,
 }
 
@@ -235,10 +235,12 @@ pub enum Access {
 }
 
 /// What `fd` refers to and how it was opened: `fstat`'s file type and
-/// `F_GETFL`'s access mode.
+/// `F_GETFL`'s access mode, with `SO_TYPE` checked for sockets. A datagram
+/// peer's closing does not promise EOF, and record-oriented sockets do
+/// not implement the byte streams a managed hand-off needs.
 ///
 /// # Errors
-/// `fstat`'s and `fcntl`'s errors.
+/// `fstat`, `getsockopt` and `fcntl` errors, or an invalid socket-type reply.
 pub fn descriptor_kind(fd: BorrowedFd<'_>) -> io::Result<(DescriptorKind, Access)> {
     // SAFETY: stat is plain data; fstat fills it in.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -248,7 +250,32 @@ pub fn descriptor_kind(fd: BorrowedFd<'_>) -> io::Result<(DescriptorKind, Access
     }
     let kind = match st.st_mode & libc::S_IFMT {
         libc::S_IFIFO => DescriptorKind::Pipe,
-        libc::S_IFSOCK => DescriptorKind::Socket,
+        libc::S_IFSOCK => {
+            let mut socket_type: libc::c_int = 0;
+            let mut len = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+            // SAFETY: socket_type and len are writable for their stated
+            // sizes; fd remains open for the duration of its borrow.
+            if unsafe {
+                libc::getsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut socket_type as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            } != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if len as usize != std::mem::size_of_val(&socket_type) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            if socket_type == libc::SOCK_STREAM {
+                DescriptorKind::Socket
+            } else {
+                DescriptorKind::Other
+            }
+        }
         _ => DescriptorKind::Other,
     };
     // SAFETY: F_GETFL only reads the open file's status flags.
@@ -271,6 +298,21 @@ mod tests {
     use std::os::unix::net::UnixStream;
 
     use super::*;
+
+    #[test]
+    fn descriptor_kind_distinguishes_streams_from_datagrams() {
+        use std::os::unix::net::UnixDatagram;
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        assert_eq!(
+            descriptor_kind(stream.as_fd()).unwrap(),
+            (DescriptorKind::Socket, Access::ReadWrite)
+        );
+        let (datagram, _peer) = UnixDatagram::pair().unwrap();
+        assert_eq!(
+            descriptor_kind(datagram.as_fd()).unwrap(),
+            (DescriptorKind::Other, Access::ReadWrite)
+        );
+    }
 
     /// A descriptor sent with the first byte arrives with it, open and
     /// close-on-exec, and names the same pipe: what is written to the
