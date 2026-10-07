@@ -130,8 +130,55 @@ fn aws_delimiters_match_python_ini_oracle() {
 }
 
 #[test]
+fn review_aws_indentation_matches_python_ini_oracle() {
+    // Hand-written reader syntax; the AWS CLI writer uses no indentation.
+    for (first, second, third) in [
+        ("  ", "  ", "  "),
+        ("    ", "  ", ""),
+        ("\t", " ", ""),
+        ("\u{a0}", " ", ""),
+    ] {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let path = home.path().join("fixture.ini");
+        let bytes = format!(
+            "[default]\n{first}aws_access_key_id = first fixture\n  # comment\n\n{second}Aws_Secret_Access_Key: second fixture=tail\n{third}aws_session_token = third fixture\n[other]\n  aws_secret_access_key = fourth fixture\n"
+        );
+        std::fs::write(&path, &bytes).unwrap();
+        let out = Command::new("/usr/bin/python3")
+            .env_clear()
+            .env("HOME", home.path())
+            .args(["-I", "-c", "import configparser,json,sys; p=configparser.RawConfigParser(); p.read(sys.argv[1]); print(json.dumps([(k.upper(),v) for s in p.sections() for k,v in p.items(s)]))"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let expected: Vec<(String, String)> = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(expected.len(), 4);
+        let report = parse_aws(&SecretBytes::copy_from(bytes.as_bytes()));
+        assert!(
+            report.complete(),
+            "equal or decreasing indentation is an option"
+        );
+        assert_eq!(report.findings.len(), expected.len());
+        for (finding, (name, value)) in report.findings.iter().zip(expected) {
+            assert!(finding.name.ct_eq(name.as_bytes()));
+            assert!(finding.value.as_ref().unwrap().ct_eq(value.as_bytes()));
+            assert!(finding.single_complete_line);
+        }
+    }
+}
+
+#[test]
 fn aws_continuation_context_matches_python_ini_oracle() {
     for (bytes, credential) in [
+        (
+            "[default]\n  aws_secret_access_key = first\n    part=two\n    tail:three\n",
+            Some("first\npart=two\ntail:three"),
+        ),
+        (
+            "[default]\n  region = first\n    aws_secret_access_key = second\n",
+            None,
+        ),
         (
             "[default]\nregion = first\n  aws_secret_access_key = second\n",
             None,

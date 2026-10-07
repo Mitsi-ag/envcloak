@@ -1147,6 +1147,37 @@ fn mcp_header_literals_are_imported_and_handed_off_by_name() {
 }
 
 #[test]
+fn review_aws_indented_options_are_imported_and_cleaned() {
+    for source in [".aws/credentials", ".aws/config"] {
+        let f = Fixture::new(true);
+        let path = f.home.home().join(source);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = format!(
+            "[default]\n    aws_access_key_id = {}\n    aws_secret_access_key: {}\n  aws_session_token = {}\nregion = retained\n",
+            f.value(),
+            f.value(),
+            f.value()
+        );
+        std::fs::write(&path, &original).unwrap();
+        age(&path);
+        let out = f.scan(&["--yes", "--delete-plaintext"]);
+        f.clean(&out);
+        assert!(
+            out.status.success(),
+            "valid indented AWS options must import"
+        );
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["items"].as_array().unwrap().len(), 1);
+        assert_eq!(report["items"][0]["slug"], "openai/existing");
+        let expected = format!(
+            "[default]\n{}region = retained\n",
+            "# envcloak: openai/existing; use envcloak run\n".repeat(3)
+        );
+        assert!(std::fs::read(&path).unwrap() == expected.as_bytes());
+    }
+}
+
+#[test]
 fn gate15_hard_links_are_importable_but_never_rewritten() {
     for source in [
         ".zshrc",

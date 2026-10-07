@@ -30,7 +30,7 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
     let mut sections = HashSet::new();
     let mut seen = HashSet::new();
     let mut offset = 0;
-    let mut prior_key = false;
+    let mut option_indent = None;
     for raw in text.split_inclusive('\n') {
         let start = offset;
         offset += raw.len();
@@ -38,22 +38,26 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
         }
-        if prior_key && raw.starts_with(char::is_whitespace) {
+        // RawConfigParser counts characters, including tabs and Unicode
+        // whitespace. Only an increase continues the preceding option.
+        let indent = raw.chars().take_while(|c| c.is_whitespace()).count();
+        if option_indent.is_some_and(|prior| indent > prior) {
             report.issue("", "multiline_aws_value");
+            continue;
         }
         if line.starts_with('[') && line.ends_with(']') && line.len() > 2 {
             section = Some(&line[1..line.len() - 1]);
             if !sections.insert(section) {
                 report.issue("", "duplicate_aws_section");
             }
-            prior_key = false;
+            option_indent = None;
             continue;
         }
         let Some((key, value)) = line.split_once(['=', ':']) else {
             report.issue("", "unsupported_aws_syntax");
             continue;
         };
-        prior_key = true;
+        option_indent = Some(indent);
         let key = key.trim();
         let name = [
             "AWS_ACCESS_KEY_ID",
