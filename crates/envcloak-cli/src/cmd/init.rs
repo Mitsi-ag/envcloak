@@ -714,8 +714,18 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
             "the backup list is incomplete; this backup was not identified",
         ));
     }
-    let statement = undo_statement(id, &project.path().to_string_lossy(), &shown, a);
-    if let Some(f) = missing_form(&shown, a) {
+    let (statement, refusal) = if first_run_v2 {
+        (
+            undo_first_run_statement(id, &shown, a),
+            missing_first_run_form(&shown, a),
+        )
+    } else {
+        (
+            undo_statement(id, &project.path().to_string_lossy(), &shown, a),
+            missing_form(&shown, a),
+        )
+    };
+    if let Some(f) = refusal {
         eprint!("{statement}");
         return Err(f);
     }
@@ -812,7 +822,18 @@ fn undo_first_run_v2(
         .statement
         .files
         .first()
-        .filter(|f| f.path == shown.files[0].path)
+        .filter(|f| {
+            f.path == shown.files[0].path
+                && f.sha256_after
+                    == match &shown.files[0].left {
+                        Some(FileLeft::Rewritten(digest)) => Some(digest.clone()),
+                        _ => None,
+                    }
+                && shown.creator.as_ref().is_some_and(|c| {
+                    c.kind == lease.statement.creator.kind
+                        && c.agent == lease.statement.creator.agent
+                })
+        })
         .ok_or_else(|| Failure::new("undo_incomplete", "the backup statement changed"))?;
     let path = Path::new(&file.path);
     let parent = path
@@ -902,6 +923,47 @@ fn recorded(shown: &FilesShown) -> bool {
 /// other needs `--created-by-agent`.
 fn by_terminal(shown: &FilesShown) -> bool {
     shown.creator.as_ref().is_some_and(|c| c.kind == "terminal")
+}
+
+fn undo_first_run_statement(id: &str, shown: &FilesShown, a: &InitArgs) -> String {
+    let files = shown
+        .files
+        .iter()
+        .map(|f| envcloak_client::doctor_report::display_path(Path::new(&f.path)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut statement = format!(
+        "Restore backup {id} to these sealed absolute paths: {files}. These files hold plaintext secrets. The current project directory does not restrict these targets.\nThe backup was {}.\n",
+        made_by(shown.creator.as_ref())
+    );
+    if recorded(shown) {
+        statement.push_str("An existing file is overwritten only while it matches the recorded result; later edits and missing files are left untouched.\n");
+    } else {
+        statement.push_str("EnvCloak does not know what the change left. --unrecorded overwrites the current file, including later edits, after checking it has not changed during this restore. Missing or linked files are left untouched.\n");
+    }
+    if !by_terminal(shown) && a.created_by_agent {
+        statement.push_str("--created-by-agent: its bytes are written back as the process that made it stored them.\n");
+    }
+    statement
+}
+
+fn missing_first_run_form(shown: &FilesShown, a: &InitArgs) -> Option<Failure> {
+    let message = match (
+        !recorded(shown) && !a.unrecorded,
+        !by_terminal(shown) && !a.created_by_agent,
+    ) {
+        (false, false) => return None,
+        (true, false) => {
+            "this backup needs --unrecorded to overwrite the current file; nothing was written"
+        }
+        (false, true) => {
+            "this backup needs --created-by-agent to write its creator's bytes; nothing was written"
+        }
+        (true, true) => {
+            "this backup needs --unrecorded --created-by-agent to overwrite the current file with its creator's bytes; nothing was written"
+        }
+    };
+    Some(Failure::new("restore_refused", message))
 }
 
 /// The statement `init --undo` shows before the passphrase: the project

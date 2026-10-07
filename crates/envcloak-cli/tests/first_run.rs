@@ -1015,9 +1015,83 @@ fn gate16_profile_undo_is_byte_exact_and_checks_the_result() {
     assert!(!refused.status.success());
     assert!(std::fs::read(&path).unwrap() == edited);
     std::fs::write(&path, &after).unwrap();
-    let restored = run_on_terminal(&f.home, &args, &[(3, &pass, true)]);
+    let mut command = on_terminal_command(&f.home, &args, &[(3, &pass, true)]);
+    command.current_dir(outside.path());
+    let restored = finish_within(command, Duration::from_secs(60));
     f.clean(&restored);
     assert!(restored.status.success());
+    let statement = String::from_utf8_lossy(&restored.stderr);
+    assert!(statement.contains(path.to_str().unwrap()));
+    assert!(statement.contains("absolute paths"));
+    assert!(statement.contains("overwritten only while it matches the recorded result"));
+    assert!(!statement.contains("nothing is written anywhere else"));
+    assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+}
+
+#[test]
+fn review_unrecorded_undo_statement_describes_overwriting_current_file() {
+    let f = Fixture::new(true);
+    let path = f.home.home().join(".zshrc");
+    let original = format!("export OPENAI_API_KEY={}\n", f.value());
+    std::fs::write(&path, &original).unwrap();
+    age(&path);
+    assert!(!paused(&f, "first_run_swapped", true, || {}).success());
+    let list = envcloak_ipc::Client::connect(
+        &envcloak_ipc::RunPaths::under(envcloak_testkit::daemon_run_dir(&f.home)).unwrap(),
+    )
+    .unwrap()
+    .backup_v2_list()
+    .unwrap();
+    let id = &list.backups[0].id;
+    std::fs::write(&path, b"# later edits are deliberately recovered over\n").unwrap();
+    let refused = run_on_terminal(
+        &f.home,
+        &[
+            "init",
+            "--undo",
+            id,
+            "--created-by-agent",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[],
+    );
+    f.clean(&refused);
+    assert!(!refused.status.success());
+    let statement = String::from_utf8_lossy(&refused.stderr);
+    assert!(statement.contains("needs --unrecorded to overwrite the current file"));
+    assert!(!statement.contains("only where a file is missing"));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"# later edits are deliberately recovered over\n"
+    );
+    let outside = outside_dir();
+    let pass = secret_file(
+        outside.path(),
+        "pass",
+        by_label(&f.values, labels::VAULT_PASSPHRASE).value(),
+    );
+    let restored = run_on_terminal(
+        &f.home,
+        &[
+            "init",
+            "--undo",
+            id,
+            "--unrecorded",
+            "--created-by-agent",
+            "--passphrase-fd",
+            "3",
+            "--json",
+        ],
+        &[(3, &pass, true)],
+    );
+    f.clean(&restored);
+    assert!(restored.status.success());
+    let statement = String::from_utf8_lossy(&restored.stderr);
+    assert!(statement.contains(path.to_str().unwrap()));
+    assert!(statement.contains("absolute paths"));
+    assert!(statement.contains("overwrites the current file, including later edits"));
+    assert!(!statement.contains("only where it is missing"));
     assert!(std::fs::read(&path).unwrap() == original.as_bytes());
 }
 
