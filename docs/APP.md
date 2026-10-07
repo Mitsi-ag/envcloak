@@ -57,6 +57,9 @@ full `items.show` metadata, links and grants, with a solid held-value block.
 The long inventory supplies recorded last-used dates without per-row RPCs. No workspace store
 holds values. Replace and Remove offer quoted commands for a human Terminal
 session; Replace requires a field and qualifies the target as `slug#field`.
+Folder paths and command targets containing control or directional characters
+cannot be copied to Terminal. The controls explain the refusal; safe text is
+quoted, while displayed metadata remains escaped.
 Reveal explicitly says it is unavailable and offers no command. Project scope
 is saved as one adopted directory path per viewer. A failed preference write
 keeps the session selection and valid inventory, shows a warning, and retries
