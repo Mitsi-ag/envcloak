@@ -10,11 +10,12 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 canary="$root/security/lint-canary"
+lint_target="${CARGO_TARGET_DIR:-$root/target}/lint-canary"
 cd "$root"
 
 json="$(RUSTFLAGS="${RUSTFLAGS:-} --cfg envcloak_lint_canary" cargo clippy --quiet --locked \
   -p envcloak-lint-canary \
-  --target-dir "$root/target/lint-canary" \
+  --target-dir "$lint_target" \
   --message-format=json 2>/dev/null || true)"
 
 expected="$(grep -c '// EXPECT-DISALLOWED$' "$canary/src/lib.rs")"
@@ -23,7 +24,7 @@ got="$({ printf '%s\n' "$json" | grep -o '"code":"clippy::disallowed_methods"' |
 if [ "$expected" -eq 0 ] || [ "$got" -ne "$expected" ]; then
   echo "check-expose-lint: expected $expected disallowed_methods reports, got $got" >&2
   RUSTFLAGS="${RUSTFLAGS:-} --cfg envcloak_lint_canary" cargo clippy --locked \
-    -p envcloak-lint-canary --target-dir "$root/target/lint-canary" >&2 || true
+    -p envcloak-lint-canary --target-dir "$lint_target" >&2 || true
   exit 1
 fi
 echo "check-expose-lint: ok ($got of $expected call sites reported)"

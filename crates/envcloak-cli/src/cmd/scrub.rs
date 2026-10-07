@@ -566,7 +566,13 @@ fn undo(id: &str, o: &Options) -> Result<bool, Failure> {
     // reading their contents or claiming that the name proves ownership.
     let scan = scrub::inspect_leftovers(&sources);
     for issue in &scan.issues {
-        report.note(&issue.source.path, issue.reason, true);
+        // A candidate name is informational. Discovery failures still make
+        // the restore report incomplete and its exit status nonzero.
+        report.note(
+            &issue.source.path,
+            issue.reason,
+            issue.reason != "possible_restore_leftover",
+        );
     }
     let leftovers: Vec<_> = scan
         .leftovers
@@ -581,7 +587,7 @@ fn undo(id: &str, o: &Options) -> Result<bool, Failure> {
         &report,
         &leftovers,
     );
-    Ok(ok)
+    Ok(ok && report.complete())
 }
 fn decode(text: &str) -> Result<[u8; 32], Failure> {
     if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
