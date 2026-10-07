@@ -13,7 +13,7 @@
 # its own group, a child it holds unreaped) calls
 # envcloak_sys::testing::kill_raw, which the `testing` feature alone builds.
 
-crates/envcloak-sys/src/owned.rs           # the one kill call: kill_number, behind kill_owned's checks and the M1 runner's signal_process and signal_group
+crates/envcloak-sys/src/owned.rs           # the one kill call: owned-child checks, the M1 runner's owned signals, and D-35's fixed current-job suspension
 crates/envcloak-exec/src/signals.rs        # the M1 runner: signals its own unreaped child or the group it leads, under the child-state lock (review R-9)
 crates/envcloak-mcp/src/child.rs           # the MCP server child: signals the group of its unreaped leader, under the leader lock
 crates/envcloak-agents/src/probe/run.rs    # the probe: kills what is left of its unreaped host's group before reaping it
