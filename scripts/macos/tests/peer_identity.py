@@ -15,6 +15,8 @@ EXCEPTIONS = ["allow-jit", "allow-unsigned-executable-memory", "allow-dyld-envir
 def prepare(root):
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = {"HOME": str(root), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "TMPDIR": str(root)}
+    if "DEVELOPER_DIR" in os.environ:
+        env["DEVELOPER_DIR"] = os.environ["DEVELOPER_DIR"]
 
     def run(*args):
         r = subprocess.run(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
