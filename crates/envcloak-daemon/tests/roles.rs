@@ -1,6 +1,6 @@
-//! Gate 22, role separation (SPEC §4.3): before the macOS app there is no
-//! `app` role, so every `app`-role method a client-role peer calls is
-//! rejected and audited, and changes nothing. The audit record names a
+//! Gate 22, role separation (SPEC §4.3): peers failing the app pins stay
+//! clients. Every `app`-role method such a peer calls is rejected and
+//! audited, and changes nothing. app_peer covers the native signed tier. The audit record names a
 //! known method, or a placeholder for an unknown one, and never repeats
 //! what the client sent.
 #![allow(clippy::unwrap_used)]

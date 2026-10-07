@@ -96,6 +96,10 @@ impl From<ClientError> for Failure {
 /// Words for each error reason token of `REASONS` that an error carries
 /// (the reasons a `run` is denied for have theirs in `DenyReason`).
 const REASON_TEXTS: &[(&str, &str)] = &[
+    (
+        "code_identity",
+        "the daemon's code identity could not be verified",
+    ),
     ("not_text", "the passphrase must be UTF-8 text"),
     (
         "control_character",

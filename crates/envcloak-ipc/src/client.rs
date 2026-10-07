@@ -26,9 +26,9 @@
 //! stalls, sends its answer a byte at a time, or reads the request slowly
 //! cannot hold `envcloak run --wait` past that instant.
 //!
-//! On signed macOS builds the client will also check the daemon's code
-//! signature from its audit token (M3). Builds that pin no signing
-//! identity, which is every M1 build, cannot, and say so:
+//! On signed macOS builds the client also checks the daemon's code
+//! signature and runtime policy from its audit token. Builds that pin no
+//! signing identity cannot, and say so:
 //! [`DaemonIdentity::Unverified`]. On them a program running as the same
 //! user can impersonate the daemon (SPEC §1.1).
 
@@ -84,6 +84,24 @@ use crate::wire_secret::WireSecret;
 /// Argon2id twice, at up to 4 GiB each.
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+fn verify_code_identity(
+    stream: &UnixStream,
+) -> Result<Option<envcloak_sys::PeerIdentity>, ClientError> {
+    use envcloak_sys::peer_code::{self, CodeVerdict, pins};
+    let denied = || ClientError::Unverified(Unverified::CodeIdentity);
+    let Some(pin) = pins::agent().map_err(|_| denied())? else {
+        return Ok(None);
+    };
+    let peer = envcloak_sys::peer_identity(stream.as_fd()).map_err(|_| denied())?;
+    let token = peer_code::audit_token(stream.as_fd()).map_err(|_| denied())?;
+    if peer_code::peer_satisfies(&token, &pin).map_err(|_| denied())? != CodeVerdict::Satisfies
+        || !envcloak_sys::peer_unchanged(stream.as_fd(), &peer).unwrap_or(false)
+    {
+        return Err(denied());
+    }
+    Ok(Some(peer))
+}
+
 /// Whether the client verified the daemon's code identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DaemonIdentity {
@@ -105,6 +123,8 @@ pub enum Unverified {
     ForeignServer,
     /// The kernel did not report who is at the other end.
     PeerUnknown,
+    /// The daemon failed the embedded code requirement or runtime policy.
+    CodeIdentity,
 }
 
 impl Unverified {
@@ -116,6 +136,9 @@ impl Unverified {
                 "the process listening on the daemon socket runs as another user"
             }
             Unverified::PeerUnknown => "the kernel did not report who is listening on the socket",
+            Unverified::CodeIdentity => {
+                "code_identity: the daemon's code identity could not be verified"
+            }
         }
     }
 }
@@ -184,6 +207,7 @@ impl From<RunPathError> for ClientError {
 #[derive(Debug)]
 pub struct Client {
     stream: UnixStream,
+    verified_peer: Option<envcloak_sys::PeerIdentity>,
     next_id: u64,
     /// For a waiter's connection ([`Client::connect_by`]): the instant by
     /// which every call on it must be answered.
@@ -346,6 +370,7 @@ impl Client {
         if server != uid {
             return Err(ClientError::Unverified(Unverified::ForeignServer));
         }
+        let verified_peer = verify_code_identity(&stream)?;
         // A waiter's calls never block on the socket: each read and write
         // waits for it only for the time left (`Bounded`).
         if by.is_some() {
@@ -355,15 +380,22 @@ impl Client {
         }
         Ok(Client {
             stream,
+            verified_peer,
             next_id: 1,
             by,
         })
     }
 
-    /// Whether the daemon's code identity was verified. Always
-    /// [`DaemonIdentity::Unverified`] in M1 builds, which pin none.
+    /// Whether this connection verified the daemon and still names that peer.
     pub fn identity(&self) -> DaemonIdentity {
-        DaemonIdentity::Unverified
+        match &self.verified_peer {
+            Some(peer)
+                if envcloak_sys::peer_unchanged(self.stream.as_fd(), peer).unwrap_or(false) =>
+            {
+                DaemonIdentity::Verified
+            }
+            _ => DaemonIdentity::Unverified,
+        }
     }
 
     /// Calls method `M`. The request frame, which may hold a value, is
@@ -374,6 +406,7 @@ impl Client {
     /// when the connection fails, [`ClientError::Protocol`] for a
     /// malformed response.
     pub fn call<M: Method>(&mut self, params: &M::Params) -> Result<M::Output, ClientError> {
+        self.check_peer()?;
         let id = self.next_id;
         self.next_id += 1;
         let request = proto::request_frame::<M>(id, params)?;
@@ -393,10 +426,18 @@ impl Client {
                 Frame::read_from(&mut s)?
             }
         };
+        self.check_peer()?;
         proto::parse_response::<M::Output>(&response, id).map_err(|e| match e {
             ResponseError::Rpc(e) => ClientError::Rpc(e),
             ResponseError::Protocol => ClientError::Protocol,
         })
+    }
+
+    fn check_peer(&self) -> Result<(), ClientError> {
+        if self.verified_peer.is_some() && self.identity() != DaemonIdentity::Verified {
+            return Err(ClientError::Unverified(Unverified::CodeIdentity));
+        }
+        Ok(())
     }
 
     /// `status`, with the daemon's strings checked

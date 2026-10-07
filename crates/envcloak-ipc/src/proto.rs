@@ -2057,6 +2057,7 @@ pub const REASONS: &[&str] = &[
     // A comparison budget of the caller's subject root stopped `scan.match`
     // before it compared anything (`too_many_checks`).
     "limited",
+    "code_identity",
 ];
 
 /// An error response. Built from fixed tokens only.
@@ -2217,6 +2218,17 @@ impl core::fmt::Debug for IncomingRequest<'_> {
 }
 
 impl<'a> IncomingRequest<'a> {
+    /// Only the evidence-tightening claims projection. App handlers still
+    /// decode their complete parameters with deny_unknown_fields afterwards.
+    pub fn claimed_markers(&self) -> Result<Vec<String>, RpcError> {
+        let object: serde_json::Map<String, serde_json::Value> = self.params()?;
+        match object.get("claims") {
+            None => Ok(Vec::new()),
+            Some(value) => serde_json::from_value(value.clone())
+                .map_err(|_| RpcError::new(ErrorKind::InvalidParams)),
+        }
+    }
+
     /// Parses a request frame. On failure, the error to answer with and
     /// the request id when it could be read.
     pub fn parse(frame: &'a Frame) -> Result<Self, RpcError> {
