@@ -53,6 +53,16 @@ class CIJob(unittest.TestCase):
             step = next(step for step in steps if step.startswith('name: ' + name))
             self.assertIn('!cancelled()', step, name + ' must still run after a UI failure')
 
+    def test_native_peer_gates_run_after_rust_setup(self):
+        with open(CI) as f:
+            block = job(f.read(), "macos-app")
+        self.assertIsNotNone(block)
+        toolchain = "uses: dtolnay/rust-toolchain@stable"
+        runner = "run: scripts/macos/check-peer-code.sh"
+        self.assertIn(toolchain, block)
+        self.assertIn(runner, block, "native Rust targets are otherwise ignored")
+        self.assertLess(block.index(toolchain), block.index(runner))
+
     def test_every_script_test_runs_whole_in_macos_app(self):
         with open(CI) as f:
             block = job(f.read(), "macos-app")
