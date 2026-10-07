@@ -26,13 +26,35 @@ struct Cleanup<'a> {
     after: SecretBytes,
     backup: Option<String>,
 }
+enum CleanupRefusal {
+    Local(&'static str),
+    Remote(Failure),
+}
+impl CleanupRefusal {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Local(reason) => reason,
+            Self::Remote(remote) => remote.token(),
+        }
+    }
+}
+impl From<Failure> for CleanupRefusal {
+    fn from(remote: Failure) -> Self {
+        Self::Remote(remote)
+    }
+}
+impl From<envcloak_ipc::ClientError> for CleanupRefusal {
+    fn from(error: envcloak_ipc::ClientError) -> Self {
+        Self::Remote(error.into())
+    }
+}
 impl DeleteGate for Cleanup<'_> {
-    type Refusal = Failure;
-    fn verify(&mut self) -> Result<(), Failure> {
-        let (bytes, stamp) =
-            read_capped(self.root, self.path, MAX_DOTENV).map_err(|_| failure("changed"))?;
+    type Refusal = CleanupRefusal;
+    fn verify(&mut self) -> Result<(), CleanupRefusal> {
+        let (bytes, stamp) = read_capped(self.root, self.path, MAX_DOTENV)
+            .map_err(|_| cleanup_refusal("changed"))?;
         if stamp != self.stamp || !bytes.ct_eq_secret(&self.bytes) {
-            return Err(failure("changed"));
+            return Err(cleanup_refusal("changed"));
         }
         let entries = self
             .selected
@@ -41,14 +63,14 @@ impl DeleteGate for Cleanup<'_> {
                 let value = self.findings[s.index]
                     .value
                     .as_ref()
-                    .ok_or_else(|| failure("manual_assignment"))?;
+                    .ok_or_else(|| cleanup_refusal("manual_assignment"))?;
                 Ok(VerifyEntry {
                     line: s.index as u32 + 1,
                     name: s.name.clone(),
                     value: WireSecret::new(secret_copy(value)),
                 })
             })
-            .collect::<Result<Vec<_>, Failure>>()?;
+            .collect::<Result<Vec<_>, CleanupRefusal>>()?;
         let v = connect()?.import_verify(&VerifyParams {
             manifest: self.manifest.to_string_lossy().into_owned(),
             files: vec![VerifyFile {
@@ -59,10 +81,10 @@ impl DeleteGate for Cleanup<'_> {
             claims: claims(),
         })?;
         if !v.recovery_confirmed {
-            return Err(failure("recovery_kit_unconfirmed"));
+            return Err(cleanup_refusal("recovery_kit_unconfirmed"));
         }
         if !v.resolves {
-            return Err(failure("unresolved_reference"));
+            return Err(cleanup_refusal("unresolved_reference"));
         }
         if v.files.len() != 1
             || !v.files[0].covered
@@ -73,14 +95,14 @@ impl DeleteGate for Cleanup<'_> {
                 .zip(&self.selected)
                 .any(|(e, s)| e.status != EntryStatus::Stored || e.line != s.index as u32 + 1)
         {
-            return Err(failure("not_imported"));
+            return Err(cleanup_refusal("not_imported"));
         }
         Ok(())
     }
     fn remains(&self, _: usize) -> Remains {
         Remains::Bytes(secret_copy(&self.after))
     }
-    fn backup(&mut self, _: &[usize]) -> Result<String, Failure> {
+    fn backup(&mut self, _: &[usize]) -> Result<String, CleanupRefusal> {
         let path = self.root.path().join(self.path);
         let begin = connect()?.backup_v2_begin(&BackupBeginParams {
             purpose: "init".into(),
@@ -92,7 +114,7 @@ impl DeleteGate for Cleanup<'_> {
             claims: claims(),
         })?;
         if begin.chunk_size as usize != envcloak_core::file_backup_v2::CHUNK_V2 {
-            return Err(failure("backup_failed"));
+            return Err(cleanup_refusal("backup_failed"));
         }
         for (i, chunk) in backup_chunks(&self.bytes, begin.chunk_size as usize)
             .into_iter()
@@ -105,12 +127,10 @@ impl DeleteGate for Cleanup<'_> {
         Ok(begin.id)
     }
 }
-fn failure(reason: &'static str) -> Failure {
-    Failure::new(
-        reason,
-        "plaintext was kept because the deletion gate did not pass",
-    )
+fn cleanup_refusal(reason: &'static str) -> CleanupRefusal {
+    CleanupRefusal::Local(reason)
 }
+
 fn copy_found(f: &Found) -> Found {
     Found {
         name: secret_copy(&f.name),
@@ -146,7 +166,7 @@ pub(super) fn run(
         };
         let rel = path
             .strip_prefix(g.root.path())
-            .map_err(|_| failure("outside_root"))?;
+            .map_err(|_| Failure::new("scan_root", "the source is outside its scan root"))?;
         let findings = entries
             .iter()
             .map(|m| copy_found(&m.found))
@@ -178,7 +198,8 @@ pub(super) fn run(
     for g in groups {
         for project in &g.projects {
             let directory = dir_of(&g.root, &project.rel_dir);
-            let root = open_root(&directory).map_err(|_| failure("changed"))?;
+            let root = open_root(&directory)
+                .map_err(|_| Failure::new("scan_root", "the project changed during cleanup"))?;
             match super::super::super::init::delete(&root) {
                 Ok((report, error)) => {
                     if let Some(id) = report.backup {
@@ -210,7 +231,7 @@ fn clean(
 ) -> Result<(), Failure> {
     let path = root.path().join(rel);
     let selected_names = selected.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
-    let result = (|| -> Result<(), Failure> {
+    let result = (|| -> Result<(), CleanupRefusal> {
         // The ignore entry is literal. A hostile sourced basename must not
         // introduce a pattern, another line or a value into that metadata.
         if !rel.file_name().and_then(OsStr::to_str).is_some_and(|name| {
@@ -220,14 +241,15 @@ fn clean(
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         }) {
-            return Err(failure("unsafe_source_name"));
+            return Err(cleanup_refusal("unsafe_source_name"));
         }
-        let (bytes, stamp) = read_capped(root, rel, MAX_DOTENV).map_err(|_| failure("changed"))?;
+        let (bytes, stamp) =
+            read_capped(root, rel, MAX_DOTENV).map_err(|_| cleanup_refusal("changed"))?;
         if findings.iter().any(|f| f.stamp != Some(stamp)) {
-            return Err(failure("changed"));
+            return Err(cleanup_refusal("changed"));
         }
         if stamp.nlink > 1 {
-            return Err(failure("hard_linked"));
+            return Err(cleanup_refusal("hard_linked"));
         }
         let parent = rel.parent().unwrap_or(Path::new(""));
         let manifest = match manifest {
@@ -235,50 +257,51 @@ fn clean(
             None => {
                 let mut bindings = BTreeMap::new();
                 for s in &selected {
-                    let name = EnvName::new(&s.name).map_err(|_| failure("invalid_name"))?;
+                    let name =
+                        EnvName::new(&s.name).map_err(|_| cleanup_refusal("invalid_name"))?;
                     if bindings
                         .insert(name, s.reference.clone())
                         .is_some_and(|prior| prior != s.reference)
                     {
-                        return Err(failure("ambiguous_assignment"));
+                        return Err(cleanup_refusal("ambiguous_assignment"));
                     }
                 }
                 let text = new_manifest("imported-profile", &[(None, bindings)].into());
                 let directory = format!(".envcloak-import-{}", project_name(rel));
                 let (held, _) = root
                     .open_parent(rel)
-                    .map_err(|_| failure("cleanup_manifest_refused"))?;
+                    .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?;
                 match envcloak_sys::create_dir_beneath(&held, OsStr::new(&directory), 0o700) {
                     Ok(()) => held
                         .sync_all()
-                        .map_err(|_| failure("cleanup_manifest_refused"))?,
+                        .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?,
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-                    Err(_) => return Err(failure("cleanup_manifest_refused")),
+                    Err(_) => return Err(cleanup_refusal("cleanup_manifest_refused")),
                 }
                 let directory_handle =
                     envcloak_sys::open_dir_beneath(&held, OsStr::new(&directory))
-                        .map_err(|_| failure("cleanup_manifest_refused"))?;
+                        .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?;
                 let metadata = directory_handle
                     .metadata()
-                    .map_err(|_| failure("cleanup_manifest_refused"))?;
+                    .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?;
                 if metadata.uid()
                     != root
                         .dir()
                         .metadata()
-                        .map_err(|_| failure("cleanup_manifest_refused"))?
+                        .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?
                         .uid()
                     || metadata.mode() & 0o077 != 0
                 {
-                    return Err(failure("cleanup_manifest_refused"));
+                    return Err(cleanup_refusal("cleanup_manifest_refused"));
                 }
                 let manifest = parent.join(directory).join(MANIFEST_NAME);
                 match read_plain(root, &manifest, 64 << 10) {
                     Ok((prior, _)) if prior == text.as_bytes() => (),
                     Err(e) if e.kind == envcloak_scan::ScanErrorKind::NotFound => {
                         create_atomically(root, &manifest, text.as_bytes(), 0o600)
-                            .map_err(|_| failure("cleanup_manifest_refused"))?;
+                            .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?;
                     }
-                    _ => return Err(failure("cleanup_manifest_changed")),
+                    _ => return Err(cleanup_refusal("cleanup_manifest_changed")),
                 }
                 root.path().join(manifest)
             }
@@ -298,7 +321,7 @@ fn clean(
                     .collect::<Vec<_>>(),
             )
         } else {
-            comment_assignments(&bytes, &findings, &selection).map_err(failure)?
+            comment_assignments(&bytes, &findings, &selection).map_err(cleanup_refusal)?
         };
         let mut gate = Cleanup {
             root,
@@ -321,11 +344,11 @@ fn clean(
             &[rel
                 .file_name()
                 .and_then(|n| n.to_str())
-                .ok_or_else(|| failure("invalid_name"))?],
+                .ok_or_else(|| cleanup_refusal("invalid_name"))?],
             &[],
         ) == FileChange::Refused
         {
-            return Err(failure("gitignore_refused"));
+            return Err(cleanup_refusal("gitignore_refused"));
         }
         let result = delete_plaintext(
             root,
@@ -357,7 +380,7 @@ fn clean(
             let id = gate
                 .backup
                 .as_deref()
-                .ok_or_else(|| failure("backup_failed"))?;
+                .ok_or_else(|| cleanup_refusal("backup_failed"))?;
             connect()?.backup_v2_record_result(id, 0, &gate.after.sha256())?;
             pause_point("first_run_recorded");
             r.source(&path, source_kind)["replacement"] = json!(format!(
@@ -368,9 +391,9 @@ fn clean(
         Ok(())
     })();
     if let Err(error) = result {
-        r.fail(&path, source_kind, error.token());
+        r.fail(&path, source_kind, error.reason());
         for name in &selected_names {
-            r.keep(&path, source_kind, Some(name), error.token());
+            r.keep(&path, source_kind, Some(name), error.reason());
         }
     }
     Ok(())
