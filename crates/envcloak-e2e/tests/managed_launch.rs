@@ -1202,6 +1202,9 @@ const REGISTRY: &str = r##"import base64, hashlib, http.server, io, json, os, sy
 root, port_file = sys.argv[1:3]
 server_js = b"""#!/usr/bin/env node
 const crypto = require('crypto');
+// Keep the group alive through TERM so the test must await runner cleanup.
+process.on('SIGTERM', () => {});
+setInterval(() => {}, 1000);
 const rl = require('readline').createInterface({ input: process.stdin });
 rl.on('line', (line) => {
   if (line.trim() !== 'report') return;
@@ -1271,6 +1274,8 @@ impl Drop for Registry {
 /// Mutation checked: the runner's argv cut to the declared program alone
 /// (the arguments after `npx` dropped in `launch_check::resolve`): `npx`
 /// runs no package, no report comes, and this fails.
+/// Also checked: omit the group-exit wait; suppress the runner-release
+/// trace. The group must be absent and the completed release counted.
 #[test]
 fn a_package_runner_launch_runs_its_package_from_a_registry() {
     let npx = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
@@ -1327,11 +1332,21 @@ fn a_package_runner_launch_runs_its_package_from_a_registry() {
     let first = w.request(&launch);
     w.assert_released(0, 0, "nothing was released before the approval");
     w.approve(&pending_id(&first));
-    let answer = w.request(&launch);
+    let answer = w.agent(
+        "request",
+        &json!({"launch": launch, "send": ["report"], "wait_group_exit": true}),
+    );
     assert!(started(&answer), "{answer}");
     let r = report(&answer);
     assert_eq!(r["via"], "npx", "{answer}");
     assert_eq!(r["vars"][KEY], w.key_digest(), "{answer}");
+    let group = i32::try_from(answer["server_group"].as_i64().unwrap()).unwrap();
+    assert!(
+        managed_common::process_groups()
+            .iter()
+            .all(|(_, g)| *g != group),
+        "the package server group still runs before the sweep"
+    );
     w.assert_released(0, 1, "the runner alone got the value");
     let asked = std::fs::read_to_string(reg_dir.join("requests.log")).unwrap();
     assert!(

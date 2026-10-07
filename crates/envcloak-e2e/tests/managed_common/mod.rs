@@ -163,6 +163,38 @@ fn ask(
     }
 }
 
+/// Kernel observations only, never signal targets. A failed or malformed
+/// process listing cannot stand in for an empty server group.
+pub fn process_groups() -> Vec<(i32, i32)> {
+    let ps = std::process::Command::new("/bin/ps")
+        .env_clear()
+        .args(["-A", "-o", "pid=,pgid="])
+        .output()
+        .unwrap();
+    assert!(ps.status.success(), "cannot read the process groups");
+    let rows: Vec<_> = String::from_utf8(ps.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next().unwrap().parse().unwrap();
+            let group = fields.next().unwrap().parse().unwrap();
+            assert!(fields.next().is_none());
+            (pid, group)
+        })
+        .collect();
+    assert!(!rows.is_empty(), "the kernel returned no processes");
+    rows
+}
+
+fn wait_group_exit(group: i32) {
+    let end = Instant::now() + Duration::from_secs(10);
+    while process_groups().iter().any(|(_, g)| *g == group) {
+        assert!(Instant::now() < end, "the server group did not exit");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The client's side (the stand-in for `mcp-bridge --stdio --launch`):
 /// hardened as the CLI is, it asks for the launch (or the bridge) with its
 /// pipe ends and a lifeline. When `started`, it writes `send`'s lines to
@@ -252,6 +284,21 @@ fn helper_request(input: &Value) -> Value {
     let mut from = BufReader::new(std::fs::File::from(from_server));
     let mut replies = Vec::new();
     ask(&mut to, &mut from, &input["send"], &mut replies);
+    // A caller that will sweep files written asynchronously by the server
+    // needs its whole group gone, not just the client's input closed.
+    let wait_group = input["wait_group_exit"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(|| {
+            let reply: Value = serde_json::from_str(replies[0].as_str().unwrap()).unwrap();
+            let pid = i32::try_from(reply["pid"].as_i64().unwrap()).unwrap();
+            let group = process_groups()
+                .into_iter()
+                .find_map(|(p, g)| (p == pid).then_some(g))
+                .expect("the reporting server must still be running");
+            out["server_group"] = json!(group);
+            group
+        });
     // While the server runs: its parent (the runner) and the runner's
     // parent, from the kernel.
     if let Some(r) = replies
@@ -331,6 +378,9 @@ fn helper_request(input: &Value) -> Value {
         ));
         drop(to);
         drop(life_write);
+    }
+    if let Some(group) = wait_group {
+        wait_group_exit(group);
     }
     out["replies"] = Value::from(replies);
     if let Some(e) = from_errors {
@@ -469,6 +519,15 @@ impl World {
             &[],
         );
         assert_eq!(created.code, 0, "{}", created.all());
+        if h.test_build() {
+            // A plain `cargo build -p envcloakd` can replace this cache's
+            // instrumented binary. Refuse that fixture before a zero
+            // release count could pass without any trace at all.
+            h.expect_log(
+                "envcloakd: test: connection opened",
+                Duration::from_secs(10),
+            );
+        }
         let kit_text = std::fs::read_to_string(&kit).unwrap();
         h.add_canary(Canary::new(
             envcloak_e2e::RECOVERY_KIT,
@@ -745,6 +804,17 @@ impl World {
     /// rest on the sweeps alone.
     pub fn assert_released(&self, client: usize, runner: usize, when: &str) {
         if self.traced() {
+            // The reply can precede the test reader collecting the trace.
+            // Still require exact counts, and never infer a release from
+            // a successful answer when the trace is missing.
+            let end = Instant::now() + Duration::from_secs(10);
+            loop {
+                let counts = self.released();
+                if counts.0 >= client && counts.1 >= runner || Instant::now() >= end {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             assert_eq!(self.released(), (client, runner), "{when}");
         }
     }
