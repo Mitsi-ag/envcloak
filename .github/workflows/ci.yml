@@ -536,6 +536,7 @@ jobs:
           cargo test --locked -p envcloakd --no-run
           cargo test --locked -p envcloak-scan --lib gate37 --no-fail-fast -- --test-threads 3
           cargo test --locked -p envcloak-scan --test scrub --test scrub_oracle --no-fail-fast -- --test-threads 3
+          cargo test --locked -p envcloak --bin envcloak gate37 --no-fail-fast -- --test-threads 3
           cargo test --locked -p envcloak --test scrub --no-fail-fast -- --test-threads 3
       # The positive control: --exact runs nothing for a name no test has,
       # and passes, so the step also requires that the one test ran and passed.

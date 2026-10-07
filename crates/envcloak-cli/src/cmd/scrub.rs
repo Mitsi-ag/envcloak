@@ -89,9 +89,62 @@ pub fn run(args: &[&str]) -> ExitCode {
         Err(e) => e.report(FAILURE),
     }
 }
+// The scanner's reasons become CLI tokens only through this fixed vocabulary.
+// Unknown reasons still fail without echoing unregistered or input-derived text.
 fn fail(reason: &'static str) -> Failure {
     Failure::new(
-        reason,
+        match reason {
+            "aside_changed" => "aside_changed",
+            "backup_failed" => "backup_failed",
+            "backup_unread" => "backup_unread",
+            "binding" => "binding",
+            "bounds" => "bounds",
+            "cancelled" => "cancelled",
+            "candidate_too_large" => "candidate_too_large",
+            "changed" => "changed",
+            "edited_since" => "edited_since",
+            "exists" => "exists",
+            "hard_linked" => "hard_linked",
+            "incomplete" => "incomplete",
+            "invalid_home" => "invalid_home",
+            "invalid_json" => "invalid_json",
+            "invalid_path" => "invalid_path",
+            "invalid_response" => "invalid_response",
+            "invalid_slug" => "invalid_slug",
+            "invalid_text" => "invalid_text",
+            "io" => "io",
+            "items_changed" => "items_changed",
+            "leftover" => "leftover",
+            "limited" => "limited",
+            "line_too_large" => "line_too_large",
+            "mount_point" => "mount_point",
+            "moved_aside" => "moved_aside",
+            "no_such_backup" => "no_such_backup",
+            "no_terminal" => "no_terminal",
+            "not_a_profile_name" => "not_a_profile_name",
+            "not_found" => "not_found",
+            "not_owned" => "not_owned",
+            "not_regular" => "not_regular",
+            "not_removed" => "not_removed",
+            "open_elsewhere" => "open_elsewhere",
+            "overlap" => "overlap",
+            "recently_changed" => "recently_changed",
+            "refused" => "refused",
+            "restore_refused" => "restore_refused",
+            "result_unrecorded" => "result_unrecorded",
+            "scan_failed" => "scan_failed",
+            "statement_changed" => "statement_changed",
+            "swap_unsupported" => "swap_unsupported",
+            "symlink" => "symlink",
+            "too_deep" => "too_deep",
+            "too_large" => "too_large",
+            "too_many_entries" => "too_many_entries",
+            "unchecked" => "unchecked",
+            "unreadable" => "unreadable",
+            "unsupported" => "unsupported",
+            "write_failed" => "write_failed",
+            _ => "incomplete",
+        },
         "scrub did not complete; the file was kept or its backup needs recovery",
     )
 }
@@ -599,4 +652,24 @@ fn decode(text: &str) -> Result<[u8; 32], Failure> {
             .map_err(|_| fail("invalid_response"))?;
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate37_failure_tokens_are_fixed_and_unknown_reasons_stay_failures() {
+        for reason in [
+            "open_elsewhere",
+            "recently_changed",
+            "bounds",
+            "invalid_json",
+        ] {
+            assert_eq!(fail(reason).token(), reason);
+        }
+        let unknown = fail("unrecognized fixture reason");
+        assert_eq!(unknown.token(), "incomplete");
+        assert!(!unknown.message().contains("unrecognized fixture reason"));
+    }
 }
