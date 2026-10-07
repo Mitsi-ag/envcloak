@@ -53,15 +53,91 @@ fn aws_hostile_grammar_is_explicit_and_value_free() {
         vec![0],
         vec![b'a'; MAX_DOTENV + 1],
         b"[default]\naws_secret_access_key = first\n continuation\n".to_vec(),
+        b"[default]\naws_secret_access_key = first\n  part=two\n".to_vec(),
+        b"[default]\nAWS_SECRET_ACCESS_KEY = first\naws_secret_access_key = second\n".to_vec(),
         b"[default]\naws_secret_access_key = first\naws_secret_access_key = second\n".to_vec(),
         b"[broken\naws_secret_access_key = first\n".to_vec(),
     ] {
         let r = parse_aws(&SecretBytes::from_vec(bytes));
         assert!(!r.complete());
         assert!(r.findings.iter().all(|f| !f.single_complete_line));
+        assert!(r.findings.iter().all(|f| f.value.is_none()));
         assert!(!format!("{r:?}").contains("first"));
     }
     assert!(parse_aws(&SecretBytes::copy_from(b"")).complete());
+}
+
+#[test]
+fn aws_option_casing_matches_python_ini_oracle() {
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let path = home.path().join("fixture.ini");
+    let bytes = b"[default]\nAWS_ACCESS_KEY_ID = first fixture\nAws_Secret_Access_Key = second fixture\nAWS_SESSION_TOKEN = third fixture\nregion = fixture-region\n[other]\naws_secret_access_key = fourth fixture\n";
+    std::fs::write(&path, bytes).unwrap();
+    let out = Command::new("/usr/bin/python3")
+        .env_clear()
+        .env("HOME", home.path())
+        .args(["-I", "-c", "import configparser,json,sys; p=configparser.RawConfigParser(); p.read(sys.argv[1]); print(json.dumps([(k.upper(),v) for s in p.sections() for k,v in p.items(s) if k.startswith('aws_')]))"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let expected: Vec<(String, String)> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(expected.len(), 4);
+    let report = parse_aws(&SecretBytes::copy_from(bytes));
+    assert!(report.complete());
+    assert_eq!(report.findings.len(), expected.len());
+    for (finding, (name, value)) in report.findings.iter().zip(expected) {
+        assert!(finding.name.ct_eq(name.as_bytes()));
+        assert!(finding.value.as_ref().unwrap().ct_eq(value.as_bytes()));
+    }
+}
+
+#[test]
+fn review_profile_include_and_aws_leftovers_survive_missing_originals() {
+    for name in [
+        ".zshrc",
+        "included/profile",
+        ".aws/credentials",
+        ".aws/config",
+    ] {
+        for present in [false, true] {
+            for operation in ["new", "swap", "del"] {
+                let home = tempfile::tempdir_in("/tmp").unwrap();
+                let path = home.path().join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                if name == "included/profile" {
+                    std::fs::write(home.path().join(".zshrc"), b"source included/profile\n")
+                        .unwrap();
+                }
+                if present {
+                    std::fs::write(&path, b"# retained\n").unwrap();
+                }
+                let sibling = path.with_file_name(format!(
+                    ".{}.envcloak-{operation}-{}.tmp",
+                    path.file_name().unwrap().to_str().unwrap(),
+                    "a".repeat(16)
+                ));
+                std::fs::write(&sibling, b"fixture plaintext").unwrap();
+                let root = open_root(home.path()).unwrap();
+                let report = if name.starts_with(".aws/") {
+                    scan_aws(&root)
+                } else {
+                    envcloak_scan::profile::scan_profiles(&root).unwrap()
+                };
+                assert!(!report.complete(), "{name}: {operation}, present={present}");
+                assert_eq!(
+                    report.leftovers.len(),
+                    1,
+                    "{name}: {operation}, present={present}"
+                );
+                assert_eq!(
+                    report.leftovers[0].source.path,
+                    std::fs::canonicalize(&sibling).unwrap()
+                );
+                assert_eq!(std::fs::read(&sibling).unwrap(), b"fixture plaintext");
+            }
+        }
+    }
 }
 
 #[test]

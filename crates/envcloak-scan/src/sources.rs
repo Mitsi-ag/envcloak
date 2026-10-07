@@ -137,7 +137,11 @@ pub fn restore_leftover_name(name: &std::ffi::OsStr) -> bool {
     if !b.starts_with(b".") {
         return false;
     }
-    for tag in [b".envcloak-new-".as_slice(), b".envcloak-swap-"] {
+    for tag in [
+        b".envcloak-new-".as_slice(),
+        b".envcloak-swap-",
+        b".envcloak-del-",
+    ] {
         if let Some(i) = b.windows(tag.len()).rposition(|s| s == tag) {
             if i <= 1 {
                 continue;
@@ -269,6 +273,17 @@ pub(crate) fn walk_sources(
 }
 /// Inspect only siblings of an approved include, even if its leaf is absent.
 /// Parent traversal keeps the same no-follow and device rules as reading it.
+pub(crate) fn inspect_optional_siblings(root: &ScanRoot, rel: &Path, report: &mut ScanReport) {
+    // A missing conventional parent is normal; other discovery failures are
+    // incomplete even when the original file no longer exists.
+    if matches!(root.open_parent(rel), Err(crate::ScanErrorKind::NotFound)) {
+        return;
+    }
+    let mut attempts = report.leftovers.len();
+    inspect_include_siblings(root, rel, Budget::default(), &mut attempts, report);
+}
+
+/// Inspect siblings under the caller's shared discovery budget.
 pub(crate) fn inspect_include_siblings(
     root: &ScanRoot,
     rel: &Path,
