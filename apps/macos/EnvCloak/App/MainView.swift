@@ -8,23 +8,33 @@ struct MainView: View {
     @State private var selectedKey: DaemonText?
     @State private var inspector = false
     @State private var query = ""
-    @State private var scope: DaemonText?
+    private var scope: DaemonText? { session.projects.scope }
+    private var scopeBinding: Binding<DaemonText?> { Binding(get: { scope }, set: { session.setScope($0) }) }
     @State private var grouping = KeyGrouping.none
     @State private var columns = NavigationSplitViewVisibility.all
     @FocusState private var searchFocused: Bool
+    init(session: VaultSession, initialRoute: Route = .projects) {
+        self.session = session
+        _route = State(initialValue: initialRoute)
+    }
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
             List(selection: $route) {
                 Section {
                     Label("Projects", systemImage: "folder").tag(Route.projects)
-                    if session.state == .ready {
+                    if session.state.canReadMetadata {
                         ForEach(session.projects.directories, id: \.self) { dir in
-                            Text(MetadataRequest.basename(dir)).tag(Route.project(dir)).padding(.leading, 12)
+                            Text(session.projects.title(dir)).tag(Route.project(dir)).padding(.leading, 12)
                         }
                     }
                     Label("Keys", systemImage: "key.horizontal").tag(Route.keys(.all))
                     ForEach([KeyFilter.live, .test, .exposed], id: \.self) { filter in
-                        Text(filter.rawValue).tag(Route.keys(filter)).padding(.leading, 12)
+                        VStack(alignment: .leading) {
+                            Text(filter.rawValue)
+                            if let message = Route.keys(filter).unavailableMessage {
+                                Text(message).font(.caption).foregroundStyle(ECToken.secondary.color)
+                            }
+                        }.tag(Route.keys(filter)).padding(.leading, 12)
                     }
                     unavailableRow(.approvals, icon: "tray")
                     unavailableRow(.activity, icon: "clock.arrow.circlepath")
@@ -43,7 +53,10 @@ struct MainView: View {
                     HStack { Text(notice); Spacer(); Button("Dismiss") { session.notice = nil } }.padding(12)
                         .background(ECToken.raised.color).accessibilityIdentifier("session.notice")
                 }
-                if session.state == .ready { detail }
+                if session.state == .readOnly {
+                    ReadOnlyBanner()
+                    ContentUnavailableView("Metadata unavailable", systemImage: "exclamationmark.triangle", description: Text("This build cannot read keys or projects from a vault that failed its integrity check. Recover from a backup to continue."))
+                } else if session.state.canReadMetadata { detail }
                 else { ConnectionView(session: session) }
             }.frame(minWidth: 420).background(ECToken.background.color)
         }
@@ -62,12 +75,13 @@ struct MainView: View {
             }
             ToolbarSpacer(.fixed)
             ToolbarItemGroup {
-                Picker("Scope", selection: $scope) {
+                Picker("Scope", selection: scopeBinding) {
                     Text("All projects").tag(Optional<DaemonText>.none)
-                    ForEach(session.projects.directories, id: \.self) { Text(MetadataRequest.basename($0)).tag(Optional($0)) }
+                    ForEach(session.projects.scopeDirectories, id: \.self) { Text(session.projects.title($0)).tag(Optional($0)) }
+                    if let scope, !session.projects.scopeDirectories.contains(scope) { Text(MetadataRequest.basename(scope)).tag(Optional(scope)) }
                 }
                 Button { Task { await session.lock() } } label: { Label("Lock", systemImage: "lock") }
-                    .help("Lock the vault").disabled(session.state != .ready)
+                    .help("Lock the vault").disabled(!session.state.canLock)
             }
             ToolbarSpacer(.fixed)
             ToolbarItem {
@@ -77,12 +91,11 @@ struct MainView: View {
         .frame(minWidth: 900, minHeight: 560)
         .onGeometryChange(for: Bool.self) { $0.size.width < 980 } action: { columns = $0 ? .detailOnly : .all }
         .onChange(of: selectedKey) { _, key in if key != nil { inspector = true } }
-        .onChange(of: session.state) { _, state in if state != .ready { selectedKey = nil } }
-        .onChange(of: session.projects.directories) { _, dirs in if let scope, !dirs.contains(scope) { self.scope = nil } }
+        .onChange(of: session.state) { _, state in if !state.canReadMetadata { selectedKey = nil } }
         .focusedSceneValue(\.workspaceNavigation, WorkspaceNavigation(
             navigate: { route = $0 }, search: { searchFocused = true },
             addFolder: { addFolder() }, lock: { Task { await session.lock() } },
-            group: { grouping = $0 }, ready: session.state == .ready))
+            group: { grouping = $0 }, ready: session.state == .ready, canLock: session.state.canLock))
         .task { await session.run() }
     }
 
@@ -93,9 +106,9 @@ struct MainView: View {
         return route?.title ?? "Projects"
     }
     private var windowSubtitle: String {
-        guard session.state == .ready else { return "" }
+        guard session.state.canReadMetadata else { return "" }
         switch route ?? .projects {
-        case .projects: return "\(session.projects.directories.count) projects"
+        case .projects: return "\(session.projects.inventory.count) projects"
         case .project(let directory):
             guard let project = session.projects.opened, project.directory == directory else { return "Not checked" }
             return "\(project.check.bindings.count) bindings across profiles"
@@ -144,6 +157,7 @@ struct WorkspaceNavigation {
     let lock: () -> Void
     let group: (KeyGrouping) -> Void
     let ready: Bool
+    let canLock: Bool
 }
 private struct WorkspaceNavigationKey: FocusedValueKey { typealias Value = WorkspaceNavigation }
 extension FocusedValues {
@@ -165,7 +179,7 @@ struct WorkspaceCommands: Commands {
         }
         CommandGroup(after: .newItem) {
             Button("Add project folder…") { navigation?.addFolder() }.disabled(navigation?.ready != true)
-            Button("Lock the vault") { navigation?.lock() }.keyboardShortcut("l", modifiers: [.command, .shift]).disabled(navigation?.ready != true)
+            Button("Lock the vault") { navigation?.lock() }.keyboardShortcut("l", modifiers: [.command, .shift]).disabled(navigation?.canLock != true)
         }
         CommandGroup(after: .textEditing) {
             Button("Find") { navigation?.search() }.keyboardShortcut("f")

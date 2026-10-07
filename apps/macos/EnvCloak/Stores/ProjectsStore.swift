@@ -31,6 +31,7 @@ struct ProjectInventoryRow: Identifiable {
     private var openRevision = 0
     private var manifestSignal: ManifestSignal?
     private var dirty = true
+    private(set) var scope: DaemonText?
     private(set) var rows: [ProjectView] = []
     private(set) var added: [DaemonText]
     private(set) var opened: OpenedProject?
@@ -39,7 +40,13 @@ struct ProjectInventoryRow: Identifiable {
     private(set) var checkFailure: EnvCloakError?
     var manifestMissing: Bool { manifestSignal?.fileMissing == true }
     init(client: (any WorkspaceClient)?, folders: ProjectFolders?) {
-        self.client = client; self.folders = folders; added = folders?.paths ?? []
+        self.client = client; self.folders = folders; added = folders?.paths ?? []; scope = folders?.scope
+    }
+    var scopeDirectories: [DaemonText] { rows.map(\.dir).filter { MetadataRequest.directoryURL($0) != nil } }
+    func setScope(_ scope: DaemonText?) throws {
+        guard let folders else { throw EnvCloakError.protocolError }
+        try folders.saveScope(scope)
+        self.scope = scope
     }
     var directories: [DaemonText] {
         var result = rows.map(\.dir).filter { MetadataRequest.directoryURL($0) != nil }
@@ -104,6 +111,7 @@ struct ProjectInventoryRow: Identifiable {
                 next = page.next
             } while next != nil
             rows = result; failure = nil; dirty = false
+            if let scope, !scopeDirectories.contains(scope) { try setScope(nil) }
             if let openedDirectory { await open(openedDirectory) }
         } catch {
             guard captured == revision else { return }

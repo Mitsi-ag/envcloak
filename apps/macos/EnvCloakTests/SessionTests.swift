@@ -12,6 +12,10 @@ actor ScriptedClient: WorkspaceClient {
     var pending = 0
     var vault = "unlocked"
     var integrity = "ok"
+    var idleLimit: UInt64 = 3600
+    var lockReason = "sleep"
+    nonisolated let socketPath: DaemonText? = DaemonText("/tmp/ec05-fixture\u{202e}/envcloakd.sock")
+    func idle(_ seconds: UInt64) { idleLimit = seconds; lockReason = "idle" }
     var failure: EnvCloakError?
     var projectFailure = false
     var itemCount = 1
@@ -49,7 +53,7 @@ actor ScriptedClient: WorkspaceClient {
         case "status": result = [
             "daemon": ["version": "fixture", "pid": 42, "hardening": ["core_dumps_off": true, "non_dumpable": false], "runtime_dir_fallback": false],
             "vault": ["state": vault, "integrity": integrity, "read_only": integrity != "ok", "busy": false, "failed_unlocks": 0],
-            "lock": ["last_reason": "sleep", "idle_limit_secs": 3600],
+            "lock": ["last_reason": lockReason, "idle_limit_secs": idleLimit],
             "approvals": ["grants": grants, "pending": pending, "proof_failures": 0, "proof_wait_secs": 0],
             "audit": ["open": true, "head_seq": head, "unanchored": 0, "anchor_failed": false, "queued": 0, "dropped": 0]]
         case "items.list": result = ["items": (0..<itemCount).map { item($0) }]
@@ -189,6 +193,60 @@ final class SessionTests: XCTestCase {
         await barrier.release(); await load.value
         XCTAssertNil(store.opened)
         XCTAssertEqual(store.checkFailure, .protocolError)
+    }
+
+    @MainActor func testReadOnlyHonorsDaemonRefusalAndLockedWins() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await client.configure(integrity: "tampered")
+        await session.poll()
+        XCTAssertFalse(session.state.canReadMetadata)
+        XCTAssertTrue(session.state.canLock)
+        XCTAssertTrue(session.items.rows.isEmpty)
+        XCTAssertTrue(session.projects.rows.isEmpty)
+        let lists = await client.calls("items.list")
+        XCTAssertEqual(lists, 0)
+        await session.openProject(DaemonText("/tmp/project"))
+        XCTAssertNil(session.projects.opened)
+        await session.revoke(DaemonText("fixture"))
+        let revokes = await client.calls("grants.revoke")
+        XCTAssertEqual(revokes, 0)
+        await client.configure(vault: "locked")
+        await session.poll()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertTrue(session.items.rows.isEmpty)
+        XCTAssertNil(session.projects.opened)
+    }
+
+    @MainActor func testIdleDurationsAndVerificationDetailsAreExact() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        for (seconds, words) in [(UInt64(30), "30 seconds"), (60, "1 minute"), (90, "1 minute 30 seconds"), (3599, "59 minutes 59 seconds"), (3600, "1 hour"), (5400, "1 hour 30 minutes")] {
+            await client.idle(seconds); await session.poll()
+            XCTAssertEqual(session.lockReason, "Locked after " + words + " idle")
+        }
+        await client.configure(failure: .daemonUnverified(.peerUID)); await session.poll()
+        XCTAssertEqual(session.verificationDetails, "Failed check: peerUID. Socket: /tmp/ec05-fixture\\u{202e}/envcloakd.sock")
+    }
+
+    @MainActor func testScopeRestoresPerViewerAndSurvivesFailedRefresh() async throws {
+        let root = URL(fileURLWithPath: "/tmp/ec05-scope-" + UUID().uuidString.prefix(8))
+        let file = root.appendingPathComponent("viewer-a/projects.json")
+        let folders = try ProjectFolders(file: file)
+        try folders.saveScope(DaemonText("/tmp/project"))
+        let client = ScriptedClient()
+        let store = ProjectsStore(client: client, folders: try ProjectFolders(file: file))
+        XCTAssertEqual(store.scope, DaemonText("/tmp/project"))
+        XCTAssertNil(try ProjectFolders(file: root.appendingPathComponent("viewer-b/projects.json")).scope)
+        await client.configure(projectFailure: true); await store.refetch(.projects)
+        XCTAssertEqual(store.scope, DaemonText("/tmp/project"))
+        store.clear()
+        XCTAssertEqual(store.scope, DaemonText("/tmp/project"))
+        await client.configure(); await store.refetch(.projects)
+        XCTAssertEqual(store.scope, DaemonText("/tmp/project"))
+        XCTAssertThrowsError(try folders.saveScope(DaemonText("relative")))
+        XCTAssertThrowsError(try folders.saveScope(DaemonText("/tmp/bad\0path")))
+        await client.pages("hidden-one-page"); await store.refetch(.projects)
+        XCTAssertNil(store.scope)
+        XCTAssertNil(try ProjectFolders(file: file).scope)
     }
 
     @MainActor func testOnlyChangedStoresRefetch() async {

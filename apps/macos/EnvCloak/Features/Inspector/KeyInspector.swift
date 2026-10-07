@@ -26,7 +26,7 @@ struct KeyInspector: View {
                     Text("Stored in the vault. \(item.fields.count) fields, \(item.fields.reduce(0) { $0 + Int($1.prior_count) }) earlier values kept.")
                     HStack {
                         Button("Reveal…") { command = MetadataRequest.terminalCommand("reveal", slug: item.slug) }
-                        Button("Replace…") { command = MetadataRequest.terminalCommand("rotate", slug: item.slug) }
+                        Button("Replace…") { command = MetadataRequest.terminalCommand("rotate", slug: item.slug) }.disabled(session.state != .ready)
                     }
                     Text("Account").font(.headline)
                     ForEach([item.account?.email, item.account?.label, item.account?.org_id].compactMap { $0 }, id: \.self) { Text($0.escaped) }
@@ -59,7 +59,7 @@ struct KeyInspector: View {
                     LabeledContent("Expires") { DateLabel(seconds: item.expires_secs) }
                     Text("Balance and spend arrive in a later release (M4).").foregroundStyle(ECToken.secondary.color)
                     Button("Remove key…") { command = MetadataRequest.terminalCommand("rm", slug: item.slug) }
-                        .foregroundStyle(ECToken.danger.color)
+                        .foregroundStyle(ECToken.danger.color).disabled(session.state != .ready)
                 }.padding(16)
             }.sheet(isPresented: Binding(get: { command != nil }, set: { if !$0 { command = nil } })) {
                 VStack(alignment: .leading, spacing: 16) {

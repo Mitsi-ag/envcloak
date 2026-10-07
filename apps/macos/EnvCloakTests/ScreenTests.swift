@@ -100,6 +100,17 @@ import XCTest
         XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
+    func testReadOnlyBannerExplainsMetadataRefusal() async {
+        let client = ScriptedClient(); await client.configure(integrity: "tampered")
+        let session = VaultSession(client: client); await session.poll()
+        await session.openProject(DaemonText("/tmp/project"))
+        let window = host(MainView(session: session))
+        await assertVisible("The vault failed its integrity check, so it is open read-only.", in: window)
+        await assertVisible("How to recover", in: window)
+        await assertVisible("Metadata unavailable", in: window)
+        XCTAssertFalse(labels(window).contains("No projects yet."))
+    }
+
     func testInspectorFetchesAndEscapesFullMetadata() async {
         let client = ScriptedClient(); let session = VaultSession(client: client); await session.poll()
         let window = host(KeyInspector(session: session, slug: session.items.rows.first?.slug, route: .constant(.keys(.all))))
@@ -125,10 +136,13 @@ import XCTest
     func testUnavailableRowsAreAccessible() async {
         let client = ScriptedClient(); let session = VaultSession(client: client)
         await session.poll()
-        let window = host(MainView(session: session))
+        await session.openProject(DaemonText("/tmp/project"))
+        let window = host(MainView(session: session, initialRoute: .settings))
+        await assertVisible("project\\u{202e}\\u{1b}[31m", in: window)
         await assertVisible("Arrives with Touch ID approvals", in: window)
         await assertVisible("Spend · M4", in: window)
         await assertVisible("Devices · M5", in: window)
+        await assertVisible("Leak checks arrive with envcloak doctor", in: window)
     }
 
     func testTwoThousandKeysRenderAndScrollWithoutLoader() async {

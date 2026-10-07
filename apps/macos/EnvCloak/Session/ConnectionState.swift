@@ -3,6 +3,10 @@ import EnvCloakKit
 enum ConnectionState: Equatable {
     case connecting, noDaemon, unverified(PeerCheck), noVault, locked, ready, readOnly, unavailable
 
+    // The current metadata RPCs refuse a tampered vault (State.unlocked).
+    var canReadMetadata: Bool { self == .ready }
+    var canLock: Bool { self == .ready || self == .readOnly }
+
     var title: String {
         switch self {
         case .connecting: "Connecting to EnvCloak's background process"

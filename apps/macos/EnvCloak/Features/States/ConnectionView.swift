@@ -29,19 +29,13 @@ struct ConnectionView: View {
                 if session.state == .locked {
                     Button("Open Terminal") { WorkspaceActions.openTerminal() }
                 }
-                if details { Text(session.state.detail).textSelection(.enabled) }
+                if details { Text(session.verificationDetails).textSelection(.enabled) }
             }
         }
         .multilineTextAlignment(.center).padding(32).frame(maxWidth: .infinity, maxHeight: .infinity)
         .accessibilityElement(children: .contain).accessibilityIdentifier("connection.state")
         .sheet(isPresented: $recoveryHelp) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Recover from a backup").font(.title2)
-                Text("Keep a copy of the vault and its backups. In a human Terminal session, use envcloak recover with your Recovery Kit. Read the command's instructions before choosing a backup. Recovery ends existing grants.")
-                Button("Copy recovery help command") { WorkspaceActions.copy("envcloak help recover") }
-                Button("Open Terminal") { WorkspaceActions.openTerminal() }
-                Button("Done") { recoveryHelp = false }
-            }.padding(24).frame(width: 480)
+            RecoveryHelp()
         }
         .task(id: session.state == .connecting) {
             showConnecting = false
@@ -70,5 +64,31 @@ struct DevelopmentBanner: View {
             Button("Open guarantees") { openWindow(id: WindowID.about) }
         }.padding().foregroundStyle(ECToken.warning.color)
             .accessibilityIdentifier("development.banner")
+    }
+}
+
+struct ReadOnlyBanner: View {
+    @State private var recoveryHelp = false
+    var body: some View {
+        HStack {
+            Text(ConnectionState.readOnly.title)
+            Spacer()
+            Button("How to recover") { recoveryHelp = true }
+        }.padding(12).foregroundStyle(ECToken.danger.color)
+            .accessibilityIdentifier("read-only.banner")
+            .sheet(isPresented: $recoveryHelp) { RecoveryHelp() }
+    }
+}
+
+struct RecoveryHelp: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Recover from a backup").font(.title2)
+            Text("Keep a copy of the vault and its backups. In a human Terminal session, use envcloak recover with your Recovery Kit. Read the command's instructions before choosing a backup. Recovery ends existing grants.")
+            Button("Copy recovery help command") { WorkspaceActions.copy("envcloak help recover") }
+            Button("Open Terminal") { WorkspaceActions.openTerminal() }
+            Button("Done") { dismiss() }
+        }.padding(24).frame(width: 480)
     }
 }
