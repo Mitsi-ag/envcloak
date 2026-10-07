@@ -75,3 +75,46 @@ fn unset_refuses_value_shaped_names_without_echo_or_write() {
         }
     }
 }
+
+#[test]
+fn edits_refuse_value_shaped_previous_references_without_echo_or_write() {
+    let home = TestHome::new();
+    let dir = common::project(&home, "previous", "[env]\n");
+    let path = dir.join("envcloak.toml");
+    let cs = canaries(fresh_seed());
+    let key = cs
+        .iter()
+        .find(|c| c.label == labels::GITHUB_TOKEN)
+        .unwrap()
+        .as_str()
+        .to_ascii_lowercase();
+    for reference in [key.to_owned(), format!("ordinary#{key}")] {
+        for source in [
+            format!("[env]\nKEEP='{reference}'\n"),
+            if reference.contains('#') {
+                format!("[env]\nKEEP={{ref='ordinary',field='{key}'}}\n")
+            } else {
+                format!("[env]\nKEEP={{ref='{reference}'}}\n")
+            },
+        ] {
+            for args in [vec!["ref", "--unset", "KEEP", "--json"], vec!["ref", "--unset", "KEEP"]] {
+                std::fs::write(&path, &source).unwrap();
+                let mut cmd = common::cli_command(&home, &args, &[]);
+                cmd.current_dir(&dir);
+                let out = common::finish_within(cmd, std::time::Duration::from_secs(30));
+                assert_no_canary(&out.stdout, &cs);
+                assert_no_canary(&out.stderr, &cs);
+                assert!(!out.stdout.windows(key.len()).any(|w| w == key.as_bytes()));
+                assert!(!out.stderr.windows(key.len()).any(|w| w == key.as_bytes()));
+                assert_eq!(out.status.code(), Some(1));
+                assert!(out.stdout.is_empty());
+                assert!(
+                    std::str::from_utf8(&out.stderr)
+                        .unwrap()
+                        .contains("manifest_invalid")
+                );
+                assert!(std::fs::read(&path).unwrap() == source.as_bytes());
+            }
+        }
+    }
+}

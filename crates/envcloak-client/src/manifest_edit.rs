@@ -65,6 +65,8 @@ pub enum EditError {
     NameIsProfile,
     /// The selected table does not bind this name.
     BindingAbsent,
+    /// A previous reference looks like a value and cannot be returned.
+    ValueShaped,
     /// The manifest has another hard link.
     HardLinked,
     /// The new manifest would differ from the old one in more than the
@@ -104,6 +106,9 @@ impl From<EditError> for Failure {
             EditError::NameIsProfile => invalid(
                 "[env] has a profile with the variable's name, so the variable cannot be \
                  written there",
+            ),
+            EditError::ValueShaped => invalid(
+                "the previous reference is shaped like a key; nothing was changed; if it was a key, rotate it",
             ),
             EditError::HardLinked => invalid(
                 "envcloak.toml has another hard link, which replacing it would split from it, \
@@ -266,6 +271,12 @@ fn edited_text(
         }
         Some(item) => {
             let previous = reference_of(item);
+            if previous
+                .as_ref()
+                .is_some_and(|r| crate::render::looks_like_value(&r.to_string()))
+            {
+                return Err(EditError::ValueShaped);
+            }
             if previous.as_ref() == Some(&binding.reference) {
                 return Ok((
                     None,
@@ -367,6 +378,9 @@ fn unset_with(
                 .position(|b| &b.env_name == name)
                 .ok_or(EditError::BindingAbsent)?;
             let removed = list.remove(index).reference;
+            if crate::render::looks_like_value(&removed.to_string()) {
+                return Err(EditError::ValueShaped);
+            }
             let new_text = removed_text(text, name, profile)?;
             let new = parse_manifest(new_text.as_bytes()).map_err(EditError::Manifest)?;
             // Removing the only dotted binding also removes its implicit
@@ -666,6 +680,40 @@ SHORT_TOKEN = \"short/acme-web\"
 [policy]
 agents = \"approve\" # never allow
 ";
+
+    #[test]
+    fn previous_reference_is_screened_before_set_or_unset_writes() {
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let cs = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+        let key = cs
+            .iter()
+            .find(|c| c.label == envcloak_testkit::labels::GITHUB_TOKEN)
+            .unwrap()
+            .as_str()
+            .to_ascii_lowercase();
+        for reference in [key.to_owned(), format!("ordinary#{key}")] {
+            for source in [
+                format!("[env]\nKEEP='{reference}'\n"),
+                if reference.contains('#') {
+                    format!("[env]\nKEEP={{ref='ordinary',field='{key}'}}\n")
+                } else {
+                    format!("[env]\nKEEP={{ref='{reference}'}}\n")
+                },
+            ] {
+                parse_manifest(source.as_bytes()).unwrap();
+                for unset in [false, true] {
+                    let path = manifest_in(d.path(), &source);
+                    let result = if unset {
+                        unset_manifest_ref(&path, &EnvName::new("KEEP").unwrap(), None).map(drop)
+                    } else {
+                        edit_manifest_ref(&path, &binding("KEEP=ordinary"), None).map(drop)
+                    };
+                    assert_eq!(result, Err(EditError::ValueShaped));
+                    assert!(std::fs::read(path).unwrap() == source.as_bytes());
+                }
+            }
+        }
+    }
 
     fn binding(s: &str) -> Binding {
         Binding::parse_arg(s).unwrap()

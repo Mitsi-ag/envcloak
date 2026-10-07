@@ -65,9 +65,28 @@ for before, expected, profile in (
     manifest.write_bytes(before)
     args = ["--unset", "DROP", "--json"] + (["--profile", profile] if profile else [])
     result = run(*args)
-    assert result.returncode == 0, "alternate syntax"
+    assert result.returncode == 0, ("alternate syntax", before, result.stderr)
     assert manifest.read_bytes() == expected, "alternate bytes"
     tomllib.loads(manifest.read_text())
+
+# Valid TOML is not necessarily an EnvCloak manifest. Inline env tables
+# contain bindings only; profile tables must be standard or dotted tables.
+for before, _, profile in (
+    (b"env = { ci.DROP = 'ordinary', KEEP = 'kept' }\n", b"env = {  KEEP = 'kept' }\n", "ci"),
+    (b"env = { KEEP = 'kept', ci.DROP = 'ordinary' }\n", b"env = { KEEP = 'kept'  }\n", "ci"),
+    (b"env = { ci.DROP = 'ordinary', ci.KEEP = 'kept' }\n", b"env = {  ci.KEEP = 'kept' }\n", "ci"),
+    (b"env = { ci.KEEP = 'kept', ci.DROP = {ref='ordinary'}, ci.LAST = 'last' }\n", b"env = { ci.KEEP = 'kept',  ci.LAST = 'last' }\n", "ci"),
+    (b"env = { 'ci'.\"DROP\" = 'ordinary' }\r\n", b"env = {  }\r\n", "ci"),
+    (b"env = { ci = { DROP = 'ordinary', KEEP = 'kept' }, KEEP = 'outer' }\n", b"env = { ci = {  KEEP = 'kept' }, KEEP = 'outer' }\n", "ci"),
+    (b"[env]\nci = { DROP = 'ordinary', KEEP = 'kept' }\n", b"[env]\nci = {  KEEP = 'kept' }\n", "ci"),
+):
+    tomllib.loads(before.decode())
+    manifest.write_bytes(before)
+    old = stamp()
+    result = run("--unset", "DROP", "--profile", profile, "--json")
+    assert result.returncode == 1 and b"manifest_invalid" in result.stderr
+    assert b"unknown key" in result.stderr and not result.stdout
+    assert stamp() == old and list(project.iterdir()) == [manifest]
 
 for args, code, reason in (
     (("--unset", ""), 2, b"invalid variable name"),
