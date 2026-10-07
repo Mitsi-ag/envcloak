@@ -90,3 +90,41 @@ This lane adds fresh macOS development-build and isolated launchd evidence. Linu
 Raw check and mutation logs are local under `/Volumes/KeenShiftDev/tmp/envcloak-target/A/m27-*.log`; aggregate check results are `m27-final2-results.json` and `m27-final3-results.json`. The first covers all twelve changed crates; the last rechecks the three crates affected by the final repair. `m27-service-retry.log` and its `.done` file record the successful retry of the service-startup failure retained in the last aggregate result. No push, PR or GitHub comment was performed.
 
 Final confirmation at `b43364b5`: the requested detached rerun passed formatting, strict workspace/all-target Clippy, the binary freshness build, all three follow-up crate suites (210 policy, 258 daemon and 179 e2e tests), all four runtime oracles, and unsafe, expose, source, crate-graph and reservation checks. Every command exited 0; no implementation change or retry was needed in this rerun. Results are in `m27-resume-final-results.json` and `m27-resume-final-*.log` in the same local target directory. The earlier successful nine unchanged-crate suites and explicit launchd qualification remain the evidence for those checks.
+
+## M3-03 integration receipt
+
+Main merged without conflicts in `25a15619`. Commit `b7b4b049` adds the four managed-launch error kinds and codes (-32039 through -32042) and the seven missing reason tokens to EnvCloakKit. The Swift enums now match all 50 Rust kinds and 76 reasons. `requester_terminal` was already present; the sweep of Swift client and app sources found no separate words or strings table to update. The repository's `swift_cross_language_vectors` generator and Python escape oracle generated fresh private vectors for each run; no checked-in vector was hand-edited.
+
+The merged baseline failed the reason-set, kind-count and non-nil-kind assertions. The restored oracle passed before and after three mutations: `drop-runner-unavailable` removed its enum case and code arm, `drop-header-bindings` removed its reason, and `wrong-managed-launch-code` substituted -32039 for -32040. Each mutation compiled and failed its expected assertion.
+
+The detached `scripts/macos/test-kit.sh` run passed all 36 Swift tests, including the real daemon and generated Rust vectors, plus both optimized buffer tests. Xcode tests for EnvCloakKit and EnvCloakDesign passed, as did `check-sources.sh --swift` on both derived-data trees. Every cheap macos-app script test passed: CI coverage, Swift rules and literal oracle, project settings, signature fixtures and policy, build-swap cleanup, compiled-source fixtures, and owned-cleanup/record models. Built-app-only cases report their normal skips when no app bundle is supplied.
+
+Formatting, strict workspace/all-target Clippy, IPC (64), policy (210), daemon (258), both managed suites, runtime oracles, unsafe/expose lint, Rust source, graph, reservation and SPEC-decision checks passed. The first daemon run overlapped the Swift script's plain daemon build in the same target directory and lost its test hooks; its backup pause/trace assertions failed. After all Swift work ended, the test-enabled binaries were rebuilt and the complete daemon and both managed suites passed sequentially. The failed run remains in the logs. Results are in `m27-m3-*-results.json`, `m27-m3-swift-full.log` and `m27-m3-retry-*.log` under the local target directory.
+
+## Package-runner lifecycle follow-up
+
+The driver subsequently reproduced a real sweep race on Node v26.7.0: the request helper closed its input and lifeline, wrote its result, and returned while the runner was still stopping the Node group. Node's compile-cache temporary file could disappear between the sweep's directory listing and read. Commit `ba2dbedb` records the live server's group, waits for every group member to exit after closing the lifeline, and independently requires the group absent before the sweep. The fixture stays alive through TERM to exercise cleanup. Kernel listings are observations only, never signal targets; failed, empty or malformed listings fail the test. The sweep and its refusal of unreadable files are unchanged.
+
+The three isolated zero-release failures have a different cause. The driver's `ec-checks-m2-27-r7.log` ends with `test-kit.sh` rebuilding `envcloakd` without `envcloak-sys/testing` in the shared target. That disables `test_event` entirely. The unchanged success trace in `Ready::send` predates both cleanup commits (`git blame` attributes it to `87a6394c2`); the merge did not remove it. Building the plain daemon reproduced a missing trace; rebuilding with `--features envcloak-sys/testing` restored the passing test. Reusing a target after the Swift script therefore requires rebuilding the test-enabled Rust fixture binaries before the managed suites.
+
+The class sweep covers both users of `managed_common`: `managed_launch` and `managed_runner`. Their shared World setup now requires an actual test trace, so a wrong fixture cannot silently pass zero-release assertions. Their shared release assertion waits boundedly for positive counts to reach the reader and still requires exact counts. The local npm-registry test is the suites' only Node package/cache writer; its group wait covers both npm's cache and Node's temporary compile cache. Other lifecycle tests deliberately retain a client or server to measure its behavior and keep their existing exit controls.
+
+Mutations witnessed against the package-runner gate, with restoration passing each time:
+
+- `plain-daemon-refused`: build without the testing feature; the fixture's trace-presence assertion fails before release counts are trusted.
+- `omit-group-exit-wait`: remove the helper's exit wait; the independent assertion sees the package server group still running before the sweep.
+- `omit-runner-release-trace`: suppress only the successful release event; the exact count fails as (0, 0) instead of (0, 1) after its deadline.
+
+The final run at `ba2dbedb` used Node v26.7.0, the detached empty-environment launcher, private HOME/XDG/TMPDIR beneath `/tmp`, the required target directory, incremental compilation disabled, three build jobs, and `--no-fail-fast` with three test threads. All requested checks exited 0:
+
+| Check | Result |
+| --- | --- |
+| Package-runner test, five consecutive runs | 5/5 pass |
+| Complete `managed_launch` suite | 29/29 pass |
+| Complete `managed_runner` suite | 19/19 pass |
+| `cargo fmt --all --check` | Pass |
+| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Pass |
+| `scripts/check-unsafe.sh` | Pass |
+| `scripts/check-expose-lint.sh` | Pass, all 8 exposure call sites reported |
+
+The final run rebuilt the test-enabled binaries before testing and did not overlap a plain daemon build. Raw results are `m27-npx-final-results.json`, `m27-npx-final-*.log` and `m27-npx-mutation-results.json` under `/Volumes/KeenShiftDev/tmp/envcloak-target/A`. The older M2-25 residual and other tasks' plan ownership above are unchanged. No push was performed by this lane.
