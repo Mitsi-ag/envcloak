@@ -16,6 +16,7 @@
 #![allow(clippy::unwrap_used)]
 
 mod doctor;
+mod first_run;
 mod install;
 mod live_guard;
 mod mcp;

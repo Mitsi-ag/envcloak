@@ -103,7 +103,7 @@ const HELP: &str = "usage:
   envcloak items reclassify <slug> test|live|unknown [--passphrase-fd N] [--json]
   envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
-  envcloak import --scan <dir> [--yes] [--json]
+  envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json]
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
