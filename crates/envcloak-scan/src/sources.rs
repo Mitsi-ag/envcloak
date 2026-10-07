@@ -27,7 +27,8 @@ fn omitted_kind(kind: SourceKind) -> bool {
     matches!(kind, SourceKind::Database | SourceKind::Credentials)
 }
 
-pub(crate) fn omitted_path(sources: &[ConfigSource], path: &Path) -> bool {
+/// Whether a catalog credential store or database forbids reading this path.
+pub fn omitted_path(sources: &[ConfigSource], path: &Path) -> bool {
     omitted_source(sources, path, false).is_some()
 }
 
@@ -43,17 +44,31 @@ fn omitted_source<'a>(
             let Ok(root) = system_path(&s.path) else {
                 return false;
             };
-            if path == root {
+            // Catalog names must remain omitted through case aliases on
+            // insensitive volumes. Conservatively omit those spellings on
+            // sensitive volumes too, without resolving user-controlled links.
+            let mut parts = path.components();
+            if !root.components().all(|r| {
+                parts.next().is_some_and(|p| {
+                    p.as_os_str()
+                        .as_bytes()
+                        .eq_ignore_ascii_case(r.as_os_str().as_bytes())
+                })
+            }) {
+                return false;
+            }
+            let rest = parts.as_path();
+            if rest.as_os_str().is_empty() {
                 return true;
             }
             match &s.names {
-                None => path.starts_with(root),
+                None => true,
                 Some(name) => {
-                    path.parent() == Some(root.as_path())
-                        && path.file_name().is_some_and(|n| {
+                    rest.components().count() == 1
+                        && rest.file_name().is_some_and(|n| {
                             n.as_bytes()
                                 .windows(name.len().max(1))
-                                .any(|w| w == name.as_bytes())
+                                .any(|w| w.eq_ignore_ascii_case(name.as_bytes()))
                         })
                 }
             }

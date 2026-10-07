@@ -1337,6 +1337,115 @@ fn review_undo_refuses_redirected_parents_in_both_modes() {
 }
 
 #[test]
+fn review_protected_stores_survive_every_first_run_reader() {
+    for reader in ["json", "toml", "profile", "dotenv", "nested_config"] {
+        for store in ["copilot", "opencode"] {
+            if store == "opencode" && matches!(reader, "dotenv" | "nested_config") {
+                continue;
+            }
+            let f = Fixture::new(true);
+            let root = f.home.home().join(".codex");
+            let copilot = root.join("copilot");
+            let data = root.join("data");
+            let target = if store == "copilot" {
+                copilot
+                    .join("mcp-secrets")
+                    .join(if reader == "nested_config" {
+                        ".mcp.json"
+                    } else if reader == "dotenv" {
+                        ".env"
+                    } else {
+                        "values"
+                    })
+            } else {
+                data.join("opencode/auth.json")
+            };
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            let protected = by_label(&f.values, labels::STRIPE_SECRET_KEY).as_str();
+            let original = if reader == "nested_config" {
+                serde_json::to_vec(
+                    &json!({"mcpServers":{"fixture":{"env":{"SECRET_TOKEN":protected}}}}),
+                )
+                .unwrap()
+            } else {
+                format!("export SECRET_TOKEN={protected}\n").into_bytes()
+            };
+            std::fs::write(&target, &original).unwrap();
+            age(&target);
+            std::fs::write(
+                f.home.home().join(".zshrc"),
+                format!("export OPENAI_API_KEY={}\n", f.value()),
+            )
+            .unwrap();
+            let include = target.strip_prefix(&root).unwrap().to_str().unwrap();
+            match reader {
+                "json" => {
+                    std::fs::write(
+                        f.home.home().join(".claude.json"),
+                        serde_json::to_vec(&json!({"mcpServers":{"fixture":{"envFile":std::fs::canonicalize(&target).unwrap()}}}))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                }
+                "toml" => {
+                    std::fs::write(
+                        root.join("config.toml"),
+                        format!("[mcp_servers.fixture]\nenvFile = '{include}'\n"),
+                    )
+                    .unwrap();
+                }
+                "profile" => {
+                    std::fs::write(
+                        f.home.home().join(".bashrc"),
+                        format!("source .codex/{include}\n"),
+                    )
+                    .unwrap();
+                }
+                _ => (),
+            }
+            // With the catalog pointing elsewhere, this exact file and
+            // route must be readable. Otherwise another refusal could mask
+            // the missing omission guard.
+            let control = f.scan(&["--dry-run"]);
+            f.clean(&control);
+            let control_report: Value = serde_json::from_slice(&control.stdout).unwrap();
+            assert_eq!(
+                control_report["items"].as_array().unwrap().len(),
+                2,
+                "positive reader control: {reader}, {store}"
+            );
+            let mut command =
+                cli_command(&f.home, &["import", "--machine", "--yes", "--json"], &[]);
+            command
+                .env("COPILOT_HOME", &copilot)
+                .env("XDG_DATA_HOME", &data)
+                .env("CLAUDECODE", "1");
+            let out = finish_within(command, Duration::from_secs(60));
+            f.clean(&out);
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                report["items"].as_array().unwrap().len(),
+                1,
+                "protected store read: {reader}, {store}"
+            );
+            assert_eq!(report["items"][0]["slug"], "openai/existing");
+            assert!(
+                report["sources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["kept"].as_array().unwrap().iter().any(|k| matches!(
+                        k["reason"].as_str(),
+                        Some("manual_credentials" | "unread_env_file")
+                    ))),
+                "omission must be named: {reader}, {store}"
+            );
+            assert!(std::fs::read(&target).unwrap() == original);
+        }
+    }
+}
+
+#[test]
 fn gate16_profile_undo_is_byte_exact_and_checks_the_result() {
     let f = Fixture::new(true);
     let path = f.home.home().join(".zshrc");

@@ -196,7 +196,7 @@ pub(crate) fn shown_rel(rel: &Path) -> String {
 /// groups them by directory. Paths that were not read are listed with why:
 /// a profile shaped like a key among them ([`key_shaped_profile`]).
 pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<SkippedPath>) {
-    let (projects, skipped, _) = scan_selected(root, recursive, false);
+    let (projects, skipped, _) = scan_selected(root, recursive, false, &[]);
     (projects, skipped)
 }
 
@@ -204,6 +204,7 @@ fn scan_selected(
     root: &ScanRoot,
     recursive: bool,
     machine: bool,
+    omissions: &[envcloak_scan::source::ConfigSource],
 ) -> (Vec<Project>, Vec<SkippedPath>, Vec<PathBuf>) {
     let mut options = WalkOptions {
         recursive,
@@ -234,6 +235,13 @@ fn scan_selected(
                 continue;
             }
         };
+        if envcloak_scan::sources::omitted_path(omissions, &root.path().join(&f.rel)) {
+            skipped.push(SkippedPath {
+                path: shown_rel(&f.rel),
+                reason: "manual_credentials".into(),
+            });
+            continue;
+        }
         if f.rel.to_str().is_none() {
             skipped.push(SkippedPath {
                 path: shown_rel(&f.rel),

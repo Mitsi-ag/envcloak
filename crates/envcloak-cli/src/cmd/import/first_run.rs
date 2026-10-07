@@ -239,6 +239,17 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             source.path = path;
         }
     }
+    // Omission policy survives readable-source, root and volume selection.
+    let omissions = configs
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.source_kind,
+                SourceKind::Credentials | SourceKind::Database
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     configs.retain(|s| {
         roots
             .iter()
@@ -255,7 +266,8 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
         claims: claims(),
     };
     for root in roots {
-        let (mut projects, skipped, directories) = scan_selected(&root, true, options.machine);
+        let (mut projects, skipped, directories) =
+            scan_selected(&root, true, options.machine, &omissions);
         projects.retain(|p| project_paths.insert(dir_of(&root, &p.rel_dir)));
         for directory in directories {
             configs.extend(Locations::project_config_sources(&dir_of(
@@ -300,14 +312,22 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
         }
         match envcloak_scan::profile::scan_profiles_selected(&root, &|path| {
             source_allowed(path, &options.dirs)
+                && !envcloak_scan::sources::omitted_path(&omissions, path)
         }) {
-            Ok(part) => absorb(
-                part,
-                MachineSource::Profile,
-                &mut machine,
-                &mut r,
-                &mut seen,
-            ),
+            Ok(mut part) => {
+                for issue in &mut part.issues {
+                    if envcloak_scan::sources::omitted_path(&omissions, &issue.source.path) {
+                        issue.reason = "manual_credentials".into();
+                    }
+                }
+                absorb(
+                    part,
+                    MachineSource::Profile,
+                    &mut machine,
+                    &mut r,
+                    &mut seen,
+                );
+            }
             Err(e) => r.fail(root.path(), "profile", e.kind.token()),
         }
         absorb(
@@ -334,6 +354,7 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             false
         }
     });
+    configs.extend(omissions);
     let part = envcloak_scan::agent_config::scan_config_sources_selected(
         &configs,
         Budget {
