@@ -85,6 +85,10 @@ fn gate34_reveal_story() {
         for field in ["warning", "waited", "echo_off", "restored"] {
             assert_eq!(o[field], true);
         }
+        let offsets =
+            ["warning_at", "prompt_at", "value_at", "ack_at"].map(|key| o[key].as_i64().unwrap());
+        assert!(offsets[0] >= 0);
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
         let agent = h.agent(&home, &["reveal", "openai/reveal"]);
         assert!(!agent.status.success());
         h.assert_clean("agent reveal stdout", &agent.stdout);

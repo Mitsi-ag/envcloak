@@ -643,6 +643,11 @@ pub(crate) fn prove<'s>(
         let (v, g) = s.begin_proof()?;
         (v, g, t)
     };
+    #[cfg(target_os = "linux")]
+    if write == Write::Reveal {
+        // A test-only barrier after admission, while the state lock is free.
+        envcloak_sys::pause_point("reveal.proof.verifying");
+    }
     let verified = vault.verify_passphrase(&pass);
     drop(pass);
     let mut s = locked(&shared.state);
