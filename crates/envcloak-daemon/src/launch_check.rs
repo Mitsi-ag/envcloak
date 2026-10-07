@@ -885,16 +885,25 @@ mod tests {
             .prefix("ecl")
             .tempdir_in("/tmp")
             .unwrap();
-        let base = resolve(&decl(&["true"]), home.path(), vec![], [21; 16], 1).unwrap();
+        let fixture_root = home.path().canonicalize().unwrap();
+        let base = resolve(
+            &decl(&["true"]),
+            fixture_root.as_path(),
+            vec![],
+            [21; 16],
+            1,
+        )
+        .unwrap();
         assert!(check(&base).is_ok());
-        let entry = home.path().join("entry");
+        let entry = fixture_root.as_path().join("entry");
         script(&entry, "#!/bin/sh\nexit 0\n");
         for (name, option) in [
+            ("bash", "--login"),
             ("php", "-f/selected.php"),
             ("python3", "-Xpresite=observer"),
             ("python3", "-Wignore::observer.Notice"),
         ] {
-            let interpreter = home.path().join(name);
+            let interpreter = fixture_root.as_path().join(name);
             std::fs::copy(
                 Path::new(std::ffi::OsStr::from_bytes(&base.executable.path)),
                 &interpreter,
@@ -916,6 +925,11 @@ mod tests {
                 .iter()
                 .map(|a| a.as_bytes().to_vec())
                 .collect();
+            // Control every other predicate, including canonical entry paths.
+            let mut safe = old.clone();
+            safe.declaration.argv.remove(1);
+            safe.argv.remove(1);
+            assert!(check(&safe).is_ok(), "healthy {name}");
             assert!(
                 matches!(check(&old), Err(CheckError::Changed { .. })),
                 "{name} {option}"
@@ -954,6 +968,10 @@ mod tests {
         std::fs::write(&entry, "entry\n").unwrap();
         assert!(check(&base).is_ok());
         for name in [
+            "Python",
+            "Python3",
+            "luajit-2.1.1736781742",
+            "node-22",
             "python3.12-intel64",
             "pythonw3",
             "graalpy",
@@ -987,11 +1005,12 @@ mod tests {
             .prefix("ecl")
             .tempdir_in("/tmp")
             .unwrap();
-        let entry = home.path().join("entry");
+        let fixture_root = home.path().canonicalize().unwrap();
+        let entry = fixture_root.as_path().join("entry");
         script(&entry, "#!/bin/sh\nexit 0\n");
         let base = resolve(
             &decl(&[entry.to_str().unwrap()]),
-            home.path(),
+            fixture_root.as_path(),
             vec![],
             [23; 16],
             1,
@@ -999,16 +1018,17 @@ mod tests {
         .unwrap();
         assert!(check(&base).is_ok());
         for (name, option) in [
+            ("bash", "--login"),
             ("php", "-f/selected.php"),
             ("python3", "-Xpresite=observer"),
         ] {
-            let interpreter = home.path().join(name);
+            let interpreter = fixture_root.as_path().join(name);
             std::fs::copy(
                 Path::new(std::ffi::OsStr::from_bytes(&base.executable.path)),
                 &interpreter,
             )
             .unwrap();
-            let legacy_entry = home.path().join(format!("{name}-entry"));
+            let legacy_entry = fixture_root.as_path().join(format!("entry-{name}"));
             script(
                 &legacy_entry,
                 &format!("#!{} {option}\nentry\n", interpreter.display()),
@@ -1025,6 +1045,9 @@ mod tests {
             .iter()
             .map(|a| a.as_bytes().to_vec())
             .collect();
+            let mut safe = old.clone();
+            safe.argv.remove(1);
+            assert!(check(&safe).is_ok(), "healthy prepared {name}");
             assert!(
                 matches!(check(&old), Err(CheckError::Changed { .. })),
                 "{name} {option}"
@@ -1043,22 +1066,22 @@ mod tests {
         assert!(matches!(check(&old), Err(CheckError::Changed { .. })));
         // A shebang may name a native program unknown to the interpreter
         // table; without an option its checked entry is argv[1].
-        let cat = home.path().join("cat-entry");
+        let cat = fixture_root.as_path().join("cat-entry");
         script(&cat, "#!/bin/cat\nentry\n");
         let cat = resolve(
             &decl(&[cat.to_str().unwrap()]),
-            home.path(),
+            fixture_root.as_path(),
             vec![],
             [24; 16],
             1,
         )
         .unwrap();
         assert!(check(&cat).is_ok());
-        let package = home.path().join("npx");
+        let package = fixture_root.as_path().join("npx");
         script(&package, "#!/bin/sh\nexit 0\n");
         let package = resolve(
             &decl(&[package.to_str().unwrap(), "-y", "fixture"]),
-            home.path(),
+            fixture_root.as_path(),
             vec![],
             [25; 16],
             1,
