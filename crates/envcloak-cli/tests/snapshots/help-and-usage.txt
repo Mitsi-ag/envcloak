@@ -35,9 +35,9 @@ usage:
   envcloak agents status [--json]
   envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
+  envcloak reveal <slug>[#field]
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak reveal
   envcloak scrub
   envcloak agents migrate-mcp
   envcloak mcp-bridge
@@ -90,9 +90,9 @@ usage:
   envcloak agents status [--json]
   envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
+  envcloak reveal <slug>[#field]
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak reveal
   envcloak scrub
   envcloak agents migrate-mcp
   envcloak mcp-bridge

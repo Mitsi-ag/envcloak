@@ -113,9 +113,9 @@ const HELP: &str = "usage:
   envcloak agents status [--json]
   envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
+  envcloak reveal <slug>[#field]
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak reveal
   envcloak scrub
   envcloak agents migrate-mcp
   envcloak mcp-bridge
@@ -208,7 +208,6 @@ fn main() -> ExitCode {
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
-        "reveal" => cmd::reveal::run(&[]),
         "scrub" => cmd::scrub::run(&[]),
         "mcp-bridge" => cmd::mcp_bridge::run(&[]),
         "standing" => cmd::standing::run(&[]),

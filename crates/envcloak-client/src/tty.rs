@@ -31,6 +31,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::time::Duration;
 
 use envcloak_core::{SecretBuf, SecretBytes};
+use secrecy::ExposeSecret;
 use zeroize::Zeroize;
 
 use crate::fail::Failure;
@@ -127,6 +128,16 @@ impl Terminal {
     pub fn say(&mut self, text: &str) -> Result<(), InputError> {
         self.file
             .write_all(text.as_bytes())
+            .and_then(|()| self.file.flush())
+            .map_err(|_| InputError::Io)
+    }
+
+    /// Writes a proven reveal value only to this open controlling
+    /// terminal. Never formats it or falls back to another descriptor.
+    #[allow(clippy::disallowed_methods)] // Proven reveal, directly to /dev/tty.
+    pub fn write_secret(&mut self, value: &SecretBytes) -> Result<(), InputError> {
+        self.file
+            .write_all(value.expose_secret())
             .and_then(|()| self.file.flush())
             .map_err(|_| InputError::Io)
     }
@@ -336,6 +347,17 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn a_reveal_write_failure_is_an_error() {
+        let (writer, reader) = UnixStream::pair().unwrap();
+        let mut terminal = Terminal {
+            file: File::from(OwnedFd::from(writer)),
+        };
+        drop(reader);
+        let value = SecretBytes::copy_from(b"synthetic reveal value");
+        assert_eq!(terminal.write_secret(&value), Err(InputError::Io));
+    }
 
     /// Reads `input` in pieces of `step` bytes, as a pipe delivers it.
     struct Pieces<'a> {
