@@ -231,9 +231,9 @@ fn clean(
 ) -> Result<(), Failure> {
     let path = root.path().join(rel);
     let selected_names = selected.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+    let mut rewritten = false;
     let result = (|| -> Result<(), CleanupRefusal> {
-        // The ignore entry is literal. A hostile sourced basename must not
-        // introduce a pattern, another line or a value into that metadata.
+        // The private manifest name must not hold a value or unsafe path text.
         if !rel.file_name().and_then(OsStr::to_str).is_some_and(|name| {
             name.len() <= 128
                 && !looks_like_value(name)
@@ -248,8 +248,29 @@ fn clean(
         if findings.iter().any(|f| f.stamp != Some(stamp)) {
             return Err(cleanup_refusal("changed"));
         }
-        if stamp.nlink > 1 {
-            return Err(cleanup_refusal("hard_linked"));
+        envcloak_scan::atomic::check_modifiable(root, rel, &stamp)
+            .map_err(|e| cleanup_refusal(e.token()))?;
+        let selection = selected
+            .iter()
+            .map(|s| (s.index, s.slug.as_str()))
+            .collect::<Vec<_>>();
+        let after = if source_kind == "dotenv" {
+            envcloak_scan::without_entries(
+                &bytes,
+                &selected
+                    .iter()
+                    .map(|s| {
+                        findings[s.index].range.start as usize..findings[s.index].range.end as usize
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            comment_assignments(&bytes, &findings, &selection).map_err(cleanup_refusal)?
+        };
+        // Slug comments can be longer than short assignments. Keep the file
+        // when the result would exceed the read bound used by undo.
+        if after.len() > MAX_DOTENV {
+            return Err(cleanup_refusal("too_large"));
         }
         let parent = rel.parent().unwrap_or(Path::new(""));
         let manifest = match manifest {
@@ -294,40 +315,24 @@ fn clean(
                 {
                     return Err(cleanup_refusal("cleanup_manifest_refused"));
                 }
-                let manifest = parent.join(directory).join(MANIFEST_NAME);
+                let manifest = parent.join(&directory).join(MANIFEST_NAME);
                 match read_plain(root, &manifest, 64 << 10) {
                     Ok((prior, _)) if prior == text.as_bytes() => (),
                     Err(e) if e.kind == envcloak_scan::ScanErrorKind::NotFound => {
                         create_atomically(root, &manifest, text.as_bytes(), 0o600)
                             .map_err(|_| cleanup_refusal("cleanup_manifest_refused"))?;
                     }
-                    _ => return Err(cleanup_refusal("cleanup_manifest_changed")),
+                    _ => {
+                        r.source(&path, source_kind)["manual"] = json!(format!(
+                            "Move the private manifest directory aside: {}. Keep its manifest and update earlier envcloak run commands to use the moved manifest, then rerun import.",
+                            display_path(&root.path().join(parent).join(&directory))
+                        ));
+                        return Err(cleanup_refusal("cleanup_manifest_changed"));
+                    }
                 }
                 root.path().join(manifest)
             }
         };
-        let selection = selected
-            .iter()
-            .map(|s| (s.index, s.slug.as_str()))
-            .collect::<Vec<_>>();
-        let after = if source_kind == "dotenv" {
-            envcloak_scan::without_entries(
-                &bytes,
-                &selected
-                    .iter()
-                    .map(|s| {
-                        findings[s.index].range.start as usize..findings[s.index].range.end as usize
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        } else {
-            comment_assignments(&bytes, &findings, &selection).map_err(cleanup_refusal)?
-        };
-        // Slug comments can be longer than short assignments. Keep the file
-        // when the result would exceed the read bound used by undo.
-        if after.len() > MAX_DOTENV {
-            return Err(cleanup_refusal("too_large"));
-        }
         let mut gate = Cleanup {
             root,
             path: rel,
@@ -340,21 +345,8 @@ fn clean(
             after,
             backup: None,
         };
-        // Check before writing ignore metadata, then the deletion engine repeats
-        // the verification on both sides of the encrypted backup.
+        // Authority is rechecked on both sides of the encrypted backup.
         gate.verify()?;
-        if edit_gitignore(
-            root,
-            parent,
-            &[rel
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| cleanup_refusal("invalid_name"))?],
-            &[],
-        ) == FileChange::Refused
-        {
-            return Err(cleanup_refusal("gitignore_refused"));
-        }
         let result = delete_plaintext(
             root,
             &[(rel.to_path_buf(), stamp)],
@@ -375,30 +367,41 @@ fn clean(
             r.backups.push(id.clone());
         }
         let done = result?;
-        for (_, reason) in &done.kept {
-            r.fail(&path, source_kind, reason.token());
-            for name in &selected_names {
-                r.keep(&path, source_kind, Some(name), reason.token());
+        rewritten = !done.rewritten.is_empty();
+        for (kept, reason) in &done.kept {
+            r.fail(&root.path().join(kept), source_kind, reason.token());
+            if !rewritten {
+                for name in &selected_names {
+                    r.keep(&path, source_kind, Some(name), reason.token());
+                }
             }
         }
-        if !done.rewritten.is_empty() {
+        if rewritten {
+            r.source(&path, source_kind)["cleanup"] = json!("rewritten");
+            r.source(&path, source_kind)["replacement"] = json!(format!(
+                "envcloak run --manifest '{}' -- <command>",
+                display_path(&manifest).replace('\'', "'\\''")
+            ));
             let id = gate
                 .backup
                 .as_deref()
                 .ok_or_else(|| cleanup_refusal("backup_failed"))?;
             connect()?.backup_v2_record_result(id, 0, &gate.after.sha256())?;
+            r.source(&path, source_kind)["receipt"] = json!("confirmed");
             pause_point("first_run_recorded");
-            r.source(&path, source_kind)["replacement"] = json!(format!(
-                "envcloak run --manifest '{}' -- <command>",
-                display_path(&manifest).replace('\'', "'\\''")
-            ));
         }
         Ok(())
     })();
     if let Err(error) = result {
-        r.fail(&path, source_kind, error.reason());
-        for name in &selected_names {
-            r.keep(&path, source_kind, Some(name), error.reason());
+        if rewritten {
+            r.incomplete.insert("backup_receipt_unconfirmed".into());
+            r.source(&path, source_kind)["receipt"] = json!("unconfirmed");
+            r.source(&path, source_kind)["receipt_reason"] = json!(error.reason());
+        } else {
+            r.fail(&path, source_kind, error.reason());
+            for name in &selected_names {
+                r.keep(&path, source_kind, Some(name), error.reason());
+            }
         }
     }
     Ok(())

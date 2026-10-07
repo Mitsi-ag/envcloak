@@ -100,6 +100,105 @@ fn age(path: &Path) {
 }
 
 #[test]
+fn review_cleanup_preserves_ignore_files_and_refuses_before_metadata() {
+    for source in [".zshrc", ".aws/credentials"] {
+        for condition in ["recent", "hard_link", "open", "allowed"] {
+            let f = Fixture::new(true);
+            let home = f.home.home();
+            std::fs::create_dir(home.join(".aws")).unwrap();
+            let ignore = b"# global exclusions\n*.scratch\n!/.zshrc\n";
+            std::fs::write(home.join(".gitignore"), ignore).unwrap();
+            let path = home.join(source);
+            let original = if source == ".zshrc" {
+                format!("export OPENAI_API_KEY={}\n", f.value())
+            } else {
+                format!("[default]\naws_secret_access_key = {}\n", f.value())
+            };
+            std::fs::write(&path, &original).unwrap();
+            if condition != "recent" {
+                age(&path);
+            }
+            if condition == "hard_link" {
+                std::fs::hard_link(&path, home.join("alias")).unwrap();
+            }
+            let held = (condition == "open").then(|| std::fs::File::open(&path).unwrap());
+            let out = f.scan(&["--yes", "--delete-plaintext"]);
+            f.clean(&out);
+            assert_eq!(
+                out.status.success(),
+                condition == "allowed",
+                "{source}: {condition}"
+            );
+            assert_eq!(std::fs::read(home.join(".gitignore")).unwrap(), ignore);
+            assert!(!home.join(".aws/.gitignore").exists());
+            if condition != "allowed" {
+                assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+                for parent in [home.clone(), home.join(".aws")] {
+                    assert!(
+                        !std::fs::read_dir(parent).unwrap().any(|e| e
+                            .unwrap()
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".envcloak-import-")),
+                        "refusal created metadata: {condition}"
+                    );
+                }
+            }
+            drop(held);
+        }
+    }
+}
+
+#[test]
+fn review_repeated_cleanup_names_the_manual_manifest_step() {
+    let f = Fixture::new(true);
+    let path = f.home.home().join(".zshrc");
+    std::fs::write(&path, format!("export OPENAI_API_KEY={}\n", f.value())).unwrap();
+    age(&path);
+    assert!(f.scan(&["--yes", "--delete-plaintext"]).status.success());
+    let prior = std::fs::read(&path).unwrap();
+    let mut next = prior;
+    next.extend_from_slice(
+        format!(
+            "export GITHUB_TOKEN={}\n",
+            by_label(&f.values, labels::GITHUB_TOKEN).as_str()
+        )
+        .as_bytes(),
+    );
+    std::fs::write(&path, &next).unwrap();
+    age(&path);
+    let out = f.scan(&["--yes", "--delete-plaintext"]);
+    f.clean(&out);
+    assert!(!out.status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), next);
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let source = report["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["display_path"].as_str().unwrap().ends_with("/.zshrc"))
+        .unwrap();
+    assert!(
+        source["manual"]
+            .as_str()
+            .unwrap()
+            .contains("Move the private manifest directory aside")
+    );
+    let human = run(
+        &f.home,
+        &["import", "--machine", "--yes", "--delete-plaintext"],
+        &[],
+    );
+    f.clean(&human);
+    assert!(!human.status.success());
+    assert!(
+        String::from_utf8(human.stdout)
+            .unwrap()
+            .contains("Move the private manifest directory aside")
+    );
+}
+
+#[test]
 fn review_mcp_includes_require_cloud_opt_in() {
     let f = Fixture::new(true);
     let home = f.home.home();
@@ -479,6 +578,20 @@ fn failures_and_hostile_metadata_never_report_success_or_values() {
 }
 
 fn paused(f: &Fixture, at: &str, kill: bool, action: impl FnOnce()) -> std::process::ExitStatus {
+    paused_output(f, at, kill, action).status
+}
+
+fn paused_output(f: &Fixture, at: &str, kill: bool, action: impl FnOnce()) -> std::process::Output {
+    paused_report(f, at, kill, true, action)
+}
+
+fn paused_report(
+    f: &Fixture,
+    at: &str,
+    kill: bool,
+    json: bool,
+    action: impl FnOnce(),
+) -> std::process::Output {
     use std::process::Stdio;
     struct Owned {
         child: std::process::Child,
@@ -493,24 +606,25 @@ fn paused(f: &Fixture, at: &str, kill: bool, action: impl FnOnce()) -> std::proc
         }
     }
     let pause = tempfile::tempdir_in("/tmp").unwrap();
+    let stdout = pause.path().join("stdout");
+    let stderr = pause.path().join("stderr");
+    let output = |status| std::process::Output {
+        status,
+        stdout: std::fs::read(&stdout).unwrap(),
+        stderr: std::fs::read(&stderr).unwrap(),
+    };
     // The wrapper execs the CLI. This unreaped child handle owns the exact
     // process killed below; the barrier file's pid is never read or signalled.
-    let mut command = cli_command(
-        &f.home,
-        &[
-            "import",
-            "--machine",
-            "--yes",
-            "--delete-plaintext",
-            "--json",
-        ],
-        &[],
-    );
+    let mut args = vec!["import", "--machine", "--yes", "--delete-plaintext"];
+    if json {
+        args.push("--json");
+    }
+    let mut command = cli_command(&f.home, &args, &[]);
     command
         .env(envcloak_scan::testing::PAUSE_DIR, pause.path())
         .env("CLAUDE_CODE_TMPDIR", f.home.home().join("host-tmp"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(std::fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(std::fs::File::create(&stderr).unwrap()));
     let mut owner = Owned {
         child: command.spawn().unwrap(),
         reaped: false,
@@ -523,7 +637,7 @@ fn paused(f: &Fixture, at: &str, kill: bool, action: impl FnOnce()) -> std::proc
         if let Some(status) = owner.child.try_wait().unwrap() {
             owner.reaped = true;
             assert!(reached, "required boundary was not reached");
-            return status;
+            return output(status);
         }
         if std::time::Instant::now() > deadline {
             let _ = owner.child.kill();
@@ -544,7 +658,7 @@ fn paused(f: &Fixture, at: &str, kill: bool, action: impl FnOnce()) -> std::proc
                     owner.child.kill().unwrap();
                     let status = owner.child.wait().unwrap();
                     owner.reaped = true;
-                    return status;
+                    return output(status);
                 }
             }
             std::fs::write(pause.path().join(format!("{n:03}.go")), b"").unwrap();
@@ -556,8 +670,104 @@ fn paused(f: &Fixture, at: &str, kill: bool, action: impl FnOnce()) -> std::proc
 }
 
 #[test]
+fn review_receipt_failure_preserves_the_completed_rewrite_report() {
+    for json in [true, false] {
+        let f = Fixture::new(true);
+        let path = f.home.home().join(".zshrc");
+        std::fs::write(&path, format!("export OPENAI_API_KEY={}\n", f.value())).unwrap();
+        age(&path);
+        let out = paused_report(&f, "first_run_rewritten", false, json, || {
+            assert!(run(&f.home, &["lock"], &[]).status.success());
+        });
+        f.clean(&out);
+        assert!(!out.status.success());
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("# envcloak:")
+        );
+        if !json {
+            let text = String::from_utf8(out.stdout).unwrap();
+            assert!(text.contains("cleanup: rewritten"));
+            assert!(text.contains("backup receipt: unconfirmed"));
+            assert!(!text.contains("kept OPENAI_API_KEY"));
+            assert!(!text.contains("kept entry: vault_locked"));
+            continue;
+        }
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        let source = report["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["display_path"].as_str().unwrap().ends_with("/.zshrc"))
+            .unwrap();
+        assert_eq!(source["cleanup"], "rewritten");
+        assert_eq!(source["receipt"], "unconfirmed");
+        assert!(source["kept"].as_array().unwrap().is_empty());
+        assert!(
+            source["replacement"]
+                .as_str()
+                .unwrap()
+                .contains("envcloak run")
+        );
+        assert_eq!(report["backups"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn review_retained_swap_is_named_separately_from_the_rewritten_source() {
+    let f = Fixture::new(true);
+    let path = f.home.home().join(".zshrc");
+    std::fs::write(&path, format!("export OPENAI_API_KEY={}\n", f.value())).unwrap();
+    age(&path);
+    let mut kept = None;
+    let out = paused_output(&f, "first_run_swapped", false, || {
+        let swap = std::fs::read_dir(f.home.home())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("..zshrc.envcloak-swap-")
+            })
+            .unwrap();
+        std::fs::write(&swap, b"another writer's file\n").unwrap();
+        kept = Some(swap);
+    });
+    f.clean(&out);
+    assert!(!out.status.success());
+    let kept = kept.unwrap();
+    assert_eq!(std::fs::read(&kept).unwrap(), b"another writer's file\n");
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let sources = report["sources"].as_array().unwrap();
+    let source = sources
+        .iter()
+        .find(|s| s["display_path"].as_str().unwrap().ends_with("/.zshrc"))
+        .unwrap();
+    assert_eq!(source["cleanup"], "rewritten");
+    assert!(source["kept"].as_array().unwrap().is_empty());
+    let leftover = sources
+        .iter()
+        .find(|s| {
+            s["display_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(kept.file_name().unwrap().to_str().unwrap())
+        })
+        .unwrap();
+    assert!(
+        leftover["kept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["reason"] == "aside_changed")
+    );
+}
+
+#[test]
 fn gate16_kill_at_each_profile_and_aws_boundary_preserves_value() {
-    for source in ["profile", "aws"] {
+    for source in ["profile", "include", "aws", "aws_config"] {
         for step in [
             "first_run_planned",
             "first_run_committed",
@@ -571,13 +781,22 @@ fn gate16_kill_at_each_profile_and_aws_boundary_preserves_value() {
         ] {
             let f = Fixture::new(true);
             let key = by_label(&f.values, labels::GITHUB_TOKEN).as_str();
-            let path = if source == "profile" {
-                f.home.home().join(".zshrc")
-            } else {
-                std::fs::create_dir(f.home.home().join(".aws")).unwrap();
-                f.home.home().join(".aws/credentials")
+            let path = match source {
+                "profile" => f.home.home().join(".zshrc"),
+                "include" => {
+                    std::fs::write(f.home.home().join(".zshrc"), b"source .zprofile\n").unwrap();
+                    f.home.home().join(".zprofile")
+                }
+                _ => {
+                    std::fs::create_dir(f.home.home().join(".aws")).unwrap();
+                    f.home.home().join(if source == "aws" {
+                        ".aws/credentials"
+                    } else {
+                        ".aws/config"
+                    })
+                }
             };
-            let original = if source == "profile" {
+            let original = if matches!(source, "profile" | "include") {
                 format!("export GITHUB_TOKEN={key}\nPORT=8080\n")
             } else {
                 format!("[default]\naws_secret_access_key = {key}\nregion = ap-southeast-2\n")
@@ -585,6 +804,22 @@ fn gate16_kill_at_each_profile_and_aws_boundary_preserves_value() {
             std::fs::write(&path, &original).unwrap();
             age(&path);
             assert!(!paused(&f, step, true, || {}).success());
+            if matches!(step, "first_run_staged" | "first_run_swapped") {
+                let scan = f.scan(&["--dry-run"]);
+                f.clean(&scan);
+                assert!(
+                    !scan.status.success(),
+                    "interrupted {source} at {step} must be incomplete"
+                );
+                let report: Value = serde_json::from_slice(&scan.stdout).unwrap();
+                assert!(
+                    report["incomplete"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|r| r == "leftover")
+                );
+            }
             let bytes = std::fs::read(&path).unwrap();
             let plaintext = bytes.windows(key.len()).any(|b| b == key.as_bytes());
             let out = run(&f.home, &["ls", "--json"], &[]);
@@ -638,13 +873,16 @@ fn gate16_each_cleanup_condition_is_checked_again() {
         let original = format!("export OPENAI_API_KEY={}\n", f.value());
         std::fs::write(&path, &original).unwrap();
         age(&path);
-        let held = (condition == "open_elsewhere").then(|| std::fs::File::open(&path).unwrap());
+        let mut held = None;
         let at = if condition == "backup" {
             "first_run_verified"
         } else {
             "first_run_backed_up"
         };
         let status = paused(&f, at, false, || match condition {
+            "open_elsewhere" => {
+                held = Some(std::fs::File::open(&path).unwrap());
+            }
             "stored" => {
                 let outside = outside_dir();
                 let pass = secret_file(

@@ -1279,9 +1279,18 @@ fn check_removable(
     check_same(dir, name, expect).map(drop)
 }
 
-/// Removes the file at `rel` when it is still the one `expect` stamps, was
-/// not modified within [`MIN_AGE`], and is not open elsewhere. See the
-/// module documentation.
+/// Checks identity, age, hard links and open-file state without writing.
+/// A later change must repeat these checks; this grants no lasting permission.
+pub fn check_modifiable(
+    r: &ScanRoot,
+    rel: &Path,
+    expect: &FileStamp,
+) -> Result<(), ModifyErrorKind> {
+    let (dir, name) = r.open_parent(rel).map_err(ModifyErrorKind::Scan)?;
+    check_removable(&dir, &name, expect, SystemTime::now())
+}
+
+/// Removes a file after repeating the same admission checks at the change.
 pub fn remove_checked(r: &ScanRoot, rel: &Path, expect: &FileStamp) -> Result<(), ModifyError> {
     remove_checked_at(r, rel, expect, SystemTime::now())
 }
