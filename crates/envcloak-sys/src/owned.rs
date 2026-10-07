@@ -646,19 +646,27 @@ pub fn kill_raw(target: i32, sig: i32) -> libc::c_int {
     }
 }
 
+/// Stops only the calling process's own job (D-35). Neither a target nor
+/// a signal comes from the caller; the kernel selects the current group.
+pub(crate) fn stop_current_job() -> io::Result<()> {
+    kill_number(0, libc::SIGTSTP)
+}
+
 /// `kill(target, sig)`: the one call of `libc::kill` EnvCloak makes
 /// (`clippy.toml` bans it elsewhere). Its callers are [`kill_owned`],
 /// after its checks, and the M1 runner's [`crate::signal_process`] and
 /// [`crate::signal_group`], which signal a child the runner holds
 /// unreaped (`crate::wait_for_exit` leaves it a zombie) and refuse the
-/// numbers that name more than one process or group. Async-signal-safe.
+/// numbers that name more than one process or group. [`stop_current_job`]
+/// is the fixed self-job suspension required by D-35. Async-signal-safe.
 ///
 /// # Errors
 /// `kill`'s.
 #[allow(clippy::disallowed_methods)] // The one kill call (D-34).
 pub(crate) fn kill_number(target: i32, sig: i32) -> io::Result<()> {
     // SAFETY: kill has no memory effects; each caller checked that
-    // `target` names its own unreaped child or the group it leads.
+    // `target` names its own unreaped child or the group it leads, or is
+    // the fixed zero used to suspend the calling job itself.
     if unsafe { libc::kill(target, sig) } != 0 {
         return Err(io::Error::last_os_error());
     }
