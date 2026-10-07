@@ -538,3 +538,63 @@ probe led to the focused IPC test above; it is not counted as a failing
 mutation. The audit probe was a static checker failure, not a runtime test.
 Raw mutation receipts are `m27-m221-ipc-mutations.json` and the named audit
 checker log in the private lane target directory.
+
+
+### Detached validation after M2-21
+
+The run uses the same private short HOME/XDG/TMPDIR isolation, empty inherited
+environment, assigned target directory, incremental compilation disabled,
+three build workers and three test threads. Cargo tests use `--no-fail-fast`;
+no workspace-wide test command is used. Strict Clippy covers the workspace and
+all targets. Instrumented binaries are built before integration tests.
+
+The first build reused testkit binaries whose timestamps preceded the merged
+`Cargo.lock`: Cargo had no changed dependency to compile for those binaries,
+while the testkit's conservative freshness guard requires a newer link.
+Policy's `evidence_gates` and daemon `backups_v2`/`live_guard` therefore refused
+those fixtures before testing their behavior. These are failed checks, not
+behavioral passes. The guard remains unchanged; the repair is a package-scoped
+clean of testkit build output and a fresh instrumented binary build, followed
+by retries of every affected target. Initial and retry logs are retained
+separately in the private lane target directory.
+
+
+All requested checks are closed on the merged code. Policy was rerun in full;
+daemon `live_guard` passed 9/9 and `backups_v2` passed 38/38 after the rebuild.
+The first retry helper excluded digits in a target name and missed
+`backups_v2`; receipt inspection caught that omission, the helper was fixed,
+and the target was run explicitly. A separate receipt comparison matches
+all 12 initially failing policy cases and all 24 initially failing daemon
+cases to named passing retries. The initial failures are not erased or counted
+as passes.
+
+| Check | macOS result after retries |
+| --- | --- |
+| `cargo fmt --all --check` | Pass |
+| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Pass |
+| Full envcloak-core | 344 passed |
+| Full envcloak-ipc | 67 passed, including the new registry omission gate |
+| Full envcloak-client | 42 passed, including terminal-write refusal controls |
+| Full envcloak-policy | 214 reported passed; four ignored runtime cases exercised by the oracle script below; local service-manager path not exercised |
+| Full envcloakd, with affected targets rerun | All 278 covered; 254 initially passed, with both affected targets fully passing after fixture rebuild |
+| envcloak-sys library | 109 passed |
+| testkit `check_reservations` and `check_reservations_m3` | 92/92 and 23/23 passed |
+| Reveal CLI/stub tests and gate-34 story | 8/8 and 1/1 passed |
+| managed_launch | 32/32 passed |
+| managed_runner | 19/19 reported passed; 18 exercised cases plus the documented local service-manager skip |
+| Unsafe and exposure check scripts | Pass |
+| Source, crate graph, reservation and SPEC-decision check scripts | Pass |
+| Managed oracle controls and runtime check script | Pass; all five runtime tests executed, none ignored |
+
+The existing external-SSD launchd limitation remains: the policy launchctl
+escape and runner service-manager restart paths are not locally qualified.
+No host policy was changed. Linux reveal's runtime behavior and both real
+service-manager paths still require fresh CI on this merge; earlier green
+runs are not claimed as evidence for this head. M2R-87/88/89 and the plan's
+other task-owned follow-ups retain their existing owners and deadlines.
+
+Receipts are `m27-m221-final-results.json`, `m27-m221-recheck-results.json`,
+`m27-m221-backups-v2.log` and `m27-m221-validation.json`, with their stage logs
+in the private lane target directory. The combined receipt checks that every
+initial failure has a passing named retry. The merge and omission-test
+receipts above are unchanged. No push or GitHub comment was performed.
