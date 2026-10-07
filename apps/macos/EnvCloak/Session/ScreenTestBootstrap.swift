@@ -8,6 +8,14 @@ import AppKit
 /// Present only in the explicitly compiled XCTest host. Release refuses
 /// this flag. Normal Debug and Release builds have no runtime override.
 @MainActor enum ScreenTestBootstrap {
+    static func windowFrame(in bounds: NSRect) -> NSRect {
+        // Exercise the small desktop layout even on a larger development
+        // display. The usable frame excludes the menu bar and Dock.
+        let width = min(1024, bounds.width)
+        let height = min(700, bounds.height)
+        return NSRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2, width: width, height: height)
+    }
+
     static func positionWindow() async {
         // Keep UI automation independent of the person's restored window
         // size, monitor arrangement and focus. Only this test app moves.
@@ -15,7 +23,7 @@ import AppKit
             if let window = NSApp.windows.first(where: { $0.identifier?.rawValue == WindowID.main }),
                let screen = NSScreen.screens.first {
                 let bounds = screen.visibleFrame
-                window.setFrame(NSRect(x: bounds.midX - 590, y: bounds.midY - 370, width: 1180, height: 740), display: true)
+                window.setFrame(windowFrame(in: bounds), display: true)
                 window.makeKeyAndOrderFront(nil)
                 NSApp.activate()
                 return

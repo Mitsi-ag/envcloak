@@ -14,6 +14,8 @@ final class NavigationTests: XCTestCase {
         addTeardownBlock { @MainActor in app.terminate() }
         let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 20))
+        XCTAssertLessThanOrEqual(window.frame.width, 1024, "the fixture must exercise the small desktop layout")
+        XCTAssertLessThanOrEqual(window.frame.height, 700, "the fixture must leave room for the menu bar and Dock")
         app.typeKey("2", modifierFlags: .command)
         XCTAssertTrue(window.descendants(matching: .any)["keys.table"].firstMatch.waitForExistence(timeout: 10), window.debugDescription)
         XCTAssertTrue(window.staticTexts["fixture"].firstMatch.exists)
@@ -26,6 +28,9 @@ final class NavigationTests: XCTestCase {
         XCTAssertTrue(window.staticTexts["Resolves"].waitForExistence(timeout: 10), window.debugDescription)
         let revoke = window.buttons["Revoke"]
         XCTAssertTrue(revoke.waitForExistence(timeout: 10))
+        let reachable = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isHittable == true"), object: revoke)
+        XCTAssertEqual(XCTWaiter.wait(for: [reachable], timeout: 10), .completed,
+                       "Revoke exists but is not reachable: button=\(revoke.frame), window=\(window.frame)")
         revoke.click()
         XCTAssertTrue(window.staticTexts["No grants in force"].waitForExistence(timeout: 10))
         // The Python fixture independently checks grants.list after this test.
