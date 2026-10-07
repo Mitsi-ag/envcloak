@@ -172,3 +172,60 @@ The first end-to-end run passed 131 cases and refused two before they exercised 
 Current evidence is in `.collab/m2-16/r2-full-results.json`, `r2-full-{cli,scan,daemon,e2e}.log`, `r2-head-cli-regressions.{json,log}`, `r2-host-rerun-results.json`, `r2-case-fixture-{checks,clippy}.json`, `r2-check-results.json` and the named `*-result.json` mutation receipts. The earlier CI reservation regression remains fixed by `965c2970`; neither its checker nor its fixtures changed in this repair.
 
 These are local macOS results. Linux and complete milestone qualification remain with the plan's CI/driver flow. All nine review findings are resolved, no review finding is deferred, and no push, pull request or GitHub comment was made.
+
+## Third review repair and base integration
+
+Rebased the 17 M2-16 commits onto `origin/main` `6489768be87a4c362ce7212075a6feb243ba8ee2` without conflicts. A fresh fetch confirmed that main ref. The former `a78739b8` task head became `bde99f5c`; the fixes below are tested on the updated base. Remote PR CI remains the driver's step because this lane must not push or operate the PR.
+
+All seven review rows are accepted. The two AWS delimiter rows describe the same parser defect. The class sweep covered every Rust file in the task's diff against main, its tests, and the import/IPC documentation:
+
+| Bug class | Instances swept and repair or existing evidence |
+|---|---|
+| Grammar mismatch silently changes or omits a candidate | AWS's single parser now selects the first equals or colon delimiter, including mixed-case keys, embedded equals, base64 padding and cross-delimiter duplicates. Both AWS files have CLI import/cleanup checks. Python `RawConfigParser` supplies independent field/value expectations; the real AWS CLI writer remains a separate positive control. Profile assignment and source-path decoding share `word`: unquoted leading equals and equals after colon are manual, including conventional zsh profiles and recursively sourced files. Quoted, escaped and ordinary embedded equals are literal controls under real zsh. JSON/TOML MCP readers use their format parsers; shell assignment-name splitting does not use INI delimiter rules. No additional hand-split INI path exists in the task. |
+| An earlier refusal masks a missing later safety check | The ambiguity fixture now imports both a long quoted multiline value and a physically continued assignment that decodes to the full registry canary. It requires two imports, per-name `manual_assignment`, and byte-identical source contents. Both CLI selection and scan transformation guards were removed together for the mutation. MCP findings always lack line-removal eligibility and are handed off, not commented by first-run. |
+| A later refusal masks an unauthorized earlier comparison | First-run's shared comparison/report path now has an end-to-end assertion for exactly two comparisons and one skipped guessable candidate, plus the sealed audit's purpose, outcome, total, candidate and per-class counts. Only `scan.match` eligibility was mutated; `import.plan` and its separate refusal stayed intact. The task's daemon import path and existing purpose-aware daemon tests retain their independent guards. |
+| Defense-in-depth tests observe only the final writer | Gate 15 now covers a profile, a sourced profile, AWS credentials and AWS config. Scanner tests check both `single_complete_line` and `hard_link`, with ordinary single-link controls. CLI tests check `hard_link` and both hard-link names' unchanged bytes. The sweep also checked the existing direct hard-link assertions in dotenv walking, config/config-reference scanning, atomic writes and guarded restores (`scan_safety`, `configs`, `config_refs`, `scanner_safety`, `atomic`, `restore_left`, and CLI `import`). |
+| Validation against a stale integration base | Rebased onto the fetched main ref before testing. No conflicts or speculative changes to another task's ownership/reservations were needed. Linux and PR checks must run on the new pushed head before merge. |
+
+New oracle qualification: macOS zsh 5.9 and `/usr/bin/python3` 3.9.6. The zsh fixture executes only generated source with `-f`, a cleared environment and a private HOME/PATH. Production never executes profile contents. Existing Bash and AWS CLI oracles remain in the scanner suite. This is local macOS evidence, not a new Linux runtime claim.
+
+### Third review mutations
+
+Tests were strengthened before production repair. The original AWS parser failed both the delimiter oracle and the added hostile duplicate case; the original profile parser failed the zsh oracle. After repair their baselines passed. Each named mutation below was then applied, rebuilt, observed failing by assertion and restored. No compile error, stale helper, or setup refusal is counted as mutation evidence.
+
+| Mutation | Failing test and observation |
+|---|---|
+| `r3-aws-equals-only` | `aws_delimiters_match_python_ini_oracle`, `aws_hostile_grammar_is_explicit_and_value_free`, and CLI `aws_colon_credentials_are_imported_before_cleanup`: missing/unsupported colon fields and missed normalized duplicates. |
+| `r3-zsh-equals-literal` | `zsh_equals_expansion_matches_the_shell_oracle` and CLI `gate16_zsh_expansions_are_manual_in_profiles_and_includes`: the parser claims a complete literal and terminal cleanup changes the profile. |
+| `r3-aws-nlink-guards` | Scanner `gate15_machine_hard_links_remove_line_eligibility` and CLI `gate15_hard_links_are_importable_but_never_rewritten`: wrong eligibility and missing `hard_link` for AWS credentials. The baseline matrix also checks AWS config. |
+| `r3-profile-nlink-guards` | The same two gates fail for profiles. Their baseline matrix also checks recursive includes. |
+| `r3-comment-multiline-both` | CLI `agent_scan_leaves_guessable_and_ambiguous_assignments`: removing both complete-line guards changes the source bytes. Both long multiline candidates had been imported, so guessability cannot mask this failure. |
+| `r3-scan-match-guessable` | The same CLI test: the reported comparison count becomes 3 instead of 2 while the separate import refusal stays enabled. The restored baseline also verifies the encrypted audit counts. |
+
+Repair commits: `3c908fcc` contains the parser fixes, scanner regressions and import documentation; `a65e5d61` contains the CLI regressions and audit assertions. Both commit messages name their tested mutations. All six mutation receipts report test exit 101; the supervising mutation run exits 0 after restoration. Raw receipts and logs use the worktree-local ignored `.collab/m2-16/r3-` prefix.
+
+Requirement closure remains R-M2-69 (local portion), R-M2-70, R-M2-71, R-M2-73, R-M2-74 (integration), R-M2-75 and T-10, with gates 10, 15 and 16 and D-32's comparison boundary. The plan's existing ownership deferrals remain unchanged: M3 scan UI, M4 owning accounts, M2-20 MCP rewriting and M2-23 vendor exports. No review defect is deferred.
+
+### Third review local checks
+
+All Cargo commands use target E, incremental compilation disabled and three build jobs. Tests run detached in a cleared environment with isolated HOME/XDG paths, `--no-fail-fast` and `--test-threads 3`. No workspace-wide test command was run.
+
+- `cargo fmt --all --check`: passed.
+- `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`: passed.
+- Reservation, unsafe-boundary, exposure-lint, crate-graph, SPEC-decision and source checks: all passed (262 reservation rows in 17 tables; 6/6 exposure canaries; 50 dependency edges among 21 crates; 54 decisions and 51 sentences).
+- Full `envcloak-e2e` suite: 135 passed, including `gate10_first_run_story` on the updated base.
+- Full `envcloak-scan` suite: 222 passed, including both shell oracles, both AWS reader/writer oracles, the hostile parser cases and direct hard-link gates.
+- Full `envcloakd` suite on the rebased implementation: 259 passed.
+- `envcloak-testkit --test check_reservations`: 91 passed, including all four token tests from the earlier CI failure. The M2-14 `incomplete` reservation and checker fixtures remain unchanged.
+
+A further real-zsh sweep found that quote removal also exposes equals expansion in `''=command`, `'prefix:'=command` and related forms. Both expanded scanner and terminal CLI regressions failed against the initial raw-position guard before the follow-up repair. Literal controls include a quoted equals sign followed by unquoted text, an escaped equals sign after a quoted colon, and a quoted non-colon prefix. The decoder must track an empty decoded prefix or a trailing decoded colon, preserving that state across empty quotes and escaped newlines.
+
+The long, transcript-only `gate36_gib_dedup_and_per_root_awake_hour_budget` passed before that follow-up; its full doctor target passed 12/12 in 3,620.07 seconds. Production code stayed unchanged throughout that run. The new quoted-prefix CLI case was deliberately introduced as a failing regression during the broad run; it is not counted as a passing baseline. The final CLI rerun omits only the already-passed 1 GiB case: the follow-up changes profile word decoding, which the generated JSONL density fixture does not exercise.
+
+The follow-up is committed as `b6e71138`. Its real-zsh baseline passes 34 assignment cases plus source-path controls; the terminal CLI matrix covers 20 profile/include cases. Mutation `r3-zsh-raw-equals-position` restores the raw-position restriction while retaining the decoded state: both `zsh_equals_expansion_matches_the_shell_oracle` and `gate16_zsh_expansions_are_manual_in_profiles_and_includes` fail by assertion (test exit 101). The mutation was restored and all helpers rebuilt. This closes the quoted-prefix instance of the grammar-mismatch class, including recursive source paths.
+
+After the follow-up, the full scanner suite passed again (222 tests), `gate10_first_run_story` passed again, strict workspace clippy passed, and all seven formatting/check-script commands passed again. These final receipts use `r3-scan-final`, `r3-story-final`, `r3-clippy-final` and `r3-checks-final`; the seven named mutation receipts use the `r3-*-result.json` suffix.
+
+Final CLI rerun: 265 passed, zero failed, with only the previously passed 1 GiB case filtered out. All 28 first-run cases passed, including the expanded zsh matrix, comparison/audit assertions, AWS colon cleanup, hard-link defenses and crash/undo gates. Together with the unchanged transcript-only budget regression, all 266 CLI cases passed in aggregate. The earlier broad CLI run had 265 passes and the one deliberately added quoted-prefix failure; no other failure was suppressed or counted as a pass. Final raw receipt: `r3-cli-final.json`.
+
+The final tree has no pending production changes or review defects. These are macOS local results; the driver must push the rebased commits and rerun PR/Linux CI before merging. This lane did not push, open a PR or comment on GitHub.
