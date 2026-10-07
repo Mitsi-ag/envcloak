@@ -196,18 +196,34 @@ pub(crate) fn shown_rel(rel: &Path) -> String {
 /// groups them by directory. Paths that were not read are listed with why:
 /// a profile shaped like a key among them ([`key_shaped_profile`]).
 pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<SkippedPath>) {
+    let (projects, skipped, _) = scan_selected(root, recursive, false);
+    (projects, skipped)
+}
+
+fn scan_selected(
+    root: &ScanRoot,
+    recursive: bool,
+    machine: bool,
+) -> (Vec<Project>, Vec<SkippedPath>, Vec<PathBuf>) {
     let mut options = WalkOptions {
         recursive,
         ..WalkOptions::default()
     };
+    if machine {
+        options
+            .skip_dirs
+            .extend(["Caches", "cache", "caches", "Trash"].map(Into::into));
+    }
+    // Synced storage always needs its own named root, including --scan.
     options
         .skip_dirs
-        .extend(["Caches", "cache", "caches", "Trash", "Dropbox", "OneDrive"].map(Into::into));
+        .extend(["Dropbox", "OneDrive"].map(Into::into));
     let mut remaining = 32 * MAX_DOTENV;
     let mut skipped = Vec::new();
     let mut by_dir: BTreeMap<PathBuf, Vec<ReadFile>> = BTreeMap::new();
     let mut hidden: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-    for found in walk_dotenv(root, &options) {
+    let mut walk = walk_dotenv(root, &options);
+    for found in walk.by_ref() {
         let f = match found {
             Ok(f) => f,
             Err(e) => {
@@ -282,7 +298,13 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
             files,
         })
         .collect();
-    (projects, skipped)
+    for directory in walk.skipped_dirs() {
+        skipped.push(SkippedPath {
+            path: shown_rel(directory),
+            reason: "excluded_directory".into(),
+        });
+    }
+    (projects, skipped, walk.directories().to_vec())
 }
 
 /// Where each entry sent came from: project, file and entry indices.

@@ -207,6 +207,8 @@ pub enum ScanErrorKind {
     MountPoint,
     /// A directory with more entries than a scan reads.
     TooManyEntries,
+    /// The scan's file or directory budget ended before discovery did.
+    FileBudget,
     /// Deeper than the scan goes.
     TooDeep,
     /// Not a relative path of plain components.
@@ -233,6 +235,7 @@ impl ScanErrorKind {
             ScanErrorKind::Changed => "changed",
             ScanErrorKind::MountPoint => "mount_point",
             ScanErrorKind::TooManyEntries => "too_many_entries",
+            ScanErrorKind::FileBudget => "limited",
             ScanErrorKind::TooDeep => "too_deep",
             ScanErrorKind::InvalidPath => "invalid_path",
             ScanErrorKind::ProfileName => "not_a_profile_name",
@@ -253,6 +256,7 @@ impl ScanErrorKind {
             ScanErrorKind::Changed => "it changed while it was read",
             ScanErrorKind::MountPoint => "on another volume, which a scan never enters",
             ScanErrorKind::TooManyEntries => "a directory with too many entries to scan",
+            ScanErrorKind::FileBudget => "the scan file or directory budget was reached",
             ScanErrorKind::TooDeep => "deeper than a scan goes",
             ScanErrorKind::InvalidPath => "not a relative path of plain names",
             ScanErrorKind::ProfileName => {

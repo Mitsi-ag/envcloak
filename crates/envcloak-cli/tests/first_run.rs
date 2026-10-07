@@ -100,6 +100,178 @@ fn age(path: &Path) {
 }
 
 #[test]
+fn review_mcp_includes_require_cloud_opt_in() {
+    let f = Fixture::new(true);
+    let home = f.home.home();
+    let cloud = home.join("Dropbox");
+    std::fs::create_dir(&cloud).unwrap();
+    std::fs::write(
+        cloud.join("fixture.env"),
+        format!("OPENAI_API_KEY={}\n", f.value()),
+    )
+    .unwrap();
+    std::fs::write(
+        home.join(".mcp.json"),
+        br#"{"mcpServers":{"fixture":{"command":"fixture","envFile":"Dropbox/fixture.env"}}}"#,
+    )
+    .unwrap();
+    let out = f.scan(&["--dry-run"]);
+    f.clean(&out);
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["items"].as_array().unwrap().is_empty());
+    assert!(
+        report["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["kept"].as_array().unwrap())
+            .any(|k| k["reason"] == "volume_opt_in")
+    );
+    let out = f.scan(&["--dry-run", "--scan", cloud.to_str().unwrap()]);
+    f.clean(&out);
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["items"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn review_nested_projects_need_no_dotenv_to_discover_mcp() {
+    for name in [".mcp.json", ".cursor/mcp.json"] {
+        let f = Fixture::new(true);
+        let path = f.home.home().join("projects/only-config").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&json!({"mcpServers":{"fixture":{"command":"fixture","env":{"OPENAI_API_KEY":f.value()}}}})).unwrap()).unwrap();
+        let out = f.scan(&["--dry-run"]);
+        f.clean(&out);
+        assert!(out.status.success());
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["items"].as_array().unwrap().len(), 1, "{name}");
+        assert_eq!(report["migrate_mcp"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn review_catalog_discovery_through_an_explicit_root_alias() {
+    let f = Fixture::new(true);
+    std::fs::write(
+        f.home.home().join(".claude.json"),
+        serde_json::to_vec(&json!({"mcpServers":{"fixture":{"command":"fixture","env":{"OPENAI_API_KEY":f.value()}}}})).unwrap(),
+    ).unwrap();
+    let outside = outside_dir();
+    let alias = outside.path().join("alias");
+    std::os::unix::fs::symlink(f.home.home(), &alias).unwrap();
+    for machine in [true, false] {
+        let args = if machine {
+            vec!["import", "--machine", "--dry-run", "--json"]
+        } else {
+            vec![
+                "import",
+                "--scan",
+                alias.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ]
+        };
+        let mut cmd = cli_command(&f.home, &args, &[]);
+        cmd.env("HOME", &alias);
+        let out = finish_within(cmd, Duration::from_secs(60));
+        f.clean(&out);
+        assert!(out.status.success());
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["items"].as_array().unwrap().len(),
+            1,
+            "machine: {machine}"
+        );
+        assert_eq!(report["migrate_mcp"].as_array().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn review_named_scan_keeps_cache_projects() {
+    let f = Fixture::new(true);
+    for name in ["Dropbox", "OneDrive"] {
+        let dir = f.home.home().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join(".env"), format!("OPENAI_API_KEY={}\n", f.value())).unwrap();
+    }
+    for (n, name) in ["cache", "Caches", "caches", "Trash"].iter().enumerate() {
+        let dir = f.home.home().join(format!("project{n}")).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), format!("OPENAI_API_KEY={}\n", f.value())).unwrap();
+    }
+    let out = run(
+        &f.home,
+        &[
+            "import",
+            "--scan",
+            f.home.home().to_str().unwrap(),
+            "--dry-run",
+            "--json",
+        ],
+        &[],
+    );
+    f.clean(&out);
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    for name in ["Dropbox", "OneDrive"] {
+        assert!(report["sources"].as_array().unwrap().iter().any(|s| {
+            s["display_path"].as_str().unwrap().ends_with(name)
+                && s["kept"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|k| k["reason"] == "excluded_directory")
+        }));
+    }
+    assert_eq!(
+        report["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["kind"] == "dotenv")
+            .count(),
+        4
+    );
+    let out = f.scan(&["--dry-run"]);
+    assert!(out.status.success());
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report["items"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn review_dotenv_file_limit_is_incomplete() {
+    let f = Fixture::new(true);
+    let home = f.home.home();
+    let early = home.join("a");
+    std::fs::create_dir(&early).unwrap();
+    for n in 0..10_000 {
+        std::fs::write(early.join(format!(".env.p{n:05}")), b"").unwrap();
+    }
+    std::fs::create_dir(home.join("z")).unwrap();
+    std::fs::write(
+        home.join("z/.env"),
+        format!("OPENAI_API_KEY={}\n", f.value()),
+    )
+    .unwrap();
+    let out = f.scan(&["--dry-run"]);
+    f.clean(&out);
+    assert!(
+        !out.status.success(),
+        "the final credential was outside the file budget"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        report["incomplete"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r == "limited")
+    );
+}
+
+#[test]
 fn gate10_machine_dedupe_dry_run_and_clean_report() {
     let f = Fixture::new(true);
     let home = f.home.home();

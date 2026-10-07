@@ -141,6 +141,117 @@ fn review_profile_include_and_aws_leftovers_survive_missing_originals() {
 }
 
 #[test]
+fn review_config_selection_covers_json_toml_and_each_include() {
+    use envcloak_scan::source::{ConfigFormat, ConfigSource, SourceKind};
+    for (format, config) in [
+        (
+            ConfigFormat::Json,
+            "{\"mcpServers\":{\"fixture\":{\"command\":\"fixture\",\"envFile\":\"Dropbox/fixture.env\"}}}",
+        ),
+        (
+            ConfigFormat::Toml,
+            "[mcp_servers.fixture]\ncommand = 'fixture'\nenvFile = 'Dropbox/fixture.env'\n",
+        ),
+    ] {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let root = open_root(home.path()).unwrap();
+        let path = root.path().join("config");
+        std::fs::write(&path, config).unwrap();
+        std::fs::create_dir(root.path().join("Dropbox")).unwrap();
+        let value = "fixture".repeat(4);
+        std::fs::write(
+            root.path().join("Dropbox/fixture.env"),
+            format!("TOKEN={value}\n"),
+        )
+        .unwrap();
+        let sources = [ConfigSource {
+            path,
+            format,
+            source_kind: SourceKind::McpConfig,
+            label: "fixture".into(),
+            names: None,
+        }];
+        let scan = |allow: &dyn Fn(&std::path::Path) -> bool| {
+            envcloak_scan::agent_config::scan_config_sources_selected(
+                &sources,
+                Default::default(),
+                allow,
+            )
+            .unwrap()
+        };
+        let denied = scan(&|p| !p.components().any(|c| c.as_os_str() == "Dropbox"));
+        assert!(denied.findings.iter().all(|f| f.value.is_none()));
+        assert!(denied.issues.iter().any(|i| i.reason == "volume_opt_in"));
+        let allowed = scan(&|_| true);
+        assert!(allowed.complete());
+        assert!(
+            allowed
+                .findings
+                .iter()
+                .any(|f| f.value.as_ref().is_some_and(|v| v.ct_eq(value.as_bytes())))
+        );
+        let denied_root = scan(&|_| false);
+        assert!(denied_root.findings.is_empty());
+        assert!(!denied_root.complete());
+        assert_eq!(denied_root.files, 0);
+        assert_eq!(denied_root.bytes, 0);
+        assert_eq!(denied_root.issues[0].source.path, sources[0].path);
+    }
+}
+
+#[test]
+fn review_project_directory_discovery_has_an_explicit_limit() {
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    for name in ["a", "b"] {
+        std::fs::create_dir(home.path().join(name)).unwrap();
+    }
+    let root = open_root(home.path()).unwrap();
+    let options = envcloak_scan::WalkOptions {
+        recursive: true,
+        max_dirs: 2,
+        ..Default::default()
+    };
+    let mut walk = envcloak_scan::walk_dotenv(&root, &options);
+    assert!(
+        walk.by_ref()
+            .any(|f| f.is_err_and(|e| e.kind.token() == "limited"))
+    );
+    assert_eq!(walk.directories().len(), 2);
+}
+
+#[test]
+fn review_walk_reports_file_limits_in_one_directory_and_across_directories() {
+    for nested in [false, true] {
+        for count in [2, 3] {
+            let home = tempfile::tempdir_in("/tmp").unwrap();
+            for n in 0..count {
+                let parent = if nested {
+                    home.path().join(format!("p{n}"))
+                } else {
+                    home.path().to_path_buf()
+                };
+                std::fs::create_dir_all(&parent).unwrap();
+                std::fs::write(parent.join(format!(".env.p{n}")), b"").unwrap();
+            }
+            let root = open_root(home.path()).unwrap();
+            let options = envcloak_scan::WalkOptions {
+                recursive: true,
+                max_files: 2,
+                ..Default::default()
+            };
+            let found = envcloak_scan::walk_dotenv(&root, &options).collect::<Vec<_>>();
+            assert_eq!(found.iter().filter(|f| f.is_ok()).count(), 2);
+            assert_eq!(
+                found
+                    .iter()
+                    .any(|f| f.as_ref().is_err_and(|e| e.kind.token() == "limited")),
+                count == 3
+            );
+        }
+    }
+}
+
+#[test]
 fn gate15_aws_and_profiles_never_follow_special_files() {
     let home = tempfile::tempdir_in("/tmp").unwrap();
     let outside = tempfile::tempdir_in("/tmp").unwrap();

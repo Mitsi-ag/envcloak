@@ -196,9 +196,11 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
     }
     let mut r = FirstRunReport::new();
     let mut roots = Vec::new();
+    let mut root_names = Vec::new();
     for path in paths {
         let root = open_root(&path)
             .map_err(|_| Failure::new("scan_root", "the scan directory could not be opened"))?;
+        root_names.push((path.clone(), root.path().to_path_buf()));
         if roots
             .iter()
             .any(|x: &ScanRoot| x.identity() == root.identity())
@@ -223,6 +225,19 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
     }
     roots.sort_by(|a, b| a.path().cmp(b.path()));
     let mut configs = locations.config_sources();
+    // Resolve only the explicitly opened root alias. Child paths still pass
+    // through the scanner's no-follow walk.
+    for source in &mut configs {
+        if let Some(path) = root_names.iter().find_map(|(name, canonical)| {
+            source
+                .path
+                .strip_prefix(name)
+                .ok()
+                .map(|rel| canonical.join(rel))
+        }) {
+            source.path = path;
+        }
+    }
     configs.retain(|s| {
         roots
             .iter()
@@ -239,16 +254,19 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
         claims: claims(),
     };
     for root in roots {
-        let (mut projects, skipped) = scan(&root, true);
+        let (mut projects, skipped, directories) = scan_selected(&root, true, options.machine);
         projects.retain(|p| project_paths.insert(dir_of(&root, &p.rel_dir)));
-        for p in &projects {
+        for directory in directories {
             configs.extend(Locations::project_config_sources(&dir_of(
-                &root, &p.rel_dir,
+                &root, &directory,
             )));
         }
-        configs.extend(Locations::project_config_sources(root.path()));
         for s in &skipped {
-            r.fail(&root.path().join(&s.path), "dotenv", &s.reason);
+            if s.reason == "excluded_directory" {
+                r.keep(&root.path().join(&s.path), "directory", None, &s.reason);
+            } else {
+                r.fail(&root.path().join(&s.path), "dotenv", &s.reason);
+            }
         }
         let (mut part, sent) = import_params(&root, &projects, claims());
         let offset = params.projects.len() as u32;
@@ -315,13 +333,14 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             false
         }
     });
-    let part = envcloak_scan::agent_config::scan_config_sources_with_budget(
+    let part = envcloak_scan::agent_config::scan_config_sources_selected(
         &configs,
         Budget {
             bytes: 64 << 20,
             files: 10_000,
             ..Budget::default()
         },
+        &|path| source_allowed(path, &options.dirs),
     )
     .map_err(|_| Failure::new("io", "the config scan failed"))?;
     absorb(
@@ -645,6 +664,15 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             }
             if let Some(replacement) = source["replacement"].as_str() {
                 println!("  replacement: {replacement}");
+            }
+            if let Some(manual) = source["manual"].as_str() {
+                println!("  manual: {manual}");
+            }
+            if let Some(cleanup) = source["cleanup"].as_str() {
+                println!("  cleanup: {cleanup}");
+            }
+            if let Some(receipt) = source["receipt"].as_str() {
+                println!("  backup receipt: {receipt}");
             }
         }
         if !report["migrate_mcp"]
