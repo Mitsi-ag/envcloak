@@ -117,6 +117,7 @@ pub(crate) fn spawn_session(
     envcloak_sys::pty::spawn_session(&argv, &env, slave).map_err(|e| match e {
         SessionError::Exec(e) => spawn_error(&e),
         SessionError::Setup(e) => ExecError::Setup(e.kind()),
+        SessionError::Unconfirmed(e) => ExecError::Followed(e.kind()),
     })
 }
 

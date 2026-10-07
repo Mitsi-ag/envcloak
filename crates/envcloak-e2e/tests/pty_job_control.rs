@@ -43,6 +43,9 @@
 //!   `envcloak run` restored before it stopped;
 //! - a panic in the relay (a test build's injected one) leaves the outer
 //!   terminal as it was, echo on.
+//! - startup status stays unknown after an observed side effect if the
+//!   monitor's Started report is lost (testing builds); ordinary startup
+//!   and descriptor-inheritance controls run on release binaries too.
 //!
 //! Gate 23 in PTY mode: `y` typed into the requester's terminal while a
 //! `--pty --wait` run waits for approval approves nothing. And `--pty`
@@ -563,6 +566,166 @@ fn lines(path: &Path) -> usize {
     std::fs::read(path).map_or(0, |b| b.iter().filter(|c| **c == b'\n').count())
 }
 
+/// Missing startup evidence must not authorize retrying a side effect.
+/// Release artifacts have no injected loss; the ordinary status controls
+/// still run there. Expected records are raw wire bytes, not the codec.
+fn startup_status(h: &mut Harness, sh: &mut Shell, py: &str) {
+    let status = h.files().join("startup-status");
+    let missing = h.files().join("missing-command");
+    let not_executable = fixture(h, "not-executable", "not executable\n");
+    for (command, code, record) in [
+        (
+            "/usr/bin/true",
+            0,
+            b"{\"v\":1,\"state\":\"ran\",\"code\":0}\n".as_slice(),
+        ),
+        (
+            missing.to_str().unwrap(),
+            127,
+            b"{\"v\":1,\"state\":\"not_started\",\"token\":\"command_not_found\"}\n".as_slice(),
+        ),
+        (
+            not_executable.as_str(),
+            126,
+            b"{\"v\":1,\"state\":\"not_started\",\"token\":\"command_not_executable\"}\n"
+                .as_slice(),
+        ),
+    ] {
+        sh.say(&format!(
+            "{} run --pty --status-fd 9 -- {} 9>{}",
+            quoted(h.cli().to_str().unwrap()),
+            quoted(command),
+            quoted(status.to_str().unwrap())
+        ));
+        assert_eq!(
+            sh.status(),
+            code,
+            "the startup status control: {}",
+            sh.outer.text()
+        );
+        let bytes = std::fs::read(&status).unwrap();
+        h.record("startup status control", &bytes);
+        assert_eq!(bytes, record, "the startup status control record");
+    }
+    if !h.test_build() {
+        println!(
+            "startup loss: external release binaries have no injected loss; status controls passed"
+        );
+        return;
+    }
+    let ran = h.files().join("startup-side-effect");
+    let release = h.files().join("startup-release");
+    let command = fixture(
+        h,
+        "startup-side-effect.py",
+        "import os, sys\nwith open(sys.argv[1], 'x') as f:\n    f.write('ran\\n')\nos.read(0, 1)\n",
+    );
+    let before = sh.outer.settings();
+    let mark = sh.mark();
+    let check_by = Instant::now() + Duration::from_secs(30);
+    sh.start_job(&format!(
+        "ENVCLOAK_TEST_FAIL=sys.pty.start-report ENVCLOAK_TEST_PAUSE=sys.pty.start-report \
+         ENVCLOAK_TEST_PAUSE_RELEASE={} {} run --pty --status-fd 9 -- {} {} {} 9>{}",
+        quoted(release.to_str().unwrap()),
+        quoted(h.cli().to_str().unwrap()),
+        quoted(py),
+        quoted(&command),
+        quoted(ran.to_str().unwrap()),
+        quoted(status.to_str().unwrap())
+    ));
+    assert!(
+        sh.outer.wait_for_within(Duration::from_secs(30), |o| {
+            o.count_since(mark, b"envcloak test: paused at sys.pty.start-report") == 1
+                && std::fs::read(&ran).is_ok_and(|b| b == b"ran\n")
+        }),
+        "the startup loss needs a paused CLI and the command's side effect: {}",
+        sh.outer.text()
+    );
+    assert!(Instant::now() < check_by, "the startup witness expired");
+    std::fs::write(release, b"").unwrap();
+    sh.prompt_again("the lost startup report ended the run");
+    assert_eq!(sh.status(), 125, "startup loss must fail");
+    assert!(
+        sh.outer.settings().same_as(&before),
+        "startup loss left the terminal raw"
+    );
+    let bytes = std::fs::read(status).unwrap();
+    h.record("lost startup status", &bytes);
+    assert_eq!(
+        bytes, b"{\"v\":1,\"state\":\"unknown\"}\n",
+        "a lost startup report must not claim the command never ran"
+    );
+    println!("startup loss: command side effect witnessed, status unknown, terminal restored");
+}
+
+/// Pipe mode passes inherited descriptors through without --status-fd.
+/// PTY mode replaces 0..2 and closes the rest, even without that option.
+fn inherited_descriptors(h: &mut Harness, sh: &mut Shell, py: &str) {
+    let source = h.files().join("inherited-source");
+    std::fs::write(&source, b"owned descriptor fixture\n").unwrap();
+    let probe = fixture(
+        h,
+        "descriptor-probe.py",
+        r"import json, os, sys
+source = os.stat(sys.argv[1])
+def inherited(fd):
+    try:
+        got = os.fstat(fd)
+        return (got.st_dev, got.st_ino) == (source.st_dev, source.st_ino)
+    except OSError:
+        return False
+result = {'inherited': [inherited(3), inherited(8)],
+          'tty': [os.isatty(fd) for fd in (0, 1, 2)]}
+with open(sys.argv[2], 'x') as f:
+    json.dump(result, f)
+",
+    );
+    for pty in [false, true] {
+        for status_fd in [false, true] {
+            let result = h.files().join(format!("descriptors-{pty}-{status_fd}"));
+            let status = h
+                .files()
+                .join(format!("descriptor-status-{pty}-{status_fd}"));
+            sh.say(&format!(
+                "{} run {} {} -- {} {} {} {} 3<{} 8<{} 9>{}",
+                quoted(h.cli().to_str().unwrap()),
+                if pty { "--pty" } else { "" },
+                if status_fd { "--status-fd 9" } else { "" },
+                quoted(py),
+                quoted(&probe),
+                quoted(source.to_str().unwrap()),
+                quoted(result.to_str().unwrap()),
+                quoted(source.to_str().unwrap()),
+                quoted(source.to_str().unwrap()),
+                quoted(status.to_str().unwrap())
+            ));
+            assert_eq!(
+                sh.status(),
+                0,
+                "descriptor probe: pty={pty}, status={status_fd}"
+            );
+            let bytes = std::fs::read(result).unwrap();
+            h.record("descriptor probe", &bytes);
+            let got: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let inherit = !pty && !status_fd;
+            assert_eq!(
+                got,
+                serde_json::json!({
+                    "inherited": [inherit, inherit], "tty": [true, pty, pty]
+                }),
+                "descriptor inheritance: pty={pty}, status={status_fd}"
+            );
+            if status_fd {
+                assert_eq!(
+                    std::fs::read(status).unwrap(),
+                    b"{\"v\":1,\"state\":\"ran\",\"code\":0}\n"
+                );
+            }
+            println!("descriptor inheritance: pty={pty}, status={status_fd}, inherited={inherit}");
+        }
+    }
+}
+
 /// The real CLI is the signaller's owned child. Both a direct command and
 /// a nested shell's foreground job keep one counter per forwarded signal.
 fn cli_signal_receipts(h: &Harness, sh: &mut Shell, py: &str, signaller: &str) {
@@ -756,6 +919,10 @@ fn cat_after_fg(sh: &mut Shell, line: &str) -> bool {
 /// the outer terminal restored on an outside SIGTSTP without the command
 /// stopped first (the ticker is running at the actual restore barrier); the PTY
 /// redactor without the CR LF forms (the PEM-shaped value shows).
+/// Resume-before-raw is caught by the exec unit order model and
+/// pty_relay::the_command_is_resumed_only_once_the_outer_terminal_is_raw_again,
+/// whose barrier observes the settings before Resume. This gate's post-fg
+/// round trip alone does not establish that ordering.
 #[test]
 fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pty() {
     let mut h = Harness::start();
@@ -802,6 +969,9 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         &[],
     );
     assert_eq!(approved.code, 0, "{}", approved.all());
+
+    startup_status(&mut h, &mut sh, &py);
+    inherited_descriptors(&mut h, &mut sh, &py);
 
     // `/bin/cat`'s baseline, under the plain shell.
     let before = sh.stty_g(&files, "before");

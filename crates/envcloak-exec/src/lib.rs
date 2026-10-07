@@ -119,7 +119,8 @@ impl std::fmt::Debug for PtyCommand {
 /// [`ExecError::NoCommand`], [`ExecError::NulByte`], [`ExecError::NotFound`]
 /// and [`ExecError::NotExecutable`] before anything runs, and
 /// [`ExecError::Setup`] when no PTY can be opened or the monitor cannot set
-/// the session up.
+/// the session up; [`ExecError::Followed`] when startup evidence is lost
+/// after the monitor was forked, since the command may already have run.
 pub fn start_pty(
     argv: &[OsString],
     injected: &[(EnvName, SecretBytes)],
@@ -307,9 +308,9 @@ pub enum ExecError {
     /// signals, or the spawn itself (out of descriptors, processes or
     /// memory).
     Setup(io::ErrorKind),
-    /// The command was started, but could not be followed to its end: its
-    /// output threads, or waiting for it, failed. It may have run, and
-    /// did what it did; how it ended is not known
+    /// The command may have started, but could not be followed to its end:
+    /// its startup report, output threads, or waiting for it, failed. It
+    /// may have run, and did what it did; how it ended is not known
     /// ([`ExecError::may_have_started`]).
     Followed(io::ErrorKind),
     /// PTY mode without a terminal on standard input and standard output
@@ -359,8 +360,8 @@ impl ExecError {
     /// Whether the command may have been started before this failure:
     /// only [`ExecError::Followed`], [`ExecError::MonitorLost`] and
     /// [`ExecError::TerminalLost`]. Every
-    /// other failure comes before the command could run (a spawn that
-    /// fails runs nothing), so a program that started `envcloak run` may
+    /// other failure is known to precede execution, so a program that
+    /// started `envcloak run` may
     /// tell "not started" from "may have run" by this, never by the exit
     /// code or the output.
     pub fn may_have_started(&self) -> bool {
@@ -388,8 +389,8 @@ impl ExecError {
                  nothing was run"
             }
             ExecError::Followed(_) => {
-                "the command was started, but could not be followed to its end (pipes, threads \
-                 or waiting for it): it may have run"
+                "the command may have started, but could not be followed to its end \
+                 (startup, pipes, threads or waiting for it)"
             }
             ExecError::PtyUnavailable => {
                 "--pty needs a terminal on standard input and standard output; it never falls \
@@ -423,9 +424,9 @@ impl std::error::Error for ExecError {}
 /// [`ExecError::NoCommand`], [`ExecError::NulByte`], [`ExecError::NotFound`]
 /// and [`ExecError::NotExecutable`] before anything runs, and
 /// [`ExecError::Setup`] when signals cannot be set up or the spawn fails;
-/// [`ExecError::Followed`] once the command was started, when its output
-/// threads cannot be set up (it is then killed and reaped) or waiting for
-/// it fails.
+/// [`ExecError::Followed`] when the PTY startup report is lost or, once
+/// the command was started, its output threads cannot be set up (it is
+/// then killed and reaped) or waiting for it fails.
 pub fn run(spec: RunSpec) -> Result<ChildExit, ExecError> {
     let RunSpec {
         argv,

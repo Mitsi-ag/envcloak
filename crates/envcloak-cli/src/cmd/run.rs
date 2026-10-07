@@ -102,8 +102,9 @@
 //! ([`envcloak_client::run_status`]): refused before the command started
 //! (with the token, and the request id for `approval_required`), the
 //! command's exit, or unknown when the runner failed after the command
-//! may have started. A run without `--status-fd` passes inherited
-//! descriptors on to its command, as `env(1)` does.
+//! may have started. In pipe mode, a run without `--status-fd` passes
+//! inherited descriptors on to its command, as `env(1)` does. PTY mode
+//! always closes inherited descriptors above the standard streams.
 //!
 //! No argument is ever echoed, and no value is ever accepted on the
 //! command line (gate 13): `--ref` names an item, never a value. The

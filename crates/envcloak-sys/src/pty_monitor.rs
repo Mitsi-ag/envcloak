@@ -410,6 +410,10 @@ fn act<O: MonitorOps>(ops: &mut O, command: Command, child: i32, exited: bool) {
 /// Everything the forked monitor needs, prepared before the fork (where
 /// allocation is allowed): descriptors and C strings.
 pub(crate) struct Prepared {
+    /// Withhold Started until the owning parent's test kills the monitor.
+    /// Read before fork; the monitor never reads environment variables.
+    #[cfg(feature = "testing")]
+    pub lose_start_report: bool,
     /// The PTY's slave side.
     pub slave: libc::c_int,
     /// The monitor's end of the control channel.
@@ -1026,7 +1030,13 @@ pub(crate) unsafe fn monitor_main(p: &Prepared) -> ! {
         exit_monitor(0);
     }
     // A channel already gone shows as its end at the loop's first read.
-    ops.write_control(&encode_report(Report::Started(child)));
+    #[cfg(feature = "testing")]
+    let report_started = !p.lose_start_report;
+    #[cfg(not(feature = "testing"))]
+    let report_started = true;
+    if report_started {
+        ops.write_control(&encode_report(Report::Started(child)));
+    }
     // 6. SIGCHLD and the relayed signals blocked outside pselect;
     //    everything else unblocked.
     set_mask(
@@ -1853,6 +1863,8 @@ mod tests {
         };
         let (programs, argv, envp) = (list(0..2), list(2..5), list(5..7));
         let p = Prepared {
+            #[cfg(feature = "testing")]
+            lose_start_report: false,
             slave: -1,
             control: -1,
             programs: programs.as_ptr(),
