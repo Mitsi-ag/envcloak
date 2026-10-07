@@ -44,3 +44,4 @@ crates/envcloak-scan/tests/scanner_probe.rs  # deliberate positive-control copy 
 crates/envcloak-scan/tests/transcript_oracle.rs # hashes synthetic candidate values for the independent range oracle
 
 crates/envcloak-client/src/tty.rs           # writes a passphrase-proven reveal to an already opened /dev/tty only, never stdout or stderr
+crates/envcloak-scan/tests/scrub_oracle.rs    # generated previews sent only to the independent Python checker pipe
