@@ -37,7 +37,15 @@ struct Change: OptionSet {
     }
 
     static func live() -> VaultSession {
-        do { return VaultSession(client: SocketWorkspaceClient(client: try DaemonClient()), folders: try ProjectFolders.live()) }
+        do {
+            let client = SocketWorkspaceClient(client: try DaemonClient())
+            do { return VaultSession(client: client, folders: try ProjectFolders.live()) }
+            catch {
+                let session = VaultSession(client: client)
+                session.notice = "Saved project folders could not be restored. The adopted project index is still available."
+                return session
+            }
+        }
         catch {
             let session = VaultSession(client: nil)
             session.state = .unverified(.path)
@@ -179,9 +187,17 @@ struct Change: OptionSet {
             let result = try await client.call(MetadataRequest.revoke(id))
             guard captured == generation, state == .ready else { return }
             await grants.refetch(.grants)
+            guard captured == generation, state == .ready else { return }
             notice = grants.failure == nil
                 ? (result.revoked > 0 ? "Revoked. The agent asks again on its next run." : "That grant has already ended.")
                 : "The revoke completed, but grants could not be refreshed. Try again."
-        } catch { if captured == generation { notice = "The grant could not be revoked. Try again." } }
+        } catch {
+            guard captured == generation, state == .ready else { return }
+            await grants.refetch(.grants)
+            guard captured == generation, state == .ready else { return }
+            notice = grants.failure == nil
+                ? "The revoke outcome could not be confirmed. Grants have been refreshed."
+                : "The revoke outcome could not be confirmed, and grants could not be refreshed. Wait for a fresh listing before retrying."
+        }
     }
 }
