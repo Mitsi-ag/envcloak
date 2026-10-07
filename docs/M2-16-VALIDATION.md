@@ -48,7 +48,7 @@ The narrow daemon change supplies the v2 backup prerequisite for conventional HO
 
 Linux filesystem/process behavior and the real-host CI matrix require the existing CI runners; this macOS worktree makes no Linux or whole-milestone qualification claim. M3 owns the scan screen, M4 owns accounts, M2-20 owns MCP rewrites, and M2-23 owns vendor exports.
 
-## Local checks
+## Original implementation checks
 
 All checks use `CARGO_TARGET_DIR=/Volumes/KeenShiftDev/tmp/envcloak-target/E`, `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=3`; tests use `--no-fail-fast` and `--test-threads 3`. Cargo is launched in a detached, minimal environment. No workspace-wide test command was used.
 
@@ -89,3 +89,86 @@ The fix restores the row and uses `io` for that fallback. It preserves exit code
 - `09510afd`: ensure rewritten sources remain readable by undo; `permit-oversized-rewrite`; final 15-test first-run run and story passed.
 
 All changes are local to the M2-16 worktree. No push, pull request or GitHub comment was made.
+
+## Review repair after 965c2970
+
+All nine supplied findings are resolved. No finding was rejected. The private-manifest rerun uses the review's permitted manual-step solution: JSON and text name the directory to move, retain the earlier manifest and explain updating previous run commands before retrying. Automatic merging is not claimed.
+
+The class sweep searched all 28 files added or changed since `4f3059ba`, including the CLI, scanner, daemon backup/show integration, story, fuzz input, snapshots, documentation and expose allowance. The searches covered filesystem writes and preconditions, grammar and normalization, outcome/receipt state, approval statements, selection/discovery, leftover names and every scan limit. Matching production paths were read. Local search receipts are `sweep-*.txt` in `.collab/m2-16/`.
+
+| Bug class | Instances swept and disposition | Regression evidence |
+|---|---|---|
+| Filesystem effects before eligibility | Profile and AWS cleanup shared the project ignore writer and created private manifests before recent/open/link checks. Machine cleanup now leaves HOME and AWS ignore files alone and checks eligibility and output size first. Atomic checks still run again at the write. Project dotenv import/init retains its specified ignore edits. | `review_cleanup_preserves_ignore_files_and_refuses_before_metadata`: profile/AWS, successful/recent/open/hard-linked cases; existing size and stale-verification gates. |
+| Grammar ambiguity and option normalization | AWS continuations with `=` were masked by the old unsupported-syntax fixture. The sweep also addressed indexed F147: mixed-case fields and differently cased duplicates. Static case-insensitive field matching allocates no arbitrary option text. Continuations after ignored options, indented section-like lines, Unicode indentation and repeated sections were also found and made manual. Profile complete-line and MCP manual/references-only cleanup guards were checked. | `aws_hostile_grammar_is_explicit_and_value_free`, `aws_option_casing_matches_python_ini_oracle`, `aws_continuation_context_matches_python_ini_oracle`; existing AWS CLI and Bash oracles. |
+| Stale private metadata blocks a retry | A second profile/AWS cleanup cannot silently replace an earlier manifest's bindings. The existing mismatch refusal now gives an actionable manual step in both report formats and IMPORT.md. Dotenv manifests retain their existing verification path. | `review_repeated_cleanup_names_the_manual_manifest_step` exercises adding a second key after cleanup. |
+| Selection rules applied at the wrong boundary | Extra cache/trash rules leaked into ordinary named scans; omitted cloud directories were unnamed. JSON and TOML MCP includes bypassed cloud opt-in. Caller selection now covers top-level descriptors and every resolved include before reads or sibling inspection. The sweep also found alternate casing bypassing cloud selection or directory exclusions, and case aliases failing explicit opt-in. All readers now share case-aware selection and canonical parent scope. | `review_named_scan_keeps_cache_projects`, `review_mcp_includes_require_cloud_opt_in`, `review_config_selection_covers_json_toml_and_each_include`, `review_cloud_selection_covers_case_aliases_in_every_reader`; existing profile cloud test. |
+| Approval disclosure mismatches writes | Both v2 recorded and unrecorded undo used v1 project/missing-only text. The missing-flag refusal repeated that error (indexed F149). V2 now names sealed absolute targets and actual overwrite conditions before proof; leased target, result and creator must still match the shown metadata. V1 keeps its original behavior. | Recorded gate restores from outside the project and refuses later edits; unrecorded test discloses overwriting later edits, restores exact bytes, and verifies missing flags write nothing. |
+| Crash artifacts omitted from discovery | Profiles, sourced includes and both AWS files missed siblings, including absent originals; the shared classifier also omitted delete temporaries. New/swap/del names are now reported without granting deletion or import authority. Config/include and dotenv discovery were swept too. | `review_profile_include_and_aws_leftovers_survive_missing_originals` covers four source paths, three temporary kinds and present/missing originals. The kill gate now covers 36 boundaries across profiles, includes and both AWS files, requiring post-crash incomplete scans. Existing config-leftover test remains. |
+| Discovery depends on unrelated files or path spelling | Nested MCP-only projects depended on finding dotenv files. Catalog paths beneath an explicitly selected root alias also failed the canonical-root comparison. Config locations now come from every bounded, held directory; only explicitly opened root aliases are rebased, leaving child no-follow checks intact. | `review_nested_projects_need_no_dotenv_to_discover_mcp` covers root and host-specific config names. `review_catalog_discovery_through_an_explicit_root_alias` covers machine and explicit-root modes. |
+| Truncated scans reported complete | The dotenv file cap stopped without an error; pending entries in one directory could bypass it. Directory discovery and omitted-directory bookkeeping also need a bound. Exhaustion with work remaining now emits `limited`; byte, depth, config and retained-value limits were checked for explicit failures. | `review_walk_reports_file_limits_in_one_directory_and_across_directories`, `review_project_directory_discovery_has_an_explicit_limit`, `review_dotenv_file_limit_is_incomplete` with 10,000 empty dotenv files before a credential. |
+| Stale outcome after a completed write | Indexed F148: a failed result-record RPC falsely called rewritten entries kept. The sweep also found retained temporary paths reported as the original source. Reports now preserve actual rewrite state, backup/replacement data and unconfirmed receipt state, and name a retained sibling separately. Existing init/delete reducers already distinguish rewritten and kept paths. | `review_receipt_failure_preserves_the_completed_rewrite_report` locks after rewrite in JSON and text. `review_retained_swap_is_named_separately_from_the_rewritten_source` changes the swapped-out file and asserts both resulting paths and dispositions. |
+
+### Repair mutation evidence
+
+The following 27 named mutations each produced an assertion failure, then were restored. The `aws-case-sensitive` mutation was repeated after switching to allocation-free matching. `allow-unselected-config-source` initially survived because the include refusal hid the top-level read; the test was strengthened to require zero bytes/files and the correct originating path, then the same mutation failed. Initial stale-build and fixture-setup failures were not counted.
+
+| Named mutation | Test that failed |
+|---|---|
+| `aws-no-multiline` | `aws_hostile_grammar_is_explicit_and_value_free` |
+| `aws-case-sensitive` | `aws_option_casing_matches_python_ini_oracle` |
+| `aws-forget-unknown-option`, `aws-section-before-continuation` | `aws_continuation_context_matches_python_ini_oracle` |
+| `aws-ignore-duplicate-sections`, `aws-ascii-indentation` | `aws_hostile_grammar_is_explicit_and_value_free` |
+| `omit-profile-leftovers`, `omit-aws-leftovers` | `review_profile_include_and_aws_leftovers_survive_missing_originals` |
+| `silent-file-limit` | `review_walk_reports_file_limits_in_one_directory_and_across_directories` |
+| `ignore-directory-limit` | `review_project_directory_discovery_has_an_explicit_limit` |
+| `allow-config-includes`, `allow-unselected-config-source` | `review_config_selection_covers_json_toml_and_each_include` |
+| `ignore-post-crash-siblings` | `gate16_kill_at_each_profile_and_aws_boundary_preserves_value` |
+| `omit-config-only-projects` | `review_nested_projects_need_no_dotenv_to_discover_mcp` |
+| `omit-catalog-root-alias` | `review_catalog_discovery_through_an_explicit_root_alias` |
+| `machine-skips-every-scan`, `hide-excluded-directories` | `review_named_scan_keeps_cache_projects` |
+| `case-sensitive-cloud-selection`, `lexical-opt-in-scope`, `case-sensitive-directory-skips` | `review_cloud_selection_covers_case_aliases_in_every_reader` |
+| `edit-machine-gitignore`, `metadata-before-file-checks` | `review_cleanup_preserves_ignore_files_and_refuses_before_metadata` |
+| `omit-manifest-retry-guidance` | `review_repeated_cleanup_names_the_manual_manifest_step` |
+| `forget-rewrite-after-receipt-failure` | `review_receipt_failure_preserves_the_completed_rewrite_report` |
+| `misreport-kept-swap-as-source` | `review_retained_swap_is_named_separately_from_the_rewritten_source` |
+| `reuse-project-undo-statement` | Both recorded and unrecorded undo tests |
+| `reuse-v1-missing-form` | Unrecorded undo test |
+
+Independent checks include the isolated AWS CLI and Bash oracles from the original gate work, plus Python's `RawConfigParser` for AWS option normalization. The latter checks exact canonical names and values across sections, never machine credentials. Research index entries cycle535, cycle540 and cycle541 supplied the F147/F148/F149 cases above. The root-alias, cloud-case and retained-swap-path regressions came from this sweep. Cloud-case tests cover all four cloud-folder names across dotenv discovery, profile includes and MCP includes, before and after explicit opt-in. On a case-insensitive filesystem they also use a differently cased include spelling; that host measurement caught `lexical-opt-in-scope` locally.
+
+R-M2-69 (local portion), R-M2-70, R-M2-71, R-M2-73, R-M2-74 (M2-16 integration), R-M2-75 and gates T-10/15/16 retain the scope mapping above, with the repaired omission, cleanup and recovery cases now included. The plan's ownership boundaries remain: M2-20 MCP rewrites, M2-23 vendor exports, M3 scan UI and M4 account attribution. No new review defect is deferred to those tasks.
+
+Repair commits:
+
+- `6ae04a48`: AWS grammar/casing and profile/include/AWS leftovers; `aws-no-multiline`, `aws-case-sensitive`, `omit-profile-leftovers`, `omit-aws-leftovers`.
+- `7e0fc924`: allocation-free option matching; repeated `aws-case-sensitive`.
+- `e60d5545`: discovery, source selection and budgets; file/directory-limit, config-selection, config-only-project, root-alias and skip-rule mutations above.
+- `755b8aff`: cleanup effects, retry guidance and truthful outcomes; ignore/preflight, retry, receipt, retained-swap and post-crash mutations above.
+- `7b7fc31e`: v2 disclosure and missing-form text; `reuse-project-undo-statement`, `reuse-v1-missing-form`.
+- `bf1737c4`: AWS continuation context and section grammar; `aws-forget-unknown-option`, `aws-section-before-continuation`, `aws-ignore-duplicate-sections`, `aws-ascii-indentation`, repeated `aws-no-multiline`.
+- `6d78329f`: behavior documentation for the repaired discovery, cleanup and undo flows.
+- `d2333635`: cloud selection across case aliases; `case-sensitive-cloud-selection`, `lexical-opt-in-scope`, `case-sensitive-directory-skips`.
+
+
+### Repair local checks
+
+All runs used target E, incremental compilation off, three build jobs, detached cleared environments and isolated HOME/XDG fixtures. Tests used `--no-fail-fast` and `--test-threads 3`. No workspace-wide test command was run.
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all --check` | Passed |
+| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Passed |
+| `check-unsafe.sh`, `check-expose-lint.sh`, `check-crate-graph.py`, `check-reservations.py`, `check-spec-decisions.py`, `check-sources.sh` | All passed; reservations remain 262 rows in 17 tables |
+| Full `envcloak` tests | 259 passed, zero failed; first-run target 26/26, including 36 crash boundaries |
+| Final-code CLI regression repeat | 258 passed, zero failed; only the already-passed 1 GiB density gate excluded from this repeat |
+| Full `envcloak-scan` tests | 219 passed, zero failed; first-run target 11/11 |
+| Full `envcloakd` tests | 241 passed, zero failed |
+| Full `envcloak-e2e` tests plus two setup-refused cases rerun | 133 passed in aggregate; M2 story target 31/31 |
+
+The unchanged 1 GiB, three-scan doctor regression passed in 2,278.04 seconds. The final AWS/context and cloud/case refinements were made while that unrelated regression ran; binaries were rebuilt, the CLI unit target passed again (44/44), and the final-code CLI regression repeat above validated all other CLI tests. The full scanner, daemon and end-to-end runs followed those changes.
+
+The first end-to-end run passed 131 cases and refused two before they exercised their host: Kimi Code and Copilot CLI's own-terminal catalog cases detected an `envcloak-probe-model` older than its scanner dependency. `cargo build -p envcloak-agents --bins` rebuilt that helper; both exact cases then passed, one test per rerun. These setup failures are not mutation evidence. The initial unsafe-source check also rejected a fixture variable named `include`; it was renamed to `referenced_dir`, with the checker unchanged, and the fixture, strict clippy and all scripts passed again.
+
+Current evidence is in `.collab/m2-16/r2-full-results.json`, `r2-full-{cli,scan,daemon,e2e}.log`, `r2-head-cli-regressions.{json,log}`, `r2-host-rerun-results.json`, `r2-case-fixture-{checks,clippy}.json`, `r2-check-results.json` and the named `*-result.json` mutation receipts. The earlier CI reservation regression remains fixed by `965c2970`; neither its checker nor its fixtures changed in this repair.
+
+These are local macOS results. Linux and complete milestone qualification remain with the plan's CI/driver flow. All nine review findings are resolved, no review finding is deferred, and no push, pull request or GitHub comment was made.
