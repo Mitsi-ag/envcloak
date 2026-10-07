@@ -72,9 +72,9 @@ pub(crate) fn effective_format(path: &Path, format: ConfigFormat) -> ConfigForma
     }
 }
 
-/// Opens a catalog-selected directory without following any user-controlled
+/// Opens a catalog-selected or sealed restore directory without following any user-controlled
 /// component. Only root-owned, fixed-target macOS system aliases are resolved.
-pub(crate) fn absolute_root(path: &Path) -> Result<ScanRoot, ScanErrorKind> {
+pub fn absolute_root(path: &Path) -> Result<ScanRoot, ScanErrorKind> {
     if !path.is_absolute() {
         return Err(ScanErrorKind::InvalidPath);
     }

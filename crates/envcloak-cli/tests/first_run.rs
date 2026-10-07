@@ -1225,6 +1225,118 @@ fn gate15_hard_links_are_importable_but_never_rewritten() {
 }
 
 #[test]
+fn review_dotenv_cleanup_never_reopens_a_redirected_project() {
+    let f = Fixture::new(true);
+    let project = f.home.home().join("project");
+    std::fs::create_dir(&project).unwrap();
+    let original = format!("OPENAI_API_KEY={}\n", f.value());
+    std::fs::write(project.join(".env"), &original).unwrap();
+    age(&project.join(".env"));
+    let saved = f.home.home().join("saved-project");
+    let outside = outside_dir();
+    std::fs::write(outside.path().join(".env"), &original).unwrap();
+    age(&outside.path().join(".env"));
+    std::fs::write(
+        outside.path().join("envcloak.toml"),
+        b"[project]\nname = 'fixture'\n[env]\nOPENAI_API_KEY = 'openai/existing'\n",
+    )
+    .unwrap();
+    let out = paused_output(&f, "first_run_committed", false, || {
+        std::fs::rename(&project, &saved).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &project).unwrap();
+    });
+    f.clean(&out);
+    assert!(!out.status.success());
+    assert!(std::fs::read(outside.path().join(".env")).unwrap() == original.as_bytes());
+    assert!(std::fs::read(saved.join(".env")).unwrap() == original.as_bytes());
+    assert!(!outside.path().join(".gitignore").exists());
+}
+
+#[test]
+fn review_undo_refuses_redirected_parents_in_both_modes() {
+    for source in [
+        ".aws/credentials",
+        ".aws/config",
+        ".config/fish/config.fish",
+    ] {
+        for unrecorded in [false, true] {
+            let f = Fixture::new(true);
+            let path = f.home.home().join(source);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = if source.starts_with(".aws/") {
+                format!("[default]\naws_secret_access_key = {}\n", f.value())
+            } else {
+                format!("set -x OPENAI_API_KEY {}\n", f.value())
+            };
+            std::fs::write(&path, &original).unwrap();
+            age(&path);
+            if unrecorded {
+                assert!(!paused(&f, "first_run_swapped", true, || {}).success());
+            } else {
+                let out = f.scan(&["--yes", "--delete-plaintext"]);
+                f.clean(&out);
+                assert!(
+                    out.status.success(),
+                    "{source}: {}",
+                    String::from_utf8_lossy(&out.stdout)
+                );
+            }
+            let list = envcloak_ipc::Client::connect(
+                &envcloak_ipc::RunPaths::under(envcloak_testkit::daemon_run_dir(&f.home)).unwrap(),
+            )
+            .unwrap()
+            .backup_v2_list()
+            .unwrap();
+            assert_eq!(list.backups.len(), 1);
+            let id = &list.backups[0].id;
+            let after = std::fs::read(&path).unwrap();
+            assert!(after != original.as_bytes());
+            let parent = f.home.home().join(source.split('/').next().unwrap());
+            let rel = path.strip_prefix(&parent).unwrap();
+            let saved = f.home.home().join("saved-parent");
+            std::fs::rename(&parent, &saved).unwrap();
+            let outside = outside_dir();
+            let target = outside.path().join(rel);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, &after).unwrap();
+            std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+            let pass = secret_file(
+                outside.path(),
+                "pass",
+                by_label(&f.values, labels::VAULT_PASSPHRASE).value(),
+            );
+            let mut args = vec![
+                "init",
+                "--undo",
+                id,
+                "--created-by-agent",
+                "--passphrase-fd",
+                "3",
+                "--json",
+            ];
+            if unrecorded {
+                args.push("--unrecorded");
+            }
+            let refused = run_on_terminal(&f.home, &args, &[(3, &pass, true)]);
+            f.clean(&refused);
+            assert!(
+                !refused.status.success(),
+                "redirected parent restored: {source}, unrecorded={unrecorded}"
+            );
+            assert!(std::fs::read(&target).unwrap() == after);
+            assert!(std::fs::read(saved.join(rel)).unwrap() == after);
+            std::fs::remove_file(&parent).unwrap();
+            std::fs::rename(&saved, &parent).unwrap();
+            let restored = run_on_terminal(&f.home, &args, &[(3, &pass, true)]);
+            f.clean(&restored);
+            assert!(restored.status.success(), "original parent must restore");
+            assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+            assert!(std::fs::read(&target).unwrap() == after);
+        }
+    }
+}
+
+#[test]
 fn gate16_profile_undo_is_byte_exact_and_checks_the_result() {
     let f = Fixture::new(true);
     let path = f.home.home().join(".zshrc");
