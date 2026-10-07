@@ -1,0 +1,115 @@
+import AppKit
+import SwiftUI
+import XCTest
+@testable import EnvCloak
+@testable import EnvCloakKit
+
+@MainActor final class ScreenTests: XCTestCase {
+    private func host<V: View>(_ view: V) -> NSWindow {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 740), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = NSHostingView(rootView: view.frame(width: 1180, height: 740))
+        window.setContentSize(NSSize(width: 1180, height: 740))
+        window.makeKeyAndOrderFront(nil)
+        window.contentView?.layoutSubtreeIfNeeded()
+        NSApp.setValue(true, forKey: "accessibilityEnhancedUserInterface")
+        addTeardownBlock { @MainActor in window.close() }
+        return window
+    }
+
+    private func labels(_ object: Any) -> [String] {
+        var seen = Set<ObjectIdentifier>()
+        func walk(_ object: Any, depth: Int) -> [String] {
+            guard depth < 40, let node = object as? NSObject, seen.insert(ObjectIdentifier(node)).inserted else { return [] }
+            // SwiftUI nodes implement the accessors without declaring
+            // AppKit's full protocol. Native table cells are virtualized.
+            func attribute(_ name: String) -> Any? {
+                let selector = NSSelectorFromString(name)
+                guard node.responds(to: selector) else { return nil }
+                return node.perform(selector)?.takeUnretainedValue()
+            }
+            let own = ["accessibilityLabel", "accessibilityValue", "accessibilityTitle"].compactMap { attribute($0) as? String }
+            var children = ["accessibilityChildren", "accessibilityRows", "accessibilityContents"].flatMap { (attribute($0) as? [Any]) ?? [] }
+            if let view = node as? NSView { children += view.subviews }
+            if let window = node as? NSWindow, let view = window.contentView { children.append(view) }
+            return own + children.flatMap { walk($0, depth: depth + 1) }
+        }
+        return walk(object, depth: 0)
+    }
+
+    private func assertVisible(_ text: String, in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) async {
+        let found = XCTNSPredicateExpectation(predicate: NSPredicate { [self, window] _, _ in
+            MainActor.assumeIsolated { labels(window).contains(text) }
+        }, object: nil)
+        await fulfillment(of: [found], timeout: 5)
+        XCTAssertTrue(labels(window).contains(text), "missing accessibility text: " + text + " found=" + labels(window).joined(separator: " | "), file: file, line: line)
+    }
+
+    func testConnectionStatesHaveAccessibleCopyAndActions() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        for (state, title, action) in [
+            (ConnectionState.noDaemon, "No daemon answered, so no key was released.", "Start background process"),
+            (.unverified(.peerUID), "EnvCloak could not verify its background process, so nothing was sent to it.", "Show details"),
+            (.noVault, "No vault yet.", "Copy command"),
+            (.locked, "EnvCloak is locked. Agents get no keys until you unlock.", "Copy envcloak unlock"),
+            (.readOnly, "The vault failed its integrity check, so it is open read-only.", "How to recover"),
+            (.unavailable, "The vault is unavailable.", "Copy envcloak status"),
+        ] {
+            session.state = state
+            let window = host(ConnectionView(session: session))
+            await assertVisible(title, in: window)
+            await assertVisible(action, in: window)
+            window.close()
+        }
+        session.state = .connecting
+        let connecting = host(ConnectionView(session: session))
+        await assertVisible("Connecting to EnvCloak's background process", in: connecting)
+        let banner = host(DevelopmentBanner())
+        await assertVisible("Daemon identity unverified", in: banner)
+        await assertVisible("Open guarantees", in: banner)
+    }
+
+    func testGate31HostileProjectNameAndSlugOnAccessibilityTree() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await session.poll(); await session.openProject(DaemonText("/tmp/project"))
+        let project = host(ProjectDetail(session: session, directory: DaemonText("/tmp/project"), selectedKey: .constant(nil)))
+        await assertVisible("project\\u{202e}\\u{1b}[31m", in: project)
+        XCTAssertFalse(labels(project).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+        let keys = host(KeyInspector(session: session, slug: session.items.rows.first?.slug, route: .constant(.keys(.all))))
+        await assertVisible("fixture-0\\u{202e}\\u{1b}[31m", in: keys)
+        XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+    }
+
+    func testUnavailableRowsAreAccessible() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await session.poll()
+        let window = host(MainView(session: session))
+        await assertVisible("Arrives with Touch ID approvals", in: window)
+        await assertVisible("Spend · M4", in: window)
+        await assertVisible("Devices · M5", in: window)
+    }
+
+    func testTwoThousandKeysRenderAndScrollWithoutLoader() async {
+        let client = ScriptedClient(); await client.configure(itemCount: 2000)
+        let session = VaultSession(client: client)
+        let start = ContinuousClock.now
+        await session.poll()
+        let window = host(KeysView(session: session, filter: .all, query: "", scope: nil, grouping: .constant(.none), selectedKey: .constant(nil)))
+        await assertVisible("2,000 keys", in: window)
+        func table(_ view: NSView) -> NSTableView? {
+            if let table = view as? NSTableView { return table }
+            return view.subviews.lazy.compactMap(table).first
+        }
+        let native = try? XCTUnwrap(window.contentView.flatMap(table))
+        XCTAssertNotNil(native)
+        XCTAssertEqual(native?.numberOfRows, 2000)
+        native?.scrollRowToVisible(1999)
+        window.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertFalse(labels(window).contains { $0.contains("Connecting") || $0 == "Loading" })
+        let elapsed = start.duration(to: .now)
+        XCTAssertLessThan(elapsed, .seconds(10))
+        let measurement = XCTAttachment(string: "2000 keys, first render and native scroll: \(elapsed)")
+        measurement.lifetime = .keepAlways
+        add(measurement)
+    }
+}

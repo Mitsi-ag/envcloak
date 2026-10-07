@@ -15,10 +15,12 @@ import Foundation
         if let url = MetadataRequest.directoryURL(path) { NSWorkspace.shared.activateFileViewerSelecting([url]) }
     }
     static func openFolderInTerminal(_ path: DaemonText) {
-        guard let url = MetadataRequest.directoryURL(path) else { return }
-        NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"), configuration: NSWorkspace.OpenConfiguration())
+        // Never hand an untrusted path to Terminal's document opener:
+        // a replaced folder could instead be an executable .command file.
+        copy(MetadataRequest.changeDirectoryCommand(path))
+        openTerminal()
     }
-    static func addFolder(_ session: VaultSession) {
+    static func addFolder(_ session: VaultSession, selected: @escaping @MainActor (DaemonText) -> Void) {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false; panel.canChooseDirectories = true; panel.allowsMultipleSelection = false
         panel.prompt = "Add project folder"
@@ -26,7 +28,7 @@ import Foundation
             guard response == .OK, let url = panel.url else { return }
             do {
                 try session.projects.add(url)
-                Task { await session.openProject(DaemonText(url.path)) }
+                selected(DaemonText(url.path))
             } catch { session.notice = "The project folder could not be saved. Try again." }
         }
     }

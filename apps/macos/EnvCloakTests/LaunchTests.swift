@@ -33,7 +33,7 @@ final class LaunchTests: XCTestCase {
         let opened = expectation(description: "the main window is on screen")
         let deadline = Date(timeIntervalSinceNow: 20)
         func poll() {
-            if NSApp.windows.contains(where: { $0.title == "EnvCloak" && $0.isVisible }) {
+            if NSApp.windows.contains(where: { $0.title == "Projects" && $0.isVisible }) {
                 opened.fulfill()
             } else if Date() < deadline {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { poll() }

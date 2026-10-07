@@ -19,9 +19,9 @@ final class LaunchUITests: XCTestCase {
         // its test.
         addTeardownBlock { @MainActor in app.terminate() }
 
-        let window = app.windows["EnvCloak"]
+        let window = app.windows.firstMatch
         XCTAssertTrue(window.waitForExistence(timeout: 30), "the main window did not open")
-        XCTAssertTrue(window.staticTexts["envcloak status"].exists)
+        XCTAssertTrue(window.staticTexts["Projects"].firstMatch.exists)
 
         let appMenu = app.menuBars.menuBarItems["EnvCloak"]
         appMenu.click()
