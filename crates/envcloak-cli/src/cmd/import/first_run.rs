@@ -98,23 +98,30 @@ fn normal_path(path: &Path) -> PathBuf {
 }
 fn synced(path: &Path) -> bool {
     path.components().any(|c| {
-        matches!(
-            c.as_os_str().to_str(),
-            Some("CloudStorage" | "Mobile Documents" | "Dropbox" | "OneDrive")
-        )
+        c.as_os_str().to_str().is_some_and(|component| {
+            ["CloudStorage", "Mobile Documents", "Dropbox", "OneDrive"]
+                .iter()
+                .any(|name| component.eq_ignore_ascii_case(name))
+        })
     })
 }
 fn source_allowed(path: &Path, named: &[PathBuf]) -> bool {
     let path = normal_path(path);
-    let network = path
-        .parent()
-        .and_then(|p| open_root(p).ok())
+    let parent = path.parent().and_then(|p| open_root(p).ok());
+    let network = parent
+        .as_ref()
         .is_some_and(|root| root.volume() == envcloak_sys::Volume::Network);
-    if !synced(&path) && !network {
+    // A case alias of an explicitly named directory is the same selection.
+    // This metadata lookup grants no permission to follow child symlinks.
+    let resolved = parent
+        .as_ref()
+        .and_then(|p| path.file_name().map(|name| p.path().join(name)))
+        .unwrap_or_else(|| path.clone());
+    if !synced(&path) && !synced(&resolved) && !network {
         return true;
     }
     named.iter().filter_map(|p| open_root(p).ok()).any(|root| {
-        path.starts_with(root.path())
+        resolved.starts_with(root.path())
             && (synced(root.path()) || root.volume() == envcloak_sys::Volume::Network)
     })
 }
@@ -210,13 +217,7 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
         if options.machine
             && path == locations.home()
             && !options.dirs.contains(&path)
-            && (root.volume() == envcloak_sys::Volume::Network
-                || root.path().components().any(|c| {
-                    matches!(
-                        c.as_os_str().to_str(),
-                        Some("CloudStorage" | "Mobile Documents" | "Dropbox" | "OneDrive")
-                    )
-                }))
+            && (root.volume() == envcloak_sys::Volume::Network || synced(root.path()))
         {
             r.keep(root.path(), "root", None, "volume_opt_in");
             continue;

@@ -91,7 +91,7 @@ pub struct WalkOptions {
     pub max_files: usize,
     /// The walk stops after visiting this many directories, including the root.
     pub max_dirs: usize,
-    /// Directory names never entered.
+    /// Directory names never entered, including ASCII case variants.
     pub skip_dirs: Vec<OsString>,
 }
 
@@ -348,7 +348,12 @@ impl Walk<'_> {
             if !self.options.recursive || !may_be_dir {
                 continue;
             }
-            if self.options.skip_dirs.contains(&e.name) {
+            if self
+                .options
+                .skip_dirs
+                .iter()
+                .any(|skip| skip.as_bytes().eq_ignore_ascii_case(e.name.as_bytes()))
+            {
                 if self.skipped_dirs.len() >= self.options.max_dirs {
                     self.pending
                         .push_back(report(child, ScanErrorKind::FileBudget));
