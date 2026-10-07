@@ -317,7 +317,7 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             Ok(mut part) => {
                 for issue in &mut part.issues {
                     if envcloak_scan::sources::omitted_path(&omissions, &issue.source.path) {
-                        issue.reason = "manual_credentials".into();
+                        issue.reason = "manual_credentials";
                     }
                 }
                 absorb(
