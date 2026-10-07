@@ -696,3 +696,42 @@ fn retained_config_temporaries_are_reported_as_incomplete() {
     );
     assert!(std::fs::read(&leftover).unwrap() == f.value().as_bytes());
 }
+
+#[test]
+fn gate16_a_rewrite_must_fit_the_undo_read_limit() {
+    let f = Fixture::new(true);
+    let path = f.home.home().join(".zshrc");
+    let short = by_label(&f.values, labels::SHORT_TOKEN).as_str();
+    let mut original = format!("SHORT_TOKEN={short}\n#").into_bytes();
+    original.resize(envcloak_scan::MAX_DOTENV, b'.');
+    std::fs::write(&path, &original).unwrap();
+    age(&path);
+    // A person may import this existing short item. Its replacement comment
+    // is longer than the assignment, so the one-MiB source would grow.
+    let out = run_on_terminal(
+        &f.home,
+        &[
+            "import",
+            "--machine",
+            "--yes",
+            "--delete-plaintext",
+            "--json",
+        ],
+        &[],
+    );
+    f.clean(&out);
+    assert!(
+        !out.status.success(),
+        "cleanup must retain a file whose result undo cannot read"
+    );
+    assert!(std::fs::read(&path).unwrap() == original);
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        r["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["kept"].as_array().unwrap())
+            .any(|e| e["name"] == "SHORT_TOKEN" && e["reason"] == "too_large")
+    );
+}
