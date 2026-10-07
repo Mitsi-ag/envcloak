@@ -782,6 +782,17 @@ fn paused_report(
     json: bool,
     action: impl FnOnce(),
 ) -> std::process::Output {
+    paused_with_terminal(f, at, kill, json, false, action)
+}
+
+fn paused_with_terminal(
+    f: &Fixture,
+    at: &str,
+    kill: bool,
+    json: bool,
+    terminal: bool,
+    action: impl FnOnce(),
+) -> std::process::Output {
     use std::process::Stdio;
     struct Owned {
         child: std::process::Child,
@@ -809,7 +820,12 @@ fn paused_report(
     if json {
         args.push("--json");
     }
-    let mut command = cli_command(&f.home, &args, &[]);
+    let mut command = if terminal {
+        assert!(!kill, "terminal wrapper owns the child; never kill its pid");
+        on_terminal_command(&f.home, &args, &[])
+    } else {
+        cli_command(&f.home, &args, &[])
+    };
     command
         .env(envcloak_scan::testing::PAUSE_DIR, pause.path())
         .env("CLAUDE_CODE_TMPDIR", f.home.home().join("host-tmp"))
@@ -1052,6 +1068,75 @@ fn gate16_lock_after_backup_refuses_stale_verification() {
         assert!(run(&f.home, &["lock"], &[]).status.success());
     });
     assert!(!status.success());
+    assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+}
+
+#[test]
+fn gate16_left_out_after_agent_marker_keeps_committed_plaintext() {
+    let f = Fixture::new(true);
+    let value = by_label(&f.values, labels::SHORT_TOKEN).as_str();
+    let path = f.home.home().join(".zshrc");
+    let original = format!("export SECRET_TOKEN={value}\n");
+    std::fs::write(&path, &original).unwrap();
+    age(&path);
+    let out = paused_with_terminal(&f, "first_run_backed_up", false, true, true, || {
+        // Claims are recomputed from the live catalog. This new extension
+        // makes the existing TERM environment marker identify an agent.
+        let extensions = data_dir(&f.home).join("agents.d");
+        std::fs::create_dir(&extensions).unwrap();
+        std::fs::write(
+            extensions.join("fixture.toml"),
+            b"[[agent]]\nid = 'fixture'\nname = 'Fixture'\nmarkers = ['TERM']\n",
+        )
+        .unwrap();
+        let view = envcloak_ipc::Client::connect(
+            &envcloak_ipc::RunPaths::under(envcloak_testkit::daemon_run_dir(&f.home)).unwrap(),
+        )
+        .unwrap()
+        .import_verify(&envcloak_ipc::proto::VerifyParams {
+            manifest: f
+                .home
+                .home()
+                .join(".envcloak-import-zshrc/envcloak.toml")
+                .to_str()
+                .unwrap()
+                .into(),
+            files: vec![envcloak_ipc::proto::VerifyFile {
+                file: ".zshrc".into(),
+                profile: None,
+                entries: vec![envcloak_ipc::proto::VerifyEntry {
+                    line: 1,
+                    name: "SECRET_TOKEN".into(),
+                    value: envcloak_ipc::WireSecret::new(SecretBytes::copy_from(value.as_bytes())),
+                }],
+            }],
+            claims: vec!["CLAUDECODE".into()],
+        })
+        .unwrap();
+        assert!(view.resolves && view.recovery_confirmed && view.files[0].covered);
+        assert_eq!(
+            view.files[0].entries[0].status,
+            envcloak_ipc::view::EntryStatus::LeftOut
+        );
+        assert_eq!(
+            view.files[0].entries[0].skipped,
+            Some(envcloak_ipc::view::SkipReason::Guessable)
+        );
+    });
+    f.clean(&out);
+    assert!(
+        !out.status.success(),
+        "LeftOut must refuse cleanup despite coverage"
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["items"][0]["slug"], "short/existing");
+    assert!(report["sources"].as_array().unwrap().iter().any(|s| {
+        s["kept"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k["reason"] == "not_imported")
+    }));
     assert!(std::fs::read(&path).unwrap() == original.as_bytes());
 }
 
