@@ -1,6 +1,6 @@
 # EnvCloak: the macOS app
 
-Status: M3, written by task M3-01 as the contract the M3 tasks build to. Each part names the task that builds it, and changes from "planned" to a description of what exists only in the commit that lands it, with its test (claims match evidence). Task M3-02 built the toolchain settings, the bundle layout, the design tokens, the logging rule, the build, signing and check scripts and the CI job below; the rest is still planned. The decisions are the M3 plan's (`D3-nn`); SPEC §12 is the source of truth for what the app is, and SPEC §4.3 and §4.4 for what it may ask of the daemon.
+Status: M3, written by task M3-01 as the contract the M3 tasks build to. Each part names the task that builds it, and changes from "planned" to a description of what exists only in the commit that lands it, with its test (claims match evidence). M3-02 built the skeleton and build checks, M3-03 the client, and M3-05 the metadata workspace described below. Later slices remain planned. The decisions are the M3 plan's (`D3-nn`); SPEC §12 is the source of truth for what the app is, and SPEC §4.3 and §4.4 for what it may ask of the daemon.
 
 ## Toolchain and floor
 
@@ -37,7 +37,49 @@ As built by M3-02:
 - The targets' sources are folders Xcode keeps in step with the disk (`EnvCloak/`, `EnvCloakTests/`, `EnvCloakUITests/`, `EnvCloakHardwareTests/`), so a later task adds a Swift file without editing the project. Info.plists, entitlements and the LaunchAgent plist live in `apps/macos/Support/`, outside them. The shared schemes are `EnvCloak` (builds the app, tests `EnvCloakTests`), `EnvCloakUITests` and `EnvCloakHardwareTests`.
 - `EnvCloakAgent` is a bundle target with no code: Xcode makes `EnvCloakAgent.app` with its Info.plist (`CFBundleExecutable` `envcloakd`, `LSBackgroundOnly`), unsigned, and `build-app.sh` puts it in `Contents/Helpers/` with the Rust daemon inside. An Xcode build of the app alone (for its tests) has no helper and no CLI; only `build-app.sh` makes the bundle above.
 - `EnvCloakTests` runs inside the launched app (its test host): the bundle identifier and floor, the main window on screen, no side-door key in the running app's Info.plist (with a positive control per key), and the brand resources bundled. `EnvCloakUITests` launches the app, finds the main window and opens About from the app menu. `EnvCloakHardwareTests` holds one test that reports itself skipped until M3-10.
-- The placeholder main window shows the mark and says that projects and keys arrive in a later build; About shows the version, "Daemon identity: not checked in this build", the bundled font's licence and that the guarantees table arrives later (M3-17 builds the real one, SPEC §1.1).
+- M3-05 replaces the placeholder with Projects and Keys. About shows the version, the development-build identity warning, the bundled font's licence and that the guarantees table arrives later (M3-17 builds the real one, SPEC §1.1).
+
+## Metadata workspace (M3-05, EU-0)
+
+The main window has Projects, Keys, the native sidebar and inspector commands,
+scope, token search, Lock, and keyboard navigation with Command-1 through
+Command-5 and Command-F. Projects combine the daemon's paged adopted index
+with folder paths the person adds. Opening a project checks its current
+manifest and shows profile inheritance, binding status words and grants with
+Revoke. The adopted index and "Used by" describe the last adopted run, not all
+bindings in today's manifest or proof that an application used a value.
+
+Keys can be grouped by project, provider or account and filtered by live/test
+classification, project scope and search prefixes. The inspector shows
+metadata, links and grants, with a solid held-value block. No workspace store
+holds values. Replace and Remove offer quoted commands for a human Terminal
+session; Reveal explicitly says it is unavailable until its later task.
+
+`VaultSession` polls status one second after the preceding poll finishes.
+Unchanged status does not fetch inventories again. Audit sequence, grant
+count, vault state and daemon pid invalidate the affected stores; failures
+clear stale rows and retry. A lock invalidates in-flight refreshes. Filesystem
+metadata for the opened directory and manifest supplies a separate change
+signal, including inode and ctime, without reading file contents in the app.
+Grant countdowns use a monotonic clock. A lost revoke response reports an
+unknown outcome and refreshes grants before another action is offered.
+
+Connection screens cover connecting, missing/unverified daemon, absent or
+locked vault, read-only integrity failure and unavailable vault. The EU-0
+actions start the bundled background process or offer the required Terminal
+command. Settings and About carry the development-build warning. Approvals,
+Activity, Agents, Exposed, Spend, Dashboard and Devices explain which later
+slice supplies them.
+
+Hosted and UI test builds opt into `DEBUG ENVCLOAK_SCREEN_TESTS`; normal builds
+do not read test launch input. That flag fails compilation in Release. The
+test host accepts only a private `/tmp/ec05-` fixture path. The real-daemon
+story is `scripts/macos/tests/run_workspace.py`; run it detached from an
+agent process tree. It creates its own HOME, XDG directories, terminal proof,
+vault and generated values, then verifies the UI's Revoke independently with
+`grants.list`. Local runs can use `scripts/macos/tests/detach_m305.py` with a
+command file in the lane cache. See [M3-05 evidence](M3-05.md) for gates,
+mutations, limits and the installed EU-0 artifact.
 
 ## The Swift client (M3-03)
 
