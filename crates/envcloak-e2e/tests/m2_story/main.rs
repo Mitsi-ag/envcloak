@@ -19,6 +19,7 @@ mod doctor;
 mod install;
 mod live_guard;
 mod mcp;
+mod reveal;
 mod scanners;
 mod skeleton;
 

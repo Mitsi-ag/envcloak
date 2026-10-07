@@ -39,3 +39,5 @@ crates/envcloak-scan/src/json.rs             # bounded duplicate-key fingerprint
 crates/envcloak-scan/tests/profiles.rs       # independent Bash oracle digests synthetic fixtures only
 crates/envcloak-scan/tests/scanner_probe.rs  # deliberate positive-control copy of synthetic allocator fixtures
 crates/envcloak-scan/tests/transcript_oracle.rs # hashes synthetic candidate values for the independent range oracle
+
+crates/envcloak-client/src/tty.rs           # writes a passphrase-proven reveal to an already opened /dev/tty only, never stdout or stderr

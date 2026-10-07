@@ -23,7 +23,6 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 /// Each registered command or option (the words that select it) and how
 /// its refusal names it.
 const STUBS: &[(&[&str], &str)] = &[
-    (&["reveal"], "`envcloak reveal`"),
     (&["scrub"], "`envcloak scrub`"),
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["mcp-bridge"], "`envcloak mcp-bridge`"),

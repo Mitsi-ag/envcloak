@@ -23,6 +23,8 @@ envcloak-policy.workspace = true
 envcloak-providers.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
+# Terminal reveal writes directly from wiping storage to /dev/tty.
+secrecy.workspace = true
 # `run_status`'s record is read strictly: unknown and doubled fields
 # are refused.
 serde = { workspace = true, features = ["derive"] }
