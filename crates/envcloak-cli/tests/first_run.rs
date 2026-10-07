@@ -1462,7 +1462,7 @@ fn review_protected_stores_survive_every_first_run_reader() {
                 format!("export OPENAI_API_KEY={}\n", f.value()),
             )
             .unwrap();
-            let include = target.strip_prefix(&root).unwrap().to_str().unwrap();
+            let include_path = target.strip_prefix(&root).unwrap().to_str().unwrap();
             match reader {
                 "json" => {
                     std::fs::write(
@@ -1475,14 +1475,14 @@ fn review_protected_stores_survive_every_first_run_reader() {
                 "toml" => {
                     std::fs::write(
                         root.join("config.toml"),
-                        format!("[mcp_servers.fixture]\nenvFile = '{include}'\n"),
+                        format!("[mcp_servers.fixture]\nenvFile = '{include_path}'\n"),
                     )
                     .unwrap();
                 }
                 "profile" => {
                     std::fs::write(
                         f.home.home().join(".bashrc"),
-                        format!("source .codex/{include}\n"),
+                        format!("source .codex/{include_path}\n"),
                     )
                     .unwrap();
                 }
