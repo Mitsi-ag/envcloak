@@ -89,6 +89,8 @@ pub struct WalkOptions {
     pub max_depth: usize,
     /// The walk stops after finding this many files.
     pub max_files: usize,
+    /// The walk stops after visiting this many directories, including the root.
+    pub max_dirs: usize,
     /// Directory names never entered.
     pub skip_dirs: Vec<OsString>,
 }
@@ -99,6 +101,7 @@ impl Default for WalkOptions {
             recursive: false,
             max_depth: 12,
             max_files: 10_000,
+            max_dirs: 10_000,
             skip_dirs: DEFAULT_SKIP_DIRS.iter().map(OsString::from).collect(),
         }
     }
@@ -171,6 +174,9 @@ pub fn walk_dotenv<'r>(r: &'r ScanRoot, o: &WalkOptions) -> Walk<'r> {
         pending: VecDeque::new(),
         visited,
         found: 0,
+        directories: Vec::new(),
+        skipped_dirs: Vec::new(),
+        stopped: false,
     }
 }
 
@@ -198,6 +204,9 @@ pub struct Walk<'r> {
     pending: VecDeque<Result<FoundFile, ScanError>>,
     visited: HashSet<(u64, u64)>,
     found: usize,
+    directories: Vec<PathBuf>,
+    skipped_dirs: Vec<PathBuf>,
+    stopped: bool,
 }
 
 impl Iterator for Walk<'_> {
@@ -205,14 +214,24 @@ impl Iterator for Walk<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            if let Some(x) = self.pending.pop_front() {
-                if x.is_ok() {
-                    self.found += 1;
-                }
-                return Some(x);
+            if self.stopped {
+                return None;
             }
             if self.found >= self.options.max_files {
-                return None;
+                self.stopped = true;
+                return (!self.started
+                    || !self.pending.is_empty()
+                    || self.path.iter().any(|f| !f.subdirs.is_empty()))
+                .then(|| {
+                    Err(ScanError {
+                        rel: PathBuf::new(),
+                        kind: ScanErrorKind::FileBudget,
+                    })
+                });
+            }
+            if let Some(x) = self.pending.pop_front() {
+                self.found += 1;
+                return Some(x);
             }
             if !self.started {
                 self.started = true;
@@ -252,9 +271,28 @@ impl Iterator for Walk<'_> {
 }
 
 impl Walk<'_> {
+    /// Directories actually reached through the held root, in discovery order.
+    pub fn directories(&self) -> &[PathBuf] {
+        &self.directories
+    }
+
+    /// Directories deliberately omitted by the configured name rules.
+    pub fn skipped_dirs(&self) -> &[PathBuf] {
+        &self.skipped_dirs
+    }
+
     /// Lists `dir` and puts it on the path, with the subdirectories to
     /// enter below it.
     fn enter(&mut self, dir: File, rel: PathBuf, depth: usize) {
+        if self.directories.len() >= self.options.max_dirs {
+            self.pending.push_back(Err(ScanError {
+                rel,
+                kind: ScanErrorKind::FileBudget,
+            }));
+            self.path.clear();
+            return;
+        }
+        self.directories.push(rel.clone());
         let subdirs = self.list(&dir, &rel, depth);
         self.path.push(Frame {
             dir,
@@ -307,7 +345,16 @@ impl Walk<'_> {
                 continue;
             }
             let may_be_dir = matches!(e.kind, DirEntryKind::Dir | DirEntryKind::Unknown);
-            if !self.options.recursive || !may_be_dir || self.options.skip_dirs.contains(&e.name) {
+            if !self.options.recursive || !may_be_dir {
+                continue;
+            }
+            if self.options.skip_dirs.contains(&e.name) {
+                if self.skipped_dirs.len() >= self.options.max_dirs {
+                    self.pending
+                        .push_back(report(child, ScanErrorKind::FileBudget));
+                    break;
+                }
+                self.skipped_dirs.push(child);
                 continue;
             }
             if depth >= self.options.max_depth {

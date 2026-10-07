@@ -313,11 +313,33 @@ pub fn scan_config_sources_with_budget(
     sources: &[ConfigSource],
     budget: Budget,
 ) -> Result<ScanReport, ScanError> {
+    scan_config_sources_selected(sources, budget, &|_| true)
+}
+
+/// Apply caller selection to catalog paths and every resolved include before
+/// reading it or inspecting its siblings.
+pub fn scan_config_sources_selected(
+    sources: &[ConfigSource],
+    budget: Budget,
+    allow: &dyn Fn(&Path) -> bool,
+) -> Result<ScanReport, ScanError> {
     let mut report = ScanReport::default();
+    let selected = sources
+        .iter()
+        .filter(|s| {
+            if allow(&s.path) {
+                true
+            } else {
+                report.issue(&s.path, "volume_opt_in");
+                false
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut included_paths = std::collections::HashSet::new();
     let mut failed = std::collections::HashSet::new();
     walk_sources(
-        sources,
+        &selected,
         budget,
         &mut report,
         |root, rel, source, opened, attempts, report| {
@@ -409,6 +431,10 @@ pub fn scan_config_sources_with_budget(
                 };
                 if !path.components().all(|c| matches!(c, Component::Normal(_))) {
                     report.issue(root.path().join(rel), "env_file_outside_root");
+                    continue;
+                }
+                if !allow(&root.path().join(&path)) {
+                    report.issue(root.path().join(&path), "volume_opt_in");
                     continue;
                 }
                 if crate::sources::omitted_path(sources, &root.path().join(&path)) {
