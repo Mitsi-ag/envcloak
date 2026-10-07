@@ -7,7 +7,8 @@ let package = Package(
     name: "EnvCloakKit",
     platforms: [.macOS(.v26)],
     products: [
-        .library(name: "EnvCloakKit", targets: ["EnvCloakKit"])
+        .library(name: "EnvCloakKit", targets: ["EnvCloakKit"]),
+        .library(name: "EnvCloakKitTestSupport", targets: ["EnvCloakKitTestSupport"])
     ],
     targets: [
         .target(

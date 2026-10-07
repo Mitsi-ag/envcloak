@@ -3,3 +3,5 @@
 # one per line as `<rule> <path>  # <reason>`. Every entry needs a reason,
 # must name a product Swift file and must still allow something there, or
 # the check fails. Adding an entry needs review.
+daemon-text apps/macos/EnvCloak/Stores/MetadataRequest.swift  # Raw metadata only for IPC arguments, validated URLs, exact folder persistence and explicitly copied quoted Terminal commands; all labels escaped.
+launch-input apps/macos/EnvCloak/Session/ScreenTestBootstrap.swift  # XCTest-only runtime path under /tmp/ec05-, excluded without explicit compile flag; Release rejects the flag. No normal-build launch input.

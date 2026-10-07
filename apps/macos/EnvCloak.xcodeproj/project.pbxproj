@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+        EC00000000000000000000C0 /* EnvCloakKitTestSupport in Frameworks */ = {isa = PBXBuildFile; productRef = EC00000000000000000000C1; };
 		EC0000000000000000000050 /* EnvCloakKit in Frameworks */ = {isa = PBXBuildFile; productRef = EC0000000000000000000042 /* EnvCloakKit */; };
 		EC0000000000000000000051 /* EnvCloakDesign in Frameworks */ = {isa = PBXBuildFile; productRef = EC0000000000000000000043 /* EnvCloakDesign */; };
 		EC0000000000000000000052 /* EnvCloak.icon in Resources */ = {isa = PBXBuildFile; fileRef = EC000000000000000000001A /* EnvCloak.icon */; };
@@ -114,6 +115,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                EC00000000000000000000C0 /* EnvCloakKitTestSupport in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -262,6 +264,7 @@
 				EC0000000000000000000031 /* EnvCloakTests */,
 			);
 			name = EnvCloakTests;
+            packageProductDependencies = (EC00000000000000000000C1);
 			productName = EnvCloakTests;
 			productReference = EC0000000000000000000022 /* EnvCloakTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
@@ -670,6 +673,11 @@
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+        EC00000000000000000000C1 /* EnvCloakKitTestSupport */ = {
+            isa = XCSwiftPackageProductDependency;
+            package = EC0000000000000000000040;
+            productName = EnvCloakKitTestSupport;
+        };
 		EC0000000000000000000042 /* EnvCloakKit */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = EC0000000000000000000040 /* XCLocalSwiftPackageReference "Packages/EnvCloakKit" */;
