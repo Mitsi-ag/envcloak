@@ -698,6 +698,7 @@ impl Write for FrameWriter<'_> {
 
 /// Serves one connection until it closes, stalls or breaks the framing.
 fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
+    let mut app_role = None;
     loop {
         let mut reader = FrameReader::new(stream);
         let frame = match Frame::read_from(&mut reader) {
@@ -738,7 +739,7 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
             return;
         }
         let fds = std::mem::take(&mut reader.fds);
-        let (response, delivering) = dispatch(&frame, peer, shared, fds);
+        let (response, delivering) = dispatch(&frame, peer, shared, fds, stream, &mut app_role);
         drop(frame);
         let written = response.is_some_and(|r| r.write_to(&mut FrameWriter::new(stream)).is_ok());
         // A restore chunk's delivery ends once its answer is written, or
@@ -760,9 +761,11 @@ fn dispatch<'s>(
     peer: &PeerIdentity,
     shared: &'s Shared,
     fds: Vec<OwnedFd>,
+    stream: &UnixStream,
+    app_role: &mut Option<bool>,
 ) -> (Option<Frame>, Option<backups::Delivering<'s>>) {
     let mut delivering = None;
-    let answer = respond(frame, peer, shared, &mut delivering, fds);
+    let answer = respond(frame, peer, shared, &mut delivering, fds, stream, app_role);
     (answer, delivering)
 }
 
@@ -774,6 +777,8 @@ fn respond<'s>(
     shared: &'s Shared,
     delivering: &mut Option<backups::Delivering<'s>>,
     fds: Vec<OwnedFd>,
+    stream: &UnixStream,
+    app_role: &mut Option<bool>,
 ) -> Option<Frame> {
     let req = match IncomingRequest::parse(frame) {
         Ok(r) => r,
@@ -788,13 +793,35 @@ fn respond<'s>(
     }
     // The sleep and idle checks run before every request too.
     observe(shared);
-    if required_role(req.method) == Role::App {
+    if required_role(req.method) == Role::App
+        && !*app_role.get_or_insert_with(|| crate::app::verified(stream, peer))
+    {
         shared.audit(AuditEvent::RoleDenied {
             method: loggable_method(req.method),
             pid: peer.pid,
             uid: peer.uid,
         });
         return proto::error_frame(Some(id), &RpcError::new(ErrorKind::RoleDenied)).ok();
+    }
+    if required_role(req.method) == Role::App && req.method != "app.lock" {
+        let checked = req.claimed_markers().and_then(|claims| {
+            let evidence = requests::evidence(shared, peer, &claims)?;
+            if evidence.nearest_agent().is_some()
+                || evidence.claims().claims_agent()
+                || evidence.cut()
+            {
+                shared.audit(AuditEvent::ProofRefused {
+                    pid: peer.pid,
+                    method: loggable_method(req.method),
+                    reason: if evidence.cut() { "chain_cut" } else { "agent" },
+                });
+                return Err(RpcError::new(ErrorKind::ProofRefused));
+            }
+            Ok(())
+        });
+        if let Err(error) = checked {
+            return proto::error_frame(Some(id), &error).ok();
+        }
     }
     match req.method {
         Status::NAME => answer::<Status>(id, &req, |_| Ok(status(shared))),
