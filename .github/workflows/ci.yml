@@ -825,6 +825,8 @@ jobs:
           python3 scripts/macos/tests/test_check_swift.py
       - name: The Swift rules' literal values against the language reference (independent oracle)
         run: python3 scripts/macos/tests/test_swift_literal_values.py
+      - name: Workspace wire and test environment contracts
+        run: python3 scripts/macos/tests/test_workspace_contracts.py
       - name: The project's resolved settings
         run: python3 scripts/macos/tests/test_project_settings.py
       - name: sign-check's fixtures (gate 19 for the bundle)

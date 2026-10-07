@@ -26,7 +26,7 @@ fixture = pathlib.Path(tempfile.mkdtemp(prefix='ec05-', dir='/tmp'))
 for folder in ('tmp', 'config', 'data', 'state', 'run', 'cache'):
     (fixture / folder).mkdir(mode=0o700)
 env = {'HOME': str(fixture), 'TMPDIR': str(fixture / 'tmp') + '/',
-       'PATH': str(cargo_home / 'bin') + ':/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+       'PATH': str(pathlib.Path.home() / '.cargo/bin') + ':' + str(cargo_home / 'bin') + ':/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin',
        'CARGO_HOME': str(cargo_home), 'RUSTUP_HOME': str(rustup_home),
        'CARGO_TARGET_DIR': str(cache), 'CARGO_INCREMENTAL': '0', 'CARGO_BUILD_JOBS': '3',
        'LANG': 'en_US.UTF-8'}

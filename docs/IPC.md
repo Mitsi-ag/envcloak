@@ -683,6 +683,8 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 <!-- reservations:field -->
 | Method | Field | Task | Status | Use |
 |---|---|---|---|---|
+| `items.list` | `last_used_secs` | M3-05 | reserved | landed in code: optional last-use timestamp in each long item view, for the Keys table; same metadata as `items.show`. Kept reserved here because the field table has no code reader; `check-reservations.py` rejects landed field rows until a reader exists |
+| `items.show` | `last_used_secs` | M3-05 | reserved | landed in code: optional top-level last-use timestamp, matching the long inventory and the existing `detail.last_used_secs`; the field table has no code reader, so its status follows the `items.list` exception above |
 | `status` | `vault.keychain_anchor` | M3-16 | reserved | the keychain anchor: `matched`, `ahead` (the file was rolled back), `missing`, `none`, or `unavailable` (a build without the helper's profile, and Linux) |
 | `status` | `app_requests` | M3-14 | reserved | how many asks and reveal requests wait for the app |
 | `status` | `lock.reason=screen_lock` | M3-16 | reserved | the vault locked because the screen locked (`app.lock`) |
