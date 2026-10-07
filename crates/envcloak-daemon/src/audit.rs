@@ -125,6 +125,14 @@ impl ScanCounts {
 /// masked command line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuditEvent {
+    /// A terminal reveal, written durably before release.
+    #[cfg(target_os = "linux")]
+    Revealed {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+    },
     /// A client-role peer called an `app`-role method.
     RoleDenied {
         method: &'static str,
@@ -486,6 +494,10 @@ impl AuditEvent {
             } => {
                 format!("envcloakd: audit: item removed id={item} grants_ended={grants} pid={pid}")
             }
+            #[cfg(target_os = "linux")]
+            AuditEvent::Revealed { pid, item, .. } => {
+                format!("envcloakd: audit: revealed id={item} pid={pid}")
+            }
             AuditEvent::ItemProofFailed {
                 pid, write, item, ..
             } => format!(
@@ -818,6 +830,18 @@ impl AuditEvent {
                     Some(u64::try_from(*grants).unwrap_or(u64::MAX)),
                 ),
                 ..AuditRecord::new(AuditKind::Remove, "removed")
+            },
+            #[cfg(target_os = "linux")]
+            AuditEvent::Revealed {
+                subject,
+                item,
+                slug,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision("revealed", None, Some("items.reveal"), None),
+                ..AuditRecord::new(AuditKind::Reveal, "revealed")
             },
             AuditEvent::ItemProofFailed {
                 pid,

@@ -622,6 +622,40 @@ pub struct TargetParams {
     pub claims: Vec<String>,
 }
 
+/// `items.reveal`: a Linux terminal's fresh passphrase proof. Only secret
+/// items are eligible; the audit entry is durable before the value leaves.
+#[derive(Debug)]
+pub struct ItemsReveal;
+
+impl Method for ItemsReveal {
+    const NAME: &'static str = "items.reveal";
+    type Params = RevealParams;
+    type Output = RevealOutput;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealParams {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    pub passphrase: WireSecret,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for RevealParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RevealParams([REDACTED])")
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealOutput {
+    pub value: WireSecret,
+}
+
 /// `items.rotate`: replaces a field's value, keeping the old one as the
 /// newest of up to three prior values. A proof: the passphrase, from a
 /// terminal subject (SPEC §10b). Grants that bind the item stay.
@@ -1457,6 +1491,7 @@ pub const CLIENT_METHODS: [&str; 40] = [
     ItemsCheck::NAME,
     ItemsAdd::NAME,
     ItemsTarget::NAME,
+    ItemsReveal::NAME,
     ItemsRotate::NAME,
     ItemsRemove::NAME,
     ItemsMarkExposed::NAME,

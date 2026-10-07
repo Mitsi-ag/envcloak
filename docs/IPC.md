@@ -153,6 +153,40 @@ Every method whose name starts with `app.` belongs to the `app` role (SPEC §4.3
 
 From M3 (plan decision D3-06, task M3-07; not built yet) a connection is to get the role at its first `app.` request, and only when its peer's code signature, read from its audit token, satisfies the app's pinned requirement, the peer runs with the hardened runtime flag, and it carries neither `com.apple.security.get-task-allow` nor any of the hardened runtime's exception entitlements (SPEC §4.3). The verdict holds for that connection alone, which the daemon closes unanswered once another process sends on it ("Peer checks"). Every other peer stays a client peer, and its `app.` calls are answered `role_denied` and audited exactly as above: gate 22 (SPEC §15.2) keeps holding through M3, and each task that lands an app method adds its name to `APP_METHODS` in `crates/envcloak-ipc/src/proto.rs`, which the gate's test, `crates/envcloak-daemon/tests/roles.rs`, calls one by one from a client peer (`crates/envcloak-testkit/tests/app_role_gate.rs` refuses a `landed` app method that `APP_METHODS` lacks, and this paragraph without gate 22 and that test). The role says which code sent a request, not who started it: the daemon also reads the peer's evidence at each `app.` request, and from an `app` peer whose evidence names an agent (a known agent in its ancestry or agent markers in its claims) or whose chain is cut at the walk's depth limit, every `app.` request but `app.lock` is answered `proof_refused` and audited before anything else is done, so no envelope, pending request or prompt reaches it; `app.lock` is answered, since locking only tightens (SPEC §10b). A build that pins no signing identity (Linux, source and unsigned builds) has no `app` role, as in M1. The M3 app methods are reserved in their own table under "Reserved for M3" below.
 
+## Terminal reveal (M2-21)
+
+`items.reveal { slug, field?, passphrase, claims? }` returns
+`{ value: WireSecret }` on Linux only. `passphrase` is required and uses
+`WireSecret` too. Unknown fields are refused. On macOS this method is
+`method_not_found`; `envcloak reveal <slug>[#field]` exits 125 with
+`app_required` before contacting the daemon until the M3 app exists.
+
+A Linux reveal takes a fresh passphrase proof from a terminal subject,
+using the same attempt limiter as rotation and approval. Cards, logins
+and every class except `secret` are refused (`unknown_item_class`). A
+multi-field item needs an explicit field (`ambiguous_field`). The daemon
+re-resolves the item and field after the proof and gathers fresh process
+evidence before reading its value. The framed answer stays private until
+its `reveal` audit entry is durable; audit failure returns `audit_failed`
+with no value.
+
+The CLI refuses under a tracer, refuses agent claims, and opens `/dev/tty`
+before making any request. `items.target` provides the metadata preflight:
+like the final reveal, this proof surface also refuses a caller sharing
+a live pending nonterminal requester's session or terminal, using the
+same origin boundary as approval (`requester_terminal`). This prevents a
+prompt on the requester's terminal even when the prospective prover is
+a sibling of the agent. Both the proof and release repeat the check.
+
+The warning and hidden passphrase prompt, value, and Enter prompt all use
+that terminal. The warning says that a terminal an agent drives can read
+what is shown and that scrollback keeps it. There is no stdout, stderr,
+file-descriptor or JSON value output option and no fallback if the terminal
+cannot be opened or written. A read or write failure is unsuccessful;
+Enter finishes the display without removing scrollback. The existing
+secret-input guard restores terminal settings on input failure and caught
+termination signals. Reveal is neither listed nor callable through MCP.
+
 ## Comparisons with the vault
 
 `scan.match` (M2 plan D-32, task M2-11) is the one way a scan's candidate tokens (doctor, scrub, the first-run import, `migrate-mcp`) are compared with the vault: by keyed hash under the `index` subkey, in the daemon, which alone holds the key. The CLI scans and removes duplicates first (one comparison per distinct candidate a run); nothing it says about a candidate widens what is compared. The code is `crates/envcloak-daemon/src/scan_match.rs`.
@@ -373,7 +407,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `standing.list` | M2-15 | reserved | standing approvals, metadata only |
 | `standing.revoke` | M2-15 | reserved | revokes standing approvals; tightening, no proof |
 | `standing.confirm` | M2-15 | reserved | re-seals the policy record over every standing record, with a proof |
-| `items.reveal` | M2-21 | reserved | terminal reveal on Linux, with a proof |
+| `items.reveal` | M2-21 | landed | terminal reveal on Linux, with a proof |
 | `login.add` | M2b-03 | reserved | adds a login item; its fields cross only from the client |
 | `signin.target.add` | M2b-05 | reserved | registers a sign-in target, with a proof |
 | `signin.target.edit` | M2b-05 | reserved | edits a sign-in target, with a proof; bumps its authorization revision |
@@ -415,7 +449,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `not_started_by_daemon` | M2-27 | reserved | `envcloak run --launch`, `mcp-bridge --relay` or `mcp --browser-supervisor` started by anything but the daemon; exit 125, and nothing is received (SPEC §4); distinct from the error kind `runner_unavailable`, the daemon unable to start one |
 | `pty_unavailable` | M2-19 | landed | `run --pty` without a terminal on stdin and stdout; exit 125, never a fallback |
 | `pty_monitor_lost` | M2-19 | landed | the PTY monitor died without reporting the command's status; exit 125 |
-| `app_required` | M2-21 | reserved | `envcloak reveal` on macOS before the app; exit 125, no value requested |
+| `app_required` | M2-21 | landed | `envcloak reveal` on macOS before the app; exit 125, no value requested |
 | `edited_since` | M2-05 | landed | a file a backup v2 restore would write back over is not what the change left (its SHA-256 is not the recorded `sha256_after`); it is kept as it is |
 | `backup_unread` | M2-05 | landed | a backup v2 restore could not have a file's backed-up contents whole (a chunk missing or of another length, or the whole not the backed-up SHA-256); nothing is written in its place |
 | `swap_unsupported` | M2-05 | landed | a backup v2 restore found a file system that cannot swap two names in one step, so the file it would write over could not be checked as it moved out; nothing is written in its place |

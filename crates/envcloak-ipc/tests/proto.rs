@@ -808,3 +808,35 @@ fn a_full_backup_chunk_fits_in_one_frame() {
     };
     assert!(proto::result_frame(u64::MAX, &answer).is_ok());
 }
+
+/// M2-21: strict reveal parameters and value-free diagnostics, including
+/// attacker-controlled metadata. WireSecret's decoder owns the byte cap.
+#[test]
+fn reveal_wire_contract_is_strict_and_debug_is_value_free() {
+    use envcloak_core::SecretBytes;
+    use envcloak_ipc::WireSecret;
+    use envcloak_ipc::proto::{RevealOutput, RevealParams};
+    let input = "hostile metadata\u{1b}[31m\n";
+    let p = RevealParams {
+        slug: input.into(),
+        field: Some(input.into()),
+        claims: vec![input.into()],
+        passphrase: WireSecret::new(SecretBytes::copy_from(input.as_bytes())),
+    };
+    assert!(!format!("{p:?}").contains(input));
+    let mut wire = serde_json::to_value(&p).unwrap();
+    assert!(serde_json::from_slice::<RevealParams>(&serde_json::to_vec(&wire).unwrap()).is_ok());
+    wire["stdout"] = serde_json::Value::Bool(true);
+    assert!(serde_json::from_slice::<RevealParams>(&serde_json::to_vec(&wire).unwrap()).is_err());
+    wire.as_object_mut().unwrap().remove("stdout");
+    wire.as_object_mut().unwrap().remove("passphrase");
+    assert!(serde_json::from_slice::<RevealParams>(&serde_json::to_vec(&wire).unwrap()).is_err());
+    let out = RevealOutput {
+        value: WireSecret::new(SecretBytes::copy_from(input.as_bytes())),
+    };
+    assert!(!format!("{out:?}").contains(input));
+    let mut wire = serde_json::to_value(&out).unwrap();
+    assert!(serde_json::from_slice::<RevealOutput>(&serde_json::to_vec(&wire).unwrap()).is_ok());
+    wire["unrecognized"] = serde_json::Value::Bool(true);
+    assert!(serde_json::from_slice::<RevealOutput>(&serde_json::to_vec(&wire).unwrap()).is_err());
+}

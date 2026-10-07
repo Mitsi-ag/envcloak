@@ -450,15 +450,15 @@ pub fn add(shared: &Shared, peer: &PeerIdentity, p: AddParams) -> Result<AddedVi
 
 /// What a rotation or removal changes: the item, and the field a rotation
 /// replaces when one is named or the item has only one.
-struct Target {
-    item: ItemId,
-    slug: Slug,
-    field: Option<(FieldId, FieldName)>,
+pub(crate) struct Target {
+    pub(crate) item: ItemId,
+    pub(crate) slug: Slug,
+    pub(crate) field: Option<(FieldId, FieldName)>,
 }
 
 /// Resolves `slug` (and `field`) to a secret item of `v`. With `expect`,
 /// the item's id must be that one: the slug may name another item by now.
-fn target(
+pub(crate) fn target(
     v: &Vault,
     slug: &str,
     field: Option<&str>,
@@ -494,6 +494,8 @@ fn target(
 }
 
 /// `items.target`: for a caller that may give a proof only.
+/// This preflight also refuses a live agent request's terminal, so a
+/// reveal never asks for its passphrase on that requester's surface.
 pub fn target_view(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -502,6 +504,13 @@ pub fn target_view(
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "items.target")?;
     let mut s = locked(&shared.state);
+    refuse_item_prover(
+        &mut s,
+        peer,
+        &caller,
+        &now_of(&shared.clocks),
+        "items.target",
+    )?;
     let v = s.unlocked()?;
     let t = target(v, &p.slug, p.field.as_deref(), None)?;
     let item = v
@@ -516,13 +525,41 @@ pub fn target_view(
     })
 }
 
+/// Proof surfaces for an item have no request id. Refuse an overlap with
+/// any live pending nonterminal requester, using the same independently
+/// computed origin boundary as `approve` (T9-3, F-70).
+pub(crate) fn refuse_item_prover(
+    s: &mut crate::state::State,
+    peer: &PeerIdentity,
+    caller: &SubjectEvidence,
+    now: &envcloak_policy::Now,
+    method: &'static str,
+) -> Result<(), RpcError> {
+    let refusal = caller.proof_refusal().or_else(|| {
+        s.grants()
+            .pending_all(now)
+            .find_map(|p| caller.approval_refusal(&p.request.subject, &crate::requests::alive))
+    });
+    if let Some(r) = refusal {
+        s.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method,
+            reason: r.token(),
+        });
+        return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+    }
+    Ok(())
+}
+
 /// Which proof-gated write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Write {
+pub(crate) enum Write {
     Rotate,
     Remove,
     /// Towards `test` or `unknown` only: towards `live` takes no proof.
     Reclassify,
+    #[cfg(target_os = "linux")]
+    Reveal,
 }
 
 impl Write {
@@ -531,6 +568,8 @@ impl Write {
             Write::Rotate => "items.rotate",
             Write::Remove => "items.remove",
             Write::Reclassify => "items.reclassify",
+            #[cfg(target_os = "linux")]
+            Write::Reveal => "items.reveal",
         }
     }
 
@@ -539,6 +578,8 @@ impl Write {
             Write::Rotate => AuditKind::Rotate,
             Write::Remove => AuditKind::Remove,
             Write::Reclassify => AuditKind::Reclassify,
+            #[cfg(target_os = "linux")]
+            Write::Reveal => AuditKind::Reveal,
         }
     }
 }
@@ -547,17 +588,17 @@ impl Write {
 /// since the vault came back to its slot, the caller's evidence, and the
 /// target as it was resolved before Argon2id ran (the write resolves it
 /// again under this lock).
-struct Proven<'s> {
-    s: std::sync::MutexGuard<'s, crate::state::State>,
-    caller: SubjectEvidence,
-    target: Target,
+pub(crate) struct Proven<'s> {
+    pub(crate) s: std::sync::MutexGuard<'s, crate::state::State>,
+    pub(crate) caller: SubjectEvidence,
+    pub(crate) target: Target,
 }
 
 impl Proven<'_> {
     /// Records that the write this proof allowed changed nothing, for
     /// `e`'s reason (SPEC §3 principle 4: a proof that passed is audited
     /// whatever follows), and returns `e`.
-    fn aborted(&mut self, peer: &PeerIdentity, write: Write, e: RpcError) -> RpcError {
+    pub(crate) fn aborted(&mut self, peer: &PeerIdentity, write: Write, e: RpcError) -> RpcError {
         self.s.audit(AuditEvent::ItemWriteFailed {
             pid: peer.pid,
             subject: subject_summary(peer, &self.caller),
@@ -575,7 +616,7 @@ impl Proven<'_> {
 /// the vault back in its slot. A proof that passes when the vault cannot
 /// come back (a lock arrived while Argon2id ran) is audited as an aborted
 /// write.
-fn prove<'s>(
+pub(crate) fn prove<'s>(
     shared: &'s Shared,
     peer: &PeerIdentity,
     write: Write,
@@ -590,6 +631,10 @@ fn prove<'s>(
     let (vault, generation, t) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
+        #[cfg(target_os = "linux")]
+        if write == Write::Reveal {
+            refuse_item_prover(&mut s, peer, &caller, &now, write.method())?;
+        }
         // Everything but the passphrase is checked before Argon2id runs.
         let t = resolve(s.unlocked()?)?;
         s.limiter()

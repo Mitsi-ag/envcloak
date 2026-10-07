@@ -659,6 +659,27 @@ impl Client {
         })
     }
 
+    /// Reveals one secret to a Linux terminal after a fresh proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`]. No value is returned after a refused proof or
+    /// a failed durable audit append. Unavailable on macOS before M3.
+    pub fn items_reveal(
+        &mut self,
+        slug: &str,
+        field: Option<&str>,
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<SecretBytes, ClientError> {
+        self.call::<crate::proto::ItemsReveal>(&crate::proto::RevealParams {
+            slug: slug.to_owned(),
+            field: field.map(str::to_owned),
+            passphrase: WireSecret::new(passphrase),
+            claims: claims.to_vec(),
+        })
+        .map(|r| r.value.into_inner())
+    }
+
     /// `items.rotate`: `value` in place of the value of `slug`'s field,
     /// with the passphrase as the proof.
     ///

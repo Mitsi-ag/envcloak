@@ -378,7 +378,7 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 <!-- reservations:audit_kind -->
 | Number | Token | Task | Status | Use |
 |---|---|---|---|---|
-| 22 | `reveal` | M2-21 | reserved | a terminal reveal on Linux, before the value is written |
+| 22 | `reveal` | M2-21 | landed | a terminal reveal on Linux, before the value is written |
 | 23 | `scan_match` | M2-11 | landed | a `scan.match` call: its purpose and counts, never a candidate |
 | 24 | `mark_exposed` | M2-11 | landed | items marked "exposed: rotate" |
 | 25 | `backup_v2` | M2-05 | landed | a file backup v2 committed, with its creator and purpose |
