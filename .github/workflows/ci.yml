@@ -839,10 +839,11 @@ jobs:
         run: python3 scripts/macos/tests/test_owned_cleanup_and_records.py
       - name: EnvCloakKit and EnvCloakDesign tests
         run: |
-          for p in EnvCloakKit EnvCloakDesign; do
-            (cd "apps/macos/Packages/$p" && xcodebuild -scheme "$p" -destination 'platform=macOS' \
-              -derivedDataPath "$RUNNER_TEMP/dd-$p" SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test)
-          done
+          # Kit has two library products; Xcode puts its tests in the package scheme.
+          (cd apps/macos/Packages/EnvCloakKit && xcodebuild -scheme EnvCloakKit-Package -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-EnvCloakKit" SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test)
+          (cd apps/macos/Packages/EnvCloakDesign && xcodebuild -scheme EnvCloakDesign -destination 'platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd-EnvCloakDesign" SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test)
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
