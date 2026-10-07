@@ -54,8 +54,13 @@ fn aws_hostile_grammar_is_explicit_and_value_free() {
         vec![b'a'; MAX_DOTENV + 1],
         b"[default]\naws_secret_access_key = first\n continuation\n".to_vec(),
         b"[default]\naws_secret_access_key = first\n  part=two\n".to_vec(),
+        "[default]\naws_secret_access_key = first\n\u{a0}part=two\n"
+            .as_bytes()
+            .to_vec(),
         b"[default]\nAWS_SECRET_ACCESS_KEY = first\naws_secret_access_key = second\n".to_vec(),
         b"[default]\naws_secret_access_key = first\naws_secret_access_key = second\n".to_vec(),
+        b"[default]\naws_access_key_id = first\n[default]\naws_secret_access_key = second\n"
+            .to_vec(),
         b"[broken\naws_secret_access_key = first\n".to_vec(),
     ] {
         let r = parse_aws(&SecretBytes::from_vec(bytes));
@@ -89,6 +94,43 @@ fn aws_option_casing_matches_python_ini_oracle() {
     for (finding, (name, value)) in report.findings.iter().zip(expected) {
         assert!(finding.name.ct_eq(name.as_bytes()));
         assert!(finding.value.as_ref().unwrap().ct_eq(value.as_bytes()));
+    }
+}
+
+#[test]
+fn aws_continuation_context_matches_python_ini_oracle() {
+    for (bytes, credential) in [
+        (
+            "[default]\nregion = first\n  aws_secret_access_key = second\n",
+            None,
+        ),
+        (
+            "[default]\naws_secret_access_key = first\n  [other]\n",
+            Some("first\n[other]"),
+        ),
+    ] {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let path = home.path().join("fixture.ini");
+        std::fs::write(&path, bytes).unwrap();
+        let out = Command::new("/usr/bin/python3")
+            .env_clear()
+            .env("HOME", home.path())
+            .args(["-I", "-c", "import configparser,json,sys; p=configparser.RawConfigParser(); p.read(sys.argv[1]); print(json.dumps([p.sections(), p.get('default','aws_secret_access_key',fallback=None)]))"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let expected: (Vec<String>, Option<String>) = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(expected.0, ["default"]);
+        assert_eq!(expected.1.as_deref(), credential);
+        let report = parse_aws(&SecretBytes::copy_from(bytes.as_bytes()));
+        assert!(!report.complete());
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|f| f.value.is_none() && !f.single_complete_line)
+        );
     }
 }
 

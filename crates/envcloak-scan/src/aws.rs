@@ -27,6 +27,7 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
         return report;
     }
     let mut section = None;
+    let mut sections = HashSet::new();
     let mut seen = HashSet::new();
     let mut offset = 0;
     let mut prior_key = false;
@@ -37,18 +38,22 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
         if line.is_empty() || line.starts_with(['#', ';']) {
             continue;
         }
+        if prior_key && raw.starts_with(char::is_whitespace) {
+            report.issue("", "multiline_aws_value");
+        }
         if line.starts_with('[') && line.ends_with(']') && line.len() > 2 {
             section = Some(&line[1..line.len() - 1]);
+            if !sections.insert(section) {
+                report.issue("", "duplicate_aws_section");
+            }
             prior_key = false;
             continue;
-        }
-        if prior_key && raw.starts_with([' ', '\t']) {
-            report.issue("", "multiline_aws_value");
         }
         let Some((key, value)) = line.split_once('=') else {
             report.issue("", "unsupported_aws_syntax");
             continue;
         };
+        prior_key = true;
         let key = key.trim();
         let name = [
             "AWS_ACCESS_KEY_ID",
@@ -58,10 +63,8 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
         .into_iter()
         .find(|name| key.eq_ignore_ascii_case(name));
         let Some(name) = name else {
-            prior_key = false;
             continue;
         };
-        prior_key = true;
         let Some(section) = section else {
             report.issue("", "unsupported_aws_syntax");
             continue;
