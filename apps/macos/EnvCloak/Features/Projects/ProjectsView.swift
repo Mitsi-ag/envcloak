@@ -11,8 +11,8 @@ struct ProjectsOverview: View {
         } else if session.projects.inventory.isEmpty {
             VStack {
                 ContentUnavailableView("No projects yet.", systemImage: "folder", description: Text("Run envcloak init in a repo, or add a folder that has an envcloak.toml."))
-                Button("Add project folder…") { WorkspaceActions.addFolder(session) { route = .project($0) } }
-                Button("Copy envcloak init") { WorkspaceActions.copy("envcloak init") }
+                Button("Add project folder…") { WorkspaceActions.addFolder(session) { route = .project($0) } }.disabled(session.state != .ready)
+                Button("Copy envcloak init") { WorkspaceActions.copy("envcloak init") }.disabled(session.state != .ready)
             }
         } else {
             List(session.projects.inventory) { entry in
@@ -63,7 +63,7 @@ struct ProjectDetail: View {
                 Text("Not checked").foregroundStyle(ECToken.secondary.color); Spacer()
             } else if session.projects.manifestMissing {
                 ContentUnavailableView("This folder has no envcloak.toml.", systemImage: "folder", description: Text("Run envcloak init there to import its .env files and create one."))
-                Button("Copy envcloak init") { WorkspaceActions.copy("envcloak init") }
+                Button("Copy envcloak init") { WorkspaceActions.copy("envcloak init") }.disabled(session.state != .ready)
             } else if let failure = session.projects.checkFailure {
                 ContentUnavailableView("envcloak.toml could not be read", systemImage: "exclamationmark.triangle", description: Text(failure.description + ". Run envcloak check in this folder."))
                 Button("Check again") { Task { await session.openProject(directory) } }

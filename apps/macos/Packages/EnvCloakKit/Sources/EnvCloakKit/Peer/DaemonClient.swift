@@ -3,6 +3,7 @@
 /// cancellation/lock discards earlier completions, even if already queued.
 public actor DaemonClient {
     private let directory: String
+    public nonisolated var socketPath: DaemonText { DaemonText(directory + "/envcloakd.sock") }
     private let timeout: Duration?
     private var serial: UInt64 = 0
     private var generation: UInt64 = 0

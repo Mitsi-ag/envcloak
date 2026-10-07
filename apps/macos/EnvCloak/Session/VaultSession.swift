@@ -71,7 +71,7 @@ struct Change: OptionSet {
             guard captured == generation, !Task.isCancelled else { return }
             proofWait = status.approvals.proof_wait_secs
             lockReason = switch status.lock.last_reason {
-            case .idle: "Locked after \(status.lock.idle_limit_secs / 3600) hours idle"
+            case .idle: "Locked after \(Self.durationWords(status.lock.idle_limit_secs)) idle"
             case .sleep: "Locked when this Mac slept"
             case .request: "Locked by request"
             case .signal: "Locked when the background process stopped"
@@ -79,14 +79,11 @@ struct Change: OptionSet {
             case nil: ""
             }
             let next: ConnectionState
-            if status.vault.read_only || status.vault.integrity == .tampered { next = .readOnly }
-            else {
-                next = switch status.vault.state {
-                case .absent: .noVault
-                case .locked: .locked
-                case .unlocked: .ready
-                case .unavailable: .unavailable
-                }
+            next = switch status.vault.state {
+            case .absent: .noVault
+            case .locked: .locked
+            case .unlocked: status.vault.read_only || status.vault.integrity == .tampered ? .readOnly : .ready
+            case .unavailable: .unavailable
             }
             var change: Change = []
             if lastStatus == nil || next != state || status.daemon.pid != lastStatus?.daemon.pid {
@@ -97,7 +94,7 @@ struct Change: OptionSet {
             }
             state = next
             pendingCount = next == .ready ? status.approvals.pending : 0
-            if next != .ready {
+            if !next.canReadMetadata {
                 clearMetadata()
                 lastStatus = status
                 return
@@ -157,13 +154,27 @@ struct Change: OptionSet {
         }
     }
 
+    static func durationWords(_ seconds: UInt64) -> String {
+        let parts = [(seconds / 3600, "hour"), ((seconds / 60) % 60, "minute"), (seconds % 60, "second")]
+        let words = parts.filter { $0.0 > 0 }.map { "\($0.0) " + $0.1 + ($0.0 == 1 ? "" : "s") }
+        return words.isEmpty ? "0 seconds" : words.joined(separator: " ")
+    }
+    var verificationDetails: String {
+        guard case .unverified(let check) = state else { return "" }
+        return "Failed check: " + check.rawValue + ". Socket: " + (client?.socketPath?.escaped ?? "path unavailable")
+    }
+    func setScope(_ scope: DaemonText?) {
+        do { try projects.setScope(scope) }
+        catch { notice = "The project scope could not be saved. Try again." }
+    }
+
     func selectKey(_ slug: DaemonText?) async {
-        guard state == .ready || state == .readOnly else { return }
+        guard state.canReadMetadata else { return }
         await items.select(slug)
     }
 
     func openProject(_ directory: DaemonText) async {
-        guard state == .ready else { return }
+        guard state.canReadMetadata else { return }
         await projects.open(directory)
     }
 
