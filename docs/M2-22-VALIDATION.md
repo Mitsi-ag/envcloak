@@ -170,3 +170,92 @@ was installed under target E's `m2-22-tools` directory after verifying its
 published SHA-256, `fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3`.
 The successful check used that directory on `PATH`. The exposure-lint script
 now honors `CARGO_TARGET_DIR` for its isolated canary build.
+
+## PR 46 CI follow-up
+
+The Linux CI failures reported on 2026-10-08 exposed two separate issues.
+`check-reservations.py` could not read the dynamic `reason` forwarded to
+`Failure::new`. Commit `05046fee` makes that conversion a fixed vocabulary,
+keeps an unknown reason a failure with token `incomplete`, and records the
+previously implicit scrub tokens in `docs/IPC.md`. CI now runs the new CLI
+unit gate as well as the existing integration target.
+
+The scanner's closed controls failed because scrub retained its source
+file while `check_modifiable` opened the same inode a second time. Linux's
+`F_SETLEASE` write lease counts this process's other open descriptions too,
+so the second open produces `open_elsewhere` even without an external
+holder. Commit `52ed1b5a` checks the retained source descriptor and drops the
+temporary pathname-check descriptor before asking the kernel. Both checks
+in streamed replacement use it. Full pathname and source-stamp checks,
+including ctime, still precede publication.
+
+This uses the existing inode-specific lease detector, not a walk of
+`/proc/*/fd`: unrelated runner processes and inaccessible descriptor
+directories do not affect its answer. A real holder of the source still
+refuses the change. The existing best-effort behavior on a filesystem
+without leases is unchanged. Linux execution remains for CI; this Mac's
+process-list detector cannot reproduce the Linux duplicate-open failure.
+
+The native holder gate now retains a source before starting the independent
+Python holder. It verifies that `check`, `validate` and `apply` refuse while
+the holder is alive, drops its own source before checking a fresh open
+refusal, and checks the unchanged bytes and closed controls after the holder
+exits. The three filesystem gates share a test mutex because a sibling
+test's fork can briefly inherit descriptors before exec. The holder
+assertions require the exact `open_elsewhere` refusal.
+
+| Gate, with `gate37_` prefix omitted | Repeated named mutation | Observed failure |
+| --- | --- | --- |
+| `failure_tokens_are_fixed_and_unknown_reasons_stay_failures` | `forward_unchecked_scrub_reason` | Unknown text escaped as a token instead of `incomplete`; the original reservation check also failed |
+| `open_elsewhere_refuses_aged_source_with_a_closed_control` | `skip_open_elsewhere` | A separately held source was accepted |
+| `apply_streams_only_scrubbed_temporary_bytes_and_keeps_mode` | `copy_raw_matches_to_output` | The resulting bytes retained the matched text |
+| `recent_linked_and_stale_sources_refused` | `skip_two_minute_rule` | A recent file was accepted |
+| `scrub_exclusive_staging_and_ctime_recheck` | `ignore_ctime` | A same-size edit with restored mtime was lost |
+| `scrub_exclusive_staging_and_ctime_recheck` | `remove_exclusive_stage` | A planted temporary file was overwritten |
+
+Each negative test compiled and exited 101 at an assertion, with one failed
+test. No timeout or compiler error counts as evidence. The mutations are
+named in the two fix commits and all were restored before the final checks.
+These extend gate 37's existing R-M2-44, R-M2-45 and R-M2-84 evidence; the
+scope and OS qualifications listed above remain the same.
+
+The first final pipeline rebuilt only the normal CLI and daemon binaries.
+Its 47 CLI unit tests passed, but the 256 MiB integration test saw zero
+Argon2id trace events and correctly failed; the other ten scrub tests passed.
+The daemon was missing the syscall crate's `testing` instrumentation.
+Before the successful rerun, `cargo test -p envcloakd --no-run` rebuilt it
+with the test features, as the CI gates job already does. The count assertion
+was unchanged. Standalone CLI gate runs need this preparation after a normal
+CLI/daemon build. The complete target then passed all eleven tests in 128.59
+seconds, including the one-proof, one-Argon2id and exact-digest checks.
+
+The final follow-up pipeline passed on the same macOS and Rust versions
+listed above, using target E, incremental compilation off, three build jobs,
+and detached tests with cleared environments and three test threads.
+
+| Follow-up check | Result |
+| --- | --- |
+| `cargo fmt --all --check` | Passed |
+| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Passed |
+| Full `envcloak-scan` suite | 235 passed, zero failures or ignored tests, including the independent oracle |
+| CLI `envcloak` binary unit tests | 47 passed, zero failures or ignored tests |
+| CLI `scrub` integration target | 11 passed, zero failures or ignored tests |
+| `python3 scripts/check-reservations.py` | Passed, 276 rows in 17 tables |
+| `python3 scripts/check-spec-decisions.py` | Passed, 54 decisions and 51 sentences |
+| `scripts/check-unsafe.sh` | Passed |
+| `scripts/check-expose-lint.sh` | Passed, all 6 expected sites reported |
+| `scripts/check-sources.sh` | Passed |
+| `python3 scripts/check-crate-graph.py` | Passed, 50 edges among 21 crates |
+| `git diff --check` | Passed |
+
+The test preparation and final test commands were:
+
+```sh
+cargo build -p envcloak -p envcloakd --bins
+cargo test -p envcloakd --no-run
+cargo test -p envcloak-scan --no-fail-fast -- --test-threads 3
+cargo test -p envcloak --bin envcloak --test scrub --no-fail-fast -- --test-threads 3
+```
+
+These are 293 distinct passing tests for this follow-up, not a rerun of the
+historical 918-test receipt above. No workspace-wide test command was run.
