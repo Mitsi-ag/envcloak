@@ -220,10 +220,21 @@ fn zsh_equals_expansion_matches_the_shell_oracle() {
     for (rhs, literal) in [
         ("=fixture_command", false),
         ("prefix:=fixture_command", false),
+        ("''=fixture_command", false),
+        ("\"\"=fixture_command", false),
+        ("'prefix:'=fixture_command", false),
+        ("\"prefix:\"=fixture_command", false),
+        ("prefix:''=fixture_command", false),
+        ("prefix\\:=fixture_command", false),
+        ("\\\n=fixture_command", false),
         ("'=fixture_command'", true),
+        ("'='fixture_command", true),
+        ("\"=\"fixture_command", true),
         ("\"=fixture_command\"", true),
         ("\\=fixture_command", true),
         ("prefix=fixture_command", true),
+        ("'prefix'=fixture_command", true),
+        ("'prefix:'\\=fixture_command", true),
     ] {
         for exported in [false, true] {
             let source = format!(
@@ -275,17 +286,24 @@ fn zsh_equals_expansion_matches_the_shell_oracle() {
         b"SECRET_TOKEN=fixtureValueForLookalike\n",
     )
     .unwrap();
-    std::fs::write(home.path().join(".zshrc"), b"source =fixture_command\n").unwrap();
-    let report = envcloak_scan::profile::scan_profiles(&open_root(home.path()).unwrap()).unwrap();
-    assert!(!report.complete());
-    assert!(
-        report
-            .issues
-            .iter()
-            .any(|i| i.reason == "source_not_literal")
-    );
-    assert!(report.findings.is_empty());
-    assert_eq!(report.files, 1);
+    for spelling in [
+        "=fixture_command",
+        "''=fixture_command",
+        "\"\"=fixture_command",
+    ] {
+        std::fs::write(home.path().join(".zshrc"), format!("source {spelling}\n")).unwrap();
+        let report =
+            envcloak_scan::profile::scan_profiles(&open_root(home.path()).unwrap()).unwrap();
+        assert!(!report.complete());
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.reason == "source_not_literal")
+        );
+        assert!(report.findings.is_empty());
+        assert_eq!(report.files, 1);
+    }
     std::fs::write(home.path().join(".zshrc"), b"source '=fixture_command'\n").unwrap();
     let report = envcloak_scan::profile::scan_profiles(&open_root(home.path()).unwrap()).unwrap();
     assert!(report.complete());
