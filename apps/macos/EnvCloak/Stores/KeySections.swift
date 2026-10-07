@@ -32,3 +32,12 @@ extension VaultSession {
     }
 }
 
+
+/// Display text, including a redaction placeholder, is never a row key.
+struct DisplayRow<Value>: Identifiable {
+    let id: Int
+    let value: Value
+    static func of(_ values: [Value]) -> [Self] {
+        values.enumerated().map { Self(id: $0.offset, value: $0.element) }
+    }
+}

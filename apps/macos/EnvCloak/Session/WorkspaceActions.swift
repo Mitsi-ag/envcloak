@@ -32,16 +32,37 @@ import Foundation
             } catch { session.notice = "The project folder could not be saved. Try again." }
         }
     }
-    static func startDaemon(_ session: VaultSession) async {
+    static func installBundledDaemon() async throws {
+        let cli = try CLIRunner()
+        let daemon = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/EnvCloakAgent.app/Contents/MacOS/envcloakd")
+        try await installDaemon(using: cli, daemonPath: daemon.path)
+    }
+    static func installDaemon(using cli: CLIRunner, daemonPath: String) async throws {
+        try await cli.installDaemon(at: daemonPath)
+    }
+    static func startDaemon(_ session: VaultSession, install: @MainActor () async throws -> Void = installBundledDaemon) async {
         guard !session.actionInProgress else { return }
         session.actionInProgress = true
         defer { session.actionInProgress = false }
         do {
-            let cli = try CLIRunner()
-            let daemon = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/EnvCloakAgent.app/Contents/MacOS/envcloakd")
-            _ = try await cli.run(arguments: ["daemon", "install", "--daemon", daemon.path], workingDirectory: "/")
+            session.notice = nil
+            try await install()
             await session.poll()
             if session.state == .noDaemon { session.notice = "The background process was installed but has not answered yet." }
         } catch { session.notice = "The background process could not be started. Try envcloak daemon install in Terminal." }
     }
+}
+
+enum CopiedCommand: CaseIterable {
+    case initialize, createVault, unlock, status, recoveryHelp
+    var commandWords: [String] {
+        switch self {
+        case .initialize: ["init"]
+        case .createVault: ["vault", "create"]
+        case .unlock: ["unlock"]
+        case .status: ["status"]
+        case .recoveryHelp: ["recover", "--help"]
+        }
+    }
+    var text: String { "envcloak " + commandWords.joined(separator: " ") }
 }

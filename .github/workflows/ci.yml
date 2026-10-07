@@ -885,6 +885,7 @@ jobs:
           grep -q 'envcloak-probe-model and envcloak-probe-mcp' "$RUNNER_TEMP/probe.out" "$RUNNER_TEMP/probe.err"
       - name: The app's hosted tests
         run: |
+          TEST_RUNNER_ENVCLOAK_TEST_CLI="$RUNNER_TEMP/Applications/EnvCloak.app/Contents/MacOS/envcloak" \
           xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloak -destination 'platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/dd-debug" "SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
       - name: The app's UI tests (main, nightly and manual)

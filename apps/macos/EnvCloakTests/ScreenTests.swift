@@ -100,6 +100,22 @@ import XCTest
         XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
+    func testInspectorActionsAreUnavailableOrFieldQualified() async throws {
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        let item = try XCTUnwrap(session.items.rows.first)
+        let reveal = host(InspectorActionSheet(action: .reveal, item: item, field: nil))
+        await assertVisible("Reveal is unavailable in this build.", in: reveal)
+        XCTAssertFalse(labels(reveal).contains("Copy command"))
+        reveal.close()
+        let replace = host(InspectorActionSheet(action: .replace, item: item, field: DaemonText("secondary")))
+        await assertVisible("envcloak rotate 'fixture-0#secondary'", in: replace)
+        await assertVisible("Copy command", in: replace)
+        replace.close()
+        let inspector = host(KeyInspector(session: session, slug: item.slug, route: .constant(.keys(.all))))
+        await assertVisible("Field to replace", in: inspector)
+    }
+
     func testReadOnlyBannerExplainsMetadataRefusal() async {
         let client = ScriptedClient(); await client.configure(integrity: "tampered")
         let session = VaultSession(client: client); await session.poll()

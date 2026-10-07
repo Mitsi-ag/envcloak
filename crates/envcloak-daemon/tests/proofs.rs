@@ -130,6 +130,7 @@ fn a_caller_without_a_terminal_gives_no_proof() {
             updated_secs: 0,
             rotated_secs: None,
             expires_secs: None,
+            last_used_secs: None,
             account: None,
             detail: None,
             exposed: None,
