@@ -502,3 +502,39 @@ R-M2-50, R-M2-52, R-M2-74, R-M2-86 and T-16 remains unchanged. M2R-88, M2R-89 an
 M2R-87 retain their stated owners, deadlines and open work; HTTP transport and
 host rewrite round trips remain M2-18/M2-20 as the plan assigns. No push or
 GitHub comment was performed.
+
+
+## M2-21 merge integration
+
+Merge `56964998` joins M2-27 at `ac90aed5` with main at `6750d841`.
+The three conflict resolutions preserve the exact union of both parents:
+
+- `AuditKind` has 30 entries in numeric order. Reveal remains 22;
+  managed registration and launch remain 29 and 43. Tokens and decoding
+  retain both families with no renumbering.
+- The typed client protocol has 45 methods, including `items.reveal`, all
+  four managed methods and `projects.list`. Reveal parameters/output and
+  the managed declaration, update and runner fields are retained.
+- Reservation tests keep M2-21's synthetic audit/exit rows and M2-27's
+  independent generic token fixtures. Tests no longer borrow the now-landed
+  reveal audit kind as an unimplemented reservation.
+
+The auto-merges were checked through CLI, client, daemon routing, proof
+boundaries, audit conversion, exposure allowlisting and IPC/VAULT docs.
+Linux reveal still checks the requester before proof and again before release,
+and durably records the reveal before sending its framed value. Its shared
+pending-request boundary includes managed requests; managed update-plan and
+proof checks remain intact. macOS keeps its no-value method refusal.
+The terminal-only exposure allowlist entry coexists with the runner's entries.
+
+| Merge check | Mutation receipt |
+| --- | --- |
+| `managed_and_reveal_methods_are_known_client_methods` independently pins both families, requiring one registry entry, client role and the known log label | `drop-reveal-client-method` and `drop-managed-client-method` each compiled and failed the missing-entry assertion; original and restored controls passed |
+| The existing reservation checker validates the audit decoder's complete ordered registry | `drop-reveal-audit-all` failed on the omitted `AuditKind::Reveal`; the restored checker passed |
+
+The reservation checker alone accepted a client-method-list omission, since
+it checks typed method definitions rather than that list. That surviving
+probe led to the focused IPC test above; it is not counted as a failing
+mutation. The audit probe was a static checker failure, not a runtime test.
+Raw mutation receipts are `m27-m221-ipc-mutations.json` and the named audit
+checker log in the private lane target directory.
