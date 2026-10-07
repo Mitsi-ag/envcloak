@@ -29,17 +29,26 @@ enum Route: Hashable {
     }
 }
 
+struct KeyQuery {
+    let tokens: [Substring]
+    init(_ text: String) { tokens = text.lowercased().split(whereSeparator: \.isWhitespace) }
+    var needsProjects: Bool { tokens.contains { $0.hasPrefix("project:") } }
+}
+
 extension VaultSession {
+    func keysUnavailable(query: String, scope: DaemonText?) -> Bool {
+        items.failure != nil || (projects.failure != nil && (scope != nil || KeyQuery(query).needsProjects))
+    }
     func usedBy(_ slug: DaemonText) -> [ProjectView] {
         projects.rows.filter { $0.bindings.contains { MetadataRequest.slug($0.reference) == slug } }
     }
     func filteredKeys(query: String, filter: KeyFilter, scope: DaemonText?) -> [ItemView] {
-        let tokens = query.lowercased().split(whereSeparator: \.isWhitespace)
+        let tokens = KeyQuery(query).tokens
         return items.rows.filter { item in
             if filter == .live && item.classification != .live { return false }
             if filter == .test && item.classification != .test { return false }
             let users = usedBy(item.slug)
-            if let scope, !users.contains(where: { $0.dir == scope }) { return false }
+            if let scope, !users.contains(where: { $0.dir == projects.canonicalDirectory(scope) }) { return false }
             let text = [item.slug.escaped, item.title.escaped, item.provider?.escaped ?? "", item.account?.email?.escaped ?? "", item.env_hint?.escaped ?? ""].joined(separator: " ").lowercased()
             return tokens.allSatisfy { token in
                 let parts = token.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)

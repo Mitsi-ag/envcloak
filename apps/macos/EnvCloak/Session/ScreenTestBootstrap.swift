@@ -37,7 +37,14 @@ import AppKit
               directory.hasPrefix("/tmp/ec05-"), !directory.contains("..") else {
             return VaultSession(client: nil)
         }
-        return VaultSession(client: SocketWorkspaceClient(client: DaemonClient(directory: directory)))
+        do {
+            let folders = try ProjectFolders(file: URL(fileURLWithPath: directory).appendingPathComponent("test-folders.json"))
+            return VaultSession(client: SocketWorkspaceClient(client: DaemonClient(directory: directory)), folders: folders)
+        } catch {
+            let session = VaultSession(client: nil)
+            session.state = .unavailable
+            return session
+        }
     }
 }
 #endif

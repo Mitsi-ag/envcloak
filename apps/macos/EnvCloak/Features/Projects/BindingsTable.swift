@@ -41,7 +41,7 @@ struct BindingsTable: View {
             TableColumn("Access") { row in
                 TimelineView(.periodic(from: .now, by: 1)) { _ in
                     let grants = session.grants.rows.filter { grant in
-                        grant.project_dir == project.directory && session.grants.remaining(grant) > 0 && grant.bindings.contains { $0.env_name == row.binding.env_name && $0.slug == row.item?.slug }
+                        grant.project_dir == project.grantDirectory && session.grants.remaining(grant) > 0 && grant.bindings.contains { $0.env_name == row.binding.env_name && $0.slug == row.item?.slug }
                     }
                     Text(grants.map { "Grant recorded for " + ($0.label?.escaped ?? $0.kind.rawValue) + ", \(session.grants.remaining($0)) seconds left" }.joined(separator: "; "))
                         .help("A grant names this variable and key. The next run must still match its approved manifest, fields and command.")

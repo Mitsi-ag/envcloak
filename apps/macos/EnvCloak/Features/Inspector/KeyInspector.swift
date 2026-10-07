@@ -28,8 +28,10 @@ struct KeyInspector: View {
                     ForEach([item.account?.email, item.account?.label, item.account?.org_id].compactMap { $0 }, id: \.self) { Text($0.escaped) }
                     Text("Used by (last adopted run)").font(.headline)
                     if session.projects.failure != nil { Text("Projects could not be refreshed. Try again.") }
-                    ForEach(session.usedBy(item.slug), id: \.dir) { project in
-                        Button(MetadataRequest.basename(project.dir)) { route = .project(project.dir) }
+                    ForEach(Array(session.usedBy(item.slug).enumerated()), id: \.offset) { _, project in
+                        if MetadataRequest.directoryURL(project.dir) != nil {
+                            Button(session.projects.title(project.dir)) { route = .project(project.dir) }
+                        } else { Text(ProjectInventoryRow.hiddenPathMessage) }
                         ForEach(project.bindings.filter { MetadataRequest.slug($0.reference) == item.slug }, id: \.envName) { Text($0.envName.escaped).font(ECFont.martianMono(size: 10)) }
                     }
                     Text("Access").font(.headline)

@@ -17,6 +17,8 @@ actor ScriptedClient: WorkspaceClient {
     var itemCount = 1
     var pageMode = "single"
     var revokeFailure = false
+    var adoptedBinding = false
+    func adoptBinding() { adoptedBinding = true }
     func pages(_ mode: String) { pageMode = mode }
     func loseRevokeResponse() { revokeFailure = true }
     func configure(head: UInt64? = nil, grants: Int? = nil, pending: Int? = nil,
@@ -51,9 +53,11 @@ actor ScriptedClient: WorkspaceClient {
             if projectFailure { throw EnvCloakError.protocolError }
             let nextPage = (method as? ProjectsList)?.after != nil
             if pageMode == "fail-second" && nextPage { throw EnvCloakError.protocolError }
-            let next: Any = pageMode != "single" && (!nextPage || pageMode == "repeat")
+            let next: Any = !["single", "hidden-one-page", "duplicate-real"].contains(pageMode) && (!nextPage || pageMode == "repeat")
                 ? ["last_seen": 2, "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"] : NSNull()
-            result = ["projects": [["dir": nextPage ? "/tmp/second" : "/tmp/project", "manifest_sha256": String(repeating: "a", count: 64), "bindings": [], "last_seen_secs": nextPage ? 1 : 2]], "next": next]
+            let directory = pageMode.hasPrefix("hidden") ? "[not shown: looks like a key or token]" : (nextPage ? "/tmp/second" : "/tmp/project")
+            let row: [String: Any] = ["dir": directory, "manifest_sha256": String(repeating: "a", count: 64), "bindings": adoptedBinding ? [["env_name": "VARIABLE", "reference": "envcloak://fixture-0\u{202e}\u{1b}[31m"]] : [], "last_seen_secs": nextPage ? 1 : 2]
+            result = ["projects": ["hidden-one-page", "duplicate-real"].contains(pageMode) ? [row, row] : [row], "next": next]
 
         case "items.check": result = ["project_dir": "/tmp/project", "project_name": "project\u{202e}\u{1b}[31m", "bindings": [
             ["env_name": "VARIABLE", "reference": "envcloak://fixture", "status": "ok"],
@@ -76,6 +80,54 @@ actor ScriptedClient: WorkspaceClient {
 }
 
 final class SessionTests: XCTestCase {
+    @MainActor func testHiddenPathsAreRowsNotDirectoryIdentities() async {
+        for mode in ["hidden-one-page", "hidden-pages"] {
+            let client = ScriptedClient(); await client.pages(mode)
+            let store = ProjectsStore(client: client, folders: nil)
+            await store.refetch(.projects)
+            XCTAssertNil(store.failure)
+            XCTAssertEqual(store.rows.count, 2)
+            XCTAssertEqual(store.inventory.count, 2)
+            XCTAssertEqual(Set(store.inventory.map(\.id)).count, 2)
+            XCTAssertTrue(store.directories.isEmpty)
+            XCTAssertTrue(store.inventory.allSatisfy { $0.directory == nil })
+        }
+        let client = ScriptedClient(); await client.pages("duplicate-real")
+        let store = ProjectsStore(client: client, folders: nil)
+        await store.refetch(.projects)
+        XCTAssertEqual(store.failure, .protocolError)
+        XCTAssertTrue(store.rows.isEmpty)
+    }
+
+    @MainActor func testAliasUsesCheckedIdentityAndKeepsNavigationPath() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await session.poll()
+        await session.openProject(DaemonText("/tmp/selected-alias"))
+        XCTAssertEqual(session.projects.opened?.directory, DaemonText("/tmp/selected-alias"))
+        XCTAssertEqual(session.projects.opened?.grantDirectory, DaemonText("/tmp/project"))
+        XCTAssertEqual(session.projects.canonicalDirectory(DaemonText("/tmp/selected-alias")), DaemonText("/tmp/project"))
+    }
+
+    @MainActor func testProjectSearchDependencyNeverReportsFalseAbsence() async {
+        let client = ScriptedClient(); await client.adoptBinding()
+        let session = VaultSession(client: client)
+        await client.configure(projectFailure: true)
+        await session.poll()
+        for query in ["project:fixture", "PROJECT:fixture", "class:test  project:fixture", "project:"] {
+            XCTAssertTrue(session.keysUnavailable(query: query, scope: nil))
+        }
+        XCTAssertTrue(session.keysUnavailable(query: "", scope: DaemonText("/tmp/project")))
+        for query in ["", "provider:example", "project", "unknown:project:fixture"] {
+            XCTAssertFalse(session.keysUnavailable(query: query, scope: nil))
+        }
+        XCTAssertEqual(session.filteredKeys(query: "provider:example", filter: .all, scope: nil).count, 1)
+        await client.configure()
+        await session.poll()
+        XCTAssertFalse(session.keysUnavailable(query: "project:project", scope: nil))
+        XCTAssertEqual(session.filteredKeys(query: "project:project", filter: .all, scope: nil).count, 1)
+        XCTAssertEqual(session.filteredKeys(query: "project:missing", filter: .all, scope: nil).count, 0)
+    }
+
     @MainActor func testOnlyChangedStoresRefetch() async {
         let client = ScriptedClient()
         let session = VaultSession(client: client)

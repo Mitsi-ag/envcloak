@@ -29,6 +29,7 @@ def main():
     runtime = home / 'Library/Application Support/EnvCloak/run'
     project = home / 'workspace-fixture'
     project.mkdir(mode=0o700)
+    (home / 'selected-alias').symlink_to(project, target_is_directory=True)
     manifest = project / 'envcloak.toml'
     manifest.write_text('[project]\nname = "Workspace fixture"\n[env]\nVARIABLE = "fixture"\n')
     # This process is not a group leader under the detached check shell.
@@ -96,8 +97,9 @@ def main():
             del answer
             if len(rpc('projects.list')['projects']) != 1: raise RuntimeError('project not adopted')
             if len(rpc('grants.list')['grants']) != 1: raise RuntimeError('positive grant control absent')
+            (runtime / 'test-folders.json').write_text(json.dumps([str(home / 'selected-alias')]))
             command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / 'm305-ui'), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', 'test']
-            test_env = dict(os.environ, TEST_RUNNER_ENVCLOAK_TEST_RUNTIME=str(runtime), TEST_RUNNER_ENVCLOAK_TEST_PROJECT=str(project.resolve()))
+            test_env = dict(os.environ, TEST_RUNNER_ENVCLOAK_TEST_RUNTIME=str(runtime), TEST_RUNNER_ENVCLOAK_TEST_PROJECT=str(home / "selected-alias"))
             tested = subprocess.run(command, env=test_env, timeout=300)
             if tested.returncode: return tested.returncode
             if rpc('grants.list')['grants']: raise RuntimeError('UI revoke did not empty real grants.list')

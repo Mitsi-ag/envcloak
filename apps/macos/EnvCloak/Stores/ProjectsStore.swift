@@ -5,6 +5,7 @@ import Observation
 struct OpenedProject {
     let directory: DaemonText
     let check: CheckView
+    var grantDirectory: DaemonText? { check.project_dir }
     var title: String { check.project_name?.escaped ?? MetadataRequest.basename(directory) }
     var profiles: [String] { Array(Set(check.bindings.compactMap { $0.profile?.escaped })).sorted() }
     func bindings(profile: String?) -> [CheckBindingView] {
@@ -14,6 +15,13 @@ struct OpenedProject {
         return (selected + check.bindings.filter { $0.profile == nil && !names.contains($0.env_name ?? DaemonText("")) })
             .sorted { ($0.env_name?.escaped ?? "") < ($1.env_name?.escaped ?? "") }
     }
+}
+
+struct ProjectInventoryRow: Identifiable {
+    let id: Int
+    let directory: DaemonText?
+    let bindings: Int?
+    static let hiddenPathMessage = "Folder path hidden: it looks like a key or token"
 }
 
 @Observable @MainActor final class ProjectsStore: Store {
@@ -34,9 +42,24 @@ struct OpenedProject {
         self.client = client; self.folders = folders; added = folders?.paths ?? []
     }
     var directories: [DaemonText] {
-        var result = rows.map(\.dir)
+        var result = rows.map(\.dir).filter { MetadataRequest.directoryURL($0) != nil }
         for path in added where !result.contains(path) { result.append(path) }
         return result
+    }
+    var inventory: [ProjectInventoryRow] {
+        var result = rows.enumerated().map { index, row in
+            ProjectInventoryRow(id: index, directory: MetadataRequest.directoryURL(row.dir) == nil ? nil : row.dir, bindings: row.bindings.count)
+        }
+        for path in added where !rows.contains(where: { $0.dir == path }) {
+            result.append(ProjectInventoryRow(id: result.count, directory: path, bindings: nil))
+        }
+        return result
+    }
+    func title(_ directory: DaemonText) -> String {
+        opened?.directory == directory ? opened!.title : MetadataRequest.basename(directory)
+    }
+    func canonicalDirectory(_ directory: DaemonText) -> DaemonText? {
+        opened?.directory == directory ? opened!.check.project_dir : directory
     }
     func clear() {
         revision += 1; openRevision += 1; manifestSignal = nil; rows = []; opened = nil
@@ -71,7 +94,9 @@ struct OpenedProject {
                     guard !page.projects.isEmpty, next.map({ cursor.precedes($0) }) ?? true else { throw EnvCloakError.protocolError }
                 }
                 for row in page.projects {
-                    guard directories.insert(row.dir).inserted else { throw EnvCloakError.protocolError }
+                    if row.dir != DaemonText("[not shown: looks like a key or token]") {
+                        guard MetadataRequest.directoryURL(row.dir) != nil, directories.insert(row.dir).inserted else { throw EnvCloakError.protocolError }
+                    }
                     result.append(row)
                 }
                 // Refuse oversized inventories explicitly; never publish a partial page set.
@@ -92,11 +117,11 @@ struct OpenedProject {
     }
     func open(_ directory: DaemonText) async {
         guard let client else { return }
+        openRevision += 1
         guard let url = MetadataRequest.directoryURL(directory) else {
             opened = nil; checkFailure = .protocolError; return
         }
         manifestSignal = ManifestSignal(directory: url)
-        openRevision += 1
         let captured = openRevision
         openedDirectory = directory; opened = nil; checkFailure = nil
         do {
