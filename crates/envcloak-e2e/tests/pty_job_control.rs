@@ -33,7 +33,10 @@
 //!   suspends, the byte reaches cat);
 //! - SIGTSTP sent to `envcloak run` from outside (by the program that
 //!   started it, its owner): the command is stopped before the outer
-//!   terminal is restored (it is stopped when the outer prompt comes);
+//!   terminal is restored, observed at the actual restore in testing
+//!   builds. External release binaries have no test hooks; they still
+//!   must leave the command stopped when the outer prompt comes, restore
+//!   the settings and resume the command on `fg`;
 //! - the retrying cat again under `/bin/dash -i`, a job of the outer shell
 //!   in its session: dash, unlike bash, does not put its own terminal
 //!   settings back when a job stops, so `stty -g` at its prompt is what
@@ -1029,8 +1032,10 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         "the suspend character back"
     );
 
-    // SIGTSTP from outside: the command is stopped before the outer
-    // terminal is restored.
+    // SIGTSTP from outside: testing builds must stop at the actual restore
+    // barrier. External release binaries check the visible contract below.
+    // Select this by the harness's explicit binary mode, never by whether
+    // the barrier shows up: a missing testing hook must fail the gate.
     let fifo = files.join("signals");
     let made = Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap();
     assert!(made.success());
@@ -1038,9 +1043,16 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
     let restored = files.join("restore-checked");
     let before_tstp = sh.outer.settings();
     let mark = sh.mark();
+    let pause = if h.test_build() {
+        format!(
+            "ENVCLOAK_TEST_PAUSE=termios.restored ENVCLOAK_TEST_PAUSE_RELEASE={} ",
+            quoted(restored.to_str().unwrap())
+        )
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "ENVCLOAK_TEST_PAUSE=termios.restored ENVCLOAK_TEST_PAUSE_RELEASE={} {} {} {} {} run --pty --",
-        quoted(restored.to_str().unwrap()),
+        "{pause}{} {} {} {} run --pty --",
         quoted(&py),
         quoted(&signaller),
         quoted(fifo.to_str().unwrap()),
@@ -1074,32 +1086,42 @@ fn the_outer_shell_gets_its_terminal_back_and_fg_resumes_through_envcloak_run_pt
         .unwrap()
         .write_all(b"TSTP\n")
         .unwrap();
-    sh.outer.expect_since(
-        mark,
-        b"envcloak test: paused at termios.restored",
-        1,
-        "the actual outer-terminal restore",
-    );
-    // The barrier is inside TerminalGuard::restore, after tcsetattr. It
-    // catches an early restore through either relay call site, before a
-    // later Suspend or Stopped report can hide the wrong ordering.
-    let at_restore = state_of(pid);
-    let settings_restored = sh.outer.settings().same_as(&before_tstp);
-    let barrier_held = Instant::now() < check_by;
-    std::fs::write(&restored, b"").unwrap();
-    assert!(barrier_held, "the restore observation outlived its barrier");
-    assert!(
-        at_restore.starts_with('T'),
-        "the command ran at the actual terminal restore: state {at_restore:?}"
-    );
-    assert!(
-        settings_restored,
-        "the restore barrier precedes restored settings"
-    );
-    println!(
-        "outside SIGTSTP ({}): command {at_restore:?}, terminal restored at the restore barrier",
-        std::env::consts::OS
-    );
+    if h.test_build() {
+        assert!(
+            sh.outer
+                .wait_for_within(check_by.saturating_duration_since(Instant::now()), |o| o
+                    .count_since(mark, b"envcloak test: paused at termios.restored")
+                    >= 1),
+            "testing binary missed the actual outer-terminal restore barrier; the terminal showed:\n{}",
+            sh.outer.text()
+        );
+        // The barrier is inside TerminalGuard::restore, after tcsetattr. It
+        // catches an early restore through either relay call site, before a
+        // later Suspend or Stopped report can hide the wrong ordering.
+        let at_restore = state_of(pid);
+        let settings_restored = sh.outer.settings().same_as(&before_tstp);
+        let barrier_held = Instant::now() < check_by;
+        std::fs::write(&restored, b"").unwrap();
+        assert!(barrier_held, "the restore observation outlived its barrier");
+        assert!(
+            at_restore.starts_with('T'),
+            "the command ran at the actual terminal restore: state {at_restore:?}"
+        );
+        assert!(
+            settings_restored,
+            "the restore barrier precedes restored settings"
+        );
+        println!(
+            "outside SIGTSTP ({}): command {at_restore:?}, terminal restored at the restore barrier",
+            std::env::consts::OS
+        );
+    } else {
+        println!(
+            "outside SIGTSTP ({}): external release binaries have no restore barrier; \
+             checking the stopped job, terminal settings and fg",
+            std::env::consts::OS
+        );
+    }
     sh.prompt_again("SIGTSTP from outside gave the shell its prompt");
     let state = state_of(pid);
     assert!(
