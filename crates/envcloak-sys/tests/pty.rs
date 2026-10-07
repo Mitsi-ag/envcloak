@@ -717,6 +717,7 @@ fn exec_error(argv: &[&OsStr], env: &[(&OsStr, &OsStr)]) -> Option<i32> {
     match spawn_session(argv, env, pty.slave) {
         Err(SessionError::Exec(e)) => e.raw_os_error(),
         Err(SessionError::Setup(e)) => panic!("a setup error: {e}"),
+        Err(SessionError::Unconfirmed(e)) => panic!("an unconfirmed start: {e}"),
         Ok(m) => {
             drop(m);
             None

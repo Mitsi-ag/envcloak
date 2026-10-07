@@ -197,16 +197,19 @@ pub enum MonitorCommand {
     Signal(i32),
 }
 
-/// Why [`spawn_session`] started no command.
+/// Why [`spawn_session`] could not confirm a command's start.
 #[derive(Debug)]
 pub enum SessionError {
-    /// EnvCloak's own failure: the control channel, the fork, or the
-    /// monitor's session, descriptors or terminal.
+    /// EnvCloak's own failure before launch: the control channel, the
+    /// fork, or a reported failure of the monitor's session or terminal.
     Setup(io::Error),
     /// The command could not be executed: `ENOENT` when no candidate path
     /// exists, `EACCES` when one was refused, or the error of the last
     /// `execve`.
     Exec(io::Error),
+    /// The monitor's first report was missing, unreadable or unexpected.
+    /// The command may already have run, so this is never a setup refusal.
+    Unconfirmed(io::Error),
 }
 
 impl core::fmt::Display for SessionError {
@@ -214,6 +217,7 @@ impl core::fmt::Display for SessionError {
         match self {
             SessionError::Setup(e) => write!(f, "the PTY session could not be set up: {e}"),
             SessionError::Exec(e) => write!(f, "the command could not be executed: {e}"),
+            SessionError::Unconfirmed(e) => write!(f, "the PTY command may have started: {e}"),
         }
     }
 }
@@ -346,8 +350,10 @@ fn socket_pair() -> io::Result<(OwnedFd, OwnedFd)> {
 ///
 /// # Errors
 /// [`SessionError::Exec`] when the command could not be executed;
-/// [`SessionError::Setup`] for everything else, including a SIGCHLD that
-/// would reap the monitor on its own and cannot be given its default back.
+/// [`SessionError::Setup`] for a failure known to precede launch, including
+/// a SIGCHLD that would reap the monitor on its own and cannot be given its
+/// default back; [`SessionError::Unconfirmed`] when the first report is
+/// lost or invalid after forking the monitor. The command may have run.
 /// A NUL byte in `argv` or `env` is [`io::ErrorKind::InvalidInput`], under
 /// `Setup`.
 pub fn spawn_session(
@@ -400,6 +406,8 @@ pub fn spawn_session(
     crate::owned::keep_children_unreaped().map_err(SessionError::Setup)?;
     let (ours, theirs) = socket_pair().map_err(SessionError::Setup)?;
     let prepared = pty_monitor::Prepared {
+        #[cfg(feature = "testing")]
+        lose_start_report: crate::fail_point("sys.pty.start-report").is_err(),
         slave: slave.as_raw_fd(),
         control: theirs.as_raw_fd(),
         programs: program_ptrs.as_ptr(),
@@ -435,27 +443,39 @@ pub fn spawn_session(
         buf: [0; FRAME],
         filled: 0,
     };
-    match session.next_report(None) {
-        Ok(Some(Report::Started(pid))) => {
-            session.command = pid.unsigned_abs();
+    #[cfg(feature = "testing")]
+    if prepared.lose_start_report {
+        // The fixture proves the command ran before releasing this pause.
+        // The monitor withholds Started, then dies through its owned handle.
+        crate::pause_point("sys.pty.start-report");
+        session.kill_point("sys.pty.start-report");
+    }
+    match startup_command(session.next_report(None)) {
+        Ok(pid) => {
+            session.command = pid;
             Ok(session)
         }
-        Ok(Some(Report::ExecFailed(e))) => {
-            session.reap_now();
-            Err(SessionError::Exec(io::Error::from_raw_os_error(e)))
+        Err(e) => {
+            if !matches!(e, SessionError::Unconfirmed(_)) {
+                session.reap_now();
+            }
+            // On an ambiguous report, Drop kills and reaps the owned
+            // monitor: a malformed report need not mean it has exited.
+            Err(e)
         }
+    }
+}
+
+/// Only the monitor's explicit pre-exec refusals establish no launch.
+fn startup_command(report: io::Result<Option<Report>>) -> Result<u32, SessionError> {
+    match report {
+        Ok(Some(Report::Started(pid))) => Ok(pid.unsigned_abs()),
+        Ok(Some(Report::ExecFailed(e))) => Err(SessionError::Exec(io::Error::from_raw_os_error(e))),
         Ok(Some(Report::SetupFailed(e))) => {
-            session.reap_now();
             Err(SessionError::Setup(io::Error::from_raw_os_error(e)))
         }
-        Ok(_) => {
-            session.reap_now();
-            Err(SessionError::Setup(io::ErrorKind::InvalidData.into()))
-        }
-        Err(e) => {
-            session.reap_now();
-            Err(SessionError::Setup(e))
-        }
+        Ok(_) => Err(SessionError::Unconfirmed(io::ErrorKind::InvalidData.into())),
+        Err(e) => Err(SessionError::Unconfirmed(e)),
     }
 }
 
@@ -884,6 +904,73 @@ fn session_signal(_: &SessionMonitor, _: BorrowedFd<'_>, _: i32) -> io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_startup_refusals_mean_no_command_ran() {
+        use std::io::Write;
+
+        // Wire bytes written without the encoder, through the real channel
+        // reader. Short reads and every partial-frame EOF remain uncertain.
+        let read = |wire: &[u8]| {
+            let (ours, theirs) = socket_pair().unwrap();
+            let mut writer = std::fs::File::from(theirs);
+            writer.write_all(wire).unwrap();
+            drop(writer);
+            let mut session = SessionMonitor {
+                monitor: None,
+                control: Some(ours),
+                command: 0,
+                buf: [0; FRAME],
+                filled: 0,
+            };
+            startup_command(session.next_report(None))
+        };
+        let started = [1, 0xec, 0, 0, 42, 0, 0, 0];
+        assert_eq!(read(&started).unwrap(), 42);
+        assert!(matches!(
+            read(&[2, 0xec, 0, 0, 5, 0, 0, 0]),
+            Err(SessionError::Setup(_))
+        ));
+        assert!(matches!(
+            read(&[3, 0xec, 0, 0, 2, 0, 0, 0]),
+            Err(SessionError::Exec(_))
+        ));
+        for len in 0..FRAME {
+            assert!(
+                matches!(read(&started[..len]), Err(SessionError::Unconfirmed(_))),
+                "partial startup frame {len} claimed no launch"
+            );
+        }
+        for wire in [
+            [0xff; FRAME],
+            [1, 0xec, 1, 0, 42, 0, 0, 0], // padding
+            [1, 0xec, 0, 0, 0, 0, 0, 0],  // invalid pid
+            [4, 0xec, 0, 0, 2, 0, 0, 0],  // stopped before Started
+            [5, 0xec, 0, 0, 0, 0, 0, 0],  // continued before Started
+            [6, 0xec, 0, 0, 0, 0, 0, 0],  // exited before Started
+        ] {
+            assert!(
+                matches!(read(&wire), Err(SessionError::Unconfirmed(_))),
+                "invalid or unexpected startup report claimed no launch: {wire:?}"
+            );
+        }
+        assert!(matches!(
+            startup_command(Ok(None)),
+            Err(SessionError::Unconfirmed(_))
+        ));
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::InvalidData,
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Other,
+        ] {
+            assert!(
+                matches!(startup_command(Err(kind.into())), Err(SessionError::Unconfirmed(e)) if e.kind() == kind),
+                "a startup channel error claimed no launch: {kind:?}"
+            );
+        }
+    }
 
     #[test]
     fn a_program_is_looked_up_as_execvp_does() {
