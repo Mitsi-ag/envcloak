@@ -230,6 +230,7 @@ const VERSIONED: &[&str] = &[
     "perl",
     "php",
     "lua",
+    "luajit",
     "tclsh",
     "wish",
     "guile",
@@ -340,7 +341,7 @@ fn stem_loading_short(stem: &str) -> &'static [char] {
     }
 }
 
-const CODE_LOADING_LONG: [&str; 30] = [
+const CODE_LOADING_LONG: [&str; 31] = [
     "--inspect",
     "--inspect-brk",
     "--inspect-wait",
@@ -371,6 +372,7 @@ const CODE_LOADING_LONG: [&str; 30] = [
     "--run",
     "--test",
     "--watch-path",
+    "--login",
 ];
 
 /// The long interpreter options that take a value attached with `=` and
@@ -405,7 +407,7 @@ const VALUE_LONG_PREFIXES: [&str; 2] = ["--allow-", "--deny-"];
 /// before the entry file without `=`. Any other long option without `=`
 /// may take the next argument as its value (`node --title /a /b.js` runs
 /// `/b.js`), so which argument is the entry file is not known.
-const BOOLEAN_LONG: [&str; 18] = [
+const BOOLEAN_LONG: [&str; 17] = [
     "--trace-warnings",
     "--trace-deprecation",
     "--trace-uncaught",
@@ -420,7 +422,6 @@ const BOOLEAN_LONG: [&str; 18] = [
     "--norc",
     "--noprofile",
     "--posix",
-    "--login",
     "--verbose",
     "--quiet",
     "--unsafe-proto",
@@ -662,7 +663,7 @@ fn base(arg: &str) -> &str {
 
 /// The interpreter family `name` is, by its name: one of [`INTERPRETERS`],
 /// or one of [`VERSIONED`] with a version after it (`python3.12`,
-/// `node22`), which may end in CPython's ABI flags (for example
+/// `node22`, `node-22`, `luajit-2.1`), ignoring ASCII case, which may end in CPython's ABI flags (for example
 /// `python3.14t`, a free-threaded build; `python3.13d`, a debug build;
 /// `python3.13td`; `python3.7m`) and in Debian's `-dbg`
 /// (`python3.12-dbg`). Architecture suffixes, pythonw, alternate Python
@@ -671,7 +672,15 @@ fn base(arg: &str) -> &str {
 /// an interpreter: a name it missed would pass as a native program, whose
 /// class binds what runs, while the interpreter's code is chosen by its
 /// arguments (review of M2-27: `python3.14t` was a program).
-fn interpreter_family(name: &str) -> Option<&str> {
+fn interpreter_family(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let name = lower.as_str();
+    let versioned = |version: &str| {
+        version
+            .strip_prefix('-')
+            .unwrap_or(version)
+            .starts_with(|c: char| c.is_ascii_digit())
+    };
     let name = ["-intel64", "-arm64", "-universal2", "-x86_64"]
         .iter()
         .find_map(|suffix| name.strip_suffix(suffix))
@@ -692,18 +701,21 @@ fn interpreter_family(name: &str) -> Option<&str> {
         ("truffleruby", "ruby"),
     ] {
         if let Some(version) = name.strip_prefix(alias) {
-            if version.is_empty() || version.starts_with(|c: char| c.is_ascii_digit()) {
+            if version.is_empty() || versioned(version) {
                 return Some(family);
             }
         }
     }
-    if INTERPRETERS.contains(&name) {
-        return Some(name);
+    if let Some(stem) = INTERPRETERS
+        .iter()
+        .find(|stem| stem.eq_ignore_ascii_case(name))
+    {
+        return Some(stem);
     }
-    VERSIONED.iter().copied().find(|stem| {
-        name.strip_prefix(stem)
-            .is_some_and(|version| version.starts_with(|c: char| c.is_ascii_digit()))
-    })
+    VERSIONED
+        .iter()
+        .copied()
+        .find(|stem| name.strip_prefix(stem).is_some_and(versioned))
 }
 
 /// The first argument of `argv` after `from` that is not an option.
@@ -1541,6 +1553,69 @@ mod tests {
         ] {
             assert_eq!(
                 classify_argv(&decl(&[name]).argv),
+                Ok(ArgvClass::Program),
+                "{name}"
+            );
+        }
+    }
+
+    /// Mutations: case-sensitive families, or no hyphen-version match.
+    #[test]
+    fn interpreter_case_and_hyphen_versions_keep_code_loading_refusals() {
+        for name in [
+            "Python",
+            "Python3",
+            "PYTHON3.12",
+            "luajit-2.1.1736781742",
+            "node-22",
+            "Node-22",
+            "Pythonw-3",
+            "PHP-CGI-8.4",
+        ] {
+            let path = format!("/x/{name}");
+            for option in ["-m", "-e"] {
+                let d = decl(&[&path, option, "server"]);
+                let refused = Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+                assert_eq!(classify_argv(&d.argv), refused, "{name} {option}");
+                assert_eq!(refuse_disguised(&d.argv, &path), refused, "{name}");
+                assert_eq!(
+                    check_declaration(&d),
+                    Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+                );
+                assert!(matches!(
+                    apply_changes(
+                        &decl(&["/bin/server"]),
+                        &LaunchChanges {
+                            argv: Some(d.argv),
+                            ..LaunchChanges::default()
+                        }
+                    ),
+                    Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+                ));
+                assert_eq!(
+                    shebang_argv(&path, Some(option), "/srv/entry", &[], &path),
+                    Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+                );
+                assert_eq!(
+                    refuse_disguised(&decl(&["/bin/server", option, "server"]).argv, &path),
+                    Err(DeclError::Disguised)
+                );
+            }
+            assert_eq!(
+                classify_argv(&decl(&[&path, "/srv/entry"]).argv),
+                Ok(ArgvClass::Interpreter { entry: 1 })
+            );
+        }
+        for name in [
+            "python-server",
+            "nodemon",
+            "pythonwrench",
+            "Python-server",
+            "node-",
+            "luajit-server",
+        ] {
+            assert_eq!(
+                classify_argv(&decl(&[name, "-m", "server"]).argv),
                 Ok(ArgvClass::Program),
                 "{name}"
             );

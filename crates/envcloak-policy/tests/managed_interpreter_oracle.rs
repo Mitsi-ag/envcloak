@@ -243,3 +243,58 @@ fn python_startup_environment_cannot_select_unchecked_code() {
         assert!(environment.iter().all(|(n, _)| n != name.as_bytes()));
     }
 }
+
+/// A real login shell loads a private startup file before the entry.
+/// Mutation: keep --login in BOOLEAN_LONG instead of CODE_LOADING_LONG.
+#[test]
+fn bash_login_startup_is_refused_for_declarations_updates_and_shebangs() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let bash = Path::new("/bin/bash");
+    let entry = h.join("entry.sh");
+    std::fs::write(&entry, "printf 'entry\\n'\n").unwrap();
+    std::fs::write(h.join(".bash_profile"), "printf 'startup\\n'\n").unwrap();
+    let e = entry.to_str().unwrap();
+    assert_eq!(run(bash, h, &[e.into()], &[]), "entry\n");
+    let base = LaunchDecl {
+        argv: vec!["/bin/bash".into(), e.into()],
+        cwd: None,
+        env: vec![],
+        path_env: None,
+    };
+    assert!(check_declaration(&base).is_ok());
+    for option in ["--login", "-l", "-lx"] {
+        assert_eq!(
+            run(bash, h, &[option.into(), e.into()], &[]),
+            "startup\nentry\n"
+        );
+        let argv = vec!["/bin/bash".into(), option.into(), e.into()];
+        let declaration = LaunchDecl {
+            argv: argv.clone(),
+            ..base.clone()
+        };
+        assert_eq!(
+            check_declaration(&declaration),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+        assert!(matches!(
+            apply_changes(
+                &base,
+                &LaunchChanges {
+                    argv: Some(argv),
+                    ..LaunchChanges::default()
+                }
+            ),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        ));
+        assert_eq!(
+            shebang_argv("/bin/bash", Some(option), e, &[], "/bin/bash"),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+    }
+}
