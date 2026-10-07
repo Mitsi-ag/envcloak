@@ -1238,7 +1238,7 @@ fn statement(
     }
 }
 
-/// Metadata for the first-run undo statement, before any passphrase is read.
+/// Metadata for first-run and scrub undo, before any passphrase is read.
 pub(crate) fn show_first_run(
     shared: &Shared,
     caller: &SubjectEvidence,
@@ -1248,7 +1248,7 @@ pub(crate) fn show_first_run(
     use envcloak_ipc::view::FileBackupCreatorView;
     let (reader, _) = open_reader(shared, id)?;
     let m = reader.meta();
-    if m.purpose != BackupPurpose::Init || m.files.len() != 1 {
+    if !matches!(m.purpose, BackupPurpose::Init | BackupPurpose::Scrub) || m.files.len() != 1 {
         return Err(RpcError::new(ErrorKind::NoSuchBackup));
     }
     if m.creator.kind != CreatorKind::Terminal && shares_with_creator(caller, &m.creator) {
