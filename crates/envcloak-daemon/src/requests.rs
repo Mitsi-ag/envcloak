@@ -655,6 +655,22 @@ pub fn run_request(
                 // The daemon hands out no value under a tracer.
                 refuse_if_traced()?;
                 let (fields, released) = release_plan(s.unlocked()?, &again.bindings)?;
+                let adopted_project = envcloak_core::vault::ProjectRecord {
+                    key: again.project.vault_key(),
+                    display_path: project_dir.clone(),
+                    manifest_sha256: project.manifest.sha256,
+                    bindings: bindings
+                        .iter()
+                        .filter(|(_, source)| {
+                            matches!(source, BindingSource::Env | BindingSource::Profile { .. })
+                        })
+                        .map(|(b, _)| envcloak_core::vault::ProjectBinding {
+                            env_name: b.env_name.as_str().to_owned(),
+                            reference: b.reference.to_string(),
+                        })
+                        .collect(),
+                    last_seen: 0, // Read at commit, after framing.
+                };
                 if let Some((checked, ends)) = &route {
                     // A managed server's values go to the runner or relay
                     // the daemon starts, never to the client (D-36).
@@ -663,6 +679,7 @@ pub fn run_request(
                         entry: covered,
                         fields,
                         released,
+                        project: adopted_project,
                     };
                     match prepare_runner(shared, id, &mut s, c, checked, ends) {
                         Prepared::Lapsed => {
@@ -715,22 +732,7 @@ pub fn run_request(
                     &alive,
                     AuditEvent::Request(Box::new(covered)),
                     &fields,
-                    Some(envcloak_core::vault::ProjectRecord {
-                        key: again.project.vault_key(),
-                        display_path: project_dir.clone(),
-                        manifest_sha256: project.manifest.sha256,
-                        bindings: bindings
-                            .iter()
-                            .filter(|(_, source)| {
-                                matches!(source, BindingSource::Env | BindingSource::Profile { .. })
-                            })
-                            .map(|(b, _)| envcloak_core::vault::ProjectBinding {
-                                env_name: b.env_name.as_str().to_owned(),
-                                reference: b.reference.to_string(),
-                            })
-                            .collect(),
-                        last_seen: 0, // Read at commit, after framing.
-                    }),
+                    Some(adopted_project),
                     answer,
                 );
                 let frame = match delivered {
@@ -876,6 +878,7 @@ fn launch_manifest(
 struct Covered {
     grant: GrantId,
     entry: RequestAudit,
+    project: envcloak_core::vault::ProjectRecord,
     fields: Vec<FieldId>,
     released: Vec<(String, String, bool)>,
 }
@@ -1087,6 +1090,7 @@ fn prepare_runner(
         &alive,
         AuditEvent::Request(Box::new(c.entry)),
         &c.fields,
+        Some(c.project),
         release,
     );
     let release = match delivered {

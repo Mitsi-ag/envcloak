@@ -42,6 +42,65 @@ fn helper() {
     helper_main();
 }
 
+/// SPEC 6.4/6.6: managed directories enter the project index through
+/// covered delivery, with the same transaction and refresh as ordinary runs.
+/// Registration, a pending request and approval alone adopt nothing; a
+/// refused changed launch cannot refresh the last successful adoption.
+/// Mutation: omit-managed-project-adoption leaves the index empty.
+#[test]
+fn a_managed_launch_is_adopted_only_when_delivery_is_admitted() {
+    let mut w = World::new(&[]);
+    let empty = json!({"projects": [], "next": null});
+    let (launch, _) = w.register_fixture();
+    assert_eq!(w.agent("projects", &json!({})), empty);
+    let pending = w.request(&launch);
+    assert_eq!(w.agent("projects", &json!({})), empty);
+    w.approve(&pending_id(&pending));
+    assert_eq!(w.agent("projects", &json!({})), empty);
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    let adopted = w.agent("projects", &json!({}));
+    assert!(adopted["next"].is_null(), "{adopted}");
+    assert_eq!(adopted["projects"].as_array().unwrap().len(), 1);
+    let row = &adopted["projects"][0];
+    let manifest = w.project.join("envcloak.toml");
+    assert_eq!(row["dir"], w.project.to_str().unwrap());
+    assert_eq!(
+        row["manifest_sha256"],
+        sha256_hex(&std::fs::read(&manifest).unwrap())
+    );
+    assert_eq!(
+        row["bindings"],
+        json!([{"env_name": KEY, "reference": "stripe/fixture"}])
+    );
+    assert!(row["last_seen_secs"].as_u64().unwrap() > 0);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&manifest)
+        .unwrap();
+    file.write_all(b"# refreshed metadata\n").unwrap();
+    drop(file);
+    let answer = w.request(&launch);
+    assert!(started(&answer), "{answer}");
+    let refreshed = w.agent("projects", &json!({}));
+    assert_eq!(refreshed["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        refreshed["projects"][0]["manifest_sha256"],
+        sha256_hex(&std::fs::read(&manifest).unwrap())
+    );
+    assert_ne!(
+        refreshed["projects"][0]["manifest_sha256"],
+        row["manifest_sha256"]
+    );
+    assert_eq!(refreshed["projects"][0]["bindings"], row["bindings"]);
+    other_build(&w.fixture);
+    let answer = w.request(&launch);
+    assert_eq!(error_of(&answer), "managed_launch_changed", "{answer}");
+    assert_eq!(w.agent("projects", &json!({})), refreshed);
+    w.assert_released(0, 2, "project adoption preserves the private recipient");
+    w.h.assert_swept("after managed project adoption");
+}
+
 /// `envcloak run` by the agent against the managed project: with
 /// `--manifest`, and from inside it (upward search), `printenv` of the
 /// key. Both refused `managed_command_mismatch` (exit 125) with no
