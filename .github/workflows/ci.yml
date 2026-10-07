@@ -247,6 +247,33 @@ jobs:
           RUST_BACKTRACE: full
         run: cargo test --locked -p envcloak-e2e --test pty_job_control --no-fail-fast
 
+  managed-oracles:
+    name: managed runtime oracles (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: managed-oracles
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26.7.0"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/managed-oracles
+          key: managed-oracles-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/provision-managed-oracles.py') }}
+      - name: Build pinned PHP, debug CPython and npm oracles
+        run: python3 -B scripts/provision-managed-oracles.py "$RUNNER_TEMP/managed-oracles"
+      - name: Require every runtime oracle and its execution controls
+        run: |
+          python3 -B scripts/test-managed-oracles.py
+          scripts/check-managed-oracles.sh
+
   # The shipped binaries as `cargo build --release` makes them: panic =
   # "abort" and no core file (gate 19), no test hook, a truthful `status`,
   # and the fixture story and gate 12 run on them
