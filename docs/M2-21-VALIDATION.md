@@ -140,3 +140,45 @@ already-pinned `secrecy 0.10.3`; no package version was added or changed.
 The full workspace and real-agent acceptance jobs also remain with CI and
 M2-26, as required by the task's local-test restriction. No claim is made for
 production-signed artifacts or an opt-in privileged core-dump control.
+
+## CI follow-up after the M3-04 rebase
+
+The driver commit `53e91c03` keeps `CLIENT_METHODS` at 41. The real `reveal`
+audit kind 22 and `app_required` exit token remain landed. Reservation tests
+now add synthetic `fixture_audit` (200) and `tst_required` rows to their
+isolated document copies. The exit token keeps the original token's length
+for the formatting cases. Numeric-literal cases use 200 in each radix and
+201 for an unregistered entry. The production checker is unchanged.
+
+Mutation `ignore_synthetic_reservation_entries` removed these entries from
+both the rows and the code checked by a temporary copy of the checker. All
+five selected gates failed because the checker incorrectly returned success:
+`a_reserved_entry_the_code_already_has_fails`,
+`a_landed_row_the_code_lacks_fails`,
+`a_landed_row_with_another_number_than_the_code_fails`,
+`a_line_whose_pieces_the_source_holds_is_read_whole`, and
+`a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused` (the
+compiled `relative` case). No mutation remains in the tracked tree.
+
+The doctor gate has a pre-existing fixture-dependent failure. Temporarily
+replacing only its `fresh_seed()` with `51` reproduces exactly the extra
+`unknown openai` line. That generated fixture ends in `-`; the scanner's
+punctuation trimming emits another valid provider-shaped candidate that is
+not the full value held in the vault. The human grammar allows only
+`unknown github`, although its JSON assertions permit other unknown
+providers. No timing or ordering change is needed to reproduce it.
+The doctor test and command, scanner, provider registry, daemon scan matcher,
+and canary generator are identical to pre-M2-21 commit `6489768b`.
+The seed change was restored; the unmodified doctor gate passed. Doctor is
+left unchanged as requested for an unrelated existing flake.
+
+Detached macOS checks after the fixture repair passed: `cargo fmt --all
+--check`, `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`,
+`check-unsafe.sh`, `check-expose-lint.sh` (6 of 6 call sites), and
+`check-reservations.py` on the real tree (262 rows, 17 tables). Builds used
+target C, incremental disabled and three jobs; tests used `--no-fail-fast`
+and `--test-threads 3`. No full workspace or GiB-scale scanner test was run.
+
+The detached `check_reservations` target passed all 91 tests, including the
+26 failures reported by CI (0 failed, 0 ignored). The unmodified doctor
+gate passed its one selected test; the GiB test stayed filtered out.
