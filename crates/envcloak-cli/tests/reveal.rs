@@ -115,8 +115,21 @@ mod linux {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_value(None)
+        }
+        fn with_value(value: Option<String>) -> Self {
+            Self::configured(value, false)
+        }
+        fn configured(value: Option<String>, pause: bool) -> Self {
             let home = TestHome::new();
             let mut cs = canaries(fresh_seed());
+            if let Some(value) = value {
+                let index = cs
+                    .iter()
+                    .position(|c| c.label == labels::OPENAI_API_KEY)
+                    .unwrap();
+                cs[index] = Canary::new(labels::OPENAI_API_KEY, value);
+            }
             cs.push(common::seed_vault(&home, &cs));
             let dir = common::data_dir(&home).join("agents.d");
             std::fs::create_dir(&dir).unwrap();
@@ -124,8 +137,18 @@ mod linux {
             let path = dir.join("test.toml");
             std::fs::write(&path, "[[agent]]\nid = \"extension-agent\"\nname = \"Extension agent\"\nexecutables = [\"extension-agent\"]\nmarkers = [\"EXTENSION_AGENT\"]\n").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            let d = common::start_daemon(&home);
             let files = common::outside_dir();
+            let mut daemon = Command::new(common::daemon_exe());
+            home.apply(&mut daemon);
+            if pause {
+                daemon
+                    .env(envcloak_sys::testing::PAUSE_SITE, "reveal.proof.verifying")
+                    .env(
+                        envcloak_sys::testing::PAUSE_RELEASE,
+                        files.path().join("release"),
+                    );
+            }
+            let d = Daemon::start_command(daemon, &[]);
             let pass = common::secret_file(
                 files.path(),
                 "pass",
@@ -153,6 +176,15 @@ mod linux {
             spec.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
+            if extra["wrong_proof"] == true {
+                spec["proof"] = hex(b"deliberately wrong proof").into();
+            }
+            let during_proof = extra.get("ancestor_name").is_some();
+            let reached = self.files.path().join("reached");
+            if during_proof {
+                spec["proof_reached"] = serde_json::json!(reached);
+                spec["proof_release"] = serde_json::json!(self.files.path().join("release"));
+            }
             let path = self.files.path().join("terminal.json");
             std::fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
             let mut cmd = Command::new(common::python3());
@@ -170,7 +202,18 @@ mod linux {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            let out = common::finish_within(cmd, Duration::from_secs(60));
+            let out = std::thread::scope(|scope| {
+                if during_proof {
+                    scope.spawn(|| {
+                        let log = self.d.log_when(Duration::from_secs(20), |s| {
+                            s.contains("envcloak test: paused at reveal.proof.verifying")
+                        });
+                        assert!(log.contains("envcloak test: paused at reveal.proof.verifying"));
+                        std::fs::write(&reached, b"reached").unwrap();
+                    });
+                }
+                common::finish_within(cmd, Duration::from_secs(60))
+            });
             assert!(
                 out.status.success(),
                 "PTY observer failed: {}",
@@ -205,6 +248,39 @@ mod linux {
         for flag in ["warning", "prompt", "ack", "waited", "echo_off"] {
             assert_eq!(o[flag], true, "{flag}");
         }
+        let offsets =
+            ["warning_at", "prompt_at", "value_at", "ack_at"].map(|key| o[key].as_i64().unwrap());
+        assert!(offsets[0] >= 0);
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn gate34_hostile_values_never_reach_the_terminal() {
+        for controls in [
+            "\u{1b}]52;c;Zml4dHVyZQ==\u{7}\u{1b}[2J\u{1b}[6n".to_owned(),
+            (1u8..=31).map(char::from).collect(),
+            (127u8..=159).map(char::from).collect(),
+        ] {
+            let cs = canaries(fresh_seed());
+            let value = format!(
+                "prefix{}{}suffix",
+                by_label(&cs, labels::OPENAI_API_KEY).as_str(),
+                controls
+            );
+            let f = Fixture::with_value(Some(value));
+            let o = f.human(&[], &[], serde_json::json!({}));
+            assert!(o["control_terminal_controls"].as_u64().unwrap() > 0);
+            assert_eq!(o["tty_controls"], 0);
+            assert_eq!(o["tty_hits"], 0);
+            assert_eq!(o["invalid_value"], true);
+            assert_eq!(o["ack"], false);
+            assert_ne!(o["code"], 0);
+        }
+        let f = Fixture::with_value(Some("printable é 日本語 😀".into()));
+        let o = f.human(&[], &[], serde_json::json!({}));
+        assert_eq!(o["code"], 0);
+        assert_eq!(o["tty_hits"], 1);
+        assert_eq!(o["tty_controls"], 0);
     }
 
     #[test]
@@ -259,7 +335,7 @@ mod linux {
     }
 
     #[test]
-    fn gate23_reveal_rechecks_requester_after_the_prompt() {
+    fn gate23_reveal_refuses_requester_before_proof_verification() {
         let f = Fixture::new();
         let project = common::project(&f.home, "late-reveal", common::MANIFEST);
         let o = f.human(
@@ -269,6 +345,7 @@ mod linux {
                 "sibling": testkit_bin("fixture-agent"),
                 "manifest": project.join("envcloak.toml"),
                 "late": true,
+                "wrong_proof": true,
             }),
         );
         assert_eq!(o["prompt"], true, "the preflight must have succeeded");
@@ -279,6 +356,25 @@ mod linux {
             f.d.log()
                 .contains("method=items.reveal reason=requester_terminal")
         );
+    }
+
+    #[test]
+    fn gate23_reveal_revalidates_ancestry_during_proof() {
+        for name in ["fixture-agent", "extension-agent"] {
+            let f = Fixture::configured(None, true);
+            let o = f.human(&[], &[], serde_json::json!({"ancestor_name": name}));
+            assert_eq!(o["proof_barrier"], true);
+            assert_eq!(o["ancestor_changed"], true);
+            assert_eq!(o["prompt"], true);
+            assert_eq!(o["refused"], true);
+            assert_eq!(o["tty_hits"], 0);
+            assert_eq!(o["ack"], false);
+            assert_ne!(o["code"], 0);
+            assert!(f.d.log().contains("method=items.reveal reason=agent"));
+            let control = f.human(&[], &[], serde_json::json!({}));
+            assert_eq!(control["code"], 0);
+            assert_eq!(control["tty_hits"], 1);
+        }
     }
 
     #[test]

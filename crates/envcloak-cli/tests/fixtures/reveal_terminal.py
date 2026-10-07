@@ -39,6 +39,21 @@ if pid == 0:
     os.dup2(errors.fileno(), 2)
     os.close(master)
     os.close(slave)
+    if spec.get("ancestor_name"):
+        reveal = subprocess.Popen(sys.argv[2:])
+        if os.read(start_read, 1) != b'1':
+            raise RuntimeError('missing proof barrier')
+        # Exec keeps this session leader's process instance and its child.
+        # Only its argv identity changes, which can tighten but never grant.
+        os.set_inheritable(ready_write, True)
+        reaper = """import os, sys
+os.write(int(sys.argv[2]), b'1')
+os.close(int(sys.argv[2]))
+_, status = os.waitpid(int(sys.argv[1]), 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"""
+        os.execve(sys.executable, [spec["ancestor_name"], '-c', reaper,
+                                  str(reveal.pid), str(ready_write)], os.environ)
     if spec.get("sibling"):
         # Keep the agent alive in this terminal while a sibling gives a
         # proof. The request itself may lead another session (F-70).
@@ -83,6 +98,8 @@ proof_echo_off = False
 waited_for_ack = False
 finished = False
 interrupted = False
+proof_barrier = False
+ancestor_changed = False
 start = time.monotonic()
 status = None
 try:
@@ -108,6 +125,15 @@ try:
             else:
                 os.write(master, proof + b"\n")
             proof_sent = True
+        if spec.get("ancestor_name") and proof_sent and not proof_barrier:
+            if os.path.exists(spec["proof_reached"]):
+                proof_barrier = True
+                os.write(start_write, b'1')
+                if not select.select([ready_read], [], [], 20)[0] or os.read(ready_read, 1) != b'1':
+                    raise RuntimeError('missing ancestor exec barrier')
+                ancestor_changed = True
+                with open(spec["proof_release"], 'wb') as release:
+                    release.write(b'release')
         if b"Press Enter to finish: " in shown and not ack_sent:
             # A non-reaping kernel observation. Exiting instead of waiting
             # cannot pass even when output scheduling happens to line up.
@@ -146,6 +172,9 @@ try:
     proof_forms = encodings(proof)
     def hits(stream, forms):
         return sum(stream.count(form) for form in forms)
+    def controls(stream):
+        return sum(c not in '\r\n' and (ord(c) < 32 or 127 <= ord(c) <= 159)
+                   for c in stream.decode('utf-8', errors='replace'))
     print(json.dumps({
         "code": os.waitstatus_to_exitcode(status),
         "stdout_bytes": len(stdout),
@@ -157,15 +186,24 @@ try:
         "stderr_hits": stderr.count(value),
         "proof_hits": shown.count(proof),
         "control_hits": (b"control=" + value).count(value),
+        "control_terminal_controls": controls(value),
+        "tty_controls": controls(shown),
         "warning": b"a terminal an agent drives can read what is shown here; scrollback keeps it" in shown,
+        "warning_at": shown.find(b"a terminal an agent drives can read what is shown here; scrollback keeps it"),
+        "prompt_at": shown.find(b"Vault passphrase to reveal this: "),
+        "value_at": shown.find(value),
+        "ack_at": shown.find(b"Press Enter to finish: "),
         "prompt": proof_sent,
         "ack": ack_sent,
         "waited": waited_for_ack,
         "echo_off": proof_echo_off,
         "restored": before == after,
         "interrupted": interrupted,
+        "proof_barrier": proof_barrier,
+        "ancestor_changed": ancestor_changed,
         "refused": b"proof_refused" in stderr,
         "audit_failed": b"audit_failed" in stderr,
+        "invalid_value": b"invalid_value" in stderr,
         "app_required": b"app_required" in stderr,
         "traced": b"traced" in stderr,
     }))
