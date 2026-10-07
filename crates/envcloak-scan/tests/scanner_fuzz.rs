@@ -36,6 +36,8 @@ proptest! {
         input.extend_from_slice(&bytes);
         input.extend_from_slice(marker.as_bytes());
         let secret = SecretBytes::copy_from(&input);
+        let aws = envcloak_scan::aws::parse_aws(&secret);
+        prop_assert!(value_free(&format!("{aws:?}"), &marker), "AWS diagnostic contains input");
         for shell in [Shell::Posix,Shell::Fish] {
             let r = parse_profile(&secret,shell);
             prop_assert!(value_free(&format!("{r:?}"), &marker), "diagnostic contains input");

@@ -100,7 +100,7 @@ fn gate15_aws_and_profiles_never_follow_special_files() {
     std::fs::write(home.path().join(".aws/config"), b"[default]\n").unwrap();
     std::fs::set_permissions(
         home.path().join(".aws/config"),
-        std::fs::Permissions::from_mode(0),
+        std::fs::Permissions::from_mode(0o000),
     )
     .unwrap();
     assert!(!scan_aws(&root).complete());
@@ -123,4 +123,57 @@ fn gate16_only_complete_single_lines_are_commented() {
         let parsed = parse_profile(&input, Shell::Posix);
         assert!(comment_assignments(&input, &parsed.findings, &[(0, "token/profile")]).is_err());
     }
+}
+
+#[test]
+#[allow(clippy::disallowed_methods)] // Only generated oracle fixtures are written and sourced.
+fn gate16_profile_edits_preserve_bash_oracle_bindings() {
+    use secrecy::ExposeSecret;
+    let dir = tempfile::Builder::new()
+        .prefix("ec-p")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .unwrap();
+    let oracle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles/profile.py");
+    let output = Command::new("/usr/bin/python3")
+        .arg("-I")
+        .arg(oracle)
+        .arg(dir.path())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success() && output.stderr.is_empty());
+    let cases: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let mut edited = 0;
+    for case in cases.as_array().unwrap() {
+        if case["proposed_whole_line_delete_eligible"] != true || case["include_file"].is_string() {
+            continue;
+        }
+        let mut bytes =
+            std::fs::read(dir.path().join(case["source_file"].as_str().unwrap())).unwrap();
+        bytes.extend_from_slice(b"EC_SURVIVE=42\n");
+        let input = SecretBytes::from_vec(bytes);
+        let parsed = parse_profile(&input, Shell::Posix);
+        let index = parsed
+            .findings
+            .iter()
+            .position(|f| f.name.ct_eq(b"EC_ORACLE_A"))
+            .unwrap();
+        let after =
+            comment_assignments(&input, &parsed.findings, &[(index, "fixture/profile")]).unwrap();
+        let path = dir.path().join("edited.sh");
+        std::fs::write(&path, after.expose_secret()).unwrap();
+        let out = Command::new("/bin/bash").args(["--noprofile","--norc","-c",
+            "unset EC_ORACLE_A EC_SURVIVE; . \"$1\" >/dev/null 2>/dev/null; test \"${EC_ORACLE_A+x}\" != x && test \"$EC_SURVIVE\" = 42", "oracle"])
+            .arg(&path).env_clear().env("HOME",dir.path()).env("PATH","/usr/bin:/bin").output().unwrap();
+        assert!(
+            out.status.success(),
+            "Bash removal or preservation witness failed"
+        );
+        assert!(out.stdout.is_empty() && out.stderr.is_empty());
+        edited += 1;
+    }
+    assert!(edited >= 60, "independent removal corpus was not exercised");
 }
