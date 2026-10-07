@@ -593,7 +593,13 @@ fn agent_scan_leaves_guessable_and_ambiguous_assignments() {
 #[test]
 fn gate16_zsh_expansions_are_manual_in_profiles_and_includes() {
     for source in [".zshrc", ".zprofile", ".zshenv", "included/profile"] {
-        for rhs in ["=python3", "prefix:=python3"] {
+        for rhs in [
+            "=python3",
+            "prefix:=python3",
+            "''=python3",
+            "'prefix:'=python3",
+            "prefix:''=python3",
+        ] {
             let f = Fixture::new(true);
             let path = f.home.home().join(source);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();

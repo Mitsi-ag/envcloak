@@ -199,6 +199,7 @@ fn word(bytes: &[u8], fish: bool, exported: bool, home_prefix: bool) -> (SecretB
     let mut q = 0;
     let mut i = 0;
     let mut unsupported = false;
+    let mut equals_prefix = true;
     while i < bytes.len() {
         let b = bytes[i];
         if fish && b == b'\\' {
@@ -220,8 +221,8 @@ fn word(bytes: &[u8], fish: bool, exported: bool, home_prefix: bool) -> (SecretB
         if q == 0
             && ((b == b'~' && !(home_prefix && i == 0))
                 // The shared POSIX reader also serves zsh and its includes.
-                // Filename expansion can resolve =command at either position.
-                || (!fish && b == b'=' && (i == 0 || bytes[i - 1] == b':'))
+                // Quote removal can leave an empty prefix or a trailing colon.
+                || (!fish && b == b'=' && equals_prefix)
                 || matches!(b, b'(' | b')')
                 || (exported && matches!(b, b'{' | b'}'))
                 || (fish && matches!(b, b'*' | b'?' | b'{' | b'}')))
@@ -239,6 +240,7 @@ fn word(bytes: &[u8], fish: bool, exported: bool, home_prefix: bool) -> (SecretB
             {
                 if next != b'\n' {
                     let _ = out.extend(&[next]);
+                    equals_prefix = next == b':';
                 }
                 i += 2;
                 continue;
@@ -248,6 +250,7 @@ fn word(bytes: &[u8], fish: bool, exported: bool, home_prefix: bool) -> (SecretB
             }
         }
         let _ = out.extend(&[b]);
+        equals_prefix = b == b':';
         i += 1;
     }
     (out.freeze(), i, unsupported || q != 0)
