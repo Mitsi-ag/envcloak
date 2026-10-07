@@ -235,6 +235,53 @@ fn review_mcp_includes_require_cloud_opt_in() {
 }
 
 #[test]
+fn review_cloud_selection_covers_case_aliases_in_every_reader() {
+    for name in ["dRoPbOx", "oNeDrIvE", "cLoUdStOrAgE", "mObIlE dOcUmEnTs"] {
+        let f = Fixture::new(true);
+        let home = f.home.home();
+        let cloud = home.join(name);
+        std::fs::create_dir(&cloud).unwrap();
+        let content = format!("OPENAI_API_KEY={}\n", f.value());
+        std::fs::write(cloud.join(".env"), &content).unwrap();
+        std::fs::write(cloud.join("fixture.env"), &content).unwrap();
+        let lowercase = name.to_ascii_lowercase();
+        let include = if home.join(&lowercase).is_dir() {
+            &lowercase
+        } else {
+            name
+        };
+        std::fs::write(
+            home.join(".zshrc"),
+            format!("source '{include}/fixture.env'\n"),
+        )
+        .unwrap();
+        std::fs::write(home.join(".mcp.json"), serde_json::to_vec(&json!({"mcpServers":{"fixture":{"command":"fixture","envFile":format!("{include}/fixture.env")}}})).unwrap()).unwrap();
+        let out = f.scan(&["--dry-run"]);
+        f.clean(&out);
+        assert!(out.status.success());
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(report["items"].as_array().unwrap().is_empty(), "{name}");
+        let out = f.scan(&["--scan", cloud.to_str().unwrap(), "--dry-run"]);
+        f.clean(&out);
+        assert!(out.status.success());
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["items"].as_array().unwrap().len(), 1, "{name}");
+        assert!(
+            !report["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["kept"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|k| k["reason"] == "volume_opt_in")),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn review_nested_projects_need_no_dotenv_to_discover_mcp() {
     for name in [".mcp.json", ".cursor/mcp.json"] {
         let f = Fixture::new(true);

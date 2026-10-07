@@ -217,7 +217,7 @@ fn scan_selected(
     // Synced storage always needs its own named root, including --scan.
     options
         .skip_dirs
-        .extend(["Dropbox", "OneDrive"].map(Into::into));
+        .extend(["Dropbox", "OneDrive", "CloudStorage", "Mobile Documents"].map(Into::into));
     let mut remaining = 32 * MAX_DOTENV;
     let mut skipped = Vec::new();
     let mut by_dir: BTreeMap<PathBuf, Vec<ReadFile>> = BTreeMap::new();
