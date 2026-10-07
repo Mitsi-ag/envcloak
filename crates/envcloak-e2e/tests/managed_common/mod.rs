@@ -116,6 +116,7 @@ fn helper_proof(action: &str, input: &Value) -> Value {
         "unregister" => {
             shown!(c.unregister_managed(input["id"].as_str().unwrap(), passphrase(input), &[]))
         }
+        "projects" => shown!(c.projects_list(None)),
         "plan" => shown!(c.plan_managed_update(input["launch"].as_str().unwrap(), &changes, &[])),
         "update" => shown!(c.update_managed(
             input["launch"].as_str().unwrap(),
