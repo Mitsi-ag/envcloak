@@ -506,9 +506,14 @@ fn gate16_profile_requires_kit_and_old_complete_assignment() {
 
 #[test]
 fn agent_scan_leaves_guessable_and_ambiguous_assignments() {
-    let f = Fixture::new(true);
+    let mut f = Fixture::new(true);
+    // A continued physical line decodes to a full registry-pattern value.
+    // Its import must succeed while whole-line cleanup remains forbidden.
+    let multiline = format!("{}\nsecond", f.value());
+    f.values.push(Canary::new("multiline", multiline.clone()));
+    let (first, second) = f.value().split_at(32);
     let original = format!(
-        "export SHORT_TOKEN={}\nexport MULTI_SECRET='first\nsecond'\nexport DYNAMIC_SECRET=$OTHER\n",
+        "export SHORT_TOKEN={}\nexport MULTI_SECRET=\"{first}\\\n{second}\"\nexport NEWLINE_SECRET='{multiline}'\nexport DYNAMIC_SECRET=$OTHER\n",
         by_label(&f.values, labels::SHORT_TOKEN).as_str()
     );
     let path = f.home.home().join(".zshrc");
@@ -524,13 +529,145 @@ fn agent_scan_leaves_guessable_and_ambiguous_assignments() {
             .iter()
             .any(|x| x["slug"] == "short/existing")
     );
-    let kept = r["sources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .flat_map(|x| x["kept"].as_array().unwrap());
-    assert!(kept.into_iter().any(|x| x["name"] == "MULTI_SECRET"));
+    for name in ["MULTI_SECRET", "NEWLINE_SECRET"] {
+        assert!(
+            r["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|s| s["kept"].as_array().unwrap())
+                .any(|k| k["name"] == name && k["reason"] == "manual_assignment")
+        );
+    }
+    assert!(
+        r["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["slug"] == "openai/existing")
+    );
+    assert_eq!(r["sources"][0]["imported"], 2);
+    assert_eq!(r["compared"], 2);
+    assert_eq!(r["skipped_guessable"], 1);
     assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+
+    f._daemon.signal("-TERM");
+    assert!(f._daemon.wait_exit(Duration::from_secs(30)).is_some());
+    let vault = envcloak_core::vault::LockedVault::open(&VaultPaths::under(data_dir(&f.home)))
+        .unwrap()
+        .unlock_with_passphrase(&SecretBytes::copy_from(
+            by_label(&f.values, labels::VAULT_PASSPHRASE).value(),
+        ))
+        .map_err(|(_, error)| error)
+        .unwrap();
+    let (entries, _) = vault.read_audit().unwrap();
+    assert_no_canary(format!("{entries:?}").as_bytes(), &f.values);
+    let scans = entries
+        .iter()
+        .filter(|e| e.record.kind == envcloak_core::audit::AuditKind::ScanMatch)
+        .collect::<Vec<_>>();
+    assert_eq!(scans.len(), 1);
+    let decision = &scans[0].record.decision;
+    assert_eq!(decision.method.as_deref(), Some("scan.match"));
+    assert_eq!(decision.reason.as_deref(), Some("import"));
+    assert_eq!(decision.outcome, "checked");
+    assert_eq!(decision.count, Some(2));
+    for (name, count) in [
+        ("compared_guessable", 0),
+        ("compared_other", 2),
+        ("skipped_guessable", 1),
+        ("candidates_mixed", 3),
+    ] {
+        assert_eq!(
+            decision
+                .counts
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, n)| *n),
+            Some(count),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn gate16_zsh_expansions_are_manual_in_profiles_and_includes() {
+    for source in [".zshrc", ".zprofile", ".zshenv", "included/profile"] {
+        for rhs in ["=python3", "prefix:=python3"] {
+            let f = Fixture::new(true);
+            let path = f.home.home().join(source);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if source == "included/profile" {
+                std::fs::write(f.home.home().join(".zshrc"), b"source included/profile\n").unwrap();
+            }
+            let original = format!("export SECRET_TOKEN={rhs}\n");
+            std::fs::write(&path, &original).unwrap();
+            age(&path);
+            let out = run_on_terminal(
+                &f.home,
+                &[
+                    "import",
+                    "--machine",
+                    "--yes",
+                    "--delete-plaintext",
+                    "--json",
+                ],
+                &[],
+            );
+            f.clean(&out);
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert!(
+                std::fs::read(&path).unwrap() == original.as_bytes(),
+                "{source}"
+            );
+            assert!(!out.status.success());
+            assert_eq!(report["compared"], 0);
+            assert!(report["items"].as_array().unwrap().is_empty());
+            assert!(
+                report["sources"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|s| s["kept"].as_array().unwrap())
+                    .any(|k| k["name"] == "SECRET_TOKEN" && k["reason"] == "manual_assignment")
+            );
+        }
+    }
+}
+
+#[test]
+fn aws_colon_credentials_are_imported_before_cleanup() {
+    for source in [".aws/credentials", ".aws/config"] {
+        let mut f = Fixture::new(true);
+        let path = f.home.home().join(source);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let token = format!(
+            "{}=padding==",
+            by_label(&f.values, labels::GITHUB_TOKEN).as_str()
+        );
+        f.values.push(Canary::new("aws_padded", token.clone()));
+        let original = format!(
+            "[default]\naws_secret_access_key: {}\naws_session_token: {token}\nregion = retained\n",
+            f.value()
+        );
+        std::fs::write(&path, &original).unwrap();
+        age(&path);
+        let out = f.scan(&["--yes", "--delete-plaintext"]);
+        f.clean(&out);
+        assert!(out.status.success());
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["compared"], 2);
+        assert_eq!(report["sources"][0]["imported"], 2);
+        assert!(report["sources"][0]["kept"].as_array().unwrap().is_empty());
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(b"[default]\n# envcloak:"));
+        assert!(after.ends_with(b"region = retained\n"));
+        assert!(
+            !after
+                .windows(b"aws_session_token".len())
+                .any(|w| w == b"aws_session_token")
+        );
+    }
 }
 
 #[test]
@@ -1005,20 +1142,49 @@ fn mcp_header_literals_are_imported_and_handed_off_by_name() {
 
 #[test]
 fn gate15_hard_links_are_importable_but_never_rewritten() {
-    let f = Fixture::new(true);
-    let path = f.home.home().join(".zshrc");
-    let original = format!("export OPENAI_API_KEY={}\n", f.value());
-    std::fs::write(&path, &original).unwrap();
-    age(&path);
-    let alias = f.home.home().join("hardlink");
-    std::fs::hard_link(&path, &alias).unwrap();
-    let out = f.scan(&["--yes", "--delete-plaintext"]);
-    f.clean(&out);
-    assert!(!out.status.success());
-    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(r["items"][0]["slug"], "openai/existing");
-    assert!(std::fs::read(&path).unwrap() == original.as_bytes());
-    assert!(std::fs::read(&alias).unwrap() == original.as_bytes());
+    for source in [
+        ".zshrc",
+        "included/profile",
+        ".aws/credentials",
+        ".aws/config",
+    ] {
+        let f = Fixture::new(true);
+        let path = f.home.home().join(source);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        if source == "included/profile" {
+            std::fs::write(f.home.home().join(".zshrc"), b"source included/profile\n").unwrap();
+        }
+        let original = if source.starts_with(".aws/") {
+            format!("[default]\naws_secret_access_key = {}\n", f.value())
+        } else {
+            format!("export OPENAI_API_KEY={}\n", f.value())
+        };
+        std::fs::write(&path, &original).unwrap();
+        age(&path);
+        let alias = f.home.home().join("hardlink");
+        std::fs::hard_link(&path, &alias).unwrap();
+        let out = f.scan(&["--yes", "--delete-plaintext"]);
+        f.clean(&out);
+        assert!(!out.status.success());
+        let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(r["items"][0]["slug"], "openai/existing");
+        let report = r["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["display_path"].as_str().unwrap().ends_with(source))
+            .unwrap();
+        assert!(
+            report["kept"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k["reason"] == "hard_link"),
+            "{source}"
+        );
+        assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+        assert!(std::fs::read(&alias).unwrap() == original.as_bytes());
+    }
 }
 
 #[test]
