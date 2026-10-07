@@ -534,7 +534,7 @@ fn add_unsent(report: &mut VerifyView, files: &[Candidate<'_>]) {
 /// Takes the project's imported entries out of its env files. See the
 /// module documentation. Returns the report, and the failure to end with
 /// when the gate refused or a file was kept.
-fn delete(root: &ScanRoot) -> Result<(DeleteReport, Option<Failure>), Failure> {
+pub(super) fn delete(root: &ScanRoot) -> Result<(DeleteReport, Option<Failure>), Failure> {
     let manifest = root.path().join(MANIFEST_NAME);
     if read_plain(root, Path::new(MANIFEST_NAME), 64 * 1024).is_err() {
         return Err(Failure::new(
@@ -696,6 +696,24 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
     // What the backup is, as the daemon sealed it, before the passphrase:
     // the statement names who made it (SPEC §6.4).
     let shown = connect()?.files_show(id, &claims_now)?;
+    let backups = connect()?.backup_v2_list()?;
+    let first_run_v2 = backups
+        .backups
+        .iter()
+        .any(|b| b.id == id && b.purpose.as_deref() == Some("init"));
+    if backups.truncated
+        && !first_run_v2
+        && shown.files.iter().any(|f| {
+            Path::new(&f.path)
+                .file_name()
+                .is_some_and(|n| dotenv_kind(n).is_none())
+        })
+    {
+        return Err(Failure::new(
+            "undo_incomplete",
+            "the backup list is incomplete; this backup was not identified",
+        ));
+    }
     let statement = undo_statement(id, &project.path().to_string_lossy(), &shown, a);
     if let Some(f) = missing_form(&shown, a) {
         eprint!("{statement}");
@@ -718,6 +736,12 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
             t.read_secret("Vault passphrase to write them back: ")?
         }
     };
+    // M2-16's first-run backups contain a conventional profile or AWS file.
+    // The v1 writer only restores dotenv files; v2 keeps the same pre-proof
+    // metadata/origin check above and streams under a process-bound lease.
+    if first_run_v2 {
+        return undo_first_run_v2(id, a, passphrase, &shown);
+    }
     // The files come from the manifest the statement was read from: it
     // is sealed under the vault's `backup` subkey and bound to the
     // backup's id, which only the daemon writes, never two under one id.
@@ -758,6 +782,111 @@ fn undo(id: &str, a: &InitArgs) -> Result<ExitCode, Failure> {
         Err(Failure::new(
             "undo_incomplete",
             "some files were not written back (the report says why)",
+        ))
+    }
+}
+
+fn undo_first_run_v2(
+    id: &str,
+    a: &InitArgs,
+    passphrase: SecretBytes,
+    shown: &FilesShown,
+) -> Result<ExitCode, Failure> {
+    let lease = connect()?.backup_v2_open_restore(
+        id,
+        passphrase,
+        a.created_by_agent,
+        a.unrecorded,
+        &claims(),
+    )?;
+    if lease.statement.purpose != "init"
+        || lease.statement.files_total != 1
+        || shown.files.len() != 1
+    {
+        return Err(Failure::new(
+            "undo_incomplete",
+            "this first-run backup cannot be restored",
+        ));
+    }
+    let file = lease
+        .statement
+        .files
+        .first()
+        .filter(|f| f.path == shown.files[0].path)
+        .ok_or_else(|| Failure::new("undo_incomplete", "the backup statement changed"))?;
+    let path = Path::new(&file.path);
+    let parent = path
+        .parent()
+        .ok_or_else(|| Failure::new("undo_incomplete", "the backup path is invalid"))?;
+    let root = open_root(parent)
+        .map_err(|_| Failure::new("undo_incomplete", "the backup directory cannot be opened"))?;
+    let rel = Path::new(
+        path.file_name()
+            .ok_or_else(|| Failure::new("undo_incomplete", "the backup path is invalid"))?,
+    );
+    let decode = |text: &str| -> Option<[u8; 32]> {
+        if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let mut digest = [0; 32];
+        for (n, byte) in digest.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[n * 2..n * 2 + 2], 16).ok()?;
+        }
+        Some(digest)
+    };
+    let mut report = UndoReport {
+        backup: id.into(),
+        creator: shown.creator.clone(),
+        files: Vec::new(),
+    };
+    let current = read_capped(&root, rel, MAX_DOTENV);
+    let state = match current {
+        Err(_) => "deleted_since".to_owned(),
+        Ok((bytes, _)) => {
+            let digest = decode(&file.sha256)
+                .ok_or_else(|| Failure::new("undo_incomplete", "the backup digest is invalid"))?;
+            if bytes.sha256() == digest {
+                "unchanged".into()
+            } else {
+                let after = match &file.sha256_after {
+                    Some(text) => decode(text),
+                    None if a.unrecorded => Some(bytes.sha256()),
+                    None => None,
+                }
+                .ok_or_else(|| {
+                    Failure::new("restore_refused", "the backup result was not recorded")
+                })?;
+                let backed = envcloak_scan::BackedUpFile {
+                    size: file.size,
+                    sha256: digest,
+                    sha256_after: after,
+                };
+                match envcloak_scan::restore_over_left(&root, rel, &backed, &mut |chunk| {
+                    let chunk = u32::try_from(chunk).ok()?;
+                    connect()
+                        .ok()?
+                        .backup_v2_read(&lease.lease, 0, chunk)
+                        .ok()
+                        .map(|c| c.data.into_inner())
+                }) {
+                    Ok(_) => "restored".into(),
+                    Err(e) => e.kind.token().into(),
+                }
+            }
+        }
+    };
+    let ok = matches!(state.as_str(), "restored" | "unchanged");
+    report.files.push(UndoFile {
+        path: envcloak_client::doctor_report::display_path(path),
+        state,
+    });
+    print(&report, a.json);
+    if ok {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Err(Failure::new(
+            "undo_incomplete",
+            "the file was kept because it no longer matches the backup result",
         ))
     }
 }

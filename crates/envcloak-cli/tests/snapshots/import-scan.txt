@@ -1,9 +1,8 @@
 exit: 0
 --- stdout
-Scanned <ROOT> (dry run: nothing was imported or written)
-
-project acme-web (<ROOT>/acme-web)
-  .env.example (template: names only)
-    line 1  OPENAI_API_KEY     name only
-    line 2  STRIPE_SECRET_KEY  name only
+First-run import: 0 items, 0 duplicates merged. Owning accounts: unknown.
+<ROOT>/acme-web/.env.example: 2 found, 0 imported
+  kept OPENAI_API_KEY: template_or_reference
+  kept STRIPE_SECRET_KEY: template_or_reference
+Dry run: nothing imported. Use --yes to import.
 --- stderr

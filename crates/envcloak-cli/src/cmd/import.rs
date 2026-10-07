@@ -39,7 +39,7 @@ use envcloak_client::claims::claims;
 use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, usage};
 use envcloak_client::gitignore::{Pos, ignores, ignores_every, shape};
-use envcloak_client::render::{HIDDEN, looks_like_value, print};
+use envcloak_client::render::{HIDDEN, looks_like_value};
 use envcloak_core::SecretBytes;
 use envcloak_ipc::WireSecret;
 use envcloak_ipc::proto::{
@@ -57,8 +57,9 @@ use envcloak_scan::{
 };
 
 use super::require_unlocked;
+mod first_run;
 
-const USAGE: &str = "envcloak import --scan <dir> [--yes] [--json]";
+const USAGE: &str = "envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json]";
 
 /// An env file read for an import or a deletion.
 pub(crate) struct ReadFile {
@@ -195,10 +196,14 @@ pub(crate) fn shown_rel(rel: &Path) -> String {
 /// groups them by directory. Paths that were not read are listed with why:
 /// a profile shaped like a key among them ([`key_shaped_profile`]).
 pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<SkippedPath>) {
-    let options = WalkOptions {
+    let mut options = WalkOptions {
         recursive,
         ..WalkOptions::default()
     };
+    options
+        .skip_dirs
+        .extend(["Caches", "cache", "caches", "Trash", "Dropbox", "OneDrive"].map(Into::into));
+    let mut remaining = 32 * MAX_DOTENV;
     let mut skipped = Vec::new();
     let mut by_dir: BTreeMap<PathBuf, Vec<ReadFile>> = BTreeMap::new();
     let mut hidden: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
@@ -231,7 +236,14 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
             }
             continue;
         }
-        let (bytes, stamp) = match read_capped(root, &f.rel, MAX_DOTENV) {
+        if remaining == 0 {
+            skipped.push(SkippedPath {
+                path: shown_rel(&f.rel),
+                reason: "byte_budget".into(),
+            });
+            break;
+        }
+        let (bytes, stamp) = match read_capped(root, &f.rel, MAX_DOTENV.min(remaining)) {
             Ok(x) => x,
             Err(e) => {
                 skipped.push(SkippedPath {
@@ -241,6 +253,7 @@ pub(crate) fn scan(root: &ScanRoot, recursive: bool) -> (Vec<Project>, Vec<Skipp
                 continue;
             }
         };
+        remaining = remaining.saturating_sub(bytes.len());
         let parsed = parse_dotenv(&bytes);
         // Gate 12: a test build panics here on request, holding a file's
         // bytes and the values parsed from them.
@@ -770,25 +783,42 @@ fn too_large(e: envcloak_ipc::ClientError) -> Failure {
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ImportArgs {
-    dir: String,
+    dirs: Vec<PathBuf>,
+    machine: bool,
+    dry_run: bool,
+    delete: bool,
     yes: bool,
     json: bool,
 }
 
 fn parse(args: &[&str]) -> Option<ImportArgs> {
     let mut a = ImportArgs::default();
-    let mut dir = None;
-    let mut it = args.iter();
+    let mut it = args.iter().peekable();
     while let Some(&arg) = it.next() {
         match arg {
-            "--scan" if dir.is_none() => dir = Some(*it.next()?),
+            "--scan" => {
+                let before = a.dirs.len();
+                while it.peek().is_some_and(|s| !s.starts_with("--")) {
+                    let path = it.next()?;
+                    if path.is_empty() || a.dirs.len() >= 64 {
+                        return None;
+                    }
+                    a.dirs.push(PathBuf::from(path));
+                }
+                if a.dirs.len() == before {
+                    return None;
+                }
+            }
+            "--machine" if !a.machine => a.machine = true,
+            "--dry-run" if !a.dry_run => a.dry_run = true,
+            "--delete-plaintext" if !a.delete => a.delete = true,
             "--yes" if !a.yes => a.yes = true,
             "--json" if !a.json => a.json = true,
             _ => return None,
         }
     }
-    a.dir = dir?.to_owned();
-    Some(a)
+    ((!a.dirs.is_empty() || a.machine) && !(a.dry_run && a.yes) && (!a.delete || a.yes))
+        .then_some(a)
 }
 
 pub fn run(args: &[&str]) -> ExitCode {
@@ -799,25 +829,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     let Some(a) = parse(args) else {
         return usage(USAGE);
     };
-    run_import(&a).unwrap_or_else(|f| f.report(FAILURE))
-}
-
-fn run_import(a: &ImportArgs) -> Result<ExitCode, Failure> {
-    // The scan reads the env files whole: not under a tracer (SPEC §5).
-    envcloak_client::fail::refuse_if_traced()?;
-    let root = open_root(Path::new(&a.dir)).map_err(|_| {
-        Failure::new(
-            "scan_root",
-            "the directory to scan could not be opened, or is not a directory",
-        )
-    })?;
-    let (projects, skipped) = scan(&root, true);
-    let r = import(&root, &projects, skipped, a.yes)?;
-    print(&r, a.json);
-    if !r.committed && !a.json && !r.items.is_empty() {
-        eprintln!("envcloak: dry run: nothing was imported; run it again with --yes to import");
-    }
-    Ok(ExitCode::SUCCESS)
+    first_run::run(&a).unwrap_or_else(|f| f.report(FAILURE))
 }
 
 #[cfg(test)]

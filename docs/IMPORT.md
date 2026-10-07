@@ -12,9 +12,29 @@ envcloak recovery confirm [--kit-fd N]     # you hold the Recovery Kit
 envcloak init --delete-plaintext           # take the imported entries out of the .env files, after the four conditions
 envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N]   # write them back, byte for byte
 envcloak import --scan ~/Dev [--yes]       # every project under a directory; a dry run without --yes
+envcloak import --scan ~/Dev ~/Work --machine --dry-run --json
+envcloak import --machine --yes --delete-plaintext --json
 ```
 
 The project is the directory of the nearest `envcloak.toml` at or above the working directory, or the working directory when there is none. `init` reads that directory's env files; `import --scan` reads every directory below the one named, and each directory holding env files is a project. Every command takes `--json`.
+
+## Machine-wide first run (M2-16)
+
+`import` accepts multiple roots, including repeated `--scan`, and `--machine` adds HOME. Roots and physical sources are deduplicated. Without `--yes` it plans only: no vault import, manifest, ignore file, backup or source change. `--dry-run` and `--yes` conflict; `--delete-plaintext` requires `--yes`.
+
+In addition to dotenv, each root is scanned for the seven conventional shell profiles, literal includes (depth 4, 64 files), and `.aws/credentials` and `.aws/config`. AWS imports only access-key, secret-key and session-token fields. Malformed, repeated or continued credential assignments are kept, with fixed reasons. Profiles are parsed without executing shell code. Multiline, ambiguous and interpolated assignments stay in place. Retained config temporaries are named as incomplete, never read or removed. Cleanup refuses names containing unsafe ignore-pattern characters or shaped like a value before writing metadata. MCP JSON/TOML locations come from `envcloak-agents::Locations`, including project configurations. Literal environment entries and HTTP headers are imported by name; configs stay unchanged and the report hands their names and slugs to `envcloak agents migrate-mcp` (M2-20).
+
+Machine scans skip caches, dependencies, trash, cloud storage and network volumes. The cloud/network check also runs before opening a profile include or catalog config. A directory on such storage must itself be named with `--scan`; naming HOME is not consent to descend into every cloud subdirectory. Each dotenv walk has a 10,000-file and 32 MiB read budget. A retained-value budget (32 MiB or 50,000 entries, checked between bounded scanner batches) also limits combined roots. The config scan is capped at 64 MiB and 10,000 files. Budget exhaustion is an incomplete result, never a successful clean scan.
+
+Comparisons use `scan.match` with purpose `import`, then one combined `import.plan` and, with `--yes`, its digest-bound commit. Duplicates across projects, profiles, AWS and MCP reuse the same item. Machine-only items use M2-11 machine scope. Agent callers leave guessable values uncompared. No account ownership is inferred: it is `unknown` until M4. Existing doctor exposure metadata is read again for each report; first-run does not run a new transcript scan.
+
+JSON uses `first_run.v1`: `sources` contain `kind`, `display_path`, `found`, `imported` and `kept` (name and reason); `items` contain slug, scope, providers and referencing paths; `leaked` names already exposed items. Additional fields include `committed`, `duplicates_merged`, `compared`, `skipped_guessable`, `migrate_mcp`, `backups`, `incomplete` and the legacy project report. Values, source lines and snippets are never included. Key-shaped path components and names are masked. An incomplete scan, refused write, unresolved reference or failed cleanup exits nonzero, even if earlier items were committed. Dry-run source import counts stay zero.
+
+With `--delete-plaintext`, a complete single physical profile or AWS assignment is replaced by a comment naming its slug. All other bytes stay intact. Each source gets a private `.envcloak-import-<source>/envcloak.toml` containing references only. An existing different manifest is refused. The report gives its `envcloak run --manifest ... -- <command>` replacement. The four deletion conditions below apply, with fresh daemon verification on both sides of the encrypted **v2** backup. Files modified within 120 seconds, open elsewhere, hard-linked or changed during the operation are kept. The backup result digest is recorded only after successful rewrite. A crash before that record requires the explicit recovery form on undo.
+
+Backup v2 admits the conventional profiles and AWS files under HOME for purpose `init` only. An arbitrary sourced script outside the existing backup allowlist is imported but kept with a backup refusal; source syntax supplied by a client does not grant restore authority over additional paths. Dotenv cleanup continues to use the existing `init` deletion and v1 backup path. Vendor exports belong to M2-23.
+
+`init --undo <ID>` also handles these single-file v2 first-run backups. The sealed file path and creator are shown before requesting a person-held proof. Agent-created backups require `--created-by-agent`; a missing recorded result requires `--unrecorded`. The checked `restore_over_left` helper refuses edits made since cleanup and concurrent changes. A file deleted since rewriting stays deleted. For an explicitly unrecorded v2 backup, the current bytes are the expected replacement state and must remain unchanged throughout restore. A truncated backup listing that cannot identify a non-dotenv backup is refused, rather than guessed. The v1 behavior below remains unchanged.
 
 ## Scanning
 
