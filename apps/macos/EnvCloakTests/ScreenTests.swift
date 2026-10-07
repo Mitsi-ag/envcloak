@@ -66,6 +66,23 @@ import XCTest
         }
     }
 
+    private func identified(_ id: String, in window: NSWindow) -> [NSObject] {
+        nodes(window).filter { node in
+            let selector = NSSelectorFromString("accessibilityIdentifier")
+            return node.responds(to: selector) && node.perform(selector)?.takeUnretainedValue() as? String == id
+        }
+    }
+
+    private func assertScoped(_ text: String, identifier: String, in window: NSWindow,
+                              file: StaticString = #filePath, line: UInt = #line) async {
+        let found = XCTNSPredicateExpectation(predicate: NSPredicate { [self, window] _, _ in
+            MainActor.assumeIsolated { identified(identifier, in: window).contains { labels($0).contains { $0.contains(text) } } }
+        }, object: nil)
+        await fulfillment(of: [found], timeout: 5)
+        XCTAssertTrue(identified(identifier, in: window).contains { labels($0).contains { $0.contains(text) } },
+                      "missing scoped accessibility text: " + identifier + " / " + text, file: file, line: line)
+    }
+
     private func assertDisabled(_ title: String, in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) {
         let states: [Bool] = nodes(window).compactMap { node in
             let selector = NSSelectorFromString("accessibilityLabel")
@@ -144,6 +161,39 @@ import XCTest
             XCTAssertFalse(labels(window).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
             window.close()
         }
+    }
+
+    func testGate31UnopenedBasenameOnSidebarOverviewScopeAndSubtitle() async throws {
+        let client = ScriptedClient(); await client.unopenedBasenameFixture()
+        let session = VaultSession(client: client); await session.poll()
+        await session.openProject(DaemonText("/tmp/project"))
+        XCTAssertEqual(session.projects.opened?.title, "Benign manifest name")
+        let directory = try XCTUnwrap(session.projects.rows.last?.dir)
+        XCTAssertNotEqual(directory, session.projects.opened?.directory)
+        let escaped = "second\\u{202e}\\u{1b}[31m"
+        XCTAssertEqual(session.projects.title(directory), escaped)
+        XCTAssertEqual(Route.project(directory).title, escaped)
+        // A separate opened project's benign manifest name cannot satisfy
+        // any assertion for this unopened directory's fallback basename.
+        let overview = host(ProjectsOverview(session: session, route: .constant(.projects)))
+        await assertVisible(escaped + ", /tmp/" + escaped + ", 0 adopted bindings", in: overview)
+        XCTAssertFalse(labels(overview).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+        overview.close()
+        session.setScope(directory)
+        let workspace = host(MainView(session: session, initialRoute: .keys(.all)))
+        await assertScoped(escaped, identifier: "sidebar.project." + directory.escaped, in: workspace)
+        await assertScoped(escaped, identifier: "workspace.scope", in: workspace)
+        XCTAssertEqual(workspace.subtitle, escaped)
+        XCTAssertFalse(labels(workspace).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+        workspace.close()
+        // items.check may omit project_name. Its detail fallback uses the
+        // selected directory, independently of the canonical grant path.
+        await client.unopenedBasenameFixture(name: nil)
+        await session.openProject(directory)
+        XCTAssertEqual(session.projects.opened?.title, escaped)
+        let detail = host(ProjectDetail(session: session, directory: directory, selectedKey: .constant(nil)))
+        await assertScoped(escaped, identifier: "project.title", in: detail)
+        XCTAssertFalse(labels(detail).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
     func testAliasProjectShowsGrantsAndBindingAccess() async throws {
@@ -268,10 +318,27 @@ import XCTest
         await session.openProject(DaemonText("/tmp/project"))
         let window = host(MainView(session: session, initialRoute: .settings))
         await assertVisible("project\\u{202e}\\u{1b}[31m", in: window)
-        await assertVisible("Arrives with Touch ID approvals", in: window)
+        for title in ["Approvals", "Activity", "Agents"] {
+            await assertScoped("Arrives with Touch ID approvals", identifier: "sidebar." + title, in: window)
+        }
         await assertVisible("Spend · M4", in: window)
         await assertVisible("Devices · M5", in: window)
         await assertVisible("Leak checks arrive with envcloak doctor", in: window)
+        window.close()
+        for route in [Route.approvals, .activity, .agents, .keys(.exposed), .later(.spend), .later(.devices), .later(.dashboard)] {
+            let detail = host(MainView(session: session, initialRoute: route))
+            await assertScoped(route.title, identifier: "feature.unavailable", in: detail)
+            // Fixed expected copy is independent of Route.unavailableMessage.
+            let message: String
+            switch route {
+            case .keys: message = "Leak checks arrive with envcloak doctor"
+            case .later(.spend), .later(.dashboard): message = "Spend arrives in M4"
+            case .later(.devices): message = "Devices arrive in M5"
+            default: message = "Arrives with Touch ID approvals"
+            }
+            await assertScoped(message, identifier: "feature.unavailable", in: detail)
+            detail.close()
+        }
     }
 
     func testTwoThousandKeysRenderAndScrollWithoutLoader() async {

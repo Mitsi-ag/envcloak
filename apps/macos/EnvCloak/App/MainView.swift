@@ -25,6 +25,7 @@ struct MainView: View {
                     if session.state.canReadMetadata {
                         ForEach(session.projects.directories, id: \.self) { dir in
                             Text(session.projects.title(dir)).tag(Route.project(dir)).padding(.leading, 12)
+                                .accessibilityIdentifier("sidebar.project." + dir.escaped)
                         }
                     }
                     Label("Keys", systemImage: "key.horizontal").tag(Route.keys(.all))
@@ -88,7 +89,7 @@ struct MainView: View {
                     Text("All projects").tag(Optional<DaemonText>.none)
                     ForEach(session.projects.scopeDirectories, id: \.self) { Text(session.projects.title($0)).tag(Optional($0)) }
                     if let scope, !session.projects.scopeDirectories.contains(scope) { Text(MetadataRequest.basename(scope)).tag(Optional(scope)) }
-                }
+                }.accessibilityIdentifier("workspace.scope")
                 Button { Task { await session.lock() } } label: { Label("Lock", systemImage: "lock") }
                     .help("Lock the vault").disabled(!session.state.canLock)
             }
@@ -155,7 +156,8 @@ struct MainView: View {
         VStack(alignment: .leading) {
             Label(route.title, systemImage: icon)
             Text(route.unavailableMessage ?? "").font(.caption).foregroundStyle(ECToken.secondary.color)
-        }.tag(route)
+        }.tag(route).accessibilityElement(children: .contain)
+            .accessibilityIdentifier("sidebar." + route.title)
     }
 }
 

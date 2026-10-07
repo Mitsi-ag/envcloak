@@ -35,6 +35,12 @@ final class NavigationTests: XCTestCase {
         XCTAssertTrue(window.staticTexts["No grants in force"].waitForExistence(timeout: 10))
         // The Python fixture independently checks grants.list after this test.
         app.typeKey("3", modifierFlags: .command)
-        XCTAssertTrue(window.staticTexts["Arrives with Touch ID approvals"].exists)
+        let approvals = window.descendants(matching: .any)["sidebar.Approvals"].firstMatch
+        XCTAssertTrue(approvals.waitForExistence(timeout: 10))
+        XCTAssertTrue(approvals.staticTexts["Arrives with Touch ID approvals"].exists)
+        let unavailable = window.descendants(matching: .any)["feature.unavailable"].firstMatch
+        XCTAssertTrue(unavailable.waitForExistence(timeout: 10))
+        XCTAssertTrue(unavailable.staticTexts["Approvals"].exists)
+        XCTAssertTrue(unavailable.staticTexts["Arrives with Touch ID approvals"].exists)
     }
 }

@@ -28,6 +28,11 @@ actor ScriptedClient: WorkspaceClient {
     var fieldNameSuffix = ""
     func fieldSuffix(_ text: String) { fieldNameSuffix = text }
     var hostileSurfaceMetadata = false
+    var unopenedHostilePath = false
+    var checkedName: String? = "project\u{202e}\u{1b}[31m"
+    func unopenedBasenameFixture(name: String? = "Benign manifest name") {
+        unopenedHostilePath = true; pageMode = "two"; checkedName = name
+    }
     private var hostileSuffix: String { hostileSurfaceMetadata ? "\u{202e}\u{1b}[31m" : "" }
     func hostileMetadata() { hostileSurfaceMetadata = true; grants = 1; adoptedBinding = true }
     func plainSlugs() { hostileSlugs = false }
@@ -85,11 +90,11 @@ actor ScriptedClient: WorkspaceClient {
             if pageMode == "fail-second" && nextPage { throw EnvCloakError.protocolError }
             let next: Any = !["single", "hidden-one-page", "duplicate-real"].contains(pageMode) && (!nextPage || pageMode == "repeat")
                 ? ["last_seen": 2, "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"] : NSNull()
-            let directory = pageMode.hasPrefix("hidden") ? "[not shown: looks like a key or token]" : (nextPage ? "/tmp/second" : "/tmp/project") + hostileSuffix
+            let directory = pageMode.hasPrefix("hidden") ? "[not shown: looks like a key or token]" : (nextPage ? "/tmp/second" : "/tmp/project") + (nextPage && unopenedHostilePath ? "\u{202e}\u{1b}[31m" : hostileSuffix)
             let row: [String: Any] = ["dir": directory, "manifest_sha256": String(repeating: "a", count: 64), "bindings": adoptedBinding ? [["env_name": "VARIABLE", "reference": "envcloak://fixture-0\u{202e}\u{1b}[31m"]] : [], "last_seen_secs": nextPage ? 1 : 2]
             result = ["projects": ["hidden-one-page", "duplicate-real"].contains(pageMode) ? [row, row] : [row], "next": next]
 
-        case "items.check": result = ["project_dir": "/tmp/project" + hostileSuffix, "project_name": "project\u{202e}\u{1b}[31m", "bindings": [
+        case "items.check": result = ["project_dir": "/tmp/project" + hostileSuffix, "project_name": checkedName as Any? ?? NSNull(), "bindings": [
             ["env_name": "VARIABLE" + hostileSuffix, "reference": hostileSurfaceMetadata ? "envcloak://fixture-0" + hostileSuffix : hostileSlugs ? "envcloak://fixture" : "envcloak://fixture-0", "status": "ok"],
             ["profile": "test", "env_name": "VARIABLE", "reference": "envcloak://second", "status": "unknown_item"]], "refs": []]
         case "grants.list": result = ["grants": grants == 0 ? [] : [[
