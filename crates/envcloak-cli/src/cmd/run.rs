@@ -983,7 +983,7 @@ fn run_launch(launch: &str) -> ExitCode {
     };
     let redactor = match built {
         Ok((r, report)) => {
-            print_coverage(&report);
+            print_coverage(&report, false);
             r
         }
         Err(ExecError::ValueTooShort(r)) => return too_short(&r).report(RUN_FAILURE),
