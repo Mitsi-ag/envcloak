@@ -5,6 +5,26 @@ import XCTest
 @testable import EnvCloakKit
 
 @MainActor final class ScreenTests: XCTestCase {
+    #if ENVCLOAK_SCREEN_TESTS
+    func testAutomationWindowFitsSmallAndOffsetDisplays() {
+        // Geometry in points, including a small CI desktop with menu and
+        // Dock space removed and displays left of or above the primary.
+        for bounds in [
+            NSRect(x: 0, y: 64, width: 1024, height: 680),
+            NSRect(x: -1280, y: 36, width: 1280, height: 960),
+            NSRect(x: 100, y: 1100, width: 1728, height: 1000),
+        ] {
+            let frame = ScreenTestBootstrap.windowFrame(in: bounds)
+            XCTAssertTrue(bounds.contains(frame), "automation window \(frame) exceeds usable display \(bounds)")
+            XCTAssertGreaterThanOrEqual(frame.width, 900)
+            XCTAssertGreaterThanOrEqual(frame.height, 560)
+            // Exercise the constrained layout on large local displays too.
+            XCTAssertLessThanOrEqual(frame.width, 1024)
+            XCTAssertLessThanOrEqual(frame.height, 700)
+        }
+    }
+    #endif
+
     private func host<V: View>(_ view: V) -> NSWindow {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 740), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
