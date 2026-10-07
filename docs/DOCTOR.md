@@ -73,3 +73,52 @@ two runs from one fixture-agent root exceed it. This is a measured-density
 synthetic workload, not a universal performance claim or a new host measurement.
 The independent cycle432 JSON oracle supplies 37 cases and 100,080 expected
 occurrences for count-mode verification.
+
+## Scrub and undo
+
+Rotate exposed values first. `envcloak scrub [--path <path>]... [--yes] [--json]`
+rewrites confirmed occurrences in local transcript stores, including Claude
+Code's configuration backups. Without `--path`, it uses the agent catalog's
+transcript, history, cache, log and backup locations. Explicit paths restrict
+the selection; catalog credential stores and databases remain excluded.
+Without `--yes`, a terminal confirmation shows the affected files and rotation
+links before any rewrite. Linked, recently modified or open files are refused:
+quit the agent first. Refusals and incomplete scans return a nonzero status.
+
+Each file receives an encrypted backup before its confirmed spans are replaced
+with `[envcloak:redacted:<slug>]`. JSON strings keep valid escaping, and every
+rewritten JSONL line is parsed again. Repeated occurrences are all retained.
+Conflicting overlapping matches refuse that file. A whole base64, hex or
+percent-encoded token can be replaced; a value inside a longer encoded run is
+reported as unsupported and left alone. SQLite stores are named as not
+scrubbed. Unknown provider-pattern hits are not rewrite authority.
+
+Only values of at least 16 characters, or registry-recognized values, are
+compared for every caller. Short values are neither found nor scrubbed. The
+report lists slugs, sanitized paths, counts, rotation links, backup IDs and
+fixed reasons, without values, offsets or snippets. Every item scrubbed is
+marked exposed for rotation before publication.
+
+`envcloak scrub --undo <id>` shows the backup's sealed creator, then takes one
+passphrase proof from a terminal subject. `--passphrase-fd N` accepts the proof
+on a descriptor; it still requires that terminal subject. Backups created by
+an agent or unknown process also need `--created-by-agent`. Undo restores the
+original bytes only while the file has the SHA-256 recorded after scrub. A
+later edit is refused as `edited_since`.
+
+If a scrub process died before recording its result, recovery additionally
+requires `--unrecorded`. EnvCloak cannot know what that change left: this form
+uses the current file's digest as the expected replacement target, checks it
+again through the guarded restore, and replaces it with the backed-up bytes.
+Review the current file before choosing this recovery form. Backups expire
+after seven days. Possible `envcloak-new` and `envcloak-swap` leftovers are
+reported after success and refusal; their names do not establish ownership or
+authorize deletion. A stopped undo can leave restored plaintext under a
+restricted temporary name, as described in `IPC.md`'s restore contract.
+
+Scrub changes local files only. It cannot remove copies sent to model
+providers, cloud-synced transcripts, Time Machine backups, APFS snapshots,
+other machines, terminal scrollback, Spotlight's index, crash reports, or a
+running agent's context. Scrub's final stamp check and rename do not exclude
+a competing rename inside that final syscall interval. Rotation remains the
+fix for exposure.

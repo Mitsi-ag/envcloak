@@ -36,9 +36,10 @@ usage:
   envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
   envcloak reveal <slug>[#field]
+  envcloak scrub [--path <path>]... [--yes] [--json]
+  envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak scrub
   envcloak agents migrate-mcp
   envcloak mcp-bridge
   envcloak standing
@@ -91,9 +92,10 @@ usage:
   envcloak agents status --probe [--agent ID]... [--json]
   envcloak hook --host ID --event NAME
   envcloak reveal <slug>[#field]
+  envcloak scrub [--path <path>]... [--yes] [--json]
+  envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak doctor [--json] [--path <path>]... [--git-history]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak scrub
   envcloak agents migrate-mcp
   envcloak mcp-bridge
   envcloak standing
