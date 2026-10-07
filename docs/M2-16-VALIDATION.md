@@ -229,3 +229,97 @@ After the follow-up, the full scanner suite passed again (222 tests), `gate10_fi
 Final CLI rerun: 265 passed, zero failed, with only the previously passed 1 GiB case filtered out. All 28 first-run cases passed, including the expanded zsh matrix, comparison/audit assertions, AWS colon cleanup, hard-link defenses and crash/undo gates. Together with the unchanged transcript-only budget regression, all 266 CLI cases passed in aggregate. The earlier broad CLI run had 265 passes and the one deliberately added quoted-prefix failure; no other failure was suppressed or counted as a pass. Final raw receipt: `r3-cli-final.json`.
 
 The final tree has no pending production changes or review defects. These are macOS local results; the driver must push the rebased commits and rerun PR/Linux CI before merging. This lane did not push, open a PR or comment on GitHub.
+
+
+## Fourth review: restore traversal, omissions, INI indentation and eligibility
+
+All four findings at 7eb5fb24 are accepted. The sweep covers every task path in
+`git diff --name-only 6489768..7eb5fb24`, and follows shared readers and writers
+where those paths call them. No change is made to the M2-14 `incomplete`
+reservation, the daemon's coverage definition or the backup path allowlist.
+
+| Bug class | Instances inspected and repaired or retained |
+| --- | --- |
+| Reopening a sealed or discovered path with symlink-following authority | Both v2 undo modes now reuse the scanner's descriptor walk. The same issue was repaired in v1 `write_back` and the first-run handoff to dotenv cleanup. Tests cover AWS credentials/config, the ancestor of the fish profile, v1 aliases to the current project, and a project redirected after commit. Explicit user-named scan roots remain allowed aliases; `source_allowed` uses metadata only, and all actual child reads still use no-follow handles. Backup leases, digest checks, atomic writes, leftover handling and the existing root-owned macOS alias checks remain in force. |
+| Exclusion policy lost during source selection or through another reader | Credential/database descriptors are kept separately while selecting readable MCP sources, then supplied to the scanner. Root and volume filtering cannot drop policy; overlapping scanner sources keep exclusions even when the selector rejects the descriptor itself. The sweep also repaired profile includes, dotenv reads, nested config discovery and ASCII case aliases. CLI fixtures cover Copilot's directory and OpenCode's file through JSON, TOML and profile includes, plus dotenv and nested MCP files inside Copilot's store. Independent allowed profile data still imports. Scanner fixtures cover both omission kinds and file/directory case aliases. Case variants are conservatively excluded on case-sensitive volumes too. |
+| Grammar context confused with whitespace presence | AWS continuation detection now compares character indentation against the preceding option. Equal indentation and dedents remain separate options; deeper lines remain manual and value-free, including after ignored options and across comments/blank lines. All three credential options, both delimiters, both AWS files, tabs, Unicode whitespace, section transitions and the existing malformed/duplicate cases are covered. Python RawConfigParser is the reader oracle; the real AWS CLI remains the writer oracle. |
+| A safety assertion masked by another guard | A real terminal import commits a short value and reaches the post-backup barrier. A live catalog extension then recognizes its existing TERM marker as an agent claim. Reverification returns LeftOut with resolves, recovery confirmation and coverage still true. Cleanup retains the exact profile bytes. Removing only the Stored comparison now fails this test. The sweep checked daemon comparison/coverage, machine selection and legacy dotenv's explicit Stored eligibility and held-set recheck; these keep their separate responsibilities. |
+
+The new AWS, undo and omission tests first failed against the unrepaired code.
+A PTY-close attempt was not accepted as eligibility evidence: on this host it
+left the caller eligible. The replacement uses the real catalog and daemon,
+without injecting a successful or refused verification response.
+
+Named mutation evidence (all failures must be assertions, never build failures):
+
+- `r4-aws-any-indent`: both the independent reader oracle and CLI cleanup reject
+  the old any-indentation rule.
+- `r4-aws-no-continuation`: the hostile grammar and Python continuation oracle
+  reject losing the deeper-indentation guard.
+- `r4-skip-stored`: the eligibility regression observes a rewrite when the
+  client's Stored guard alone is removed.
+- `r4-undo-follow-parent`, `r4-v1-follow-parent`, `r4-cleanup-follow-parent`:
+  redirected-target tests detect an unauthorized restore or cleanup.
+- `r4-drop-config-omissions`, `r4-profile-reads-credentials`,
+  `r4-dotenv-reads-credentials`: the CLI detects a second imported canary from a
+  protected store when the respective reader loses its exclusion.
+- `r4-selection-drops-omissions`: an overlapping readable source defeats the
+  omission when filtering removes it.
+- `r4-case-sensitive-omissions`: an include reads a protected case alias.
+
+Raw detached receipts and logs are under the ignored worktree-local
+`.collab/m2-16/r4-*` prefix. Each mutation is restored before the next one.
+
+R-M2-69 (local sources), R-M2-70, R-M2-71, R-M2-73, R-M2-74 (integration),
+R-M2-75 and T-10 remain closed for this task, with gates 10, 15 and 16 extended
+as above. Existing plan deferrals remain M3's scan UI, M4 owning accounts,
+M2-20 MCP rewriting and M2-23 vendor exports. Arbitrary sourced scripts outside
+the backup allowlist stay imported but manual: client-provided source syntax
+cannot grant restore authority. No review finding is deferred.
+
+Driver handoff: the reviewer reported an unrelated macOS timing failure in
+`envcloak-exec`'s `a_grandchild_holding_the_terminal_is_cut_off_2_s_after_the_exit`
+before a successful CI rerun at 7eb5fb24. Flag that report to M2-19; this lane did
+not change exec or send an external message. New Linux/PR CI remains the
+driver's responsibility after pushing. This lane does not push.
+
+
+### Fourth review commits and checks
+
+- `74920158`: AWS indentation repair and reader/writer/CLI regressions;
+  mutations `r4-aws-any-indent` and `r4-aws-no-continuation`.
+- `b3751b9d`: v2/v1 restore and dotenv cleanup parent traversal;
+  mutations `r4-undo-follow-parent`, `r4-v1-follow-parent` and
+  `r4-cleanup-follow-parent`.
+- `2e058f55`: credential-store exclusion policy across readers and selectors;
+  mutations `r4-drop-config-omissions`, `r4-profile-reads-credentials`,
+  `r4-dotenv-reads-credentials`, `r4-selection-drops-omissions` and
+  `r4-case-sensitive-omissions`.
+- `01600f03`: live caller-eligibility regression; mutation `r4-skip-stored`.
+- `6a876fa1`, `401a947e`: lint-only follow-ups removing an identity conversion
+  and renaming a test binding reserved by the safety checker. No safety guard,
+  parser behavior or fixture value changed.
+
+Final checks use target E, incremental compilation disabled, three build jobs,
+and detached tests with cleared environments, private HOME/XDG directories,
+`--no-fail-fast` and `--test-threads 3`. No workspace test command is used.
+Formatting and strict workspace/all-target clippy pass. Reservation, unsafe,
+exposure-lint, crate-graph, SPEC-decision and source checks pass: 262 reservation
+rows in 17 tables, all six exposure canaries, 50 edges among 21 crates and 54
+SPEC decisions. The full scanner suite passes 225 tests, including the Python
+INI and AWS CLI oracles. All 11 named mutation receipts report test exit 101
+with the expected failing assertion, followed by restoration.
+
+
+The final full CLI suite passes 272 tests with zero failures, ignored tests or
+filtered tests. This includes all 33 first-run tests and the full doctor target
+(12/12, including the three 1 GiB scans, in 2,599.55 seconds). The selected
+`first_run::gate10_first_run_story` E2E test also passes. Production code stayed
+unchanged throughout these final runs. The receipts are
+`r4-final-complete.json`, `r4-final-results.json`, `r4-check-results.json` and the
+`r4-final-{scan,cli,story,clippy,checks}.log` files. These are local macOS results;
+new Linux/PR CI has not been run by this lane.
+
+All requested fixes, their additional class instances, and validation are
+committed. No review finding is rejected or deferred. The final tree is clean;
+no push, pull request or GitHub comment was made.
