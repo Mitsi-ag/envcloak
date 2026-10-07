@@ -21,6 +21,8 @@ actor ScriptedClient: WorkspaceClient {
     var itemCount = 1
     var pageMode = "single"
     var revokeFailure = false
+    var hostileSlugs = true
+    func plainSlugs() { hostileSlugs = false }
     var showFailure = false
     var wrongDetail = false
     func detailResponse(fails: Bool = false, wrong: Bool = false) { showFailure = fails; wrongDetail = wrong }
@@ -40,7 +42,7 @@ actor ScriptedClient: WorkspaceClient {
     }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
-        ["id": "item-\(i)", "slug": "fixture-\(i)\u{202e}\u{1b}[31m", "class": "secret", "title": "Fixture \(i)",
+        ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)",
          "provider": "example", "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
          "fields": ["value", "secondary"].map { ["name": $0, "prior_count": 0, "created_secs": 1, "updated_secs": 1] as [String: Any] },
          "last_used_secs": 123, "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid"]]
@@ -247,6 +249,67 @@ final class SessionTests: XCTestCase {
         await client.pages("hidden-one-page"); await store.refetch(.projects)
         XCTAssertNil(store.scope)
         XCTAssertNil(try ProjectFolders(file: file).scope)
+    }
+
+    @MainActor func testCopiedCommandsAreAcceptedByBuiltDispatcher() async throws {
+        guard let executable = ProcessInfo.processInfo.environment["ENVCLOAK_TEST_CLI"] else {
+            throw XCTSkip("Set ENVCLOAK_TEST_CLI to the built CLI for the dispatcher oracle")
+        }
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        let item = try XCTUnwrap(session.items.rows.first)
+        XCTAssertNil(InspectorAction.reveal.commandWords(item: item, field: nil))
+        XCTAssertNil(InspectorAction.replace.commandWords(item: item, field: nil))
+        XCTAssertNil(InspectorAction.replace.commandWords(item: item, field: DaemonText("missing")))
+        let replace = try XCTUnwrap(InspectorAction.replace.commandWords(item: item, field: DaemonText("secondary")))
+        XCTAssertEqual(replace, ["rotate", "fixture-0#secondary"])
+        let remove = try XCTUnwrap(InspectorAction.remove.commandWords(item: item, field: nil))
+        var commands = CopiedCommand.allCases.map(\.commandWords)
+        commands += [replace, remove, ["daemon", "install", "--daemon", "/tmp/ec05-missing/daemon"]]
+        for (index, arguments) in commands.enumerated() {
+            let home = URL(fileURLWithPath: "/tmp/ec05-command-" + UUID().uuidString.prefix(8))
+            try FileManager.default.createDirectory(at: home, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let process = Process(); process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments; process.currentDirectoryURL = home
+            process.environment = ["HOME": home.path, "PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8", "TMPDIR": home.path,
+                                   "XDG_CONFIG_HOME": home.path, "XDG_DATA_HOME": home.path, "XDG_STATE_HOME": home.path,
+                                   "XDG_CACHE_HOME": home.path, "XDG_RUNTIME_DIR": home.path]
+            process.standardInput = FileHandle.nullDevice; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+            try process.run()
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while process.isRunning, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+            if process.isRunning { process.terminate(); XCTFail("command timed out: \(index)") }
+            process.waitUntilExit()
+            XCTAssertNotEqual(process.terminationStatus, 2, "dispatcher rejected command \(index)")
+            XCTAssertNotEqual(process.terminationStatus, 125, "unavailable command \(index)")
+            if arguments == CopiedCommand.recoveryHelp.commandWords { XCTAssertEqual(process.terminationStatus, 0) }
+        }
+    }
+
+    @MainActor func testStartActionRunsStatusInstallerAndReconciles() async throws {
+        for succeeds in [true, false] {
+            let home = "/tmp/ec05-installer-" + UUID().uuidString.prefix(8)
+            try FileManager.default.createDirectory(atPath: home, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            let executable = home + "/cli"
+            try ("#!/bin/sh\ntest \"$#\" -eq 4 && test \"$1\" = daemon && test \"$2\" = install && test \"$3\" = --daemon || exit 2\nprintf 'installed'\nexit " + (succeeds ? "0" : "1") + "\n").write(toFile: executable, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable)
+            let runner = CLIRunner(executable: executable, home: String(home), timeout: .seconds(2))
+            let client = ScriptedClient(); let session = VaultSession(client: client); session.state = .noDaemon
+            await WorkspaceActions.startDaemon(session) { try await WorkspaceActions.installDaemon(using: runner, daemonPath: "/tmp/fixture-daemon") }
+            let polls = await client.calls("status")
+            XCTAssertEqual(polls, succeeds ? 1 : 0)
+            XCTAssertEqual(session.state, succeeds ? .ready : .noDaemon)
+            XCTAssertEqual(session.notice == nil, succeeds)
+            XCTAssertFalse(session.actionInProgress)
+        }
+    }
+
+    func testRepeatedDisplayTextNeverDefinesRowIdentity() {
+        let hidden = DaemonText("[not shown: looks like a key or token]")
+        let rows = DisplayRow.of([hidden, hidden, DaemonText("same"), DaemonText("same")])
+        XCTAssertEqual(rows.count, 4)
+        XCTAssertEqual(Set(rows.map(\.id)).count, 4)
+        XCTAssertEqual(rows.map(\.value), [hidden, hidden, DaemonText("same"), DaemonText("same")])
     }
 
     @MainActor func testOnlyChangedStoresRefetch() async {

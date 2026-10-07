@@ -46,10 +46,10 @@ struct ConnectionView: View {
         switch session.state {
         case .noDaemon: Task { await WorkspaceActions.startDaemon(session) }
         case .unverified: details = true
-        case .noVault: WorkspaceActions.copy("envcloak vault create")
-        case .locked: WorkspaceActions.copy("envcloak unlock")
+        case .noVault: WorkspaceActions.copy(CopiedCommand.createVault.text)
+        case .locked: WorkspaceActions.copy(CopiedCommand.unlock.text)
         case .readOnly: recoveryHelp = true
-        case .unavailable: WorkspaceActions.copy("envcloak status")
+        case .unavailable: WorkspaceActions.copy(CopiedCommand.status.text)
         default: break
         }
     }
@@ -86,7 +86,7 @@ struct RecoveryHelp: View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Recover from a backup").font(.title2)
             Text("Keep a copy of the vault and its backups. In a human Terminal session, use envcloak recover with your Recovery Kit. Read the command's instructions before choosing a backup. Recovery ends existing grants.")
-            Button("Copy recovery help command") { WorkspaceActions.copy("envcloak help recover") }
+            Button("Copy recovery help command") { WorkspaceActions.copy(CopiedCommand.recoveryHelp.text) }
             Button("Open Terminal") { WorkspaceActions.openTerminal() }
             Button("Done") { dismiss() }
         }.padding(24).frame(width: 480)

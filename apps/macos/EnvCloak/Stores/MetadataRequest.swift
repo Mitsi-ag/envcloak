@@ -29,9 +29,14 @@ enum MetadataRequest {
               !raw.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
         return url
     }
-    static func terminalCommand(_ verb: String, slug: DaemonText) -> String {
-        // POSIX shell single-quote escaping, including a quote in a slug.
-        "envcloak " + verb + " '" + slug.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    static func terminalCommand(_ arguments: [String]) -> String {
+        // The verb comes from InspectorAction, the target is always quoted.
+        "envcloak " + arguments.enumerated().map { index, argument in
+            index == 0 ? argument : "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }.joined(separator: " ")
+    }
+    static func replaceTarget(slug: DaemonText, field: DaemonText) -> String {
+        slug.unescaped + "#" + field.unescaped
     }
     static func changeDirectoryCommand(_ directory: DaemonText) -> String {
         "cd -- '" + directory.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"

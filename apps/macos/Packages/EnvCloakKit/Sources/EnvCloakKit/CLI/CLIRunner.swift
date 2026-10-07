@@ -52,10 +52,21 @@ public struct CLIRunner: Sendable {
 
     public func run(arguments: [String], workingDirectory: String) async throws -> CLIResult {
         // These commands emit metadata. Value and proof flows use typed IPC.
-        guard let first = arguments.first, ["ref", "check", "agents", "daemon"].contains(first),
+        guard let first = arguments.first, ["ref", "check", "agents"].contains(first),
               workingDirectory.hasPrefix("/"), !workingDirectory.utf8.contains(0),
               arguments.allSatisfy({ !$0.utf8.contains(0) }) else { throw CLIError.invalidArguments }
-        let operation: @Sendable () throws -> CLIResult = { try execute(arguments: arguments, directory: workingDirectory) }
+        return try await perform(arguments: arguments, directory: workingDirectory, expectsJSON: true)
+    }
+
+    /// Installation emits human text. Only the bounded child's exit status
+    /// establishes completion; the caller separately checks daemon status.
+    public func installDaemon(at path: String) async throws {
+        guard path.hasPrefix("/"), !path.utf8.contains(0) else { throw CLIError.invalidArguments }
+        _ = try await perform(arguments: ["daemon", "install", "--daemon", path], directory: "/", expectsJSON: false)
+    }
+
+    private func perform(arguments: [String], directory: String, expectsJSON: Bool) async throws -> CLIResult {
+        let operation: @Sendable () throws -> CLIResult = { try execute(arguments: arguments, directory: directory, expectsJSON: expectsJSON) }
         #if DEBUG
         let hooks = CLIProbe.hooks
         let worker = Task.detached { try CLIProbe.$hooks.withValue(hooks, operation: operation) }
@@ -74,7 +85,7 @@ public struct CLIRunner: Sendable {
         return ContinuousClock.now
     }
 
-    private func execute(arguments: [String], directory: String) throws -> CLIResult {
+    private func execute(arguments: [String], directory: String, expectsJSON: Bool) throws -> CLIResult {
         let deadline = Self.now.advanced(by: timeout)
         var out = [Int32](repeating: -1, count: 2)
         var err = [Int32](repeating: -1, count: 2)
@@ -106,7 +117,7 @@ public struct CLIRunner: Sendable {
               posix_spawn_file_actions_adddup2(&actions, out[1], 1) == 0,
               posix_spawn_file_actions_adddup2(&actions, err[1], 2) == 0,
               posix_spawn_file_actions_addchdir(&actions, directory) == 0 else { throw CLIError.unavailable }
-        let argv = [executable] + arguments + (arguments.contains("--json") ? [] : ["--json"])
+        let argv = [executable] + arguments + (expectsJSON && !arguments.contains("--json") ? ["--json"] : [])
         let environment = ["HOME=" + home, "PATH=/usr/bin:/bin", "LANG=en_US.UTF-8"]
         var args = argv.map { strdup($0) } + [nil]
         var env = environment.map { strdup($0) } + [nil]
@@ -146,7 +157,7 @@ public struct CLIRunner: Sendable {
                 if count > 0 {
                     total += count
                     guard total <= Frame.limit else { throw CLIError.outputLimit }
-                    if index == 0 { output += bytes.prefix(count) }
+                    if index == 0 && expectsJSON { output += bytes.prefix(count) }
                 }
                 if count < 0 && errno != EINTR && errno != EAGAIN { throw CLIError.unavailable }
             }
@@ -159,13 +170,17 @@ public struct CLIRunner: Sendable {
         }
         reaped = true
         guard status == 0 else { throw CLIError.failed(status) }
-        do {
-            try output.withUnsafeBytes { bytes in
-                var parser = JSONParser(bytes: bytes)
-                guard case .object = try parser.parse() else { throw CLIError.invalidOutput }
-            }
-        } catch { throw CLIError.invalidOutput }
-        guard let json = String(bytes: output, encoding: .utf8) else { throw CLIError.invalidOutput }
+        var json = ""
+        if expectsJSON {
+            do {
+                try output.withUnsafeBytes { bytes in
+                    var parser = JSONParser(bytes: bytes)
+                    guard case .object = try parser.parse() else { throw CLIError.invalidOutput }
+                }
+            } catch { throw CLIError.invalidOutput }
+            guard let text = String(bytes: output, encoding: .utf8) else { throw CLIError.invalidOutput }
+            json = text
+        }
         #if DEBUG
         CLIProbe.hooks?.beforeResult()
         #endif

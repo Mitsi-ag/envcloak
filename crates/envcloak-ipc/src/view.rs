@@ -802,7 +802,9 @@ impl ItemView {
             updated_secs: m.updated_at,
             rotated_secs: d.rotated_at,
             expires_secs: d.expires_at,
-            last_used_secs: (detail != ItemDetail::Summary).then_some(d.last_used_at).flatten(),
+            last_used_secs: (detail != ItemDetail::Summary)
+                .then_some(d.last_used_at)
+                .flatten(),
             account,
             detail: full,
             exposed: m.exposure.as_ref().map(|e| ExposedView {

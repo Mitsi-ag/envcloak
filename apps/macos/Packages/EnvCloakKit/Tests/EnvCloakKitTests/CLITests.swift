@@ -55,6 +55,48 @@ final class CLITests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testInstallUsesExitStatusAndExactArguments() async throws {
+        for output in ["installed", ""] {
+            let fixture = try fixture("""
+            test "$#" -eq 4 && test "$1" = daemon && test "$2" = install || exit 7
+            test "$3" = --daemon && test "$4" = '/tmp/fixture daemon' || exit 8
+            test "$PATH" = /usr/bin:/bin && test -d "$HOME" || exit 9
+            printf '\(output)'
+            """)
+            try await fixture.runner.installDaemon(at: "/tmp/fixture daemon")
+        }
+    }
+
+    func testInstallFailureBoundsAndCancellationNeverSucceed() async throws {
+        for (script, expected, timeout) in [
+            ("printf 'installed'; exit 2", CLIError.failed(512), Duration.seconds(3)),
+            ("while :; do :; done", .timedOut, .milliseconds(200)),
+            ("/bin/sleep 30 & exit 0", .timedOut, .milliseconds(300)),
+            ("/usr/bin/awk 'BEGIN { for (i=0; i<200000; i++) printf \"abcdefghij\" }'", .outputLimit, .seconds(3))
+        ] {
+            let fixture = try fixture(script, timeout: timeout)
+            do { try await fixture.runner.installDaemon(at: "/tmp/daemon"); XCTFail("failed install succeeded") }
+            catch { XCTAssertEqual(error as? CLIError, expected) }
+        }
+        let fixture = try fixture("while :; do :; done")
+        let install = Task { try await fixture.runner.installDaemon(at: "/tmp/daemon") }
+        install.cancel()
+        do { try await install.value; XCTFail("cancelled install succeeded") }
+        catch { XCTAssertEqual(error as? CLIError, .timedOut) }
+        for path in ["relative", "/tmp/bad\0path"] {
+            do { try await fixture.runner.installDaemon(at: path); XCTFail("invalid install path accepted") }
+            catch { XCTAssertEqual(error as? CLIError, .invalidArguments) }
+        }
+    }
+
+    func testInstallCompletionAfterDeadlineNeverSucceeds() async throws {
+        let clock = TestClock(); let fixture = try fixture("exit 0")
+        await CLIProbe.$hooks.withValue(CLITestHooks(now: { clock.now }, beforeResult: { clock.advance(.seconds(3)) })) {
+            do { try await fixture.runner.installDaemon(at: "/tmp/daemon"); XCTFail("late install succeeded") }
+            catch { XCTAssertEqual(error as? CLIError, .timedOut) }
+        }
+    }
+
     private func fixture(_ script: String, timeout: Duration = .seconds(2)) throws -> (root: String, runner: CLIRunner) {
         let root = (ProcessInfo.processInfo.environment["TMPDIR"] ?? "/tmp") + "/c" + String(UUID().uuidString.prefix(8))
         try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
