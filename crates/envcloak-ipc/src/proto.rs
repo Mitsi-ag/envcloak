@@ -1472,7 +1472,7 @@ impl Method for BackupList {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 40] = [
+pub const CLIENT_METHODS: [&str; 41] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
