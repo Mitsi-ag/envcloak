@@ -58,7 +58,9 @@ The long inventory supplies recorded last-used dates without per-row RPCs. No wo
 holds values. Replace and Remove offer quoted commands for a human Terminal
 session; Replace requires a field and qualifies the target as `slug#field`.
 Reveal explicitly says it is unavailable and offers no command. Project scope
-is saved as one adopted directory path per viewer.
+is saved as one adopted directory path per viewer. A failed preference write
+keeps the session selection and valid inventory, shows a warning, and retries
+the local save without refetching unchanged remote data.
 
 `VaultSession` polls status one second after the preceding poll finishes.
 Unchanged status does not fetch inventories again. Audit sequence, grant
@@ -75,7 +77,9 @@ actions start the bundled background process or offer the required Terminal
 command. Startup uses a bounded exit-status runner for `daemon install`;
 recovery help copies `envcloak recover --help`. An integrity failure shows a
 recovery banner and explicitly unavailable metadata: the current daemon
-refuses reads of a tampered vault. Locked takes precedence over tampered.
+refuses reads of a tampered vault. An upgrade failure with intact integrity
+keeps metadata readable, disables writes and says the next unlock retries the
+upgrade. Locked takes precedence over either read-only state.
 Settings and About carry the development-build warning. Approvals,
 Activity, Agents, Exposed, Spend, Dashboard and Devices explain which later
 slice supplies them.

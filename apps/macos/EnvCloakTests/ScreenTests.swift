@@ -142,6 +142,17 @@ import XCTest
         XCTAssertFalse(labels(window).contains("Metadata unavailable"))
     }
 
+    func testScopeSaveWarningKeepsNonemptyOverview() async throws {
+        let fixture = try ScopeWriteFixture()
+        let client = ScriptedClient(); let session = VaultSession(client: client, folders: fixture.folders)
+        try fixture.block(); await session.poll()
+        let window = host(MainView(session: session))
+        await assertVisible("The project scope applies for this session but could not be saved. EnvCloak will retry.", in: window)
+        await assertVisible("project, /tmp/project, 0 adopted bindings", in: window)
+        await assertVisible("All projects", in: window)
+        XCTAssertFalse(labels(window).contains("Projects could not be refreshed"))
+    }
+
     func testReadOnlyBannerExplainsMetadataRefusal() async {
         let client = ScriptedClient(); await client.configure(integrity: "tampered")
         let session = VaultSession(client: client); await session.poll()
