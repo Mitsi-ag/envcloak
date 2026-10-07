@@ -13,6 +13,8 @@ actor ScriptedClient: WorkspaceClient {
     var vault = "unlocked"
     var integrity = "ok"
     var readOnly = false
+    var busyResponses = 0
+    func busy(_ count: Int) { busyResponses = count }
     var idleLimit: UInt64 = 3600
     var lockReason = "sleep"
     nonisolated let socketPath: DaemonText? = DaemonText("/tmp/ec05-fixture\u{202e}/envcloakd.sock")
@@ -59,9 +61,12 @@ actor ScriptedClient: WorkspaceClient {
         if let failure { throw failure }
         let result: [String: Any]
         switch M.name {
-        case "status": result = [
+        case "status":
+            let busy = busyResponses > 0
+            if busy { busyResponses -= 1 }
+            result = [
             "daemon": ["version": "fixture", "pid": 42, "hardening": ["core_dumps_off": true, "non_dumpable": false], "runtime_dir_fallback": false],
-            "vault": ["state": vault, "integrity": integrity, "read_only": readOnly, "busy": false, "failed_unlocks": 0],
+            "vault": ["state": busy ? "locked" : vault, "integrity": integrity, "read_only": readOnly, "busy": busy, "failed_unlocks": 0],
             "lock": ["last_reason": lockReason, "idle_limit_secs": idleLimit],
             "approvals": ["grants": grants, "pending": pending, "proof_failures": 0, "proof_wait_secs": 0],
             "audit": ["open": true, "head_seq": head, "unanchored": 0, "anchor_failed": false, "queued": 0, "dropped": 0]]
@@ -552,6 +557,110 @@ final class SessionTests: XCTestCase {
         XCTAssertTrue(session.grants.rows.isEmpty)
     }
 
+    @MainActor func testPollDuringLockNeverReadsOrRestoresMetadata() async throws {
+        for lockFinishesFirst in [false, true] {
+            let barrier = LockRaceClient()
+            await barrier.client.configure(grants: 1, pending: 2)
+            let session = VaultSession(client: barrier); await session.poll()
+            await session.selectKey(try XCTUnwrap(session.items.rows.first?.slug))
+            await session.openProject(DaemonText("/tmp/project"))
+            XCTAssertNotNil(session.items.selectedItem)
+            XCTAssertNotNil(session.projects.opened)
+            await barrier.arm(holdStatus: lockFinishesFirst)
+            let locking = Task { await session.lock() }
+            await barrier.lockGate.arrived()
+            let started = expectation(description: "poll started during Lock")
+            let polling = Task { started.fulfill(); await session.poll() }
+            await fulfillment(of: [started], timeout: 2)
+            if lockFinishesFirst {
+                await barrier.lockGate.release(); await locking.value
+                await barrier.statusGate.release(); await polling.value
+            } else {
+                await polling.value
+                XCTAssertEqual(session.state, .connecting)
+                XCTAssertTrue(session.items.rows.isEmpty)
+                XCTAssertTrue(session.projects.rows.isEmpty)
+                XCTAssertTrue(session.grants.rows.isEmpty)
+                await barrier.lockGate.release(); await locking.value
+            }
+            let calls = await barrier.client.calls("status")
+            XCTAssertEqual(calls, 1, "Lock must suspend status polling in either completion order")
+            XCTAssertEqual(session.state, .locked)
+            XCTAssertEqual(session.pendingCount, 0)
+            XCTAssertTrue(session.items.rows.isEmpty)
+            XCTAssertTrue(session.projects.rows.isEmpty)
+            XCTAssertTrue(session.grants.rows.isEmpty)
+            XCTAssertNil(session.items.selectedItem)
+            XCTAssertNil(session.projects.opened)
+        }
+    }
+
+    @MainActor func testLockInvalidatesEarlierStatusInBothCompletionOrders() async {
+        for lockFinishesFirst in [false, true] {
+            let barrier = LockRaceClient()
+            let session = VaultSession(client: barrier); await session.poll()
+            await barrier.arm(holdStatus: true)
+            let polling = Task { await session.poll() }
+            await barrier.statusGate.arrived()
+            let locking = Task { await session.lock() }
+            await barrier.lockGate.arrived()
+            if lockFinishesFirst {
+                await barrier.lockGate.release(); await locking.value
+                await barrier.statusGate.release(); await polling.value
+            } else {
+                await barrier.statusGate.release(); await polling.value
+                XCTAssertEqual(session.state, .connecting)
+                await barrier.lockGate.release(); await locking.value
+            }
+            XCTAssertEqual(session.state, .locked)
+            XCTAssertTrue(session.items.rows.isEmpty)
+            XCTAssertTrue(session.projects.rows.isEmpty)
+            XCTAssertTrue(session.grants.rows.isEmpty)
+        }
+    }
+
+    @MainActor func testBusyStatusPreservesWorkspaceAndRecoversWithBackoff() async {
+        let client = ScriptedClient(); await client.configure(grants: 1, pending: 2)
+        let session = VaultSession(client: client); await session.poll()
+        await client.busy(100)
+        let start = ContinuousClock.now
+        await session.poll()
+        XCTAssertGreaterThanOrEqual(start.duration(to: .now), .seconds(2))
+        XCTAssertLessThan(start.duration(to: .now), .seconds(4))
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(session.pendingCount, 2)
+        XCTAssertEqual(session.items.rows.count, 1)
+        XCTAssertEqual(session.projects.rows.count, 1)
+        XCTAssertEqual(session.grants.rows.count, 1)
+        XCTAssertEqual(session.notice, "EnvCloak is busy finishing an unlock or approval. Try again in a moment.")
+        let calls = await client.calls("status")
+        XCTAssertGreaterThan(calls, 2)
+        XCTAssertLessThan(calls, 25, "Busy retries must back off")
+        await client.busy(2)
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertNil(session.notice, "A recovered status must clear the stale Busy notice")
+        let lists = await client.calls("items.list")
+        XCTAssertEqual(lists, 1, "Busy must not reset the change detector")
+        await client.busy(2); await client.configure(vault: "locked")
+        await session.poll()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertTrue(session.items.rows.isEmpty)
+    }
+
+    @MainActor func testBusyAtLaunchNeverAdvertisesUnlockAndCancellationStopsRetries() async {
+        let client = ScriptedClient(); await client.busy(100)
+        let session = VaultSession(client: client)
+        let polling = Task { await session.poll() }
+        while await client.calls("status") == 0 { await Task.yield() }
+        polling.cancel(); await polling.value
+        XCTAssertEqual(session.state, .connecting)
+        XCTAssertNil(session.notice)
+        await client.busy(2)
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+    }
+
     @MainActor func testGroupingAndUnsafeLinks() async {
         let client = ScriptedClient(); let session = VaultSession(client: client)
         await session.poll()
@@ -687,5 +796,40 @@ actor FailingRefreshClient: WorkspaceClient {
     func restore() throws {
         try FileManager.default.moveItem(at: scopeFile, to: file.appendingPathExtension("blocked"))
         try FileManager.default.moveItem(at: savedFile, to: scopeFile)
+    }
+}
+
+/// A latched barrier allows either completion order without timing sleeps.
+actor ResponseGate {
+    private var entered = false
+    private var released = false
+    private var arrival: CheckedContinuation<Void, Never>?
+    private var waiter: CheckedContinuation<Void, Never>?
+    func arrived() async {
+        if entered { return }
+        await withCheckedContinuation { arrival = $0 }
+    }
+    func wait() async {
+        entered = true; arrival?.resume(); arrival = nil
+        if released { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    func release() { released = true; waiter?.resume(); waiter = nil }
+}
+
+actor LockRaceClient: WorkspaceClient {
+    let client = ScriptedClient()
+    let lockGate = ResponseGate()
+    let statusGate = ResponseGate()
+    private var armed = false
+    private var holdStatus = false
+    func arm(holdStatus: Bool) { armed = true; self.holdStatus = holdStatus }
+    func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
+        if armed && M.name == "lock" { await lockGate.wait() }
+        // Snapshot before waiting, as an already encoded daemon response can
+        // arrive after Lock even though it still describes an unlocked vault.
+        let result = try await client.call(method)
+        if armed && holdStatus && M.name == "status" { await statusGate.wait() }
+        return result
     }
 }

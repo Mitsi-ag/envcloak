@@ -21,6 +21,8 @@ struct Change: OptionSet {
     private let client: (any WorkspaceClient)?
     private var lastStatus: StatusView?
     private var polling = false
+    private var locking = false
+    private static let busyNotice = "EnvCloak is busy finishing an unlock or approval. Try again in a moment."
     private var generation = 0
     var state = ConnectionState.connecting
     var lockReason = ""
@@ -62,13 +64,14 @@ struct Change: OptionSet {
     }
 
     func poll() async {
-        guard !polling, let client else { return }
+        guard !polling, !locking, let client else { return }
         polling = true
         defer { polling = false }
         let captured = generation
         do {
             let status = try await readStatus(client)
             guard captured == generation, !Task.isCancelled else { return }
+            if notice == Self.busyNotice { notice = nil }
             proofWait = status.approvals.proof_wait_secs
             lockReason = switch status.lock.last_reason {
             case .idle: "Locked after \(Self.durationWords(status.lock.idle_limit_secs)) idle"
@@ -118,9 +121,9 @@ struct Change: OptionSet {
             }
             lastStatus = status
         } catch {
-            if captured == generation {
+            if captured == generation, !Task.isCancelled {
                 if error as? EnvCloakError == .rpc(.busy, nil) {
-                    notice = "EnvCloak is busy finishing an unlock or approval. Try again in a moment."
+                    notice = Self.busyNotice
                 } else { fail(error) }
             }
         }
@@ -128,11 +131,18 @@ struct Change: OptionSet {
 
     private func readStatus(_ client: any WorkspaceClient) async throws -> StatusView {
         let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        var delay = Duration.milliseconds(100)
         while true {
-            do { return try await client.call(Status()) }
-            catch EnvCloakError.rpc(.busy, _) {
-                guard ContinuousClock.now < deadline else { throw EnvCloakError.rpc(.busy, nil) }
-                try await Task.sleep(for: .milliseconds(100))
+            try Task.checkCancellation()
+            do {
+                let status = try await client.call(Status())
+                guard !status.vault.busy else { throw EnvCloakError.rpc(.busy, nil) }
+                return status
+            } catch EnvCloakError.rpc(.busy, _) {
+                let remaining = ContinuousClock.now.duration(to: deadline)
+                guard remaining > .zero else { throw EnvCloakError.rpc(.busy, nil) }
+                try await Task.sleep(for: min(delay, remaining))
+                delay = min(delay * 2, .milliseconds(400))
             }
         }
     }
@@ -181,12 +191,25 @@ struct Change: OptionSet {
     }
 
     func lock() async {
-        guard let client, state != .locked else { return }
+        guard let client, !locking, state != .locked else { return }
+        locking = true
         actionInProgress = true
-        defer { actionInProgress = false }
+        defer {
+            // Lock uses its own client slot. Retire every earlier refresh at
+            // completion as well as entry, including failed lock responses.
+            generation += 1
+            lastStatus = nil
+            clearMetadata()
+            pendingCount = 0
+            proofWait = 0
+            locking = false
+            actionInProgress = false
+        }
         generation += 1
         lastStatus = nil
         clearMetadata()
+        pendingCount = 0
+        proofWait = 0
         state = .connecting
         do {
             _ = try await client.call(Lock())
