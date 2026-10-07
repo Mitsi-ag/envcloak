@@ -88,7 +88,8 @@ def prepare(root):
         else:
             run(str(root / "sign_peer"), chosen["keychain"], chosen["certificate"], str(file), "ai.envcloak.app", "65536" if runtime else "0", str(plist) if entitlement else "")
             requirement = f'identifier "ai.envcloak.app" and certificate leaf = H"{chosen["sha1"]}"'
-            run("/usr/bin/codesign", "--verify", "--strict", "-R", requirement, str(file))
+            # The leading = selects an inline requirement instead of a file.
+            run("/usr/bin/codesign", "--verify", "--strict", "-R", "=" + requirement, str(file))
     # Independent reader already used by gate 19, via Security.framework rather than codesign text.
     run("/usr/bin/swiftc", str(ROOT / "scripts/macos/tests/oracles/codesign_facts.swift"),
         "-o", str(root / "facts"))
