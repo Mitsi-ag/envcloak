@@ -230,6 +230,46 @@ pub fn allowed_path(path: &str, home: Option<&Path>, data_dir: &Path) -> bool {
     *name == "mcp.json" && dirs.last().is_some_and(|d| PROJECT_MCP_DIRS.contains(d))
 }
 
+/// M2-16 adds only these conventional first-run sources, for import cleanup.
+/// Other purposes retain their original roots. Arbitrary sourced scripts do
+/// not gain restore authority from a client-supplied source relationship.
+fn allowed_first_run_path(path: &str, home: Option<&Path>, purpose: BackupPurpose) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    if purpose != BackupPurpose::Init
+        || path.len() > 4096
+        || path.contains('\0')
+        || rest
+            .split('/')
+            .any(|p| p.is_empty() || p == "." || p == "..")
+    {
+        return false;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    let canonical = std::fs::canonicalize(home).ok();
+    [Some(home.to_path_buf()), canonical]
+        .into_iter()
+        .flatten()
+        .any(|home| {
+            [
+                ".zshrc",
+                ".zprofile",
+                ".zshenv",
+                ".bashrc",
+                ".bash_profile",
+                ".profile",
+                ".config/fish/config.fish",
+                ".aws/credentials",
+                ".aws/config",
+            ]
+            .iter()
+            .any(|relative| Path::new(path) == home.join(relative))
+        })
+}
+
 /// The running boot's id (`envcloak_sys::boot_id`), read once: `None` on
 /// macOS, and on Linux when it cannot be read, which no recorded boot
 /// matches.
@@ -859,7 +899,9 @@ pub fn begin(
     let data_dir = locked(&shared.state).paths().data_dir.clone();
     let mut plan = Vec::with_capacity(p.files.len());
     for f in p.files {
-        if !allowed_path(&f.path, home.as_deref(), &data_dir) {
+        if !allowed_path(&f.path, home.as_deref(), &data_dir)
+            && !allowed_first_run_path(&f.path, home.as_deref(), purpose)
+        {
             return Err(invalid());
         }
         // The permission bits only: a set-user-id, set-group-id or sticky
@@ -1196,7 +1238,44 @@ fn statement(
     }
 }
 
-/// `backup.v2.open_restore`. See the module documentation.
+/// Metadata for the first-run undo statement, before any passphrase is read.
+pub(crate) fn show_first_run(
+    shared: &Shared,
+    caller: &SubjectEvidence,
+    id: &FileBackupId,
+) -> Result<envcloak_ipc::proto::FilesShown, RpcError> {
+    use envcloak_ipc::proto::{FileLeft, FilesShown, ShownFile};
+    use envcloak_ipc::view::FileBackupCreatorView;
+    let (reader, _) = open_reader(shared, id)?;
+    let m = reader.meta();
+    if m.purpose != BackupPurpose::Init || m.files.len() != 1 {
+        return Err(RpcError::new(ErrorKind::NoSuchBackup));
+    }
+    if m.creator.kind != CreatorKind::Terminal && shares_with_creator(caller, &m.creator) {
+        return Err(RpcError::with_reason(
+            ErrorKind::ProofRefused,
+            ProofRefusal::RequesterTerminal.token(),
+        ));
+    }
+    let results = reader.results().map_err(|e| backup_error(&e))?;
+    Ok(FilesShown {
+        creator: Some(FileBackupCreatorView {
+            kind: m.creator.kind.as_str().into(),
+            agent: m.creator.agent.clone(),
+        }),
+        files: m
+            .files
+            .iter()
+            .zip(results)
+            .map(|(file, result)| ShownFile {
+                path: file.path.clone(),
+                left: result.map(|digest| FileLeft::Rewritten(hex(&digest))),
+            })
+            .collect(),
+    })
+}
+
+/// Open a restore lease after its proof and creator-origin checks.
 pub fn open_restore(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -1538,6 +1617,59 @@ mod tests {
         // Without a home, only the rest.
         assert!(!allowed_path("/h/u/.claude.json", None, data));
         assert!(allowed_path("/h/u/.claude/settings.json", None, data));
+    }
+
+    #[test]
+    fn first_run_backup_paths_are_exact_and_init_only() {
+        let home = Path::new("/h/u");
+        for relative in [
+            ".zshrc",
+            ".zprofile",
+            ".zshenv",
+            ".bashrc",
+            ".bash_profile",
+            ".profile",
+            ".config/fish/config.fish",
+            ".aws/credentials",
+            ".aws/config",
+        ] {
+            let path = format!("/h/u/{relative}");
+            assert!(allowed_first_run_path(
+                &path,
+                Some(home),
+                BackupPurpose::Init
+            ));
+            assert!(!allowed_first_run_path(&path, None, BackupPurpose::Init));
+            for purpose in [
+                BackupPurpose::Agents,
+                BackupPurpose::Scrub,
+                BackupPurpose::Migrate,
+            ] {
+                assert!(!allowed_first_run_path(&path, Some(home), purpose));
+            }
+            assert!(!allowed_first_run_path(
+                &format!("{path}.bak"),
+                Some(home),
+                BackupPurpose::Init
+            ));
+        }
+        for path in [
+            "",
+            "é",
+            "/h/u/.aws/other",
+            "/h/u/.aws/../.ssh/config",
+            "/h/u/.ssh/config",
+            "/h/other/.zshrc",
+            "/h/u/.config/fish/functions/a.fish",
+            "/h/u/.bashrc/child",
+            "/h/u//.zshrc",
+        ] {
+            assert!(!allowed_first_run_path(
+                path,
+                Some(home),
+                BackupPurpose::Init
+            ));
+        }
     }
 
     /// The statement's budget counts a path as JSON writes it, escapes

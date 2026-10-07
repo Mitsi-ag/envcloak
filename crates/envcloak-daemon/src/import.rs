@@ -1431,10 +1431,16 @@ pub fn files_show(
     let backup = FileBackupId::parse(&p.backup).ok_or(RpcError::new(ErrorKind::NoSuchBackup))?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "files.show")?;
-    let m = locked(&shared.state)
+    let manifest = locked(&shared.state)
         .unlocked()?
-        .file_backup_manifest(&backup)
-        .map_err(|e| open_backup_error(&e))?;
+        .file_backup_manifest(&backup);
+    let m = match manifest {
+        Ok(m) => m,
+        Err(e) if e.kind() == VaultErrorKind::NotFound => {
+            return crate::backups::show_first_run(shared, &caller, &backup);
+        }
+        Err(e) => return Err(open_backup_error(&e)),
+    };
     Ok(FilesShown {
         creator: m.creator.map(creator_view),
         files: m
