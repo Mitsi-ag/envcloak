@@ -813,6 +813,10 @@ fn respond<'s>(
             answer::<ItemsTarget>(id, &req, |p| items::target_view(shared, peer, p))
         }
         ItemsRotate::NAME => answer::<ItemsRotate>(id, &req, |p| items::rotate(shared, peer, p)),
+        #[cfg(target_os = "linux")]
+        proto::ItemsReveal::NAME => {
+            framed::<proto::ItemsReveal>(id, &req, |p| crate::reveal::reveal(shared, peer, id, p))
+        }
         ItemsRemove::NAME => answer::<ItemsRemove>(id, &req, |p| items::remove(shared, peer, p)),
         ItemsReclassify::NAME => {
             answer::<ItemsReclassify>(id, &req, |p| items::reclassify(shared, peer, p))

@@ -43,6 +43,8 @@ mod lock;
 mod projects;
 mod redact;
 mod requests;
+#[cfg(target_os = "linux")]
+mod reveal;
 mod scan_match;
 mod server;
 mod state;
