@@ -97,7 +97,10 @@ fn edits_refuse_value_shaped_previous_references_without_echo_or_write() {
                 format!("[env]\nKEEP={{ref='{reference}'}}\n")
             },
         ] {
-            for args in [vec!["ref", "--unset", "KEEP", "--json"], vec!["ref", "--unset", "KEEP"]] {
+            for args in [
+                vec!["ref", "--unset", "KEEP", "--json"],
+                vec!["ref", "--unset", "KEEP"],
+            ] {
                 std::fs::write(&path, &source).unwrap();
                 let mut cmd = common::cli_command(&home, &args, &[]);
                 cmd.current_dir(&dir);

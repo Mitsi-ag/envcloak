@@ -9,9 +9,16 @@ use crate::server::{Shared, locked};
 
 const PAGE_BYTES: usize = 768 * 1024;
 
-fn view(p: &ProjectRecord) -> ProjectView {
+fn view(shared: &Shared, p: &ProjectRecord) -> ProjectView {
+    let shown = |s: &str| {
+        if crate::items::looks_like_value(shared, s) {
+            envcloak_policy::HIDDEN.to_owned()
+        } else {
+            s.to_owned()
+        }
+    };
     ProjectView {
-        dir: p.display_path.clone(),
+        dir: shown(&p.display_path),
         manifest_sha256: p
             .manifest_sha256
             .iter()
@@ -21,8 +28,8 @@ fn view(p: &ProjectRecord) -> ProjectView {
             .bindings
             .iter()
             .map(|b| ProjectBindingView {
-                env_name: b.env_name.clone(),
-                reference: b.reference.clone(),
+                env_name: shown(&b.env_name),
+                reference: shown(&b.reference),
             })
             .collect(),
         last_seen_secs: p.last_seen,
@@ -60,7 +67,7 @@ pub fn list(shared: &Shared, p: ProjectsListParams) -> Result<ProjectsView, RpcE
     let mut out = ProjectsView::default();
     let mut bytes = 0;
     while let Some((id, row)) = rows.next() {
-        let item = view(row);
+        let item = view(shared, row);
         let item_bytes = Frame::encode(&item)
             .map_err(|_| RpcError::new(ErrorKind::FrameTooLarge))?
             .len();

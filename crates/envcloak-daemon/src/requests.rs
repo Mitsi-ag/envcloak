@@ -550,6 +550,9 @@ pub fn run_request(
                         manifest_sha256: project.manifest.sha256,
                         bindings: bindings
                             .iter()
+                            .filter(|(_, source)| {
+                                matches!(source, BindingSource::Env | BindingSource::Profile { .. })
+                            })
                             .map(|(b, _)| envcloak_core::vault::ProjectBinding {
                                 env_name: b.env_name.as_str().to_owned(),
                                 reference: b.reference.to_string(),
@@ -571,7 +574,7 @@ pub fn run_request(
                     }
                     Err(Delivery::Lapsed) => {
                         // The grant ran out, or its root exited, while the
-                        // answer was prepared: nothing was recorded or
+                        // answer was prepared or finalized: nothing was
                         // released, and a grant whose root exited is gone.
                         // The request is decided again on clocks read now,
                         // as if it came now, which that grant no longer
@@ -603,15 +606,6 @@ pub fn run_request(
                         });
                     }
                 };
-                if let Some(approved_sha256) = approved {
-                    s.audit(AuditEvent::ManifestChanged {
-                        pid: peer.pid,
-                        grant: g.to_string(),
-                        dir: project_dir.clone(),
-                        approved_sha256,
-                        sha256: project.manifest.sha256,
-                    });
-                }
                 // Under the lock since the decision: the grant is there.
                 if !s.grants().consume(g) {
                     return Err(RpcError::new(ErrorKind::Internal));
