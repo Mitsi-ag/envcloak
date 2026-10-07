@@ -121,7 +121,7 @@ fn stream_caps_and_malformed_input_never_report_complete() {
 }
 
 #[test]
-fn encoded_tokens_keep_their_full_raw_span_without_claiming_rewrite() {
+fn whole_encoded_tokens_keep_their_rewritable_raw_span() {
     let output=std::process::Command::new("/usr/bin/python3").args(["-I","-c","import base64,urllib.parse; v=b'fixtureZencodedValueWithSpaces'; print(base64.b64encode(v).decode()); print(v.hex()); print(''.join('%%%02X'%b for b in v)); print(base64.b64encode(b'prefix '+v+b' suffix').decode())"])
         .env_clear().output().unwrap();
     assert!(output.status.success());
@@ -154,7 +154,7 @@ fn encoded_tokens_keep_their_full_raw_span_without_claiming_rewrite() {
                     && c.occurrence.encoding == encoding
             })
             .unwrap();
-        assert!(!c.occurrence.rewritable);
+        assert!(c.occurrence.rewritable, "whole decoded token is rewritable");
         assert!(c.occurrence.range.end > c.occurrence.range.start);
         assert!(
             !output.stdout[c.occurrence.range.start as usize..c.occurrence.range.end as usize]

@@ -45,6 +45,7 @@ mod json;
 pub mod profile;
 pub mod restore;
 pub mod root;
+pub mod scrub;
 pub mod source;
 mod token_readings;
 pub mod transcript;

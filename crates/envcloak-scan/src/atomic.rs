@@ -1401,6 +1401,50 @@ pub fn rewrite_checked_observed(
     replace_in(&dir, rel, &name, new, expect, observe)
 }
 
+/// Scrub's streamed replacement. Only the scrubbed bytes get a temporary
+/// name: the original is replaced by rename, never moved aside. This follows
+/// SPEC 6.5's last-check/rename contract; a concurrent rename in that final
+/// syscall interval cannot be excluded. No success is returned for a changed
+/// staged file. Undo uses the stronger, digest-checked restore path instead.
+pub(crate) fn scrub_stream(
+    r: &ScanRoot,
+    rel: &Path,
+    expect: &FileStamp,
+    fill: Fill<'_>,
+    observe: &mut dyn FnMut(Inside),
+) -> Result<[u8; 32], ModifyError> {
+    let fail = |kind| ModifyError {
+        rel: rel.to_owned(),
+        kind,
+    };
+    let (dir, name) = r
+        .open_parent(rel)
+        .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
+    check_removable(&dir, &name, expect, SystemTime::now()).map_err(fail)?;
+    let temp = temp_name(&name, "new");
+    let staged = write_new_with(&dir, rel, &name, &temp, expect.mode, fill)?;
+    observe(Inside::Staged);
+    let stop = |k, observe: &mut dyn FnMut(Inside)| {
+        give_up(&dir, rel, &name, &staged, &temp, "new", k, observe)
+    };
+    if !staged.named(&dir, &temp) {
+        return Err(stop(ModifyErrorKind::Changed, observe));
+    }
+    observe(Inside::Checked);
+    if let Err(k) = check_removable(&dir, &name, expect, SystemTime::now()) {
+        return Err(stop(k, observe));
+    }
+    if let Err(e) = rename_beneath(&dir, &temp, &name) {
+        return Err(stop(io(&e), observe));
+    }
+    observe(Inside::Swapped);
+    if !staged.named(&dir, &name) {
+        return Err(fail(ModifyErrorKind::Changed));
+    }
+    sync_file(&dir).map_err(|e| fail(io(&e)))?;
+    Ok(staged.sha256)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1411,6 +1455,57 @@ mod tests {
         /// in order ([`temp_name`]), so a test can put a file there first.
         pub(super) static NEXT_HEX: core::cell::RefCell<std::collections::VecDeque<u64>> =
             const { core::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+
+    #[test]
+    fn gate37_scrub_exclusive_staging_and_ctime_recheck() {
+        use std::io::Write;
+        let d = tempfile::tempdir_in("/tmp").unwrap();
+        let p = d.path().join("events");
+        std::fs::write(&p, b"original transcript").unwrap();
+        File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(300))
+            .unwrap();
+        let r = crate::open_root(d.path()).unwrap();
+        let stamp = FileStamp::of(&std::fs::metadata(&p).unwrap());
+        let planted = d.path().join(".events.envcloak-new-0000000000000022.tmp");
+        std::fs::write(&planted, b"foreign file").unwrap();
+        next_names(&[0x22]);
+        let result = scrub_stream(
+            &r,
+            Path::new("events"),
+            &stamp,
+            &mut |w| w.write_all(b"scrubbed").map_err(|e| io(&e)),
+            &mut |_| {},
+        );
+        assert!(result.is_err(), "existing temporary name was reused");
+        assert_eq!(std::fs::read(&planted).unwrap(), b"foreign file");
+        assert_eq!(std::fs::read(&p).unwrap(), b"original transcript");
+        let mut fired = false;
+        let result = scrub_stream(
+            &r,
+            Path::new("events"),
+            &stamp,
+            &mut |w| w.write_all(b"scrubbed").map_err(|e| io(&e)),
+            &mut |at| {
+                if at == Inside::Checked {
+                    let mut f = File::options().write(true).open(&p).unwrap();
+                    let modified = f.metadata().unwrap().modified().unwrap();
+                    f.write_all(b"edited!!").unwrap();
+                    f.set_modified(modified).unwrap();
+                    fired = true;
+                }
+            },
+        );
+        assert!(fired);
+        assert!(
+            result.is_err(),
+            "same-size edit with restored mtime was lost"
+        );
+        assert!(std::fs::read(&p).unwrap().starts_with(b"edited!!"));
     }
 
     /// Makes the next temporary names on this thread end in `hex`, in

@@ -173,12 +173,8 @@ fn independent_json_ranges_and_duplicate_occurrences_match_in_small_chunks() {
                         Encoding::Hex => "hex",
                         Encoding::Percent => "percent",
                     };
-                    if matches!(
-                        o.encoding,
-                        Encoding::Base64 | Encoding::Hex | Encoding::Percent
-                    ) {
-                        assert!(!o.rewritable);
-                    }
+                    // This oracle checks physical ranges. Whole decoded-token
+                    // rewrite authority is covered by M2-22's paired controls.
                     spans.insert((o.range.start, o.range.end, form.to_owned(), digest.clone()));
                 }
             }

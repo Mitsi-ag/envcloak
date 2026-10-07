@@ -484,9 +484,13 @@ fn decoded_tokens(
         } else {
             reading_form
         };
+        // Only the complete decoded spelling authorizes replacing its source
+        // span. A token inside a longer encoded run remains detection-only.
+        let mut occurrence = at.clone();
+        occurrence.rewritable = r.start == 0 && r.end == bytes.len();
         if !send(
             SecretBytes::copy_from(&bytes[r]),
-            at.clone(),
+            occurrence,
             form,
             report,
             budget,
