@@ -339,7 +339,7 @@ impl OpenFile {
         if actual != stamp {
             return Err("changed");
         }
-        crate::atomic::check_modifiable(&root, &rel, &stamp).map_err(|e| e.token())?;
+        crate::atomic::check_open_modifiable(&root, &rel, &file, &stamp).map_err(|e| e.token())?;
         Ok(Self {
             root,
             rel,
@@ -357,7 +357,8 @@ impl OpenFile {
         if FileStamp::of(&self.file.metadata().map_err(|_| "unreadable")?) != self.stamp {
             return Err("changed");
         }
-        crate::atomic::check_modifiable(&self.root, &self.rel, &self.stamp).map_err(|e| e.token())
+        crate::atomic::check_open_modifiable(&self.root, &self.rel, &self.file, &self.stamp)
+            .map_err(|e| e.token())
     }
     pub fn validate(&mut self, plan: &FilePlan, format: ConfigFormat) -> Result<(), &'static str> {
         rewrite(plan, self.reader()?, &mut std::io::sink(), format)?;
@@ -371,14 +372,15 @@ impl OpenFile {
         use std::io::Seek;
         self.check()?;
         self.file.rewind().map_err(|_| "unreadable")?;
-        let file = &mut self.file;
+        let mut file = &self.file;
         let mut cause = None;
         let result = crate::atomic::scrub_stream(
             &self.root,
             &self.rel,
             &self.stamp,
+            file,
             &mut |w| {
-                rewrite(plan, file, w, format).map_err(|reason| {
+                rewrite(plan, &mut file, w, format).map_err(|reason| {
                     cause = Some(reason);
                     crate::ModifyErrorKind::Changed
                 })

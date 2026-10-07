@@ -1267,15 +1267,31 @@ fn check_removable(
     now: SystemTime,
 ) -> Result<(), ModifyErrorKind> {
     let f = check_same(dir, name, expect)?;
+    check_open_removable(dir, name, &f, expect, now)
+}
+
+// Reuse the source descriptor through scrub's checks. Linux write leases count
+// this process's other opens too, so close the path-check descriptor before
+// asking whether the held source is open elsewhere.
+fn check_open_removable(
+    dir: &File,
+    name: &OsStr,
+    source: &File,
+    expect: &FileStamp,
+    now: SystemTime,
+) -> Result<(), ModifyErrorKind> {
+    drop(check_same(dir, name, expect)?);
+    if FileStamp::of(&source.metadata().map_err(|e| io(&e))?) != *expect {
+        return Err(ModifyErrorKind::Changed);
+    }
     if expect.age_at(now).is_none_or(|age| age < MIN_AGE.as_secs()) {
         return Err(ModifyErrorKind::RecentlyChanged);
     }
-    match open_elsewhere(&f) {
+    match open_elsewhere(source) {
         InUse::Yes => return Err(ModifyErrorKind::OpenElsewhere),
         InUse::Unmatched => return Err(ModifyErrorKind::Unchecked),
         InUse::No | InUse::Unknown => {}
     }
-    drop(f);
     check_same(dir, name, expect).map(drop)
 }
 
@@ -1288,6 +1304,18 @@ pub fn check_modifiable(
 ) -> Result<(), ModifyErrorKind> {
     let (dir, name) = r.open_parent(rel).map_err(ModifyErrorKind::Scan)?;
     check_removable(&dir, &name, expect, SystemTime::now())
+}
+
+/// Checks a source the caller already holds, without retaining another open.
+/// The caller must hold only this descriptor when Linux checks its write lease.
+pub(crate) fn check_open_modifiable(
+    r: &ScanRoot,
+    rel: &Path,
+    source: &File,
+    expect: &FileStamp,
+) -> Result<(), ModifyErrorKind> {
+    let (dir, name) = r.open_parent(rel).map_err(ModifyErrorKind::Scan)?;
+    check_open_removable(&dir, &name, source, expect, SystemTime::now())
 }
 
 /// Removes a file after repeating the same admission checks at the change.
@@ -1410,6 +1438,7 @@ pub(crate) fn scrub_stream(
     r: &ScanRoot,
     rel: &Path,
     expect: &FileStamp,
+    source: &File,
     fill: Fill<'_>,
     observe: &mut dyn FnMut(Inside),
 ) -> Result<[u8; 32], ModifyError> {
@@ -1420,7 +1449,7 @@ pub(crate) fn scrub_stream(
     let (dir, name) = r
         .open_parent(rel)
         .map_err(|k| fail(ModifyErrorKind::Scan(k)))?;
-    check_removable(&dir, &name, expect, SystemTime::now()).map_err(fail)?;
+    check_open_removable(&dir, &name, source, expect, SystemTime::now()).map_err(fail)?;
     let temp = temp_name(&name, "new");
     let staged = write_new_with(&dir, rel, &name, &temp, expect.mode, fill)?;
     observe(Inside::Staged);
@@ -1431,7 +1460,7 @@ pub(crate) fn scrub_stream(
         return Err(stop(ModifyErrorKind::Changed, observe));
     }
     observe(Inside::Checked);
-    if let Err(k) = check_removable(&dir, &name, expect, SystemTime::now()) {
+    if let Err(k) = check_open_removable(&dir, &name, source, expect, SystemTime::now()) {
         return Err(stop(k, observe));
     }
     if let Err(e) = rename_beneath(&dir, &temp, &name) {
@@ -1469,6 +1498,7 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(300))
             .unwrap();
+        let source = File::open(&p).unwrap();
         let r = crate::open_root(d.path()).unwrap();
         let stamp = FileStamp::of(&std::fs::metadata(&p).unwrap());
         let planted = d.path().join(".events.envcloak-new-0000000000000022.tmp");
@@ -1478,6 +1508,7 @@ mod tests {
             &r,
             Path::new("events"),
             &stamp,
+            &source,
             &mut |w| w.write_all(b"scrubbed").map_err(|e| io(&e)),
             &mut |_| {},
         );
@@ -1489,6 +1520,7 @@ mod tests {
             &r,
             Path::new("events"),
             &stamp,
+            &source,
             &mut |w| w.write_all(b"scrubbed").map_err(|e| io(&e)),
             &mut |at| {
                 if at == Inside::Checked {

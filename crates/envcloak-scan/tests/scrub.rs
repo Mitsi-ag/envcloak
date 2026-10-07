@@ -113,6 +113,10 @@ fn gate37_json_preview_preserves_escape_boundaries_and_refuses_invalid_json() {
     }
 }
 
+// A sibling test's fork briefly inherits all this process's descriptors until
+// exec. Keep the filesystem gates apart so the closed controls have no holder.
+static FILES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn file_plan(path: &std::path::Path) -> envcloak_scan::scrub::FilePlan {
     let stamp = FileStamp::of(&std::fs::metadata(path).unwrap());
     let mut c = candidate(0, 0..stamp.size, stamp.size);
@@ -130,6 +134,7 @@ fn age(path: &std::path::Path) {
 }
 #[test]
 fn gate37_recent_linked_and_stale_sources_refused() {
+    let _files = FILES.lock().unwrap();
     use envcloak_scan::scrub::OpenFile;
     use std::os::unix::fs::symlink;
     let d = tempfile::tempdir_in("/tmp").unwrap();
@@ -166,6 +171,7 @@ fn gate37_recent_linked_and_stale_sources_refused() {
 }
 #[test]
 fn gate37_apply_streams_only_scrubbed_temporary_bytes_and_keeps_mode() {
+    let _files = FILES.lock().unwrap();
     use envcloak_scan::scrub::OpenFile;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let d = tempfile::tempdir_in("/tmp").unwrap();
@@ -225,13 +231,16 @@ proptest::proptest! {
 
 #[test]
 fn gate37_open_elsewhere_refuses_aged_source_with_a_closed_control() {
+    let _files = FILES.lock().unwrap();
     use std::io::BufRead;
     let d = tempfile::tempdir_in("/tmp").unwrap();
     let path = d.path().join("events");
     std::fs::write(&path, b"fixtureZheldByAnotherProcess").unwrap();
     age(&path);
     let plan = file_plan(&path);
-    assert!(envcloak_scan::scrub::OpenFile::open(&plan).is_ok());
+    let mut opened = envcloak_scan::scrub::OpenFile::open(&plan).unwrap();
+    opened.check().unwrap();
+    opened.validate(&plan, ConfigFormat::Raw).unwrap();
     let mut holder=std::process::Command::new("/usr/bin/python3").args(["-I","-B","-c",
         "import sys\nf=open(sys.argv[1],'rb')\nprint('ready',flush=True)\nsys.stdin.readline()\nf.close()\n"])
         .arg(&path).env_clear().env("HOME",d.path()).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
@@ -241,8 +250,22 @@ fn gate37_open_elsewhere_refuses_aged_source_with_a_closed_control() {
         .unwrap();
     assert_eq!(line, "ready\n");
     let refused = envcloak_scan::scrub::OpenFile::open(&plan);
+    let held_check = opened.check();
+    let held_validate = opened.validate(&plan, ConfigFormat::Raw);
+    let held_apply = opened.apply(&plan, ConfigFormat::Raw);
     holder.stdin.take();
     assert!(holder.wait().unwrap().success());
     assert!(matches!(refused, Err("open_elsewhere")));
+    assert_eq!(held_check, Err("open_elsewhere"));
+    assert_eq!(held_validate, Err("open_elsewhere"));
+    assert_eq!(held_apply, Err("open_elsewhere"));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"fixtureZheldByAnotherProcess"
+    );
+    assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    opened.check().unwrap();
+    opened.validate(&plan, ConfigFormat::Raw).unwrap();
+    drop(opened);
     assert!(envcloak_scan::scrub::OpenFile::open(&plan).is_ok());
 }
