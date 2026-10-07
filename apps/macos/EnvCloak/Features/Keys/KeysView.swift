@@ -25,7 +25,7 @@ struct KeysView: View {
                     ForEach(KeyGrouping.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                 }.fixedSize()
             }.padding(.horizontal)
-            if session.items.failure != nil || (session.projects.failure != nil && scope != nil) {
+            if session.keysUnavailable(query: query, scope: scope) {
                 ContentUnavailableView("Keys could not be refreshed", systemImage: "exclamationmark.triangle", description: Text("Try again. No old listing is shown."))
             } else if rows.isEmpty {
                 ContentUnavailableView(query.isEmpty ? "No keys yet." : "No matching keys", systemImage: "key.horizontal", description: Text(query.isEmpty ? "Add a key in Terminal with envcloak add. Pasting in the app arrives in the next build." : "Try another search."))

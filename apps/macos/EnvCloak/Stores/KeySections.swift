@@ -24,7 +24,7 @@ extension VaultSession {
             case .provider: [item.provider?.escaped ?? "No provider"]
             case .account: [item.account?.email?.escaped ?? "No account"]
             }
-            for name in names {
+            for name in Set(names) {
                 groups[name, default: []].append(KeyRow(item: item, group: name, usedBy: projects.failure == nil ? users.joined(separator: ", ") : "Projects could not be refreshed"))
             }
         }

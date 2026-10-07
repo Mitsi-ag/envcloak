@@ -8,27 +8,34 @@ struct ProjectsOverview: View {
     var body: some View {
         if session.projects.failure != nil {
             ContentUnavailableView("Projects could not be refreshed", systemImage: "exclamationmark.triangle", description: Text("Try again. No partial listing is shown."))
-        } else if session.projects.directories.isEmpty {
+        } else if session.projects.inventory.isEmpty {
             VStack {
                 ContentUnavailableView("No projects yet.", systemImage: "folder", description: Text("Run envcloak init in a repo, or add a folder that has an envcloak.toml."))
                 Button("Add project folder…") { WorkspaceActions.addFolder(session) { route = .project($0) } }
                 Button("Copy envcloak init") { WorkspaceActions.copy("envcloak init") }
             }
         } else {
-            List(session.projects.directories, id: \.self) { directory in
-                Button { route = .project(directory) } label: {
-                    HStack(spacing: 12) {
-                        Image(systemName: "folder").foregroundStyle(ECToken.secondary.color)
-                        VStack(alignment: .leading) {
-                            Text(MetadataRequest.basename(directory)).font(.headline)
-                            Text(directory.escaped).font(ECFont.martianMono(size: 10)).lineLimit(1).truncationMode(.middle).help(directory.escaped)
-                        }
-                        Spacer()
-                        if let row = session.projects.rows.first(where: { $0.dir == directory }) {
-                            Text("\(row.bindings.count) adopted bindings").foregroundStyle(ECToken.secondary.color)
-                        } else { Text("Not checked") }
-                    }.frame(minHeight: 48).contentShape(Rectangle())
-                }.buttonStyle(.plain).accessibilityIdentifier("project.open." + directory.escaped)
+            List(session.projects.inventory) { entry in
+                if let directory = entry.directory {
+                    Button { route = .project(directory) } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: "folder").foregroundStyle(ECToken.secondary.color)
+                            VStack(alignment: .leading) {
+                                Text(session.projects.title(directory)).font(.headline)
+                                Text(directory.escaped).font(ECFont.martianMono(size: 10)).lineLimit(1).truncationMode(.middle).help(directory.escaped)
+                            }
+                            Spacer()
+                            if let count = entry.bindings {
+                                Text("\(count) adopted bindings").foregroundStyle(ECToken.secondary.color)
+                            } else { Text("Not checked") }
+                        }.frame(minHeight: 48).contentShape(Rectangle())
+                    }.buttonStyle(.plain).accessibilityIdentifier("project.open." + directory.escaped)
+                } else {
+                    VStack(alignment: .leading) {
+                        Text(ProjectInventoryRow.hiddenPathMessage)
+                        Text("\(entry.bindings ?? 0) adopted bindings").foregroundStyle(ECToken.secondary.color)
+                    }.padding(.vertical, 8)
+                }
             }.accessibilityIdentifier("projects.list")
         }
     }
@@ -67,7 +74,9 @@ struct ProjectDetail: View {
                 }.pickerStyle(.segmented)
                 BindingsTable(session: session, project: project, profile: profile.isEmpty ? nil : profile, selectedKey: $selectedKey)
                 Text("Grants in force in this project").font(.headline)
-                GrantRows(session: session, directory: directory, slug: nil)
+                if let canonical = project.grantDirectory {
+                    GrantRows(session: session, directory: canonical, slug: nil)
+                } else { Text("Project identity unavailable. Grants could not be matched.") }
             } else { Text("Not checked").foregroundStyle(ECToken.secondary.color); Spacer() }
         }.padding(16)
         .task(id: directory) { profile = ""; await session.openProject(directory) }

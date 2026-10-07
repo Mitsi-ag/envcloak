@@ -100,6 +100,20 @@ import XCTest
         XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
+    func testHiddenProjectsAndFailedProjectSearchAreExplicit() async {
+        let client = ScriptedClient(); await client.pages("hidden-one-page")
+        let session = VaultSession(client: client); await session.poll()
+        let projects = host(ProjectsOverview(session: session, route: .constant(.projects)))
+        await assertVisible("Folder path hidden: it looks like a key or token", in: projects)
+        XCTAssertFalse(labels(projects).contains("No projects yet."))
+        await client.configure(projectFailure: true)
+        await client.pages("single")
+        await session.projects.refetch(.projects)
+        let keys = host(KeysView(session: session, filter: .all, query: "PrOjEcT:fixture provider:example", scope: nil, grouping: .constant(.none), selectedKey: .constant(nil)))
+        await assertVisible("Keys could not be refreshed", in: keys)
+        XCTAssertFalse(labels(keys).contains("No matching keys"))
+    }
+
     func testUnavailableRowsAreAccessible() async {
         let client = ScriptedClient(); let session = VaultSession(client: client)
         await session.poll()
