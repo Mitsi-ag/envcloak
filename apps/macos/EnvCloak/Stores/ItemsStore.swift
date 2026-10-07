@@ -47,6 +47,7 @@ import Observation
             await select(selectedSlug)
         } catch {
             guard captured == revision else { return }
+            clearDetail()
             rows = []; failure = error as? EnvCloakError ?? .protocolError; dirty = true
         }
     }
