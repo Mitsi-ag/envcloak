@@ -346,6 +346,14 @@ fn visit(
         report.issue(root.path().join(rel), "volume_opt_in");
         return;
     }
+    crate::sources::inspect_optional_siblings(root, rel, report);
+    if rel
+        .file_name()
+        .is_some_and(crate::sources::restore_leftover_name)
+    {
+        crate::sources::leftover(root, rel, report);
+        return;
+    }
     // Missing conventional profiles are not an incomplete scan. A missing
     // explicit source is. Unsafe existing profiles are always reported.
     let (bytes, stamp) = match read_capped(root, rel, MAX_DOTENV) {

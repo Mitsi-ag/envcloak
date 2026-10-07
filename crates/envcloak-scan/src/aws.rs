@@ -49,8 +49,8 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
             report.issue("", "unsupported_aws_syntax");
             continue;
         };
-        let key = key.trim();
-        let name = match key {
+        let key = key.trim().to_ascii_lowercase();
+        let name = match key.as_str() {
             "aws_access_key_id" => "AWS_ACCESS_KEY_ID",
             "aws_secret_access_key" => "AWS_SECRET_ACCESS_KEY",
             "aws_session_token" => "AWS_SESSION_TOKEN",
@@ -93,6 +93,7 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
 pub fn scan_aws(root: &ScanRoot) -> ScanReport {
     let mut report = ScanReport::default();
     for name in [".aws/credentials", ".aws/config"] {
+        crate::sources::inspect_optional_siblings(root, Path::new(name), &mut report);
         let (bytes, stamp) = match read_capped(root, Path::new(name), MAX_DOTENV) {
             Ok(read) => read,
             Err(e) => {
