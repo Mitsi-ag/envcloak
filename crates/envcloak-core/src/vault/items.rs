@@ -11,15 +11,18 @@ use crate::crypto::ItemClass;
 use super::codec::{Dec, Enc};
 use super::error::{VaultError, VaultErrorKind};
 
-/// The largest sealed plaintext of one column: a secret value, an item's
-/// metadata, a project or a policy (SPEC §5: 64 KiB per sensitive field).
-/// The prior list is the exception: it packs up to [`MAX_PRIOR`] values of
+/// A secret value, caller-supplied item metadata or a policy is at most
+/// this size (SPEC §5: 64 KiB per sensitive field). Projects use
+/// [`MAX_PROJECT`]. The prior list packs up to [`MAX_PRIOR`] values of
 /// at most this size each into one column, bounded by [`MAX_ROW`]. An
 /// item's record holds this much of what its writer gives, and after it the
 /// few bytes the vault keeps itself ([`MAX_ITEM_KEPT`]).
 pub const MAX_FIELD: usize = 64 * 1024;
 /// The largest row, all columns together (SPEC §5: 1 MiB per row).
 pub const MAX_ROW: usize = 1024 * 1024;
+/// Encoded project metadata, including length prefixes for bindings from a
+/// 64 KiB manifest. This is not a secret field and remains under MAX_ROW.
+pub const MAX_PROJECT: usize = 128 * 1024;
 /// Prior values kept per field when a value is replaced.
 pub const MAX_PRIOR: usize = 3;
 
