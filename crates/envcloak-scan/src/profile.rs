@@ -219,6 +219,9 @@ fn word(bytes: &[u8], fish: bool, exported: bool, home_prefix: bool) -> (SecretB
         }
         if q == 0
             && ((b == b'~' && !(home_prefix && i == 0))
+                // The shared POSIX reader also serves zsh and its includes.
+                // Filename expansion can resolve =command at either position.
+                || (!fish && b == b'=' && (i == 0 || bytes[i - 1] == b':'))
                 || matches!(b, b'(' | b')')
                 || (exported && matches!(b, b'{' | b'}'))
                 || (fish && matches!(b, b'*' | b'?' | b'{' | b'}')))

@@ -6,7 +6,7 @@ use secrecy::ExposeSecret;
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Parse the literal scalar keys written by `aws configure set`.
+/// Parse literal scalar keys with AWS's INI equals or colon delimiter.
 /// Duplicate fields and multiline values make the entire file manual.
 #[allow(clippy::disallowed_methods)] // Bounded INI input to wiping values.
 pub fn parse_aws(input: &SecretBytes) -> ScanReport {
@@ -49,7 +49,7 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
             prior_key = false;
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((key, value)) = line.split_once(['=', ':']) else {
             report.issue("", "unsupported_aws_syntax");
             continue;
         };
