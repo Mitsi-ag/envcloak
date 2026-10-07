@@ -64,9 +64,20 @@ All checks use `CARGO_TARGET_DIR=/Volumes/KeenShiftDev/tmp/envcloak-target/E`, `
 
 The first broad CLI run refused stale testkit executables. They were rebuilt, and the suite rerun. The second broad run had one existing doctor grammar test observe an extra `unknown openai` provider line; the unchanged targeted rerun passed. The separate long 1 GiB regression passed (2,408.18 seconds). End-to-end agent-host tests that overlapped the final source edit refused an older CLI binary before doing their work and passed when rerun with the rebuilt binary; those setup refusals are not gate evidence.
 
-The reservation check exposed a global alias-reader collision from the new associated `Refusal = Failure` type and rejected a dynamic Failure token. Cleanup now uses its own local refusal enum, with reasons confined to the report, and config-scan failure uses the already reserved `incomplete` exit token. The checker was not modified. Its final pass covers all 262 rows in 17 tables.
+The reservation check exposed a global alias-reader collision from the new associated `Refusal = Failure` type and rejected a dynamic Failure token. Cleanup now uses its own local refusal enum, with reasons confined to the report. Config-scan failure uses the existing `io` exit token and exits non-zero. The `incomplete` exit-token row remains reserved to M2-14 under D-23; M2-16 does not take that row. The checker and its reservation fixtures were not modified. Its final pass covers all 262 rows in 17 tables.
 
 Raw local evidence: `.collab/m2-16/scanner-mutations.json`, `oracle-mutation.json`, `mutations-final.json`, the two `*-confirmed.json` hostile-input receipts, `permit-oversized-rewrite.json`, `final-check-results.json`, and per-suite logs/exit receipts. These temporary files are ignored; this document and the commit messages retain the reviewable results.
+
+## CI reservation regression
+
+The broken version `land-incomplete-outside-owner` marked M2-14's `incomplete` row as landed for the M2-16 config-scan fallback. Before restoring the reservation, all four selected `check_reservations` tests failed (0 passed, 4 failed):
+
+- `a_failure_token_returned_by_another_crates_token_method_counts`
+- `a_failure_token_through_a_helper_function_counts`
+- `a_failure_token_written_as_a_constant_in_another_crate_counts`
+- `a_token_printed_directly_as_envcloak_token_counts`
+
+The fix restores the row and uses `io` for that fallback. It preserves exit code 1 and the fixed message, while leaving the reservation checker and fixtures unchanged. The full detached `check_reservations` target passed afterward (91 passed, 0 failed, including those four; 881.94 seconds). First-run CLI tests passed again (15 tests), as did formatting, workspace clippy with `-D warnings`, and the six check scripts listed above. Evidence is in `.collab/m2-16/ci-four-before.log`, `ci-reservations-after.log`, `ci-first-run.log`, `ci-clippy.log`, `ci-checks.log` and their exit receipts.
 
 ## Commits
 
