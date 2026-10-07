@@ -187,6 +187,14 @@ Enter finishes the display without removing scrollback. The existing
 secret-input guard restores terminal settings on input failure and caught
 termination signals. Reveal is neither listed nor callable through MCP.
 
+Before writing any value bytes, the terminal client requires valid UTF-8
+without C0, DEL or C1 control characters. Otherwise it exits unsuccessfully
+with a value-free `invalid_value` message. This includes newline, tab and
+ESC/OSC sequences, so stored content cannot operate the terminal or clipboard.
+Printable Unicode remains unchanged. This client-side refusal can follow a
+durable reveal audit entry: the entry records the daemon's admitted release,
+not successful display or acknowledgement by the person.
+
 ## Comparisons with the vault
 
 `scan.match` (M2 plan D-32, task M2-11) is the one way a scan's candidate tokens (doctor, scrub, the first-run import, `migrate-mcp`) are compared with the vault: by keyed hash under the `index` subkey, in the daemon, which alone holds the key. The CLI scans and removes duplicates first (one comparison per distinct candidate a run); nothing it says about a candidate widens what is compared. The code is `crates/envcloak-daemon/src/scan_match.rs`.

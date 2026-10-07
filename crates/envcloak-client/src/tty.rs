@@ -70,6 +70,8 @@ pub enum InputError {
     StdinIsTerminal,
     /// The value holds a NUL byte, which no environment variable can carry.
     NulByte,
+    /// The reveal value is not printable UTF-8 and could control the terminal.
+    TerminalControl,
 }
 
 impl From<InputError> for Failure {
@@ -100,6 +102,10 @@ impl From<InputError> for Failure {
             InputError::NulByte => Failure::new(
                 "invalid_value",
                 "the value holds a NUL byte, which no environment variable can carry",
+            ),
+            InputError::TerminalControl => Failure::new(
+                "invalid_value",
+                "the value cannot be displayed safely on a terminal",
             ),
         }
     }
@@ -133,11 +139,17 @@ impl Terminal {
     }
 
     /// Writes a proven reveal value only to this open controlling
-    /// terminal. Never formats it or falls back to another descriptor.
+    /// terminal. Refuses invalid UTF-8 and control characters before writing
+    /// any bytes. Never formats it or falls back to another descriptor.
     #[allow(clippy::disallowed_methods)] // Proven reveal, directly to /dev/tty.
     pub fn write_secret(&mut self, value: &SecretBytes) -> Result<(), InputError> {
+        let text =
+            std::str::from_utf8(value.expose_secret()).map_err(|_| InputError::TerminalControl)?;
+        if text.chars().any(char::is_control) {
+            return Err(InputError::TerminalControl);
+        }
         self.file
-            .write_all(value.expose_secret())
+            .write_all(text.as_bytes())
             .and_then(|()| self.file.flush())
             .map_err(|_| InputError::Io)
     }
@@ -357,6 +369,41 @@ mod tests {
         drop(reader);
         let value = SecretBytes::copy_from(b"synthetic reveal value");
         assert_eq!(terminal.write_secret(&value), Err(InputError::Io));
+    }
+
+    #[test]
+    fn reveal_refuses_terminal_controls_before_writing_any_value() {
+        let mut refused = Vec::new();
+        for c in (0u8..=31).chain(127..=159) {
+            refused.push(format!("prefix{}suffix", char::from(c)).into_bytes());
+            refused.push(vec![b'x', c, b'y']);
+        }
+        refused.extend([vec![0xff], vec![b'x', 0xc2], vec![0xe2, 0x82]]);
+        for bytes in refused {
+            let (writer, mut reader) = UnixStream::pair().unwrap();
+            let mut terminal = Terminal {
+                file: File::from(OwnedFd::from(writer)),
+            };
+            let result = terminal.write_secret(&SecretBytes::copy_from(&bytes));
+            drop(terminal);
+            let mut received = Vec::new();
+            reader.read_to_end(&mut received).unwrap();
+            assert!(result.is_err(), "hostile value accepted");
+            assert!(received.is_empty(), "a refused value was partly written");
+        }
+        // UTF-8 continuation bytes in the C1 byte range are not control characters.
+        let printable = "printable é 日本語 😀".as_bytes();
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let mut terminal = Terminal {
+            file: File::from(OwnedFd::from(writer)),
+        };
+        terminal
+            .write_secret(&SecretBytes::copy_from(printable))
+            .unwrap();
+        drop(terminal);
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).unwrap();
+        assert!(received == printable);
     }
 
     /// Reads `input` in pieces of `step` bytes, as a pipe delivers it.
