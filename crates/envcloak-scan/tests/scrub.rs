@@ -44,7 +44,7 @@ fn association(id: u64) -> Match {
 #[test]
 fn gate37_plan_preserves_occurrences_coalesces_duplicates_and_accepts_adjacency() {
     let bytes = b"before AABB after AA";
-    let candidates = vec![
+    let candidates = [
         candidate(0, 7..9, 20),
         candidate(1, 9..11, 20),
         candidate(0, 7..9, 20),

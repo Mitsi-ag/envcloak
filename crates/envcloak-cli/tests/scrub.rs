@@ -568,6 +568,10 @@ fn gate37_leftovers_reported_on_undo_success_and_refusal_without_deleting_foreig
     let restored = f.undo(&id, &[]);
     assert!(restored.status.success(), "{}", stderr(&restored));
     let report: Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(
+        report["complete"], true,
+        "reported leftovers are not restore failures"
+    );
     assert_eq!(report["leftovers"].as_array().unwrap().len(), 2);
     std::fs::write(&f.path, b"later edit").unwrap();
     let denied = f.undo(&id, &[]);

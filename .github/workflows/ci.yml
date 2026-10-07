@@ -531,6 +531,11 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      - name: Scrub transaction and independent planner gates
+        run: |
+          cargo test --locked -p envcloakd --no-run
+          cargo test --locked -p envcloak-scan --test scrub --test scrub_oracle --no-fail-fast -- --test-threads 3
+          cargo test --locked -p envcloak --test scrub --no-fail-fast -- --test-threads 3
       # The positive control: --exact runs nothing for a name no test has,
       # and passes, so the step also requires that the one test ran and passed.
       - name: The network outside the namespace is open
