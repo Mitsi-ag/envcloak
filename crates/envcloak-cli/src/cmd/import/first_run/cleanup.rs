@@ -198,7 +198,7 @@ pub(super) fn run(
     for g in groups {
         for project in &g.projects {
             let directory = dir_of(&g.root, &project.rel_dir);
-            let root = open_root(&directory)
+            let root = envcloak_scan::sources::absolute_root(&directory)
                 .map_err(|_| Failure::new("scan_root", "the project changed during cleanup"))?;
             match super::super::super::init::delete(&root) {
                 Ok((report, error)) => {

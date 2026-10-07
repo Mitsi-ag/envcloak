@@ -839,7 +839,7 @@ fn undo_first_run_v2(
     let parent = path
         .parent()
         .ok_or_else(|| Failure::new("undo_incomplete", "the backup path is invalid"))?;
-    let root = open_root(parent)
+    let root = envcloak_scan::sources::absolute_root(parent)
         .map_err(|_| Failure::new("undo_incomplete", "the backup directory cannot be opened"))?;
     let rel = Path::new(
         path.file_name()
@@ -1096,7 +1096,7 @@ fn write_back(
     if !matches!(dotenv_kind(name), Some(Ok(FileKind::Dotenv { .. }))) {
         return "not_env_file";
     }
-    let Ok(root) = open_root(dir) else {
+    let Ok(root) = envcloak_scan::sources::absolute_root(dir) else {
         return "no_directory";
     };
     if root.identity() != project.identity() {
@@ -1172,6 +1172,32 @@ mod tests {
             &["somewhere"],
         ] {
             assert!(parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn review_v1_undo_rejects_parent_aliases_even_to_the_current_project() {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let project = home.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let root = open_root(&project).unwrap();
+        let alias = home.path().join("alias");
+        std::os::unix::fs::symlink(&project, &alias).unwrap();
+        for unrecorded in [false, true] {
+            let left = FileLeft::Removed;
+            let path = alias.join(".env");
+            assert_eq!(
+                write_back(
+                    &root,
+                    path.to_str().unwrap(),
+                    0o600,
+                    SecretBytes::copy_from(b"SECRET_TOKEN=fixture value\n"),
+                    (!unrecorded).then_some(&left),
+                    unrecorded
+                ),
+                "no_directory"
+            );
+            assert!(!project.join(".env").exists());
         }
     }
 
