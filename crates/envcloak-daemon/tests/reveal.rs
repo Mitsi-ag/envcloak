@@ -310,8 +310,15 @@ sys.stdout.buffer.write(exact(length))
                         class,
                         details: ItemDetails::default(),
                     })?;
-                    for name in ["first", "second"] {
-                        t.add_field(id, FieldName::new(name).unwrap(), common::passphrase(&cs))?;
+                    for (name, label) in [
+                        ("first", labels::OPENAI_API_KEY),
+                        ("second", labels::OPENAI_API_KEY_ROTATED),
+                    ] {
+                        t.add_field(
+                            id,
+                            FieldName::new(name).unwrap(),
+                            SecretBytes::copy_from(by_label(&cs, label).value()),
+                        )?;
                     }
                 }
                 Ok(())
@@ -347,14 +354,18 @@ sys.stdout.buffer.write(exact(length))
             ErrorKind::NoSuchItem
         );
         p.passphrase = WireSecret::new(common::passphrase(&cs));
-        p.field = Some("second".into());
-        let value = common::client(&home).call::<ItemsReveal>(&p).unwrap();
         assert!(
-            value
-                .value
-                .into_inner()
-                .ct_eq_secret(&common::passphrase(&cs))
+            by_label(&cs, labels::OPENAI_API_KEY).value()
+                != by_label(&cs, labels::OPENAI_API_KEY_ROTATED).value()
         );
+        for (field, label) in [
+            ("second", labels::OPENAI_API_KEY_ROTATED),
+            ("first", labels::OPENAI_API_KEY),
+        ] {
+            p.field = Some(field.into());
+            let value = common::client(&home).call::<ItemsReveal>(&p).unwrap();
+            assert!(value.value.into_inner().ct_eq(by_label(&cs, label).value()));
+        }
         assert_no_canary(&d.log_bytes(), &cs);
         home.assert_clean(&cs);
     }
