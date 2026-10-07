@@ -202,3 +202,120 @@ The initial strict-Clippy attempts exposed incoming M2-19 numeric signal calls: 
 The initial launchd installation did not produce an answering daemon within the existing install deadline. No managed registration or restart had been reached. The full detached managed-runner rerun passed with the same source and unchanged timeout after rebuilding the instrumented binaries. The initial failure remains in the receipt; the retry does not establish why that startup failed.
 
 The fixture repair commit is `9cad00f0`; its named mutation results are `m27-r8-reservation-mutations.json`. Receipts are local `m27-r8-runner-recheck-results.json`, `m27-r8-checker-final-results.json`, `m27-r8-final-results.json` and `m27-r8-final-*.log`; named mutation receipts include `m27-r8-mutation4-results.json`, `m27-r8-provision-mutations.json` and `m27-r8-pty-mutation-results.json`. Fresh merged-head PR and manual full CI on macOS and Ubuntu remain driver-owned before landing. The signed-build privacy-prompt measurement and M2R-87 remain explicit residuals with the owners above. No remote result is claimed and no push was performed.
+
+
+## M3-04 integration and current local receipt
+
+Merge `99b83863` joins `479568fe` with main at `6489768b`. The three conflicts
+retain both daemon modules (`managed` and `projects`), all 44 client methods,
+and both families of wire views. The auto-merges in requests, server dispatch,
+state, typed client helpers, IPC documentation and vault limits were reviewed.
+Both ordinary and managed delivery keep M3-04's provisional project adoption,
+rollback, audit correction and final authority check. The sealed managed record
+still governs launch identity and private value delivery; it does not replace
+SPEC 6.4/6.6's project-index adoption. Methods and descriptor/control-pipe paths
+remain present.
+
+The compile sweep found five incoming `RunRequestParams` constructors missing
+the managed fields. Commit `0fc986cb` supplies no bridge or launch and an empty
+descriptor list for each ordinary manifest request. The instances are the
+metadata-screening case, near-limit manifest case, initial and refreshed
+adoption requests, and adoption during pagination. No assertion changed.
+The first repair attempt also used an optional value for the descriptor vector;
+the compiler rejected all five sites, and the final repair uses empty vectors.
+Neither compile failure is counted as a gate mutation.
+
+A final SPEC cross-check found a second composition class: the managed route
+returned before M3-04's new project-record construction. The initial merge
+supplied no adoption row there. Commit `62a74cac` corrects this by constructing
+the effective manifest metadata once before routing and passing it into both
+production delivery calls, including the shared runner/relay path. No second
+binding filter or index writer was introduced. The new end-to-end gate proves
+that registration, pending requests and approval alone adopt nothing; admitted
+delivery records the exact directory, hash and bindings; a subsequent covered
+run refreshes the hash; and a changed executable is refused without changing
+the index. It also requires zero releases to clients, two to runners, and a
+clean value sweep. The HTTP transport itself remains M2-18's scope.
+
+Mutation `omit-managed-project-adoption` replaces `Some(c.project)` with
+`None`. It compiled and failed the new gate with zero indexed rows instead of
+one, then passed after byte-for-byte restoration. The unfixed merge also failed
+that gate before the repair. The named mutation
+`drop-ordinary-project-adoption` removes the project row from ordinary delivery while leaving delivery itself successful. The compiled
+`projects_adopted_by_run_are_listed_with_current_bindings_and_hashes` gate
+failed at runtime with zero rows instead of two. Restoring the production
+source byte for byte made all six project integration tests pass. The final
+instrumented daemon and fixture build passed after the Swift script and the
+mutation run, so neither a plain daemon nor a mutated binary is left as the
+end-to-end fixture.
+
+These are macOS 26.4.1 arm64 measurements. Cargo used the assigned lane A
+cache, incremental compilation disabled and three build jobs. Tests ran
+detached from agent ancestry with cleared inherited environments, isolated
+short temporary HOME/XDG directories, `--no-fail-fast` and three test threads.
+The main validation supervisors also set private TMPDIR/state/runtime roots.
+No workspace-wide test command was run.
+
+| Check | Current result |
+| --- | --- |
+| Formatting; strict workspace/all-target Clippy | Pass after the constructor repair |
+| Full IPC, core and client crate suites | 65, 344 and 40 pass |
+| Full daemon crate suite | 276 pass, including all six M3-04 project integration cases and delivery rollback/authority tests |
+| Full policy crate suite, with service-manager testing enabled | 211 pass, one service-start timeout; all three full runs have the same result |
+| Full managed_launch suite | 32/32 pass |
+| Full managed_runner suite, with service-manager testing enabled | 18 pass, one initial service-start failure before the restart assertion |
+| CLI run, ref_unset, ref_edit and snapshots targets | 4, 3, 3 and 5 pass; includes real CLI project adoption and the independent TOML/byte oracle |
+| All five pinned-runtime interpreter oracles; execution/archive controls | Pass; the four ignored cases in the ordinary policy run execute here |
+| `scripts/macos/test-kit.sh` | Pass: fresh Rust vectors, 36 Swift tests and two optimized wiping probes |
+| Unsafe, exposure lint and Rust compiler-source checks | Pass; all eight forbidden exposure/signal sites reported |
+| Crate graph, reservations and SPEC decisions | Pass: 50 edges, 270 rows, 54 decisions and 51 sentences |
+| Swift rules, compiled-source check, CI job controls and CI path self-test | Pass; compiled-source check uses the existing Kit build records, with unchanged Swift sources |
+
+Two local checks remain unsuccessful, and this receipt does not describe the
+aggregate as green:
+
+- Policy's `gate26_launchctl_submit_escapes_the_grant` times out waiting for its
+  service-started probe. It fails in all three full policy runs. The probe and
+  that test are unchanged from `479568fe`.
+- Managed runner's `the_runner_outlives_a_service_manager_restart` fails while
+  installing the fixture service because the daemon never answers. It has not
+  reached registration or the restart assertion. The daemon-install code and
+  system boundary are also unchanged by this merge. The separate
+  `the_runner_outlives_the_daemon` case passes.
+
+A detached, value-free diagnostic reproduced the host startup problem outside
+the test harness: launchd's system `true` control exits successfully, while its
+`ec-probe` process never connects. Sampling that owned fixture shows it still
+in dyld's `getOnDiskBinarySliceOffset` / `__open` path before program startup.
+The corresponding TCC log records a denied `SystemPolicyAllFiles` preflight.
+A diagnostic with output files in the lane cache also records launchd
+`posix_spawn` refusal with `Operation not permitted`. This establishes a host
+startup failure before the probe's code; it does not establish which host
+configuration must change, or qualify either service gate. No timeout, assertion or host
+policy was changed to turn those failures into passes. Both gates still need
+a successful run on a host where the fixture services can start. The final
+managed-runner repeat fails at the same initial installation step.
+
+The final production-code repeat is `m27-m304-adoption-results.json`, with
+`m27-m304-managed-mutation.json` for the new gate. Earlier receipts are
+`m27-m304-results.json`, `m27-m304-followup-results.json`,
+`m27-m304-policy-recheck.log` and `m27-m304-mutation-result.json`. Core, client,
+reference editing, snapshots and Swift source/CI controls are unchanged since
+their earlier passing runs; the final repeat covers the daemon, IPC, policy,
+both managed suites, CLI run, runtime oracles, boundary scripts and Swift kit.
+The first supervisor also recorded three invocation errors (an old CLI target name, an incorrect script path and a
+missing Swift build-record argument); the correctly invoked checks all passed
+in the follow-up receipt. The final Swift repeat initially reused the vector
+directory populated by the full IPC suite and correctly failed `AlreadyExists`.
+A separate fresh vector directory made the full kit script pass again, 36 plus
+two optimized Swift tests; `m27-m304-swift-final-results.json` records that run
+and the successful instrumented rebuild afterwards. Diagnostic receipts are
+`m27-m304-service-controls.log`, `m27-m304-probe-sample.txt` and
+`m27-m304-service-tcc.log`. They stay in the private lane cache. Machine-specific
+absolute paths are omitted here and removed from the incoming M3-04 receipt.
+
+The prior scope, requirement and mutation mapping remains above. Fresh PR and
+manual full CI on macOS and Ubuntu remain driver-owned before landing; no
+remote result is claimed for this merged head. The signed-build privacy-prompt
+measurement and M2R-87 retain their existing owners and are not closed by the
+startup diagnostic. No push was performed.
