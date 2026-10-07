@@ -20,6 +20,178 @@ fn kind(e: ClientError) -> ErrorKind {
     }
 }
 
+fn approved_run(
+    c: &mut envcloak_ipc::Client,
+    p: &RunRequestParams,
+    cs: &[envcloak_testkit::Canary],
+) {
+    let DecisionView::Pending { request } = c.run_request(p).unwrap().decision else {
+        panic!("expected pending");
+    };
+    let statement = c.pending_get(&request, &[]).unwrap();
+    let options = ApprovalOptions::session(Duration::from_secs(60));
+    c.approve(
+        &request,
+        options.clone(),
+        &statement_digest(&statement, &options),
+        passphrase(cs),
+        &[],
+    )
+    .unwrap();
+    assert!(matches!(
+        c.run_request(p).unwrap().decision,
+        DecisionView::Covered { .. }
+    ));
+}
+
+#[test]
+fn projects_screen_key_shaped_metadata_after_adoption_and_on_the_socket() {
+    common::terminal_session();
+    let home = TestHome::new();
+    let cs = canaries(fresh_seed());
+    seed_vault(&home, &cs);
+    let key = cs
+        .iter()
+        .find(|c| c.label == envcloak_testkit::labels::GITHUB_TOKEN)
+        .unwrap()
+        .as_str();
+    // Existing records also need screening: provenance is not proof that a
+    // name, reference or directory contains no accidentally pasted value.
+    let mut vault = LockedVault::open(&VaultPaths::under(data_dir(&home)))
+        .unwrap()
+        .unlock_with_passphrase(&passphrase(&cs))
+        .map_err(|(_, e)| e)
+        .unwrap();
+    vault
+        .transact(|t| {
+            t.upsert_project(ProjectRecord {
+                key: ProjectKey::new(b"old")?,
+                display_path: format!("/fixture/{key}"),
+                manifest_sha256: [0; 32],
+                last_seen: 1,
+                bindings: vec![ProjectBinding {
+                    env_name: "SAFE".into(),
+                    reference: format!("ordinary#{key}"),
+                }],
+            })
+        })
+        .unwrap();
+    drop(vault);
+    let path = project(
+        &home,
+        "screen",
+        &format!("[env]\n{key}='openai/acme-web'\nSAFE='stripe/acme-web'\n"),
+    );
+    let daemon = start(&home);
+    let mut c = client(&home);
+    c.unlock(passphrase(&cs), &[]).unwrap();
+    approved_run(
+        &mut c,
+        &RunRequestParams {
+            manifest: path.to_str().unwrap().into(),
+            profile: None,
+            refs: vec![],
+            env_file: None,
+            argv: vec!["/usr/bin/true".into()],
+            claims: vec![],
+        },
+        &cs,
+    );
+    let mut stream = common::raw(&home);
+    common::send_json(
+        &mut stream,
+        &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"projects.list","params":{}}),
+    );
+    let response = common::read_json(&mut stream).unwrap();
+    assert_no_canary(&serde_json::to_vec(&response).unwrap(), &cs);
+    let rows = response["result"]["projects"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let adopted = rows
+        .iter()
+        .find(|r| r["dir"].as_str().unwrap().ends_with("/screen"))
+        .unwrap();
+    assert_eq!(adopted["bindings"].as_array().unwrap().len(), 2);
+    assert!(
+        adopted["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["env_name"] == "SAFE" && b["reference"] == "stripe/acme-web")
+    );
+    assert!(
+        adopted["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["env_name"] == envcloak_policy::HIDDEN)
+    );
+    assert!(rows.iter().any(|r| r["dir"] == envcloak_policy::HIDDEN));
+    assert_no_canary(&daemon.log_bytes(), &cs);
+}
+
+#[test]
+fn projects_adopt_a_near_limit_manifest_and_keep_only_manifest_bindings() {
+    common::terminal_session();
+    let home = TestHome::new();
+    let cs = canaries(fresh_seed());
+    seed_vault(&home, &cs);
+    let mut manifest = String::from("[env]\n");
+    for n in 0..1500 {
+        manifest.push_str(&format!("BINDING_{n:015}='openai/acme-web'\n"));
+    }
+    manifest
+        .push_str("[env.ci]\nPROFILE='stripe/acme-web'\n[env.other]\nOTHER='stripe/acme-web'\n");
+    assert!(manifest.len() > 60000 && manifest.len() < 65536);
+    let path = project(&home, "large", &manifest);
+    let _daemon = start(&home);
+    let mut c = client(&home);
+    c.unlock(passphrase(&cs), &[]).unwrap();
+    let params = RunRequestParams {
+        manifest: path.to_str().unwrap().into(),
+        profile: Some("ci".into()),
+        refs: vec![
+            "ADHOC=stripe/acme-web".into(),
+            format!("BINDING_{:015}=stripe/acme-web", 0),
+        ],
+        env_file: Some(envcloak_ipc::proto::EnvFileParams {
+            refs: vec![
+                envcloak_ipc::proto::EnvFileLine {
+                    line: 1,
+                    text: "FILE_ONLY=stripe/acme-web".into(),
+                },
+                envcloak_ipc::proto::EnvFileLine {
+                    line: 2,
+                    text: format!("BINDING_{:015}=stripe/acme-web", 1),
+                },
+            ],
+            plain: vec![],
+        }),
+        argv: vec!["/usr/bin/true".into()],
+        claims: vec![],
+    };
+    approved_run(&mut c, &params, &cs);
+    let rows = c.projects_list(None).unwrap();
+    assert_eq!(rows.projects.len(), 1);
+    let bindings = &rows.projects[0].bindings;
+    assert_eq!(bindings.len(), 1499);
+    for n in [0, 1] {
+        assert!(
+            bindings
+                .iter()
+                .all(|b| b.env_name != format!("BINDING_{n:015}"))
+        );
+    }
+    assert!(bindings.iter().any(|b| b.env_name == "PROFILE"));
+    assert!(
+        bindings
+            .iter()
+            .all(|b| b.env_name != "ADHOC" && b.env_name != "OTHER" && b.env_name != "FILE_ONLY")
+    );
+    c.lock().unwrap();
+    c.unlock(passphrase(&cs), &[]).unwrap();
+    assert_eq!(c.projects_list(None).unwrap(), rows);
+}
+
 #[test]
 fn projects_adopted_by_run_are_listed_with_current_bindings_and_hashes() {
     common::terminal_session();
@@ -190,7 +362,7 @@ fn projects_worst_case_pages_fit_and_cursor_survives_a_new_adoption() {
     vault
         .transact(|t| {
             for n in 0..32_u64 {
-                let record = ProjectRecord {
+                let mut record = ProjectRecord {
                     key: ProjectKey::new(&n.to_be_bytes())?,
                     display_path: format!("/{n}/{}", "\u{1}\"\\é".repeat(6000)),
                     manifest_sha256: [u8::try_from(n).unwrap(); 32],
@@ -202,6 +374,26 @@ fn projects_worst_case_pages_fit_and_cursor_survives_a_new_adoption() {
                         .collect(),
                     last_seen: n / 4,
                 };
+                if n == 31 {
+                    for b in &mut record.bindings {
+                        b.env_name = "\u{1}".repeat(128);
+                        b.reference = "\u{1}".repeat(128);
+                    }
+                    let overhead = 1
+                        + 4
+                        + 8
+                        + 4
+                        + 32
+                        + 4
+                        + 8
+                        + record
+                            .bindings
+                            .iter()
+                            .map(|b| 8 + b.env_name.len() + b.reference.len())
+                            .sum::<usize>();
+                    record.display_path =
+                        "\u{1}".repeat(envcloak_core::vault::MAX_PROJECT - overhead);
+                }
                 let id = t.upsert_project(record.clone())?;
                 expected.push((record.last_seen, id, record.display_path));
             }

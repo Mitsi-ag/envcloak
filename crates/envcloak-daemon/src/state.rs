@@ -92,8 +92,8 @@ pub enum Delivery {
     /// frame (F-77). Nothing was recorded or released.
     Unsendable(RpcError),
     /// The grant was no longer in force once the answer was built: it ran
-    /// out while the values were read and framed (F-77). Nothing was
-    /// recorded or released.
+    /// out while the values were read, framed or finalized (F-77).
+    /// Nothing was released; a covered audit attempt may need correction.
     Lapsed,
     /// The delivery's audit entry could not be written.
     AuditFailed,
@@ -129,6 +129,8 @@ pub struct State {
     unsaved_head: Option<AuditHead>,
     /// [`Vault::save_audit_head`]; tests put a failing one in its place.
     save_head: SaveHead,
+    #[cfg(test)]
+    delivery_fault: fn(&str) -> Result<(), VaultError>,
     /// `too_many_pending` answers counted, not yet written
     /// ([`crate::crowded`]).
     crowded: Crowded,
@@ -151,6 +153,8 @@ impl State {
             audit: AuditLog::default(),
             unsaved_head: None,
             save_head: Vault::save_audit_head,
+            #[cfg(test)]
+            delivery_fault: |_| Ok(()),
             crowded: Crowded::default(),
             backups: crate::backups::Registry::default(),
         }
@@ -591,8 +595,10 @@ impl State {
     /// root exited, meanwhile covers nothing: F-77, SPEC §10b), then
     /// stages any project adoption in a vault transaction, rechecks the
     /// grant, writes the delivery's entry durably, commits the adoption,
-    /// and only then gives the answer out. A lapse or audit failure rolls
-    /// back the staged adoption, including a previous record's last seen.
+    /// anchors when due, and checks lifetime and root liveness again after
+    /// all blocking work. A lapse before commit or an audit failure rolls
+    /// back the staged adoption. A lapse after commit restores the previous
+    /// record (or removes a new one) before refusing the prepared answer.
     /// The answer is the only way to a release, so no value leaves
     /// the daemon before its entry is on disk. The caller holds the state
     /// lock from its decision to its use of the grant, so nothing else in
@@ -606,12 +612,13 @@ impl State {
     /// is marked tampered by the read, and releases nothing more), or the
     /// project transaction fails. A failed commit after the audit append
     /// can leave an audit entry for the covered attempt, never an answer
-    /// or a committed adoption. [`Delivery::Unsendable`] with `answer`'s error,
+    /// or a committed adoption; a correlated denial records that the
+    /// covered attempt released nothing. [`Delivery::Unsendable`] with `answer`'s error,
     /// and [`Delivery::Lapsed`] when the grant is no longer in force, which
     /// then sweeps the grants as the tick does (a grant whose root exited
     /// is removed, so the request decided again is not covered by it);
-    /// nothing is recorded then either, and the answer is dropped, and
-    /// wiped. [`Delivery::AuditFailed`] when the entry could not be
+    /// an already recorded covered attempt gets a denial correction, and
+    /// the answer is dropped and wiped. [`Delivery::AuditFailed`] when the entry could not be
     /// written; the answer is dropped, and wiped.
     #[allow(clippy::too_many_arguments)]
     pub fn deliver<T>(
@@ -644,6 +651,16 @@ impl State {
             self.grants.sweep(&now, alive);
             return Err(Delivery::Lapsed);
         }
+        let rollback = project
+            .as_ref()
+            .map(|p| {
+                let previous = vault
+                    .find_project(&p.key)
+                    .map_err(|_| Delivery::Refused(RpcError::new(ErrorKind::VaultTampered)))?
+                    .map(|(_, row)| row.clone());
+                Ok((p.key.clone(), previous))
+            })
+            .transpose()?;
         if let Some(mut project) = project {
             project.last_seen = now
                 .wall
@@ -657,39 +674,114 @@ impl State {
             let grants = &mut self.grants;
             let audit = &mut self.audit;
             let mut refusal = None;
+            let mut appended = false;
+            #[cfg(test)]
+            let delivery_fault = self.delivery_fault;
             let result = vault.transact(|t| {
                 t.upsert_project(project)?;
-                // No project state is published yet. Recheck after staging,
-                // then audit before committing or releasing the answer.
+                // The provisional row is not yet visible to another request.
                 let now = now_of(clocks);
                 if !grants.in_force(grant, &now, alive) {
                     grants.sweep(&now, alive);
                     refusal = Some(Delivery::Lapsed);
-                } else if !Self::write_delivery(audit, e) {
-                    refusal = Some(Delivery::AuditFailed);
+                } else {
+                    appended = Self::write_delivery(audit, e.clone());
+                    if !appended {
+                        refusal = Some(Delivery::AuditFailed);
+                    }
                 }
                 if refusal.is_some() {
-                    // Interrupt the vault transaction; the caller receives
-                    // the precise refusal below, never this rollback marker.
                     return Err(VaultErrorKind::Io(std::io::ErrorKind::Interrupted).into());
                 }
+                #[cfg(test)]
+                delivery_fault("commit")?;
                 Ok(())
             });
-            // Saving the log head also writes the vault, so it cannot run
-            // inside the adoption transaction. It is independent of adoption.
-            self.anchor_if_due(None);
-            result.map_err(|e| {
-                refusal.unwrap_or_else(|| {
+            if let Err(err) = result {
+                if appended {
+                    self.delivery_not_released(&e);
+                }
+                return Err(refusal.unwrap_or_else(|| {
                     Delivery::Refused(RpcError::with_reason(
                         ErrorKind::VaultUnavailable,
-                        vault_reason(e.kind()),
+                        vault_reason(err.kind()),
                     ))
-                })
+                }));
+            }
+            #[cfg(test)]
+            (self.delivery_fault)("committed").map_err(|err| {
+                Delivery::Refused(RpcError::with_reason(
+                    ErrorKind::VaultUnavailable,
+                    vault_reason(err.kind()),
+                ))
             })?;
-        } else if !self.audit_delivery(e) {
+            self.anchor_if_due(None);
+        } else if !self.audit_delivery(e.clone()) {
             return Err(Delivery::AuditFailed);
         }
+        if let AuditEvent::Request(request) = &e {
+            if let Some(p) = &request.project {
+                if let Some(approved_sha256) = p.approved_sha256 {
+                    self.audit(AuditEvent::ManifestChanged {
+                        pid: request.pid,
+                        grant: grant.to_string(),
+                        dir: p.dir.clone(),
+                        approved_sha256,
+                        sha256: p.manifest_sha256,
+                    });
+                }
+            }
+        }
+        // Audit flushes, SQLite commit and an anchor save can each block.
+        // Nothing that can block on storage follows this last authority check.
+        let now = now_of(clocks);
+        if !self.grants.in_force(grant, &now, alive) {
+            self.grants.sweep(&now, alive);
+            if let Some((key, previous)) = rollback {
+                #[cfg(test)]
+                let delivery_fault = self.delivery_fault;
+                let restored = self
+                    .unlocked_mut()
+                    .map_err(Delivery::Refused)?
+                    .transact(|t| {
+                        #[cfg(test)]
+                        delivery_fault("rollback")?;
+                        match previous {
+                            Some(p) => {
+                                t.upsert_project(p)?;
+                            }
+                            None => {
+                                t.delete_project(&key)?;
+                            }
+                        }
+                        Ok(())
+                    });
+                if let Err(err) = restored {
+                    self.delivery_not_released(&e);
+                    // A failed compensating write leaves metadata uncertain.
+                    // Fail closed for every reader and end every grant.
+                    self.lock(LockReason::Request);
+                    self.slot = Slot::Unavailable(vault_reason(err.kind()));
+                    return Err(Delivery::Refused(RpcError::with_reason(
+                        ErrorKind::VaultUnavailable,
+                        vault_reason(err.kind()),
+                    )));
+                }
+            }
+            self.delivery_not_released(&e);
+            return Err(Delivery::Lapsed);
+        }
         Ok(answer)
+    }
+
+    /// Corrects a durably recorded covered attempt that released nothing.
+    fn delivery_not_released(&mut self, event: &AuditEvent) {
+        if let AuditEvent::Request(request) = event {
+            let mut correction = request.clone();
+            correction.decision = "denied";
+            correction.reason = Some("delivery_not_released");
+            self.audit(AuditEvent::Request(correction));
+        }
     }
 
     /// A `too_many_pending` answer to the request with fingerprint `key`
@@ -1952,7 +2044,11 @@ mod tests {
                 Some(project_record(b"target", 3)),
                 Ok,
             );
-            assert_eq!(clocks.reads.load(Ordering::SeqCst), 2, "{case}");
+            assert_eq!(
+                clocks.reads.load(Ordering::SeqCst),
+                if case == "live" { 3 } else { 2 },
+                "{case}"
+            );
             if case == "live" {
                 assert!(result.unwrap()[0].ct_eq(VALUE));
                 assert_ne!(project_index(&s), before);
@@ -1981,6 +2077,283 @@ mod tests {
     #[test]
     fn project_lapse_does_not_refresh() {
         project_lapse(true);
+    }
+
+    #[test]
+    fn failed_delivery_commit_records_that_covered_attempt_released_nothing() {
+        for refresh in [false, true] {
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+            create(&f, &mut s);
+            let field = stored_value(&mut s, "a/b", VALUE);
+            if refresh {
+                s.unlocked_mut()
+                    .unwrap()
+                    .transact(|t| t.upsert_project(project_record(b"target", 2)))
+                    .unwrap();
+            }
+            let before = project_index(&s);
+            let g = granted(
+                &f,
+                &mut s,
+                request("OPENAI_API_KEY"),
+                envcloak_policy::ApprovalOptions::once(Duration::from_secs(60)),
+            );
+            s.delivery_fault = |phase| {
+                if phase == "commit" {
+                    Err(VaultErrorKind::Storage(13).into())
+                } else {
+                    Ok(())
+                }
+            };
+            let mut event = delivery(1);
+            if let AuditEvent::Request(e) = &mut event {
+                e.grant_id = Some(g.to_string());
+            }
+            assert!(matches!(
+                s.deliver(
+                    g,
+                    &f.clocks,
+                    &running,
+                    event,
+                    &[field],
+                    Some(project_record(b"target", 3)),
+                    Ok
+                ),
+                Err(Delivery::Refused(_))
+            ));
+            assert_eq!(project_index(&s), before);
+            let (log, _) = s.unlocked().unwrap().read_audit().unwrap();
+            assert!(log.len() >= 2, "covered attempt needs a correction");
+            let covered = &log[log.len() - 2].record;
+            let correction = &log.last().unwrap().record;
+            assert_eq!(covered.decision.outcome, "covered");
+            assert_eq!(correction.decision.outcome, "denied");
+            assert_eq!(
+                correction.decision.reason.as_deref(),
+                Some("delivery_not_released")
+            );
+            assert_eq!(correction.grant_id, covered.grant_id);
+            s.lock(LockReason::Request);
+            unlock(&f, &mut s, PASS).unwrap();
+            assert_eq!(project_index(&s), before);
+        }
+    }
+
+    #[test]
+    fn failed_adoption_compensation_quarantines_metadata_and_releases_nothing() {
+        thread_local! { static COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        for refresh in [false, true] {
+            COMMITTED.set(false);
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+            create(&f, &mut s);
+            let field = stored_value(&mut s, "a/b", VALUE);
+            if refresh {
+                s.unlocked_mut()
+                    .unwrap()
+                    .transact(|t| t.upsert_project(project_record(b"target", 2)))
+                    .unwrap();
+            }
+            let g = granted(
+                &f,
+                &mut s,
+                request("OPENAI_API_KEY"),
+                envcloak_policy::ApprovalOptions::once(Duration::from_secs(60)),
+            );
+            s.delivery_fault = |phase| {
+                if phase == "committed" {
+                    COMMITTED.set(true);
+                }
+                if phase == "rollback" {
+                    Err(VaultErrorKind::Storage(13).into())
+                } else {
+                    Ok(())
+                }
+            };
+            let result = s.deliver(
+                g,
+                &f.clocks,
+                &|_| !COMMITTED.get(),
+                delivery(1),
+                &[field],
+                Some(project_record(b"target", 3)),
+                Ok,
+            );
+            assert!(matches!(
+                result,
+                Err(Delivery::Refused(RpcError {
+                    kind: ErrorKind::VaultUnavailable,
+                    ..
+                }))
+            ));
+            assert_eq!(s.unlocked().unwrap_err().kind, ErrorKind::VaultUnavailable);
+            assert!(s.grants().grant(g).is_none());
+        }
+    }
+
+    fn finalized_project_lapse(refresh: bool, anchor: bool, manifest_changed: bool) {
+        use std::cell::Cell;
+        thread_local! {
+            static ANCHORED: Cell<bool> = const { Cell::new(false) };
+            static COMMITTED: Cell<bool> = const { Cell::new(false) };
+        }
+        struct FinalClocks<'a> {
+            base: &'a FakeClocks,
+            case: &'static str,
+            anchor: bool,
+        }
+        impl Clocks for FinalClocks<'_> {
+            fn wall(&self) -> std::time::SystemTime {
+                let finalized = if self.anchor {
+                    ANCHORED.get()
+                } else {
+                    COMMITTED.get()
+                };
+                if finalized {
+                    match self.case {
+                        "wall" => self.base.sleep(Duration::from_secs(60)),
+                        "awake" => {
+                            let wall = self.base.wall();
+                            self.base.run(Duration::from_secs(60));
+                            self.base.set_wall(wall);
+                        }
+                        _ => {}
+                    }
+                }
+                self.base.wall()
+            }
+            fn awake(&self) -> Duration {
+                self.base.awake()
+            }
+            fn including_sleep(&self) -> Duration {
+                self.base.including_sleep()
+            }
+        }
+        for case in ["live", "wall", "awake", "root"] {
+            ANCHORED.set(false);
+            COMMITTED.set(false);
+            let f = fixture();
+            let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+            create(&f, &mut s);
+            let field = stored_value(&mut s, "a/b", VALUE);
+            s.unlocked_mut()
+                .unwrap()
+                .transact(|t| {
+                    t.upsert_project(project_record(b"unrelated", 1))?;
+                    if refresh {
+                        t.upsert_project(project_record(b"target", 2))?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let before = project_index(&s);
+            let g = granted(
+                &f,
+                &mut s,
+                request("OPENAI_API_KEY"),
+                envcloak_policy::ApprovalOptions::once(Duration::from_secs(60)),
+            );
+            if anchor {
+                while s.audit.unanchored()
+                    < crate::audit::ANCHOR_EVERY - if manifest_changed { 2 } else { 1 }
+                {
+                    s.audit(revoked());
+                }
+                s.save_head = |v, head| {
+                    v.save_audit_head(head)?;
+                    std::thread::sleep(Duration::from_millis(5));
+                    ANCHORED.set(true);
+                    Ok(())
+                };
+            }
+            s.delivery_fault = |phase| {
+                if phase == "committed" {
+                    std::thread::sleep(Duration::from_millis(5));
+                    COMMITTED.set(true);
+                }
+                Ok(())
+            };
+            let clocks = FinalClocks {
+                base: &f.clocks,
+                case,
+                anchor,
+            };
+            let alive = |_: &ProcessInstance| {
+                case != "root"
+                    || !(if anchor {
+                        ANCHORED.get()
+                    } else {
+                        COMMITTED.get()
+                    })
+            };
+            let mut event = delivery(1);
+            if manifest_changed {
+                if let AuditEvent::Request(e) = &mut event {
+                    e.project = Some(envcloak_core::audit::ProjectSummary {
+                        dir: "/fixture".into(),
+                        manifest_sha256: [2; 32],
+                        approved_sha256: Some([1; 32]),
+                    });
+                }
+            }
+            let result = s.deliver(
+                g,
+                &clocks,
+                &alive,
+                event,
+                &[field],
+                Some(project_record(b"target", 3)),
+                Ok,
+            );
+            assert!(COMMITTED.get(), "commit must actually run");
+            if anchor {
+                assert!(ANCHORED.get(), "anchor must actually run");
+            }
+            if case == "live" {
+                assert!(result.unwrap()[0].ct_eq(VALUE));
+                assert_ne!(project_index(&s), before);
+            } else {
+                assert!(matches!(result, Err(Delivery::Lapsed)), "{case}");
+                assert_eq!(project_index(&s), before, "{case}: postcommit adoption");
+                assert!(s.grants().grant(g).is_none());
+                let (log, _) = s.unlocked().unwrap().read_audit().unwrap();
+                let correction = &log.last().unwrap().record.decision;
+                assert_eq!(correction.outcome, "denied");
+                assert_eq!(correction.reason.as_deref(), Some("delivery_not_released"));
+                s.lock(LockReason::Request);
+                unlock(&f, &mut s, PASS).unwrap();
+                assert_eq!(
+                    project_index(&s),
+                    before,
+                    "{case}: persisted postcommit adoption"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finalized_lapse_does_not_adopt() {
+        finalized_project_lapse(false, false, false);
+    }
+    #[test]
+    fn finalized_lapse_does_not_refresh() {
+        finalized_project_lapse(true, false, false);
+    }
+    #[test]
+    fn anchor_lapse_does_not_adopt() {
+        finalized_project_lapse(false, true, false);
+    }
+    #[test]
+    fn anchor_lapse_does_not_refresh() {
+        finalized_project_lapse(true, true, false);
+    }
+
+    #[test]
+    fn manifest_audit_lapse_does_not_adopt_or_refresh() {
+        for refresh in [false, true] {
+            finalized_project_lapse(refresh, true, true);
+        }
     }
 
     #[test]
@@ -2024,7 +2397,7 @@ mod tests {
         assert!(before[0].1.last_seen > 0);
         let audit_before = entries(&s).len();
         let mut too_large = record;
-        too_large.display_path = "x".repeat(65536);
+        too_large.display_path = "x".repeat(envcloak_core::vault::MAX_PROJECT + 1);
         let result = s.deliver(
             g,
             &f.clocks,
