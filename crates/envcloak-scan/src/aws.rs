@@ -49,22 +49,24 @@ pub fn parse_aws(input: &SecretBytes) -> ScanReport {
             report.issue("", "unsupported_aws_syntax");
             continue;
         };
-        let key = key.trim().to_ascii_lowercase();
-        let name = match key.as_str() {
-            "aws_access_key_id" => "AWS_ACCESS_KEY_ID",
-            "aws_secret_access_key" => "AWS_SECRET_ACCESS_KEY",
-            "aws_session_token" => "AWS_SESSION_TOKEN",
-            _ => {
-                prior_key = false;
-                continue;
-            }
+        let key = key.trim();
+        let name = [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+        ]
+        .into_iter()
+        .find(|name| key.eq_ignore_ascii_case(name));
+        let Some(name) = name else {
+            prior_key = false;
+            continue;
         };
         prior_key = true;
         let Some(section) = section else {
             report.issue("", "unsupported_aws_syntax");
             continue;
         };
-        if !seen.insert((section, key)) {
+        if !seen.insert((section, name)) {
             report.issue("", "duplicate_aws_key");
         }
         report.findings.push(Found {
