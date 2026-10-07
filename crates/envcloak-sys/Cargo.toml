@@ -32,6 +32,10 @@ testing = []
 libc.workspace = true
 zeroize.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "=0.10.1"
+security-framework = "=3.5.1"
+
 # Runs its own main so the traced child calls PTRACE_TRACEME on its main
 # thread (see the file).
 [[test]]
