@@ -462,3 +462,43 @@ beneath an eligible agent root with no cached grant masking it. Both residuals
 are registered and open; this corrects the review's stale registration premise,
 not the missing measurement. M2R-87 remains open with M2-25. No outside-worktree
 registry, privacy setting, signing keychain or protected user file was modified.
+
+
+### Final local receipt for the descriptor repair
+
+All 15 detached stages passed on the production changes in `0bfb2b81`, with the
+policy tests in `07c6ea1e`. The run used an empty inherited environment, private
+short temporary HOME/XDG/TMPDIR directories, the assigned target directory,
+`CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=3`, `--no-fail-fast` and three test
+threads. The instrumented binaries were rebuilt before the integration tests;
+no plain daemon build overlapped them. No workspace-wide test command was run.
+
+| Check | macOS result |
+| --- | --- |
+| Formatting and strict workspace/all-target Clippy | Pass |
+| Full envcloak-policy suite | 214 reported passed, four runtime cases ignored here and explicitly executed below; local service-manager case not exercised |
+| Full envcloakd suite | 277 passed, including descriptor admission, frame refusal and delivery/adoption checks |
+| Full envcloak-sys suite | 213 passed, two existing ignored documentation examples; OwnedChild compile-fail test passed |
+| managed_launch | 32/32 reported passed |
+| managed_runner | 19/19 reported passed; includes 18 exercised cases and the local service-manager case's documented skip path |
+| Client-death cleanup controls | `the_client_killed_stops_the_server` and `the_lifeline_ending_stops_the_server` passed |
+| Unsafe, exposure and compiler-source checks | Pass |
+| Crate graph, reservations and SPEC decisions | Pass |
+| Managed runtime oracle controls and check script | Pass; all five real-runtime cases executed, none ignored |
+
+The local service-manager opt-in was not enabled because the external-SSD
+launchd limitation above is unchanged. Its two skipped paths are not fresh
+service qualification. The supplied `98e468ea` CI runs retain that historical
+evidence; the driver must obtain fresh macOS and Linux CI for the descriptor
+repair before landing. No Linux execution or physical privacy observation is
+inferred from this Mac's checks.
+
+The final receipt is `m27-r10-final-results.json`; its stage logs and the named
+mutation logs remain in the private lane target directory. Canonical residual
+entries were compared byte-for-field with the former handoff; doc references,
+private-path/style checks and `git diff --check` passed. The task-owned mapping
+for gates 23, 33, 39 and the launch portion of 40, and R-M2-03, R-M2-24, R-M2-49,
+R-M2-50, R-M2-52, R-M2-74, R-M2-86 and T-16 remains unchanged. M2R-88, M2R-89 and
+M2R-87 retain their stated owners, deadlines and open work; HTTP transport and
+host rewrite round trips remain M2-18/M2-20 as the plan assigns. No push or
+GitHub comment was performed.
