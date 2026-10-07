@@ -323,6 +323,11 @@ fn clean(
         } else {
             comment_assignments(&bytes, &findings, &selection).map_err(cleanup_refusal)?
         };
+        // Slug comments can be longer than short assignments. Keep the file
+        // when the result would exceed the read bound used by undo.
+        if after.len() > MAX_DOTENV {
+            return Err(cleanup_refusal("too_large"));
+        }
         let mut gate = Cleanup {
             root,
             path: rel,
