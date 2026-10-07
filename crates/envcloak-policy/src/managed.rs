@@ -2178,6 +2178,250 @@ mod tests {
         assert!(!format!("{ch:?}").contains('z'), "Debug shows no value");
     }
 
+    /// Change one field at a time on each side of the statement. This
+    /// catches omitted fields even when launch-time checks still refuse
+    /// the changed object. Mutation: omit the resolved cwd from `launch`.
+    #[test]
+    fn every_launch_field_changes_both_digests() {
+        use envcloak_core::vault::LaunchEnv;
+
+        let file = FileIdentity {
+            path: b"/srv/interpreter".to_vec(),
+            dev: 11,
+            ino: 12,
+            digest: CodeDigest::Sha256([13; 32]),
+        };
+        let base = RegisteredLaunch {
+            launch_id: [1; 16],
+            revision: 2,
+            class: LaunchClass::Script,
+            strength: BindingStrength::CheckedAtRest,
+            executable: file.clone(),
+            argv: vec![b"/srv/interpreter".to_vec(), b"/srv/entry".to_vec()],
+            cwd: DirIdentity {
+                path: b"/srv".to_vec(),
+                dev: 21,
+                ino: 22,
+            },
+            env: LaunchEnv {
+                path_env: b"/usr/bin".to_vec(),
+                vars: vec![("MODE".into(), "dev".into())],
+                binding_names: vec!["TOKEN".into()],
+            },
+            entry: Some(FileIdentity {
+                path: b"/srv/entry".to_vec(),
+                ..file
+            }),
+            declaration: LaunchDecl {
+                argv: vec!["interpreter".into(), "/srv/entry".into()],
+                cwd: Some("/srv".into()),
+                env: vec![("MODE".into(), "dev".into())],
+                path_env: Some("/usr/bin".into()),
+            },
+        };
+        let check = |name: &str, old: &RegisteredLaunch, changed: &RegisteredLaunch| {
+            assert_ne!(old, changed, "{name}: fixture must change");
+            assert_ne!(launch_digest(old), launch_digest(changed), "{name}: launch");
+            let original = update_digest(&old.launch_id, old, old);
+            assert_ne!(
+                original,
+                update_digest(&old.launch_id, old, changed),
+                "{name}: new side"
+            );
+            assert_ne!(
+                original,
+                update_digest(&old.launch_id, changed, old),
+                "{name}: old side"
+            );
+        };
+        assert_eq!(launch_digest(&base), launch_digest(&base.clone()));
+        assert_eq!(
+            update_digest(&base.launch_id, &base, &base),
+            update_digest(&base.launch_id, &base.clone(), &base.clone())
+        );
+        macro_rules! changed {
+            ($name:literal, $l:ident, $change:expr) => {{
+                let mut $l = base.clone();
+                $change;
+                check($name, &base, &$l);
+            }};
+        }
+        changed!("revision", l, l.revision += 1);
+        changed!("class native", l, l.class = LaunchClass::Native);
+        changed!("class runner", l, l.class = LaunchClass::PackageRunner);
+        changed!("strength", l, l.strength = BindingStrength::Bound);
+        changed!("argv bytes", l, l.argv[1].push(0xff));
+        changed!("argv length", l, l.argv.push(Vec::new()));
+        changed!("argv order", l, l.argv.swap(0, 1));
+        changed!("cwd path", l, l.cwd.path.push(0xff));
+        changed!("cwd device", l, l.cwd.dev += 1);
+        changed!("cwd inode", l, l.cwd.ino += 1);
+        changed!("path_env", l, l.env.path_env.push(0xff));
+        changed!("vars name", l, l.env.vars[0].0.push('X'));
+        changed!("vars value", l, l.env.vars[0].1.push('X'));
+        changed!(
+            "vars length",
+            l,
+            l.env.vars.push(("MORE".into(), String::new()))
+        );
+        changed!("binding name", l, l.env.binding_names[0].push('X'));
+        changed!("binding length", l, l.env.binding_names.push("MORE".into()));
+        changed!("entry presence", l, l.entry = None);
+        changed!("declaration argv", l, l.declaration.argv[0].push('X'));
+        changed!(
+            "declaration argv length",
+            l,
+            l.declaration.argv.push(String::new())
+        );
+        changed!("declaration argv order", l, l.declaration.argv.swap(0, 1));
+        changed!(
+            "declaration cwd",
+            l,
+            l.declaration.cwd = Some("/elsewhere".into())
+        );
+        changed!("declaration cwd presence", l, l.declaration.cwd = None);
+        changed!("declaration env name", l, l.declaration.env[0].0.push('X'));
+        changed!("declaration env value", l, l.declaration.env[0].1.push('X'));
+        changed!(
+            "declaration env length",
+            l,
+            l.declaration.env.push(("MORE".into(), String::new()))
+        );
+        changed!(
+            "declaration path_env",
+            l,
+            l.declaration.path_env = Some("/bin".into())
+        );
+        changed!(
+            "declaration path_env presence",
+            l,
+            l.declaration.path_env = None
+        );
+
+        // The statement encodes the common launch id once, outside both
+        // revisions; the launch digest takes that id from its record.
+        let mut id = base.clone();
+        id.launch_id[0] += 1;
+        assert_ne!(launch_digest(&base), launch_digest(&id));
+        assert_ne!(
+            update_digest(&base.launch_id, &base, &base),
+            update_digest(&id.launch_id, &id, &id)
+        );
+
+        for entry in [false, true] {
+            fn select(l: &mut RegisteredLaunch, entry: bool) -> &mut FileIdentity {
+                if entry {
+                    l.entry.as_mut().unwrap()
+                } else {
+                    &mut l.executable
+                }
+            }
+            for field in [
+                "path",
+                "dev",
+                "ino",
+                "sha256",
+                "kind",
+                "cdhash",
+                "team",
+                "identifier",
+                "team presence",
+                "identifier presence",
+            ] {
+                let mut original = base.clone();
+                if matches!(
+                    field,
+                    "cdhash" | "team" | "identifier" | "team presence" | "identifier presence"
+                ) {
+                    select(&mut original, entry).digest = CodeDigest::CdHash {
+                        cdhash: vec![14; 20],
+                        team: Some(String::new()),
+                        identifier: Some(String::new()),
+                    };
+                }
+                let mut changed = original.clone();
+                let f = select(&mut changed, entry);
+                match field {
+                    "path" => f.path.push(0xff),
+                    "dev" => f.dev += 1,
+                    "ino" => f.ino += 1,
+                    "sha256" => f.digest = CodeDigest::Sha256([14; 32]),
+                    "kind" => {
+                        f.digest = CodeDigest::CdHash {
+                            cdhash: vec![13; 32],
+                            team: None,
+                            identifier: None,
+                        }
+                    }
+                    _ => {
+                        let CodeDigest::CdHash {
+                            cdhash,
+                            team,
+                            identifier,
+                        } = &mut f.digest
+                        else {
+                            unreachable!()
+                        };
+                        match field {
+                            "cdhash" => cdhash[0] += 1,
+                            "team" => *team = Some("fixture-team".into()),
+                            "identifier" => *identifier = Some("fixture-id".into()),
+                            "team presence" => *team = None,
+                            "identifier presence" => *identifier = None,
+                            _ => unreachable!(),
+                        }
+                    }
+                }
+                check(&format!("entry={entry} {field}"), &original, &changed);
+            }
+        }
+    }
+
+    /// Recorded variables and released bindings bypass the inherited
+    /// allowlist, so test each input independently with allowed controls.
+    /// Mutation: allow LD_/DYLD_ names through the builder's `put` filter.
+    #[test]
+    fn loader_names_are_filtered_from_recorded_vars_and_bindings() {
+        for name in [
+            "LD_PRELOAD",
+            "LD_AUDIT",
+            "LD_LIBRARY_PATH",
+            "LD_FUTURE",
+            "DYLD_INSERT_LIBRARIES",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FUTURE",
+        ]
+        .into_iter()
+        .chain(CODE_SELECTING.iter().copied())
+        {
+            for binding in [false, true] {
+                let vars = if binding {
+                    vec![]
+                } else {
+                    vec![(name.into(), "fixture".into())]
+                };
+                let bindings = if binding {
+                    vec![(name, b"fixture".as_slice())]
+                } else {
+                    vec![]
+                };
+                let env = launch_environment([], b"/bin", &vars, &bindings);
+                assert_eq!(
+                    env,
+                    vec![(b"PATH".to_vec(), b"/bin".to_vec())],
+                    "{name}, binding={binding}"
+                );
+            }
+        }
+        for name in ["MODE", "LC_LD_PRELOAD", "LDX_PRELOAD", "DYLDX_PATH"] {
+            let vars = vec![(name.into(), "recorded".into())];
+            let env = launch_environment([], b"/bin", &vars, &[]);
+            assert_eq!(env[1], (name.as_bytes().to_vec(), b"recorded".to_vec()));
+            let env = launch_environment([], b"/bin", &[], &[(name, b"binding")]);
+            assert_eq!(env[1], (name.as_bytes().to_vec(), b"binding".to_vec()));
+        }
+    }
+
     /// The environment builder: whatever the runner's environment holds
     /// (every loader and interpreter variable SPEC §6.6 names, set by the
     /// bridge or the daemon), the server gets the passthrough list, the
