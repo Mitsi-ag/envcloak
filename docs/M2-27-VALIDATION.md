@@ -1,6 +1,6 @@
 # M2-27 follow-up validation
 
-Scope: the unmerged managed-launch implementation at dff40dd1, repaired in this worktree. SPEC section 6.6 remains the source of truth. This receipt distinguishes the 2026-10-07 macOS run from Linux CI and the existing branch's earlier mutation claims.
+Scope: the unmerged managed-launch implementation at dff40dd1, repaired in this worktree. SPEC section 6.6 remains the source of truth. The dated receipts below preserve earlier failures and platform limits. The final review handoff records the current evidence at `53406f4c` and supersedes earlier requests for fresh CI; it does not turn unsuccessful local checks into passes.
 
 ## Findings and class sweep
 
@@ -45,7 +45,7 @@ The slow-cleanup follow-up also tightens native observations: failure to read or
 
 ## Gate and requirement mapping
 
-- Gates 39 and 40: interpreter and environment refusals preserve the exact-launch and standing-capability boundaries. Existing managed-launch and runner suites cover the surrounding identity/revision/descriptor paths. Gate 40's actual standing-policy issuance remains M2-15.
+- Gates 39 and 40: interpreter and environment refusals preserve the exact-launch and standing-capability boundaries. Existing managed-launch and runner suites cover the surrounding identity/revision/descriptor paths. Gate 40's actual standing-policy issuance remains M2-15. The missing foreign-client case under a standing record, plus the standing negative-case matrix audit, is handed to M2-15 as proposed M2R-89 below; that coverage is not claimed closed here.
 - Gate 23: the controlled pending-state transition verifies the post-proof check separately from the initial check.
 - Gate 33: the transition asserts the proof-refusal audit event; existing suites retain managed register/launch audit tests.
 - R-M2-03, R-M2-24, R-M2-49, R-M2-50, R-M2-52, R-M2-74, R-M2-86 and T-16: this task implements the managed record, binding, private recipient, receipt, adoption and revision portions. Actual HTTP relay behavior is M2-18; config rewriting and backup/host round trips are M2-20, as the plan specifies. No claim here closes those tasks or Linux CI.
@@ -83,7 +83,7 @@ The broader crate run includes 92 reservation-checker mutation tests and its 23 
 
 The first full e2e pass had one unrelated failure at `probe_local.rs:427`: the test compares every shared `/tmp/ecp*` directory before and after its own run and observed two additional concurrent directories. Both subsequent full e2e runs passed, including that test. No probe code or foreign temporary directory was changed to obtain a pass.
 
-The final aggregate run's separate launchd check failed at initial service installation: the loaded daemon did not answer before the install command's deadline. No managed launch or restart had been reached. An isolated retry on the same final binaries passed (12.43 seconds), as had the preceding aggregate run. This startup failure is retained in the raw result; no cause beyond that failed startup observation is claimed.
+The final aggregate run's separate launchd check failed at initial service installation: the loaded daemon did not answer before the install command's deadline. No managed launch or restart had been reached. An isolated retry on the same final binaries passed (12.43 seconds), as had the preceding aggregate run. This startup failure and successful retry are retained as historical results. Later external-SSD controls and the host limitation are recorded in the final review handoff; they do not change either result.
 
 This lane adds fresh macOS development-build and isolated launchd evidence. Linux-specific gates remain for the plan's required CI, and packaged-release/TCC observations were not rerun here. The existing branch's earlier platform evidence is not represented as a new measurement. Standing-policy issuance (M2-15), actual HTTP relay behavior (M2-18), host config rewriting/backup round trips (M2-20), and the stopped-runner recovery residual (M2-25) keep their plan owners.
 
@@ -173,7 +173,7 @@ The review sweep covered every changed or added task file (101 paths, including 
 | Tests passing because another refusal masks the intended one | Stored-record fixtures used noncanonical temporary paths; an effective-entry name also resembled an interpreter. Both independent refusal causes were removed. Each option case now first proves a healthy record with matching identities and canonical paths is accepted. | The login mutation initially passed the old test, then failed both repaired stored-record gates |
 | Test fixtures coupled to product release state | M2-19 borrowed `not_started_by_daemon` as an unlanded token, while M2-27 already lands it. Generic field, method, constant, constructor, printed-token and ignored-source cases now own three synthetic reservations. The ignored module also uses a reserved token so its inclusion cannot be masked by a landed one. Product registry rows are unchanged. | The borrowed-token failure was reproduced; `omit-method-token-reader`, `omit-field-token-reader` and `include-cfg-test-token` each fail. Restored controls and the complete 92-test target pass |
 | Runtime oracles skipped by successful CI | All four ignored PHP/CPython/npm tests are explicitly enabled in the new CI job, together with the ordinary Bash case. Source archives are version- and SHA-256-pinned; Node is 26.7.0. The runner requires exactly five executed successes, zero skipped/filtered cases and a successful Cargo exit. | `omit-include-ignored`, `accept-zero-exit-as-complete` and `omit-archive-digest` fail; all five restored runtime cases pass locally |
-| Unmeasured privacy behavior | Protected-folder and local-network prompt attribution is an explicit residual in MIGRATE-MCP, owned by M2-27 and scheduled by the driver before the M2 release. CI cannot measure the prompts. | No measurement claimed |
+| Unmeasured privacy behavior | Protected-folder and local-network prompt attribution is open, owned by M2-27 and due before the M2 release. Proposed M2R-88 below supplies the missing canonical-registry handoff. CI cannot measure the prompts. | No measurement claimed; registration must be confirmed before landing |
 | Private receipt paths and unregistered recovery residual | Machine-specific absolute receipt paths removed throughout this document; the only user-directory strings elsewhere in the task diff are synthetic plist-escaping fixtures. The canonical residual registry was checked read-only: M2R-87 already records the stopped-runner issue, open and owned by M2-25. | Static path sweep; registry evidence, no out-of-worktree edits |
 
 Repair commits: `e14a38e4` (interpreter/startup and stored-record tests), `098380c3` (statement eligibility, host-config and managed-boundary tests), `a4aa9ca8` (pinned CI oracles), `3d79ad4e` (fixed self-job suspension through the owned signal boundary), and `de7d34e8` (merged fixture signals use the test-only helper). Each commit names its mutations. Compile failures while preparing a mutation were retained as diagnostics and never counted as gate failures.
@@ -289,12 +289,11 @@ the test harness: launchd's system `true` control exits successfully, while its
 in dyld's `getOnDiskBinarySliceOffset` / `__open` path before program startup.
 The corresponding TCC log records a denied `SystemPolicyAllFiles` preflight.
 A diagnostic with output files in the lane cache also records launchd
-`posix_spawn` refusal with `Operation not permitted`. This establishes a host
-startup failure before the probe's code; it does not establish which host
-configuration must change, or qualify either service gate. No timeout, assertion or host
-policy was changed to turn those failures into passes. Both gates still need
-a successful run on a host where the fixture services can start. The final
-managed-runner repeat fails at the same initial installation step.
+`posix_spawn` refusal with `Operation not permitted`. Together with the
+verifier's independent exit-126 control below, this is a local host limitation: launchd cannot run the fixture binaries/scripts from the
+external SSD here. No timeout, assertion or host policy was changed. The final
+local managed-runner repeat still fails at initial installation; successful CI
+on both supported platforms, recorded below, is the authority for these gates.
 
 The final production-code repeat is `m27-m304-adoption-results.json`, with
 `m27-m304-managed-mutation.json` for the new gate. Earlier receipts are
@@ -314,8 +313,97 @@ and the successful instrumented rebuild afterwards. Diagnostic receipts are
 `m27-m304-service-tcc.log`. They stay in the private lane cache. Machine-specific
 absolute paths are omitted here and removed from the incoming M3-04 receipt.
 
-The prior scope, requirement and mutation mapping remains above. Fresh PR and
-manual full CI on macOS and Ubuntu remain driver-owned before landing; no
-remote result is claimed for this merged head. The signed-build privacy-prompt
-measurement and M2R-87 retain their existing owners and are not closed by the
-startup diagnostic. No push was performed.
+The prior scope, requirement and mutation mapping remains above. The final
+review handoff records the subsequently supplied PR and manual full CI results.
+The signed-build privacy-prompt measurement, standing-test handoff and M2R-87
+remain open with their owners. No push was performed.
+
+## Final review handoff, 2026-10-08
+
+This follow-up changes documentation and residual tracking only. Production code
+and runtime tests remain byte-identical to `53406f4c`. The driver-supplied verifier
+reports PR run `37609446417` green and manual full run `37610408716` green on
+macOS and Ubuntu, including test, release, managed runtime oracles and
+agents-e2e. Its macOS receipt has managed_launch 32/32 and managed_runner 19/19,
+with zero ignored; the service-manager restart asserts in CI instead of skipping.
+Linux also ran the hardened-process CR-1 precondition and the OwnedChild
+compile-fail doctest. These are attributed CI results, not new local executions.
+
+The two unsuccessful local service checks are a host limitation: launchd cannot
+run fixture binaries/scripts from the external SSD on this Mac. In addition to
+the dyld, TCC and `posix_spawn` observations above, the independent verifier's
+`launchctl submit` of an SSD script exited **126**. The system `true` control
+exited 0. This supports external-volume execution denial here, not a product
+failure or a general claim about every external volume. CI is the authority for
+`gate26_launchctl_submit_escapes_the_grant` and
+`the_runner_outlives_a_service_manager_restart`. Host policy is unchanged.
+
+### Residual registration and scope
+
+[The exact registry entries](M2-27-RESIDUALS.json) are ready for the driver to
+append to the canonical `.collab/m2-residuals.json`. That registry is outside
+this lane's permitted worktree and was inspected read-only: it contains M2R-87
+and no privacy or standing-client handoff. M2R-88 and M2R-89 are proposed IDs,
+not a claim of canonical registration; the driver must confirm their allocation
+and update these references if they collide before landing.
+
+| ID | Owner and deadline | Open work and closure evidence |
+| --- | --- | --- |
+| M2R-88 (proposed) | M2-27, before the M2 release | Signed build on a real Mac: a daemon-started server performs a protected-folder read and a local-network request. Record each prompt's named process, macOS version/build and EnvCloak version/signing identity; update MIGRATE-MCP's Consequences privacy bullet and this receipt. Existing consent or no prompt is not attribution evidence. |
+| M2R-89 (proposed) | M2-15, before its gate 39/40 closure and the M2 release | A foreign client under a real covering standing record gets `started` and fixture protocol, no value, zero client releases and a runner release. No session/once grant may mask standing coverage. Sweep every client-visible output and readable-memory capture with generated fixtures and a positive detector control. Include the genuine hardened-client control and fail the `return-values-to-foreign-client` mutation. Audit the remaining standing matrix, including upward search and changed launch inputs. |
+| M2R-87 (registered, open) | M2-25 hardening pass | Durable recovery for a stopped runner before anchor resumption, under D-34 owned authority; the earlier handoff is unchanged. |
+
+The implemented portions of gates **23, 33, 39 and 40** and requirements
+**R-M2-03, R-M2-24, R-M2-49, R-M2-50, R-M2-52, R-M2-74, R-M2-86 and T-16** retain
+the earlier test and mutation mapping. They do not close the physical spike-(c)
+measurement or M2-15's standing-policy tests. HTTP relay behavior (M2-18) and
+host rewrite/backup round trips (M2-20) remain with the plan's named owners.
+
+### Finding classes and sweep
+
+The sweep inspected all 103 paths changed from `origin/main`, plus this
+follow-up's residual handoff. No production fix was needed for these findings.
+
+| Class | Instances and disposition | Check |
+| --- | --- | --- |
+| Untracked acceptance work | Privacy prose in MIGRATE-MCP and the validation class table/final receipt; standing issuance and negative-case coverage in the gate mapping, managed_launch and managed_runner suites, policy grants documentation, and M2-15/M2-27 tests-first lists. The two new handoff entries name owners, deadlines, closure evidence and target docs. M2R-87 was checked already registered. | Read-only canonical-registry comparison; handoff JSON validation and cross-reference checks. Physical privacy and standing runtime evidence remain open. |
+| Stale or overstated qualification | Historical launchd results, final M3-04 diagnostic conclusion, repeated fresh-CI requirements, and the current summary. Historical failures stay failures; the final receipt supersedes pending-CI language and names the external-SSD limitation with the independent exit-126 control. | Compare the supplied verifier receipt with both named service gates and local diagnostic receipts; no host policy change or timeout relaxation. |
+| Missing independent review evidence | Two prior empty review outputs supplied no verdict. Neither counts as a clean review. | A new independent read-only review at `53406f4c` returned an explicit clean verdict for the inspected production paths, with no new actionable findings. It did not rerun runtime checks or close the residuals. |
+
+The verifier separately witnessed six runtime mutations at `53406f4c`: remove
+launch identity comparison, resume the macOS child before confirmation, omit
+origin and binding-digest checks, ignore launch revision, inherit all environment
+and omit its code-selecting filter, and omit the registered cwd. Each failed its
+assertion; all five affected e2e tests passed after restoration. Linux-only
+mutations retain the earlier receipts and Linux CI evidence. No new runtime gate
+or implementation mutation is introduced by this documentation-only follow-up.
+
+Driver PR-body text after canonical registration: "At 53406f4c, PR 37609446417
+and manual full 37610408716 passed on macOS and Ubuntu. Local launchd checks are
+limited by external-SSD execution denial (independent exit-126 control); CI
+qualifies both service gates. M2R-88 tracks signed-build macOS privacy-prompt
+measurement, owned by M2-27 before M2 release; M2R-89 tracks standing foreign-client
+coverage and its matrix, handed to M2-15 before gates 39/40 close. M2R-87 remains
+open with M2-25. These residuals are not implementation-complete claims."
+
+The independent review covered record/identity/origin/revision checks before
+pending and grant evaluation, lock-held record and proof rechecks, descriptor
+handoff, private runner release, Linux sealed images and retained anchor,
+macOS suspended confirmation, interpreter/environment policy, runner cleanup
+ownership, and ordinary/managed project adoption through `State::deliver`.
+Its verdict is scoped static evidence, not a second runtime pass.
+
+The final detached documentation-follow-up checks passed: `cargo fmt --all
+--check`; `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets`;
+unsafe, expose and compiler-source scripts; crate graph, reservations and SPEC
+decisions; managed-oracle control tests; and all five real-runtime managed
+oracles (5 passed, 0 failed, 0 ignored). The first unsafe invocation incorrectly
+used `sh` for a Bash script and exited 2 on syntax; the corrected Bash invocation
+passed. Raw receipts are `m27-review-final-results.json` and
+`m27-review-final-unsafe-correct.log` in the private lane target directory.
+The residual JSON parsed, its owner/state/deadline fields and proposed-ID
+availability matched the read-only canonical registry, and doc references,
+private-path/style checks and `git diff --check` passed. No crate changed in this
+follow-up, so the existing full-crate receipts and the supplied green CI at the
+identical production tree remain its crate-suite evidence. No workspace-wide
+test command, host-policy change, push or GitHub comment was performed.
