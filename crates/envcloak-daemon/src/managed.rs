@@ -758,6 +758,15 @@ pub fn update_plan(
         }
         Some(Ok(plan)) => plan,
     };
+    envcloak_sys::pause_point("managed.update_plan_resolved");
+    // Resolution reads and hashes files outside the lock. A requester may
+    // have reached this terminal meanwhile; publish no declaration to it.
+    let mut s = locked(&shared.state);
+    if caller.proof_refusal().is_some()
+        || requester_terminal_in(&mut s, &caller, &now_of(&shared.clocks)).is_some()
+    {
+        return Ok(ManagedUpdatePlanView { statement: None });
+    }
     Ok(ManagedUpdatePlanView {
         statement: Some(UpdateStatementView {
             launch: launch_id_text(&launch),

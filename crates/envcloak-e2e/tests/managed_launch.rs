@@ -832,16 +832,63 @@ fn a_proof_is_refused_beside_a_waiting_agent_on_its_terminal() {
     assert_eq!(w.pending_count(), 1, "the agent's request waits");
 }
 
+/// Mutation: accept --login as a harmless long option. The independent
+/// Bash oracle proves that it runs the startup file before this entry.
+#[test]
+fn login_startup_is_refused_at_every_managed_boundary() {
+    let mut w = World::new(&[]);
+    let entry = w.project.join("entry.sh");
+    envcloak_e2e::write_script(&entry, "#!/bin/bash\nprintf 'entry\\n'\n");
+    let good = json!(["/bin/bash", entry]);
+    let reg = w.register(json!({"argv": good}));
+    let launch = reg["launch"].as_str().unwrap().to_owned();
+    assert_eq!(reg["receipt"]["class"], "script");
+    for option in ["--login", "-l", "-lx"] {
+        let shebang = w.project.join("login.sh");
+        envcloak_e2e::write_script(
+            &shebang,
+            &format!("#!/bin/bash {option}\nprintf 'entry\\n'\n"),
+        );
+        for argv in [json!(["/bin/bash", option, entry]), json!([shebang])] {
+            let reg = w.register(json!({"argv": argv}));
+            let plan = w.person("plan", json!({"launch": launch, "changes": {"argv": argv}}));
+            let update = w.person(
+                "update",
+                json!({"launch": launch, "changes": {"argv": argv}, "digest": "0".repeat(64)}),
+            );
+            for answer in [reg, plan, update] {
+                assert_eq!(error_of(&answer), "code_selecting_env", "{answer}");
+                assert_eq!(answer["reason"], "interpreter_option", "{answer}");
+            }
+        }
+    }
+    let plan = w.person("plan", json!({"launch": launch}));
+    assert_eq!(plan["statement"]["revision"], 1);
+    assert_eq!(plan["statement"]["new_declaration"]["argv"], good);
+    assert_eq!(w.pending_count(), 0);
+    w.assert_released(0, 0, "login refusals release nothing");
+    w.h.assert_swept("after login startup refusals");
+}
+
 /// Gate 23: a pending request inserted after the first proof-origin
 /// check is observed again under the commit lock. Mutation: remove only
 /// the requester_terminal_in recheck in managed::prove.
 #[test]
 fn a_pending_request_arriving_during_registration_is_rechecked() {
+    pending_transition("register", "managed.register_resolved");
+}
+
+/// Mutation: omit the post-resolution pending-terminal check in update_plan.
+#[test]
+fn a_pending_request_arriving_during_update_plan_hides_the_statement() {
+    pending_transition("plan", "managed.update_plan_resolved");
+}
+
+fn pending_transition(action: &str, site: &str) {
     if managed_common::release_run("proof recheck") {
         return;
     }
     for same_terminal in [true, false] {
-        let site = "managed.register_resolved";
         let (mut w, gate) = held_world(site);
         let release = gate.path().join("release");
         let held = gate.path().join("held");
@@ -860,12 +907,17 @@ fn a_pending_request_arriving_during_registration_is_rechecked() {
         let registration = json!({"name": "claude-code/fixture",
             "manifest": w.project.join("envcloak.toml"), "argv": w.fixture_argv(),
             "passphrase_file": pass});
+        let input = if action == "plan" {
+            json!({"launch": launch})
+        } else {
+            registration
+        };
         let stops = paused(&w, site);
         std::fs::rename(&release, &held).unwrap();
         let answer = if same_terminal {
             let (ri, ro) = w.io_paths();
             let (ai, ao) = w.io_paths();
-            std::fs::write(&ri, registration.to_string()).unwrap();
+            std::fs::write(&ri, input.to_string()).unwrap();
             std::fs::write(&ai, request.to_string()).unwrap();
             let quote = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
             let command = |action, i: &Path, o: &Path| {
@@ -883,7 +935,7 @@ fn a_pending_request_arriving_during_registration_is_rechecked() {
                 "{} & proof=$!; while [ ! -e {} ]; do sleep 0.02; done; \
                  ( {}; while [ ! -e {} ]; do sleep 0.02; done ) & agent=$!; \
                  wait $proof; wait $agent",
-                command("register", &ri, &ro),
+                command(action, &ri, &ro),
                 quote(&trigger),
                 command("request", &ai, &ao),
                 quote(&done)
@@ -911,7 +963,7 @@ fn a_pending_request_arriving_during_registration_is_rechecked() {
             assert_eq!(code, Some(0));
             answer
         } else {
-            let proof = w.person_background("register", registration);
+            let proof = w.person_background(action, input);
             wait_paused(&w, site, stops + 1);
             let queued = w.agent("request", &request);
             pending_id(&queued);
@@ -919,7 +971,18 @@ fn a_pending_request_arriving_during_registration_is_rechecked() {
             w.person_done(proof)
         };
         let plan = w.person("plan", json!({"launch": launch}));
-        if same_terminal {
+        if action == "plan" {
+            assert!(answer["error"].is_null(), "{answer}");
+            if same_terminal {
+                assert!(
+                    answer["statement"].is_null(),
+                    "late pending request disclosed the declaration: {answer}"
+                );
+            } else {
+                assert_eq!(answer["statement"]["revision"], 1, "{answer}");
+            }
+            assert_eq!(plan["statement"]["revision"], 1, "{plan}");
+        } else if same_terminal {
             assert_eq!(error_of(&answer), "proof_refused", "{answer}");
             assert_eq!(answer["reason"], "requester_terminal");
             assert_eq!(plan["statement"]["revision"], 1, "{plan}");
@@ -945,14 +1008,22 @@ fn a_pending_request_arriving_during_registration_is_rechecked() {
 /// cover (a fresh pending request), and once approved, it runs the new
 /// image.
 ///
-/// Mutation checked: a grant that ignores the launch revision: the
-/// request after the update is started at once, and this fails.
+/// Mutations: a grant that ignores the launch revision, or building the
+/// update declaration from the host config (which contains only the wrapper).
 #[test]
 fn an_update_comes_from_the_stored_declaration() {
     let mut w = World::new(&[]);
     let argv = w.fixture_argv();
     let reg = w.register(json!({"argv": argv, "env": [["MODE", "dev"]]}));
     let launch = reg["launch"].as_str().unwrap().to_owned();
+    // The migrated host config has lost the original declaration. This
+    // fixture uses Claude's JSON shape; M2-20 owns real-host round trips.
+    let host_config = w.h.home.home().join(".claude.json");
+    let wrapper = serde_json::to_vec_pretty(&json!({"mcpServers": {"fixture": {
+        "command": "envcloak", "args": ["mcp-bridge", "--stdio", "--launch", launch]
+    }}}))
+    .unwrap();
+    std::fs::write(&host_config, &wrapper).unwrap();
     let first = w.request(&launch);
     w.approve(&pending_id(&first));
     let answer = w.request(&launch);
@@ -969,7 +1040,10 @@ fn an_update_comes_from_the_stored_declaration() {
     let no_terminal = w.no_terminal("plan", &json!({"launch": launch}));
     assert!(no_terminal["statement"].is_null(), "{no_terminal}");
     let plan = w.person("plan", json!({"launch": launch}));
+    assert_eq!(std::fs::read(&host_config).unwrap(), wrapper);
     let st = plan["statement"].clone();
+    assert_eq!(st["old_declaration"]["argv"], argv);
+    assert_eq!(st["new_declaration"]["argv"], argv);
     assert_eq!(st["revision"], 1, "{plan}");
     assert_eq!(st["old"]["identity"], receipt_identity(&reg), "{plan}");
     assert_eq!(st["new"]["identity"], file_identity(&w.fixture), "{plan}");
@@ -1011,6 +1085,7 @@ fn an_update_comes_from_the_stored_declaration() {
     assert_eq!(error_of(&mismatch), "statement_mismatch", "{mismatch}");
     let updated = w.person("update", json!({"launch": launch, "digest": digest}));
     assert_eq!(updated["revision"], 2, "{updated}");
+    assert_eq!(std::fs::read(&host_config).unwrap(), wrapper);
     let next = w.request(&launch);
     w.approve(&pending_id(&next));
     let answer = w.request(&launch);
