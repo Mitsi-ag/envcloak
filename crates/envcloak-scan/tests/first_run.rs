@@ -62,6 +62,8 @@ fn aws_hostile_grammar_is_explicit_and_value_free() {
         b"[default]\naws_access_key_id = first\n[default]\naws_secret_access_key = second\n"
             .to_vec(),
         b"[broken\naws_secret_access_key = first\n".to_vec(),
+        b"[default]\naws_session_token: first==\n  part=two\n".to_vec(),
+        b"[default]\naws_secret_access_key: first=part\nAWS_SECRET_ACCESS_KEY = second\n".to_vec(),
     ] {
         let r = parse_aws(&SecretBytes::from_vec(bytes));
         assert!(!r.complete());
@@ -95,6 +97,36 @@ fn aws_option_casing_matches_python_ini_oracle() {
         assert!(finding.name.ct_eq(name.as_bytes()));
         assert!(finding.value.as_ref().unwrap().ct_eq(value.as_bytes()));
     }
+}
+
+#[test]
+fn aws_delimiters_match_python_ini_oracle() {
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let path = home.path().join("fixture.ini");
+    // Hand-written reader syntax: aws configure set only writes equals.
+    let bytes = b"[default]\naws_access_key_id: first fixture\nAws_Secret_Access_Key: second fixture=embedded\naws_session_token: third fixture==\n[other]\naws_secret_access_key = fourth fixture:retained=tail\n";
+    std::fs::write(&path, bytes).unwrap();
+    let out = Command::new("/usr/bin/python3")
+        .env_clear()
+        .env("HOME", home.path())
+        .args(["-I", "-c", "import configparser,json,sys; p=configparser.RawConfigParser(); p.read(sys.argv[1]); print(json.dumps([(k.upper(),v) for s in p.sections() for k,v in p.items(s)]))"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let expected: Vec<(String, String)> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(expected.len(), 4);
+    let input = SecretBytes::copy_from(bytes);
+    let report = parse_aws(&input);
+    assert!(report.complete());
+    assert_eq!(report.findings.len(), expected.len());
+    for (finding, (name, value)) in report.findings.iter().zip(expected) {
+        assert!(finding.name.ct_eq(name.as_bytes()));
+        assert!(finding.value.as_ref().unwrap().ct_eq(value.as_bytes()));
+        assert!(finding.single_complete_line);
+    }
+    let edited = comment_assignments(&input, &report.findings, &[(1, "fixture/second")]).unwrap();
+    assert!(edited.ct_eq(b"[default]\naws_access_key_id: first fixture\n# envcloak: fixture/second; use envcloak run\naws_session_token: third fixture==\n[other]\naws_secret_access_key = fourth fixture:retained=tail\n"));
 }
 
 #[test]
@@ -132,6 +164,133 @@ fn aws_continuation_context_matches_python_ini_oracle() {
                 .all(|f| f.value.is_none() && !f.single_complete_line)
         );
     }
+}
+
+#[test]
+fn gate15_machine_hard_links_remove_line_eligibility() {
+    for name in [
+        ".zshrc",
+        "included/profile",
+        ".aws/credentials",
+        ".aws/config",
+    ] {
+        for linked in [false, true] {
+            let home = tempfile::tempdir_in("/tmp").unwrap();
+            let path = home.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            if name == "included/profile" {
+                std::fs::write(home.path().join(".zshrc"), b"source included/profile\n").unwrap();
+            }
+            let aws = name.starts_with(".aws/");
+            let bytes: &[u8] = if aws {
+                b"[default]\naws_secret_access_key = fixture value\n"
+            } else {
+                b"export SECRET_TOKEN='fixture value'\n"
+            };
+            std::fs::write(&path, bytes).unwrap();
+            if linked {
+                std::fs::hard_link(&path, home.path().join("alias")).unwrap();
+            }
+            let root = open_root(home.path()).unwrap();
+            let report = if aws {
+                scan_aws(&root)
+            } else {
+                envcloak_scan::profile::scan_profiles(&root).unwrap()
+            };
+            assert_eq!(report.findings.len(), 1);
+            assert!(report.findings[0].value.is_some());
+            assert_eq!(report.findings[0].single_complete_line, !linked, "{name}");
+            assert_eq!(
+                report.issues.iter().any(|i| i.reason == "hard_link"),
+                linked,
+                "{name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zsh_equals_expansion_matches_the_shell_oracle() {
+    use envcloak_scan::candidates::Disposition;
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let command = "fixture_command";
+    let executable = home.path().join(command);
+    std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (rhs, literal) in [
+        ("=fixture_command", false),
+        ("prefix:=fixture_command", false),
+        ("'=fixture_command'", true),
+        ("\"=fixture_command\"", true),
+        ("\\=fixture_command", true),
+        ("prefix=fixture_command", true),
+    ] {
+        for exported in [false, true] {
+            let source = format!(
+                "{}SECRET_TOKEN={rhs}\n",
+                if exported { "export " } else { "" }
+            );
+            let script = format!("{source}printf '%s' \"$SECRET_TOKEN\"");
+            let out = Command::new("/bin/zsh")
+                .env_clear()
+                .env("HOME", home.path())
+                .env("PATH", home.path())
+                .args(["-f", "-c", &script])
+                .output()
+                .expect("zsh is required for the profile grammar oracle");
+            assert!(out.status.success());
+            assert!(out.stderr.is_empty());
+            if !literal {
+                assert!(
+                    out.stdout
+                        .ends_with(executable.as_os_str().as_encoded_bytes())
+                );
+            }
+            let input = SecretBytes::copy_from(source.as_bytes());
+            let report = parse_profile(&input, Shell::Posix);
+            assert_eq!(report.findings.len(), 1);
+            let found = &report.findings[0];
+            if literal {
+                assert!(report.complete());
+                assert!(found.value.as_ref().unwrap().ct_eq(&out.stdout));
+                assert!(found.single_complete_line);
+                assert!(
+                    comment_assignments(&input, &report.findings, &[(0, "fixture/key")]).is_ok()
+                );
+            } else {
+                assert!(!report.complete());
+                assert_eq!(found.disposition, Disposition::Manual);
+                assert!(found.value.is_none());
+                assert!(!found.single_complete_line);
+                assert!(
+                    comment_assignments(&input, &report.findings, &[(0, "fixture/key")]).is_err()
+                );
+            }
+        }
+    }
+    // Source paths share the word decoder. An expansion must never cause
+    // the scanner to read a literal lookalike file instead of the shell target.
+    std::fs::write(
+        home.path().join("=fixture_command"),
+        b"SECRET_TOKEN=fixtureValueForLookalike\n",
+    )
+    .unwrap();
+    std::fs::write(home.path().join(".zshrc"), b"source =fixture_command\n").unwrap();
+    let report = envcloak_scan::profile::scan_profiles(&open_root(home.path()).unwrap()).unwrap();
+    assert!(!report.complete());
+    assert!(
+        report
+            .issues
+            .iter()
+            .any(|i| i.reason == "source_not_literal")
+    );
+    assert!(report.findings.is_empty());
+    assert_eq!(report.files, 1);
+    std::fs::write(home.path().join(".zshrc"), b"source '=fixture_command'\n").unwrap();
+    let report = envcloak_scan::profile::scan_profiles(&open_root(home.path()).unwrap()).unwrap();
+    assert!(report.complete());
+    assert_eq!(report.findings.len(), 1);
+    assert_eq!(report.files, 2);
 }
 
 #[test]
