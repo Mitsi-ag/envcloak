@@ -46,14 +46,19 @@ scope, token search, Lock, and keyboard navigation with Command-1 through
 Command-5 and Command-F. Projects combine the daemon's paged adopted index
 with folder paths the person adds. Opening a project checks its current
 manifest and shows profile inheritance, binding status words and grants with
-Revoke. The adopted index and "Used by" describe the last adopted run, not all
+Revoke. Hidden directory placeholders remain visible as separate rows with no
+folder actions or scope entry. Saved aliases join grants by the canonical
+identity returned by `items.check`. The adopted index and "Used by" describe the last adopted run, not all
 bindings in today's manifest or proof that an application used a value.
 
 Keys can be grouped by project, provider or account and filtered by live/test
 classification, project scope and search prefixes. The inspector shows
-metadata, links and grants, with a solid held-value block. No workspace store
+full `items.show` metadata, links and grants, with a solid held-value block.
+The long inventory supplies recorded last-used dates without per-row RPCs. No workspace store
 holds values. Replace and Remove offer quoted commands for a human Terminal
-session; Reveal explicitly says it is unavailable until its later task.
+session; Replace requires a field and qualifies the target as `slug#field`.
+Reveal explicitly says it is unavailable and offers no command. Project scope
+is saved as one adopted directory path per viewer.
 
 `VaultSession` polls status one second after the preceding poll finishes.
 Unchanged status does not fetch inventories again. Audit sequence, grant
@@ -67,7 +72,11 @@ unknown outcome and refreshes grants before another action is offered.
 Connection screens cover connecting, missing/unverified daemon, absent or
 locked vault, read-only integrity failure and unavailable vault. The EU-0
 actions start the bundled background process or offer the required Terminal
-command. Settings and About carry the development-build warning. Approvals,
+command. Startup uses a bounded exit-status runner for `daemon install`;
+recovery help copies `envcloak recover --help`. An integrity failure shows a
+recovery banner and explicitly unavailable metadata: the current daemon
+refuses reads of a tampered vault. Locked takes precedence over tampered.
+Settings and About carry the development-build warning. Approvals,
 Activity, Agents, Exposed, Spend, Dashboard and Devices explain which later
 slice supplies them.
 
