@@ -223,7 +223,11 @@ Rules (the id is what a finding and an allowlist entry name):
                  Objective-C runtime's lookups and `objc_msgSend`,
                  `Selector("...")` from a string, `value(forKey:)` and
                  `setValue(_:forKey:)` (and their key-path forms).
-  daemon-text    `.unescaped`, the raw text of a string the daemon sent
+  daemon-text    Raw-returning metadata helpers (`path`, `replaceTarget`,
+                 `terminalCommand`, `changeDirectoryCommand`, `commandWords`)
+                 cannot be referenced from App or Features view files. This
+                 covers calls and method references, including type aliases.
+                 `.unescaped`, the raw text of a string the daemon sent
                  (`DaemonText`, M3-03), outside the allowlist: views show
                  daemon text only through `Escape.display` (rule 4).
   color          a colour not from EnvCloakDesign's tokens: any call with a
@@ -1524,6 +1528,10 @@ def check_product_swift(rel, toks, brand):
             # rule 4
             if name == "unescaped" and is_member(k):
                 find("daemon-text", rel, t.line, "`.unescaped` reads a daemon string's raw text (show it with Escape.display)")
+            if (rel.startswith(("apps/macos/EnvCloak/App/", "apps/macos/EnvCloak/Features/"))
+                    and name in {"path", "replaceTarget", "terminalCommand", "changeDirectoryCommand", "commandWords"}
+                    and is_member(k)):
+                find("daemon-text", rel, t.line, "raw metadata helpers belong in stores/actions; views use escaped labels or opaque clipboard text")
             # rule 5
             if not brand:
                 check_color(rel, flat, k)

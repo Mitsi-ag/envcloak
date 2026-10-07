@@ -36,7 +36,10 @@ struct KeyInspector: View {
                     HStack {
                         Button("Reveal…") { action = .reveal }
                         Button("Replace…") { action = .replace }
-                            .disabled(session.state != .ready || InspectorAction.replace.commandWords(item: item, field: selectedField) == nil)
+                            .disabled(session.state != .ready || InspectorAction.replace.command(item: item, field: selectedField) == nil)
+                    }
+                    if !MetadataRequest.canCopy(item.slug) || selectedField.map({ !MetadataRequest.canCopy($0) }) == true {
+                        Text(TerminalCopy.refusalMessage).foregroundStyle(ECToken.warning.color)
                     }
                     Text("Account").font(.headline)
                     ForEach(DisplayRow.of([item.account?.email, item.account?.label, item.account?.org_id].compactMap { $0 })) { Text($0.value.escaped) }
@@ -69,7 +72,7 @@ struct KeyInspector: View {
                     LabeledContent("Expires") { DateLabel(seconds: item.expires_secs) }
                     Text("Balance and spend arrive in a later release (M4).").foregroundStyle(ECToken.secondary.color)
                     Button("Remove key…") { action = .remove }
-                        .foregroundStyle(ECToken.danger.color).disabled(session.state != .ready)
+                        .foregroundStyle(ECToken.danger.color).disabled(session.state != .ready || InspectorAction.remove.command(item: item, field: nil) == nil)
                 }.padding(16)
             }.onChange(of: item.fields.map(\.name), initial: true) { _, fields in
                 if !fields.contains(selectedField ?? DaemonText("")) { selectedField = fields.count == 1 ? fields.first : nil }
@@ -86,20 +89,6 @@ struct KeyInspector: View {
     }
 }
 
-enum InspectorAction: String, Identifiable {
-    case reveal, replace, remove
-    var id: String { rawValue }
-    func commandWords(item: ItemView, field: DaemonText?) -> [String]? {
-        switch self {
-        case .reveal: return nil
-        case .replace:
-            guard let field, item.fields.contains(where: { $0.name == field }) else { return nil }
-            return ["rotate", MetadataRequest.replaceTarget(slug: item.slug, field: field)]
-        case .remove: return ["rm", MetadataRequest.path(item.slug)]
-        }
-    }
-}
-
 struct InspectorActionSheet: View {
     let action: InspectorAction
     let item: ItemView
@@ -109,12 +98,13 @@ struct InspectorActionSheet: View {
         VStack(alignment: .leading, spacing: 16) {
             if action == .reveal {
                 Text("Reveal is unavailable in this build.").font(.headline)
-            } else if let arguments = action.commandWords(item: item, field: field) {
-                let command = MetadataRequest.terminalCommand(arguments)
+            } else if let command = action.command(item: item, field: field) {
                 Text("Continue in Terminal").font(.headline)
                 Text("This action arrives in the app with Touch ID. The command requires a human Terminal session.")
-                Text(Escape.display(command)).font(ECFont.martianMono(size: 12)).textSelection(.enabled)
+                Text(command.display).font(ECFont.martianMono(size: 12)).textSelection(.enabled)
                 Button("Copy command") { WorkspaceActions.copy(command) }
+            } else if !MetadataRequest.canCopy(item.slug) || field.map({ !MetadataRequest.canCopy($0) }) == true {
+                Text(TerminalCopy.refusalMessage)
             } else { Text("Choose a field before replacing its value.") }
             Button("Done") { dismiss() }
         }.padding(24).frame(width: 440)

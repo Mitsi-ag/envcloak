@@ -37,9 +37,9 @@ import XCTest
         return window
     }
 
-    private func labels(_ object: Any) -> [String] {
+    private func nodes(_ object: Any) -> [NSObject] {
         var seen = Set<ObjectIdentifier>()
-        func walk(_ object: Any, depth: Int) -> [String] {
+        func walk(_ object: Any, depth: Int) -> [NSObject] {
             guard depth < 40, let node = object as? NSObject, seen.insert(ObjectIdentifier(node)).inserted else { return [] }
             // SwiftUI nodes implement the accessors without declaring
             // AppKit's full protocol. Native table cells are virtualized.
@@ -48,13 +48,33 @@ import XCTest
                 guard node.responds(to: selector) else { return nil }
                 return node.perform(selector)?.takeUnretainedValue()
             }
-            let own = ["accessibilityLabel", "accessibilityValue", "accessibilityTitle"].compactMap { attribute($0) as? String }
             var children = ["accessibilityChildren", "accessibilityRows", "accessibilityContents"].flatMap { (attribute($0) as? [Any]) ?? [] }
             if let view = node as? NSView { children += view.subviews }
             if let window = node as? NSWindow, let view = window.contentView { children.append(view) }
-            return own + children.flatMap { walk($0, depth: depth + 1) }
+            return [node] + children.flatMap { walk($0, depth: depth + 1) }
         }
         return walk(object, depth: 0)
+    }
+
+    private func labels(_ object: Any) -> [String] {
+        nodes(object).flatMap { node in
+            ["accessibilityLabel", "accessibilityValue", "accessibilityTitle"].compactMap { name in
+                let selector = NSSelectorFromString(name)
+                guard node.responds(to: selector) else { return nil }
+                return node.perform(selector)?.takeUnretainedValue() as? String
+            }
+        }
+    }
+
+    private func assertDisabled(_ title: String, in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) {
+        let states: [Bool] = nodes(window).compactMap { node in
+            let selector = NSSelectorFromString("accessibilityLabel")
+            guard node.responds(to: selector), node.perform(selector)?.takeUnretainedValue() as? String == title,
+                  node.responds(to: NSSelectorFromString("isAccessibilityEnabled")) || node.responds(to: NSSelectorFromString("accessibilityEnabled")) else { return nil }
+            return node.value(forKey: "accessibilityEnabled") as? Bool
+        }
+        XCTAssertFalse(states.isEmpty, "Missing enabled-state oracle for " + title, file: file, line: line)
+        XCTAssertTrue(states.allSatisfy { !$0 }, title + " must be disabled", file: file, line: line)
     }
 
     private func assertVisible(_ text: String, in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) async {
@@ -100,6 +120,32 @@ import XCTest
         XCTAssertFalse(labels(keys).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
     }
 
+    func testGate31AllMetadataSurfacesEscapeHostileText() async throws {
+        let client = ScriptedClient(); await client.hostileMetadata()
+        let session = VaultSession(client: client); await session.poll()
+        let directory = try XCTUnwrap(session.projects.rows.first?.dir)
+        await session.openProject(directory)
+        let project = try XCTUnwrap(session.projects.opened)
+        let surfaces: [(AnyView, [String])] = [
+            (AnyView(KeysView(session: session, filter: .all, query: "", scope: nil, grouping: .constant(.none), selectedKey: .constant(nil))),
+             ["fixture-0\\u{202e}\\u{1b}[31m", "Fixture 0\\u{202e}\\u{1b}[31m", "example\\u{202e}\\u{1b}[31m", "fixture@example.invalid\\u{202e}\\u{1b}[31m"]),
+            (AnyView(ProjectsOverview(session: session, route: .constant(.projects))),
+             ["project\\u{202e}\\u{1b}[31m, /tmp/project\\u{202e}\\u{1b}[31m, 1 adopted bindings"]),
+            (AnyView(BindingsTable(session: session, project: project, profile: nil, selectedKey: .constant(nil))),
+             ["VARIABLE\\u{202e}\\u{1b}[31m", "envcloak://fixture-0\\u{202e}\\u{1b}[31m", "example\\u{202e}\\u{1b}[31m, fixture@example.invalid\\u{202e}\\u{1b}[31m"]),
+            (AnyView(GrantRows(session: session, directory: nil, slug: nil)),
+             ["Fixture grant\\u{202e}\\u{1b}[31m", "/tmp/project\\u{202e}\\u{1b}[31m"]),
+            (AnyView(MainView(session: session, initialRoute: .settings)),
+             ["project\\u{202e}\\u{1b}[31m"]),
+        ]
+        for (view, expected) in surfaces {
+            let window = host(view)
+            for text in expected { await assertVisible(text, in: window) }
+            XCTAssertFalse(labels(window).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+            window.close()
+        }
+    }
+
     func testAliasProjectShowsGrantsAndBindingAccess() async throws {
         let root = URL(fileURLWithPath: "/tmp/ec05-alias-" + UUID().uuidString.prefix(8))
         let project = root.appendingPathComponent("project")
@@ -131,8 +177,30 @@ import XCTest
         await assertVisible("Field to replace", in: inspector)
     }
 
+    func testClipboardControlsAreDisabledAndExplained() async throws {
+        let client = ScriptedClient(); let session = VaultSession(client: client); await session.poll()
+        let directory = DaemonText("/tmp/folder" + String(Unicode.Scalar(27)) + "[201~fixture")
+        let project = host(ProjectDetail(session: session, directory: directory, selectedKey: .constant(nil)))
+        await assertVisible(TerminalCopy.refusalMessage, in: project)
+        assertDisabled("Open in Terminal", in: project)
+        assertDisabled("Copy path", in: project)
+        project.close()
+        let item = try XCTUnwrap(session.items.rows.first)
+        let inspector = host(KeyInspector(session: session, slug: item.slug, route: .constant(.keys(.all))))
+        await assertVisible(TerminalCopy.refusalMessage, in: inspector)
+        assertDisabled("Replace…", in: inspector)
+        assertDisabled("Remove key…", in: inspector)
+        inspector.close()
+        for action in [InspectorAction.replace, .remove] {
+            let sheet = host(InspectorActionSheet(action: action, item: item, field: DaemonText("secondary")))
+            await assertVisible(TerminalCopy.refusalMessage, in: sheet)
+            XCTAssertFalse(labels(sheet).contains("Copy command"))
+            sheet.close()
+        }
+    }
+
     func testUpgradeReadOnlyBannerKeepsWorkspaceVisible() async {
-        let client = ScriptedClient(); await client.configure(readOnly: true)
+        let client = ScriptedClient(); await client.configure(grants: 1, readOnly: true)
         let session = VaultSession(client: client); await session.poll()
         let window = host(MainView(session: session))
         await assertVisible("The vault opened read-only because an upgrade failed.", in: window)
@@ -140,6 +208,14 @@ import XCTest
         await assertVisible("project, /tmp/project, 0 adopted bindings", in: window)
         XCTAssertFalse(labels(window).contains("How to recover"))
         XCTAssertFalse(labels(window).contains("Metadata unavailable"))
+        assertDisabled("Add project folder…", in: window)
+        let grants = host(GrantRows(session: session, directory: nil, slug: nil))
+        await assertVisible("Revoke", in: grants)
+        assertDisabled("Revoke", in: grants)
+        let inspector = host(KeyInspector(session: session, slug: session.items.rows.first?.slug, route: .constant(.keys(.all))))
+        await assertVisible("Replace…", in: inspector)
+        assertDisabled("Replace…", in: inspector)
+        assertDisabled("Remove key…", in: inspector)
     }
 
     func testScopeSaveWarningKeepsNonemptyOverview() async throws {

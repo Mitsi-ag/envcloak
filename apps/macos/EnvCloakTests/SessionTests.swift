@@ -23,6 +23,11 @@ actor ScriptedClient: WorkspaceClient {
     var pageMode = "single"
     var revokeFailure = false
     var hostileSlugs = true
+    var fieldNameSuffix = ""
+    func fieldSuffix(_ text: String) { fieldNameSuffix = text }
+    var hostileSurfaceMetadata = false
+    private var hostileSuffix: String { hostileSurfaceMetadata ? "\u{202e}\u{1b}[31m" : "" }
+    func hostileMetadata() { hostileSurfaceMetadata = true; grants = 1; adoptedBinding = true }
     func plainSlugs() { hostileSlugs = false }
     var showFailure = false
     var wrongDetail = false
@@ -44,10 +49,10 @@ actor ScriptedClient: WorkspaceClient {
     }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
-        ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)",
-         "provider": "example", "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
-         "fields": ["value", "secondary"].map { ["name": $0, "prior_count": 0, "created_secs": 1, "updated_secs": 1] as [String: Any] },
-         "last_used_secs": 123, "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid"]]
+        ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
+         "provider": "example" + hostileSuffix, "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
+         "fields": ["value", "secondary"].map { ["name": $0 + fieldNameSuffix, "prior_count": 0, "created_secs": 1, "updated_secs": 1] as [String: Any] },
+         "last_used_secs": 123, "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid" + hostileSuffix]]
     }
     func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
         counts[M.name, default: 0] += 1
@@ -75,16 +80,16 @@ actor ScriptedClient: WorkspaceClient {
             if pageMode == "fail-second" && nextPage { throw EnvCloakError.protocolError }
             let next: Any = !["single", "hidden-one-page", "duplicate-real"].contains(pageMode) && (!nextPage || pageMode == "repeat")
                 ? ["last_seen": 2, "id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"] : NSNull()
-            let directory = pageMode.hasPrefix("hidden") ? "[not shown: looks like a key or token]" : (nextPage ? "/tmp/second" : "/tmp/project")
+            let directory = pageMode.hasPrefix("hidden") ? "[not shown: looks like a key or token]" : (nextPage ? "/tmp/second" : "/tmp/project") + hostileSuffix
             let row: [String: Any] = ["dir": directory, "manifest_sha256": String(repeating: "a", count: 64), "bindings": adoptedBinding ? [["env_name": "VARIABLE", "reference": "envcloak://fixture-0\u{202e}\u{1b}[31m"]] : [], "last_seen_secs": nextPage ? 1 : 2]
             result = ["projects": ["hidden-one-page", "duplicate-real"].contains(pageMode) ? [row, row] : [row], "next": next]
 
-        case "items.check": result = ["project_dir": "/tmp/project", "project_name": "project\u{202e}\u{1b}[31m", "bindings": [
-            ["env_name": "VARIABLE", "reference": hostileSlugs ? "envcloak://fixture" : "envcloak://fixture-0", "status": "ok"],
+        case "items.check": result = ["project_dir": "/tmp/project" + hostileSuffix, "project_name": "project\u{202e}\u{1b}[31m", "bindings": [
+            ["env_name": "VARIABLE" + hostileSuffix, "reference": hostileSurfaceMetadata ? "envcloak://fixture-0" + hostileSuffix : hostileSlugs ? "envcloak://fixture" : "envcloak://fixture-0", "status": "ok"],
             ["profile": "test", "env_name": "VARIABLE", "reference": "envcloak://second", "status": "unknown_item"]], "refs": []]
         case "grants.list": result = ["grants": grants == 0 ? [] : [[
-            "id": "fixture-grant", "kind": "terminal", "label": "Fixture grant", "root_pid": 42,
-            "project_dir": "/tmp/project", "bindings": [["env_name": "VARIABLE", "slug": "fixture-0", "live": false]],
+            "id": "fixture-grant", "kind": "terminal", "label": "Fixture grant" + hostileSuffix, "root_pid": 42,
+            "project_dir": "/tmp/project" + hostileSuffix, "bindings": [["env_name": "VARIABLE" + hostileSuffix, "slug": "fixture-0" + hostileSuffix, "live": false]],
             "mode": "inject", "uses": "session", "created_secs": 1, "remaining_secs": 3600]]]
         case "grants.revoke":
             if revokeFailure { throw EnvCloakError.protocolError }

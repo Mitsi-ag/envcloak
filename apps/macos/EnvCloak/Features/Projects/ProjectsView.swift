@@ -56,9 +56,15 @@ struct ProjectDetail: View {
             Text(directory.escaped).font(ECFont.martianMono(size: 12)).textSelection(.enabled)
             HStack {
                 Button("Show in Finder") { WorkspaceActions.showFolder(directory) }
-                Button("Open in Terminal") { WorkspaceActions.openFolderInTerminal(directory); session.notice = "Folder command copied. Paste it in Terminal." }
-                Button("Copy path") { WorkspaceActions.copy(MetadataRequest.path(directory)) }
+                Button("Open in Terminal") {
+                    session.notice = WorkspaceActions.openFolderInTerminal(directory)
+                        ? "Folder command copied. Paste it in Terminal." : "The folder command could not be copied."
+                }.disabled(!MetadataRequest.canCopy(directory))
+                Button("Copy path") {
+                    if !WorkspaceActions.copyPath(directory) { session.notice = "The folder path could not be copied." }
+                }.disabled(!MetadataRequest.canCopy(directory))
             }
+            if !MetadataRequest.canCopy(directory) { Text(TerminalCopy.refusalMessage).foregroundStyle(ECToken.warning.color) }
             if session.projects.openedDirectory != directory {
                 Text("Not checked").foregroundStyle(ECToken.secondary.color); Spacer()
             } else if session.projects.manifestMissing {

@@ -838,6 +838,17 @@ class CheckSwift(unittest.TestCase):
                 self.assertEqual(code, 1, "%s: passed\n%s" % (what, out))
                 self.assertIn(want, self.findings(out), out)
 
+    def test_views_cannot_reach_raw_metadata_helpers(self):
+        for helper in ("path", "replaceTarget", "terminalCommand", "changeDirectoryCommand", "commandWords"):
+            for spelling in ("MetadataRequest." + helper, "EnvCloak.MetadataRequest." + helper):
+                for expression in (spelling + "(item.slug)", spelling):
+                    with self.subTest(expression=expression):
+                        tree = Tree(self.base)
+                        tree.apply(replace(VIEW, 'Text("Open the folder")', "Text(" + expression + ")"))
+                        code, out = tree.check()
+                        self.assertEqual(code, 1, out)
+                        self.assertIn(("daemon-text", VIEW), self.findings(out), out)
+
     def test_fixture_names_are_unique(self):
         names = [f[0] for f in SWIFT_REFUSALS + OTHER_REFUSALS]
         self.assertEqual(len(names), len(set(names)))

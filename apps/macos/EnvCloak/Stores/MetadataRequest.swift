@@ -1,3 +1,4 @@
+import AppKit
 import EnvCloakKit
 import Foundation
 
@@ -29,17 +30,42 @@ enum MetadataRequest {
               !raw.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else { return nil }
         return url
     }
-    static func terminalCommand(_ arguments: [String]) -> String {
+    static func terminalCommand(_ arguments: [String]) -> String? {
+        guard arguments.allSatisfy(TerminalCopy.isSafe) else { return nil }
         // The verb comes from InspectorAction, the target is always quoted.
-        "envcloak " + arguments.enumerated().map { index, argument in
+        return "envcloak " + arguments.enumerated().map { index, argument in
             index == 0 ? argument : "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }.joined(separator: " ")
     }
-    static func replaceTarget(slug: DaemonText, field: DaemonText) -> String {
-        slug.unescaped + "#" + field.unescaped
+    static func replaceTarget(slug: DaemonText, field: DaemonText) -> String? {
+        guard canCopy(slug), canCopy(field) else { return nil }
+        return slug.unescaped + "#" + field.unescaped
     }
-    static func changeDirectoryCommand(_ directory: DaemonText) -> String {
-        "cd -- '" + directory.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    static func changeDirectoryCommand(_ directory: DaemonText) -> String? {
+        guard canCopy(directory) else { return nil }
+        return "cd -- '" + directory.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
+    static func canCopy(_ text: DaemonText) -> Bool { TerminalCopy.isSafe(text.unescaped) }
+    static func clipboardPath(_ directory: DaemonText) -> TerminalCopy? { TerminalCopy(directory.unescaped) }
     static func path(_ directory: DaemonText) -> String { directory.unescaped }
+}
+
+/// Views can display or copy this text, but cannot obtain its raw String.
+struct TerminalCopy {
+    private let text: String
+    static let refusalMessage = "Copying to Terminal is unavailable because this text contains control or directional characters."
+    static func isSafe(_ text: String) -> Bool {
+        !text.unicodeScalars.contains {
+            CharacterSet.controlCharacters.contains($0) || $0.value == 0x2028 || $0.value == 0x2029
+        }
+    }
+    init?(_ text: String) {
+        guard Self.isSafe(text) else { return nil }
+        self.text = text
+    }
+    var display: String { Escape.display(text) }
+    @MainActor func copy(to board: NSPasteboard) -> Bool {
+        board.clearContents()
+        return board.setString(text, forType: .string)
+    }
 }
