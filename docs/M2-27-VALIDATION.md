@@ -1,6 +1,6 @@
 # M2-27 follow-up validation
 
-Scope: the unmerged managed-launch implementation at dff40dd1, repaired in this worktree. SPEC section 6.6 remains the source of truth. The dated receipts below preserve earlier failures and platform limits. The final review handoff records the current evidence at `53406f4c` and supersedes earlier requests for fresh CI; it does not turn unsuccessful local checks into passes.
+Scope: the unmerged managed-launch implementation at dff40dd1, repaired in this worktree. SPEC section 6.6 remains the source of truth. The dated receipts below preserve earlier failures and platform limits. Later receipts record the checks and supplied CI for each named head, superseding older pending-CI requests without turning unsuccessful local checks into passes.
 
 ## Findings and class sweep
 
@@ -45,7 +45,7 @@ The slow-cleanup follow-up also tightens native observations: failure to read or
 
 ## Gate and requirement mapping
 
-- Gates 39 and 40: interpreter and environment refusals preserve the exact-launch and standing-capability boundaries. Existing managed-launch and runner suites cover the surrounding identity/revision/descriptor paths. Gate 40's actual standing-policy issuance remains M2-15. The missing foreign-client case under a standing record, plus the standing negative-case matrix audit, is handed to M2-15 as proposed M2R-89 below; that coverage is not claimed closed here.
+- Gates 39 and 40: interpreter and environment refusals preserve the exact-launch and standing-capability boundaries. Existing managed-launch and runner suites cover the surrounding identity/revision/descriptor paths. Gate 40's actual standing-policy issuance remains M2-15. The missing foreign-client case under a standing record, plus the standing negative-case matrix audit, is handed to M2-15 as registered M2R-89 below; that coverage is not claimed closed here.
 - Gate 23: the controlled pending-state transition verifies the post-proof check separately from the initial check.
 - Gate 33: the transition asserts the proof-refusal audit event; existing suites retain managed register/launch audit tests.
 - R-M2-03, R-M2-24, R-M2-49, R-M2-50, R-M2-52, R-M2-74, R-M2-86 and T-16: this task implements the managed record, binding, private recipient, receipt, adoption and revision portions. Actual HTTP relay behavior is M2-18; config rewriting and backup/host round trips are M2-20, as the plan specifies. No claim here closes those tasks or Linux CI.
@@ -173,7 +173,7 @@ The review sweep covered every changed or added task file (101 paths, including 
 | Tests passing because another refusal masks the intended one | Stored-record fixtures used noncanonical temporary paths; an effective-entry name also resembled an interpreter. Both independent refusal causes were removed. Each option case now first proves a healthy record with matching identities and canonical paths is accepted. | The login mutation initially passed the old test, then failed both repaired stored-record gates |
 | Test fixtures coupled to product release state | M2-19 borrowed `not_started_by_daemon` as an unlanded token, while M2-27 already lands it. Generic field, method, constant, constructor, printed-token and ignored-source cases now own three synthetic reservations. The ignored module also uses a reserved token so its inclusion cannot be masked by a landed one. Product registry rows are unchanged. | The borrowed-token failure was reproduced; `omit-method-token-reader`, `omit-field-token-reader` and `include-cfg-test-token` each fail. Restored controls and the complete 92-test target pass |
 | Runtime oracles skipped by successful CI | All four ignored PHP/CPython/npm tests are explicitly enabled in the new CI job, together with the ordinary Bash case. Source archives are version- and SHA-256-pinned; Node is 26.7.0. The runner requires exactly five executed successes, zero skipped/filtered cases and a successful Cargo exit. | `omit-include-ignored`, `accept-zero-exit-as-complete` and `omit-archive-digest` fail; all five restored runtime cases pass locally |
-| Unmeasured privacy behavior | Protected-folder and local-network prompt attribution is open, owned by M2-27 and due before the M2 release. Proposed M2R-88 below supplies the missing canonical-registry handoff. CI cannot measure the prompts. | No measurement claimed; registration must be confirmed before landing |
+| Unmeasured privacy behavior | Protected-folder and local-network prompt attribution is open, owned by M2-27 and due before the M2 release. Registered M2R-88 below tracks the measurement. CI cannot measure the prompts. | No measurement claimed; canonical entry confirmed |
 | Private receipt paths and unregistered recovery residual | Machine-specific absolute receipt paths removed throughout this document; the only user-directory strings elsewhere in the task diff are synthetic plist-escaping fixtures. The canonical residual registry was checked read-only: M2R-87 already records the stopped-runner issue, open and owned by M2-25. | Static path sweep; registry evidence, no out-of-worktree edits |
 
 Repair commits: `e14a38e4` (interpreter/startup and stored-record tests), `098380c3` (statement eligibility, host-config and managed-boundary tests), `a4aa9ca8` (pinned CI oracles), `3d79ad4e` (fixed self-job suspension through the owned signal boundary), and `de7d34e8` (merged fixture signals use the test-only helper). Each commit names its mutations. Compile failures while preparing a mutation were retained as diagnostics and never counted as gate failures.
@@ -340,17 +340,16 @@ failure or a general claim about every external volume. CI is the authority for
 
 ### Residual registration and scope
 
-[The exact registry entries](M2-27-RESIDUALS.json) are ready for the driver to
-append to the canonical `.collab/m2-residuals.json`. That registry is outside
-this lane's permitted worktree and was inspected read-only: it contains M2R-87
-and no privacy or standing-client handoff. M2R-88 and M2R-89 are proposed IDs,
-not a claim of canonical registration; the driver must confirm their allocation
-and update these references if they collide before landing.
+The driver registered **M2R-88** and **M2R-89** in the canonical
+`.collab/m2-residuals.json` with the exact handoff contents. This lane confirmed
+both entries read-only, including owner, open state, deadline and closure
+evidence. The duplicate handoff JSON has been removed. M2R-87 remains registered
+and open as before.
 
 | ID | Owner and deadline | Open work and closure evidence |
 | --- | --- | --- |
-| M2R-88 (proposed) | M2-27, before the M2 release | Signed build on a real Mac: a daemon-started server performs a protected-folder read and a local-network request. Record each prompt's named process, macOS version/build and EnvCloak version/signing identity; update MIGRATE-MCP's Consequences privacy bullet and this receipt. Existing consent or no prompt is not attribution evidence. |
-| M2R-89 (proposed) | M2-15, before its gate 39/40 closure and the M2 release | A foreign client under a real covering standing record gets `started` and fixture protocol, no value, zero client releases and a runner release. No session/once grant may mask standing coverage. Sweep every client-visible output and readable-memory capture with generated fixtures and a positive detector control. Include the genuine hardened-client control and fail the `return-values-to-foreign-client` mutation. Audit the remaining standing matrix, including upward search and changed launch inputs. |
+| M2R-88 (registered, open) | M2-27, before the M2 release | Signed build on a real Mac: a daemon-started server performs a protected-folder read and a local-network request. Record each prompt's named process, macOS version/build and EnvCloak version/signing identity; update MIGRATE-MCP's Consequences privacy bullet and this receipt. Existing consent or no prompt is not attribution evidence. |
+| M2R-89 (registered, open) | M2-15, before its gate 39/40 closure and the M2 release | A foreign client under a real covering standing record gets `started` and fixture protocol, no value, zero client releases and a runner release. No session/once grant may mask standing coverage. Sweep every client-visible output and readable-memory capture with generated fixtures and a positive detector control. Include the genuine hardened-client control and fail the `return-values-to-foreign-client` mutation. Audit the remaining standing matrix, including upward search and changed launch inputs. |
 | M2R-87 (registered, open) | M2-25 hardening pass | Durable recovery for a stopped runner before anchor resumption, under D-34 owned authority; the earlier handoff is unchanged. |
 
 The implemented portions of gates **23, 33, 39 and 40** and requirements
@@ -378,13 +377,17 @@ assertion; all five affected e2e tests passed after restoration. Linux-only
 mutations retain the earlier receipts and Linux CI evidence. No new runtime gate
 or implementation mutation is introduced by this documentation-only follow-up.
 
-Driver PR-body text after canonical registration: "At 53406f4c, PR 37609446417
-and manual full 37610408716 passed on macOS and Ubuntu. Local launchd checks are
-limited by external-SSD execution denial (independent exit-126 control); CI
-qualifies both service gates. M2R-88 tracks signed-build macOS privacy-prompt
-measurement, owned by M2-27 before M2 release; M2R-89 tracks standing foreign-client
-coverage and its matrix, handed to M2-15 before gates 39/40 close. M2R-87 remains
-open with M2-25. These residuals are not implementation-complete claims."
+At `98e468ea`, the supplied verifier reports PR run `37630033288` and manual
+full run `37630066105` green on macOS and Ubuntu. The manual macOS job needed
+one rerun for the existing `proc.rs` process-memory flake, in a file M2-27 does
+not change. These newer results qualify the documentation follow-up; they do
+not qualify later production changes in this receipt. M2R-88, M2R-89 and M2R-87
+remain open with their named owners. The physical privacy measurement is
+scheduled as a driver-coordinated signed-build release prerequisite owned by
+M2-27, before the M2 release; no calendar date or completed measurement is
+claimed. It must exercise both operations on a real Mac and record prompt
+attribution plus macOS and signed-build versions before M2R-88 closes.
+
 
 The independent review covered record/identity/origin/revision checks before
 pending and grant evaluation, lock-held record and proof rechecks, descriptor
@@ -407,3 +410,55 @@ private-path/style checks and `git diff --check` passed. No crate changed in thi
 follow-up, so the existing full-crate receipts and the supplied green CI at the
 identical production tree remain its crate-suite evidence. No workspace-wide
 test command, host-policy change, push or GitHub comment was performed.
+
+
+## Descriptor and policy coverage follow-up
+
+The review at `98e468ea` found one production defect and two coverage gaps.
+`ClientEnds` accepted any socket for stdin and the lifeline. A Unix datagram
+peer's exit need not produce EOF, so the runner's reader threads could wait
+indefinitely after that client exited. Commit `0bfb2b81` checks socket `SO_TYPE`
+through the sys boundary, admits only byte-stream sockets for standard streams,
+and requires the lifeline to be a read-only pipe. Unsupported types and failed
+socket queries refuse before pending or release. The same validator serves
+stdio runners and HTTP relays.
+
+Commit `07c6ea1e` adds direct coverage of the existing policy behavior. The
+launch-field matrix changes revision, class, strength, argv bytes/order/count,
+each cwd component, environment path/names/values/counts, binding names/counts,
+entry presence and all declaration fields. Executable and entry identities each
+exercise path/device/inode, SHA-256, digest kind, cdhash, Team ID and signing
+identifier, including absent versus empty optional identities. Each variant
+must change `launch_digest` and `update_digest` on both the old and new side.
+The common launch id is checked in its outer statement field. The loader matrix
+separately feeds recorded variables and released bindings, testing `LD_*`,
+`DYLD_*`, future prefix names and every exact code-selecting variable, with
+allowed-name controls. No policy encoding or environment implementation changed.
+
+| Bug class | Instances swept across all 103 changed paths | Test and mutation |
+| --- | --- | --- |
+| Descriptor type mistaken for stream/EOF semantics | sys `descriptor_kind`; daemon `ClientEnds` and request routing; CLI control handoff. No second caller-provided descriptor validator exists. Every stdin/stdout/stderr/lifeline role is covered for runner and relay, with valid pipe/stream controls and a write-end lifeline refusal. Internal control sockets are created as streams. | `descriptor_kind_distinguishes_streams_from_datagrams` and `managed_descriptors_require_streams_and_a_read_only_pipe_lifeline` fail on the original implementation. `accept-datagram-streams` fails both gates; `accept-socket-lifeline` fails daemon admission. Both tests run on Linux and macOS. |
+| Digest fields left without omission coverage | Shared policy launch encoder, update statement and audit digest; nested executable/entry/cwd/environment/declaration encoders; core record schema and daemon update/audit consumers. | `every_launch_field_changes_both_digests` fails `omit-resolved-cwd-digest` on the cwd path assertion. No digest implementation defect was present. |
+| Another filter masks a missing boundary test | Policy environment builder, declaration/stored-record checks, exec builder call, CLI and control-message handoff. Inherited allowlisting must not stand in for recorded-variable or binding filtering. | `loader_names_are_filtered_from_recorded_vars_and_bindings` fails `allow-loader-recorded-vars` and independently `allow-loader-bindings`. Allowed names pass both paths. |
+| Stale tracking and unsupported prompt-attribution claims | MIGRATE-MCP privacy bullet; validation gate mapping, class table, residual status and CI receipt; duplicate handoff JSON. | Canonical M2R-88/89 entries checked read-only against the exact committed handoff. Proposed-ID wording and the duplicate JSON removed; newer supplied `98e468ea` CI recorded above. No physical prompt result claimed. |
+
+All five named mutations above compiled and failed their intended assertions;
+`accept-datagram-streams` was checked against two gates. All focused controls
+passed before mutation and after restoration. The first daemon baseline build
+was interrupted by the shared compiler cache retaining a deleted temporary
+directory from an earlier isolated job. That compile failure is not a mutation
+receipt. Disabling the compiler wrapper for this lane's detached jobs let the
+unchanged baseline run and fail its actual `datagram Stdin` assertion; no shared
+cache process or host policy was changed. Receipts are `m27-r10-mutations.json`
+and the correspondingly named local logs.
+
+M2R-88's physical measurement remains a pre-release prerequisite owned by M2-27,
+coordinated by the driver. The independent Cycle575 P01-P04 controls require
+synthetic operations, separate permission contexts, a prompt-producing positive
+control and a no-operation baseline for each surface. A loopback-only request,
+existing consent, process ancestry or green CI cannot establish attribution.
+M2R-89's S01-S07 controls remain with M2-15, including real standing minting
+beneath an eligible agent root with no cached grant masking it. Both residuals
+are registered and open; this corrects the review's stale registration premise,
+not the missing measurement. M2R-87 remains open with M2-25. No outside-worktree
+registry, privacy setting, signing keychain or protected user file was modified.

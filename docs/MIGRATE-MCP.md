@@ -55,7 +55,7 @@ The value recipient is a process the daemon starts itself (M2 plan D-36), never 
 - they outlive a daemon restart: the systemd unit has `KillMode=process` (`envcloak daemon install` rewrites an older unit), and launchd's cleanup of the daemon's job does not reach a process that leads its own session (measured on macOS 26.4: `launchctl kickstart -k` and `bootout` kill the job's process group, not a child that called `setsid`), so the plist needs no `AbandonProcessGroup`. Neither the runner nor the relay gets `PR_SET_PDEATHSIG`. A new daemon holds no handle to them and signals nothing;
 - a command a server starts is classed `unknown` (no terminal, no agent in its chain): no terminal grant covers it, and its proofs are refused;
 - the unit's `NoNewPrivileges` applies to them;
-- macOS privacy prompts (a protected folder, the local network) for a daemon-started server may name `envcloakd` rather than the host; this remains open as proposed residual **M2R-88**, owned by M2-27 and due before the M2 release (the driver must register the entry in [the residual handoff](M2-27-RESIDUALS.json) before landing). A real Mac must exercise both a protected-folder read and a local-network request, recording which process each prompt names and the macOS/build versions. CI does not show these prompts, so its green result does not close this residual.
+- macOS privacy-prompt attribution for a daemon-started server is not yet measured. Protected-folder and local-network prompts are tracked as **M2R-88**, due before the M2 release. CI does not show these prompts and cannot close this measurement.
 
 ## Measurements behind this
 
