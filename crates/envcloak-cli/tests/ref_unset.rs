@@ -77,7 +77,7 @@ fn unset_refuses_value_shaped_names_without_echo_or_write() {
 }
 
 #[test]
-fn edits_refuse_value_shaped_previous_references_without_echo_or_write() {
+fn unset_hides_value_shaped_previous_references_in_its_receipt() {
     let home = TestHome::new();
     let dir = common::project(&home, "previous", "[env]\n");
     let path = dir.join("envcloak.toml");
@@ -109,14 +109,16 @@ fn edits_refuse_value_shaped_previous_references_without_echo_or_write() {
                 assert_no_canary(&out.stderr, &cs);
                 assert!(!out.stdout.windows(key.len()).any(|w| w == key.as_bytes()));
                 assert!(!out.stderr.windows(key.len()).any(|w| w == key.as_bytes()));
-                assert_eq!(out.status.code(), Some(1));
-                assert!(out.stdout.is_empty());
-                assert!(
-                    std::str::from_utf8(&out.stderr)
-                        .unwrap()
-                        .contains("manifest_invalid")
-                );
-                assert!(std::fs::read(&path).unwrap() == source.as_bytes());
+                assert_eq!(out.status.code(), Some(0));
+                assert!(out.stderr.is_empty());
+                if args.contains(&"--json") {
+                    let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                    assert_eq!(receipt["reference"], envcloak_policy::HIDDEN);
+                    assert_eq!(receipt["env_name"], "KEEP");
+                } else {
+                    assert_eq!(out.stdout, b"Removed KEEP from [env].\n");
+                }
+                assert_eq!(std::fs::read(&path).unwrap(), b"[env]\n");
             }
         }
     }
