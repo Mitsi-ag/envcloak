@@ -17,6 +17,9 @@ actor ScriptedClient: WorkspaceClient {
     var itemCount = 1
     var pageMode = "single"
     var revokeFailure = false
+    var showFailure = false
+    var wrongDetail = false
+    func detailResponse(fails: Bool = false, wrong: Bool = false) { showFailure = fails; wrongDetail = wrong }
     var adoptedBinding = false
     func adoptBinding() { adoptedBinding = true }
     func pages(_ mode: String) { pageMode = mode }
@@ -32,6 +35,12 @@ actor ScriptedClient: WorkspaceClient {
         self.failure = failure; self.projectFailure = projectFailure; self.itemCount = itemCount
     }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
+    private func item(_ i: Int) -> [String: Any] {
+        ["id": "item-\(i)", "slug": "fixture-\(i)\u{202e}\u{1b}[31m", "class": "secret", "title": "Fixture \(i)",
+         "provider": "example", "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
+         "fields": ["value", "secondary"].map { ["name": $0, "prior_count": 0, "created_secs": 1, "updated_secs": 1] as [String: Any] },
+         "last_used_secs": 123, "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid"]]
+    }
     func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
         counts[M.name, default: 0] += 1
         if let failure { throw failure }
@@ -43,12 +52,15 @@ actor ScriptedClient: WorkspaceClient {
             "lock": ["last_reason": "sleep", "idle_limit_secs": 3600],
             "approvals": ["grants": grants, "pending": pending, "proof_failures": 0, "proof_wait_secs": 0],
             "audit": ["open": true, "head_seq": head, "unanchored": 0, "anchor_failed": false, "queued": 0, "dropped": 0]]
-        case "items.list": result = ["items": (0..<itemCount).map { i -> [String: Any] in
-            ["id": "item-\(i)", "slug": "fixture-\(i)\u{202e}\u{1b}[31m", "class": "secret", "title": "Fixture \(i)",
-             "provider": "example", "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
-             "fields": [["name": "value", "prior_count": 0, "created_secs": 1, "updated_secs": 1]],
-             "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid"]]
-        }]
+        case "items.list": result = ["items": (0..<itemCount).map { item($0) }]
+        case "items.show":
+            if showFailure { throw EnvCloakError.protocolError }
+            let index = (method as? ItemsShow)?.slug.hasPrefix("fixture-1") == true ? 1 : 0
+            var full = item(wrongDetail ? 99 : index)
+            full["detail"] = ["allowed_hosts": ["api.example.invalid"], "tags": ["fixture"],
+                              "links": ["docs": "https://example.invalid/docs"], "last_used_secs": 123,
+                              "notes": "Notes \(head)\u{202e}"] as [String: Any]
+            result = full
         case "projects.list":
             if projectFailure { throw EnvCloakError.protocolError }
             let nextPage = (method as? ProjectsList)?.after != nil
@@ -126,6 +138,57 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(session.keysUnavailable(query: "project:project", scope: nil))
         XCTAssertEqual(session.filteredKeys(query: "project:project", filter: .all, scope: nil).count, 1)
         XCTAssertEqual(session.filteredKeys(query: "project:missing", filter: .all, scope: nil).count, 0)
+    }
+
+    @MainActor func testSelectedMetadataUsesShowAndRefreshes() async throws {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await session.poll()
+        let item = try XCTUnwrap(session.items.rows.first)
+        XCTAssertNil(item.detail)
+        XCTAssertEqual(item.last_used_secs, 123)
+        await session.selectKey(item.slug)
+        XCTAssertEqual(session.items.selectedItem?.detail?.notes?.escaped, "Notes 1\\u{202e}")
+        XCTAssertEqual(session.items.selectedItem?.detail?.allowed_hosts.first?.escaped, "api.example.invalid")
+        await client.configure(head: 2)
+        await session.poll()
+        XCTAssertEqual(session.items.selectedItem?.detail?.notes?.escaped, "Notes 2\\u{202e}")
+        let shows = await client.calls("items.show")
+        XCTAssertEqual(shows, 2)
+        await client.detailResponse(fails: true)
+        await session.selectKey(nil); await session.selectKey(item.slug)
+        XCTAssertNil(session.items.selectedItem)
+        XCTAssertEqual(session.items.detailFailure, .protocolError)
+        await client.detailResponse(wrong: true)
+        await session.selectKey(item.slug)
+        XCTAssertNil(session.items.selectedItem)
+        XCTAssertEqual(session.items.detailFailure, .protocolError)
+    }
+
+    @MainActor func testSelectionLockAndCancellationDiscardLateDetails() async throws {
+        for operation in ["selection", "lock", "cancel"] {
+            let barrier = ItemBarrierClient(method: "items.show")
+            await barrier.client.configure(itemCount: 2)
+            let session = VaultSession(client: barrier); await session.poll()
+            let slug = try XCTUnwrap(session.items.rows.first?.slug)
+            let load = Task { await session.selectKey(slug) }
+            await barrier.arrived()
+            if operation == "lock" { await session.lock() }
+            else if operation == "selection" { await session.selectKey(nil) }
+            else { load.cancel() }
+            await barrier.release(); await load.value
+            XCTAssertNil(session.items.selectedItem, operation)
+        }
+    }
+
+    @MainActor func testInvalidProjectSelectionDiscardsEarlierCheck() async {
+        let barrier = ItemBarrierClient(method: "items.check")
+        let store = ProjectsStore(client: barrier, folders: nil)
+        let load = Task { await store.open(DaemonText("/tmp/first")) }
+        await barrier.arrived()
+        await store.open(DaemonText("not a path"))
+        await barrier.release(); await load.value
+        XCTAssertNil(store.opened)
+        XCTAssertEqual(store.checkFailure, .protocolError)
     }
 
     @MainActor func testOnlyChangedStoresRefetch() async {
@@ -318,6 +381,8 @@ final class SessionTests: XCTestCase {
 
 actor ItemBarrierClient: WorkspaceClient {
     let client = ScriptedClient()
+    let methodName: String
+    init(method: String = "items.list") { methodName = method }
     var entered = false
     var arrival: CheckedContinuation<Void, Never>?
     var waiter: CheckedContinuation<Void, Never>?
@@ -327,7 +392,7 @@ actor ItemBarrierClient: WorkspaceClient {
     }
     func release() { waiter?.resume(); waiter = nil }
     func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
-        if M.name == "items.list" {
+        if M.name == methodName && !entered {
             await withCheckedContinuation {
                 waiter = $0; entered = true; arrival?.resume(); arrival = nil
             }

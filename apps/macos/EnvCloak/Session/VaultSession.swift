@@ -110,7 +110,7 @@ struct Change: OptionSet {
             guard captured == generation, !Task.isCancelled else { return }
             await grants.refetch(change)
             guard captured == generation, !Task.isCancelled else { return }
-            for error in [items.failure, projects.failure, grants.failure].compactMap({ $0 }) {
+            for error in [items.failure, items.detailFailure, projects.failure, projects.checkFailure, grants.failure].compactMap({ $0 }) {
                 switch error {
                 case .daemonUnavailable, .daemonUnverified, .rpc(.vaultLocked, _), .rpc(.vaultTampered, _):
                     fail(error); return
@@ -155,6 +155,11 @@ struct Change: OptionSet {
             state = .unavailable
             notice = "The background process could not complete the request. Try again."
         }
+    }
+
+    func selectKey(_ slug: DaemonText?) async {
+        guard state == .ready || state == .readOnly else { return }
+        await items.select(slug)
     }
 
     func openProject(_ directory: DaemonText) async {

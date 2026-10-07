@@ -1434,6 +1434,7 @@ mod tests {
             updated_secs: T0 + 3600,
             rotated_secs: Some(T0 + 3600),
             expires_secs: None,
+            last_used_secs: None,
             account: (detail >= 1).then(|| AccountView {
                 email: Some("you@work.example".into()),
                 label: None,

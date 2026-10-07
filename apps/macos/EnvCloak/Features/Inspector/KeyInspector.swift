@@ -9,7 +9,11 @@ struct KeyInspector: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var command: String?
     var body: some View {
-        if let item = session.items.rows.first(where: { $0.slug == slug }) {
+        content.task(id: slug) { await session.selectKey(slug) }
+    }
+    @ViewBuilder private var content: some View {
+        if let summary = session.items.rows.first(where: { $0.slug == slug }) {
+            let item = session.items.selectedItem?.slug == slug ? session.items.selectedItem! : summary
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     Text(item.title.escaped).font(.title3)
@@ -36,6 +40,10 @@ struct KeyInspector: View {
                     }
                     Text("Access").font(.headline)
                     GrantRows(session: session, directory: nil, slug: item.slug)
+                    if session.items.detailFailure != nil {
+                        Text("Key details could not be refreshed. Try again.")
+                        Button("Retry details") { Task { await session.selectKey(slug) } }
+                    } else if item.detail == nil { Text("Loading key details…") }
                     if let detail = item.detail {
                         Text("Links").font(.headline)
                         link("Docs", detail.links.docs); link("Billing", detail.links.billing)
@@ -47,7 +55,7 @@ struct KeyInspector: View {
                     }
                     LabeledContent("Created") { DateLabel(seconds: item.created_secs) }
                     LabeledContent("Rotated") { DateLabel(seconds: item.rotated_secs) }
-                    LabeledContent("Last used") { DateLabel(seconds: item.detail?.last_used_secs) }
+                    LabeledContent("Last used") { DateLabel(seconds: item.last_used_secs ?? item.detail?.last_used_secs) }
                     LabeledContent("Expires") { DateLabel(seconds: item.expires_secs) }
                     Text("Balance and spend arrive in a later release (M4).").foregroundStyle(ECToken.secondary.color)
                     Button("Remove key…") { command = MetadataRequest.terminalCommand("rm", slug: item.slug) }

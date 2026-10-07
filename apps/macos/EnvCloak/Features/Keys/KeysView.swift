@@ -37,7 +37,7 @@ struct KeysView: View {
                     TableColumn("Account") { Text($0.item.account?.email?.escaped ?? "None") }.customizationID("account")
                     TableColumn("Class") { Text($0.item.classification.rawValue.capitalized) }.customizationID("class")
                     TableColumn("Used by", value: \.usedBy).customizationID("used-by")
-                    TableColumn("Last used") { row in DateLabel(seconds: row.item.detail?.last_used_secs) }.customizationID("last-used")
+                    TableColumn("Last used") { row in DateLabel(seconds: row.item.last_used_secs) }.customizationID("last-used")
                     TableColumn("Rotated") { row in DateLabel(seconds: row.item.rotated_secs) }.customizationID("rotated").defaultVisibility(.hidden)
                     TableColumn("Expires") { row in DateLabel(seconds: row.item.expires_secs) }.customizationID("expires").defaultVisibility(.hidden)
                     TableColumn("Fields") { row in Text("\(row.item.fields.count)") }.customizationID("fields").defaultVisibility(.hidden)
