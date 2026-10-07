@@ -323,7 +323,7 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             ..Budget::default()
         },
     )
-    .map_err(|_| Failure::new("incomplete", "the config scan failed"))?;
+    .map_err(|_| Failure::new("io", "the config scan failed"))?;
     absorb(
         part,
         MachineSource::McpConfig,
