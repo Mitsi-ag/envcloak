@@ -16,7 +16,9 @@ actor ScriptedClient: WorkspaceClient {
     var projectFailure = false
     var itemCount = 1
     var pageMode = "single"
+    var revokeFailure = false
     func pages(_ mode: String) { pageMode = mode }
+    func loseRevokeResponse() { revokeFailure = true }
     func configure(head: UInt64? = nil, grants: Int? = nil, pending: Int? = nil,
                    vault: String? = nil, integrity: String? = nil, failure: EnvCloakError? = nil,
                    projectFailure: Bool = false, itemCount: Int = 1) {
@@ -57,7 +59,9 @@ actor ScriptedClient: WorkspaceClient {
             ["env_name": "VARIABLE", "reference": "envcloak://fixture", "status": "ok"],
             ["profile": "test", "env_name": "VARIABLE", "reference": "envcloak://second", "status": "unknown_item"]], "refs": []]
         case "grants.list": result = ["grants": []]
-        case "grants.revoke": result = ["revoked": 1]
+        case "grants.revoke":
+            if revokeFailure { throw EnvCloakError.protocolError }
+            result = ["revoked": 1]
         case "lock": vault = "locked"; result = ["was_unlocked": true]
         default: throw EnvCloakError.protocolError
         }
@@ -204,6 +208,17 @@ final class SessionTests: XCTestCase {
         }
     }
 
+    @MainActor func testLostRevokeResponseIsUnknownAndReconciled() async {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await session.poll()
+        await client.loseRevokeResponse()
+        await session.revoke(DaemonText("fixture-grant"))
+        XCTAssertEqual(session.notice, "The revoke outcome could not be confirmed. Grants have been refreshed.")
+        let calls = await client.calls("grants.list")
+        XCTAssertEqual(calls, 2)
+        XCTAssertFalse(session.actionInProgress)
+    }
+
     @MainActor func testManifestEditsHaveTheirOwnRefreshSignal() async throws {
         let directory = URL(fileURLWithPath: "/tmp/ec05-manifest-" + UUID().uuidString.prefix(8))
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
@@ -220,6 +235,23 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(after, 2)
         let items = await client.calls("items.list")
         XCTAssertEqual(items, 1)
+    }
+
+    @MainActor func testAddedFoldersPersistOnlyPathsAndRefuseUnavailableStorage() throws {
+        let directory = URL(fileURLWithPath: "/tmp/ec05-folders-" + UUID().uuidString.prefix(8))
+        let file = directory.appendingPathComponent("project-folders.json")
+        let folders = try ProjectFolders(file: file)
+        let store = ProjectsStore(client: nil, folders: folders)
+        let project = directory.appendingPathComponent("project")
+        try store.add(project)
+        try store.add(project)
+        XCTAssertEqual(try JSONDecoder().decode([String].self, from: Data(contentsOf: file)), [project.path])
+        XCTAssertEqual(try ProjectFolders(file: file).paths, [DaemonText(project.path)])
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+        let unavailable = ProjectsStore(client: nil, folders: nil)
+        XCTAssertThrowsError(try unavailable.add(project))
+        XCTAssertTrue(unavailable.added.isEmpty)
     }
 
     func testUnavailableRoutesNeverAdvertiseShippedFeatures() {

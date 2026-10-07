@@ -29,6 +29,7 @@ struct OpenedProject {
     private(set) var openedDirectory: DaemonText?
     private(set) var failure: EnvCloakError?
     private(set) var checkFailure: EnvCloakError?
+    var manifestMissing: Bool { manifestSignal?.fileMissing == true }
     init(client: (any WorkspaceClient)?, folders: ProjectFolders?) {
         self.client = client; self.folders = folders; added = folders?.paths ?? []
     }
@@ -45,7 +46,8 @@ struct OpenedProject {
         guard url.isFileURL, url.path.hasPrefix("/"), !url.path.utf8.contains(0) else { throw EnvCloakError.protocolError }
         let path = DaemonText(url.path)
         if !added.contains(path) {
-            try folders?.save(added + [path])
+            guard let folders else { throw EnvCloakError.protocolError }
+            try folders.save(added + [path])
             added.append(path)
         }
     }
@@ -55,9 +57,15 @@ struct OpenedProject {
         do {
             var next: ProjectCursor?
             var result: [ProjectView] = []
+            var receivedBytes = 0
+            let deadline = ContinuousClock.now.advanced(by: .seconds(30))
             var directories = Set<DaemonText>()
             repeat {
                 let page = try await client.call(ProjectsList(after: next))
+                receivedBytes += page.wireByteCount
+                guard receivedBytes <= 16 * 1_048_576, ContinuousClock.now < deadline else {
+                    throw EnvCloakError.rpc(.frameTooLarge, nil)
+                }
                 guard captured == revision, !Task.isCancelled else { return }
                 if let cursor = page.next {
                     guard !page.projects.isEmpty, next.map({ cursor.precedes($0) }) ?? true else { throw EnvCloakError.protocolError }

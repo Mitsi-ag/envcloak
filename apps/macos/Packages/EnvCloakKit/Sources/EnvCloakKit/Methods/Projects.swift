@@ -40,8 +40,10 @@ public struct ProjectCursor: Sendable, Hashable, WireDecodable, CustomStringConv
 
 public struct ProjectsView: Sendable, WireDecodable {
     public let projects: [ProjectView]
+    public let wireByteCount: Int
     public let next: ProjectCursor?
     init(wire: WireReader) throws {
+        wireByteCount = wire.bytes.count
         let o = try wire.object(["projects", "next"])
         projects = try o.decode("projects")
         next = try o.optional("next")

@@ -20,12 +20,12 @@ extension VaultSession {
             let users = usedBy(item.slug).map { $0.dir.escaped }
             let names: [String] = switch grouping {
             case .none: [""]
-            case .project: users.isEmpty ? ["No adopted project"] : users
+            case .project: projects.failure != nil ? ["Project metadata unavailable"] : (users.isEmpty ? ["No adopted project"] : users)
             case .provider: [item.provider?.escaped ?? "No provider"]
             case .account: [item.account?.email?.escaped ?? "No account"]
             }
             for name in names {
-                groups[name, default: []].append(KeyRow(item: item, group: name, usedBy: users.joined(separator: ", ")))
+                groups[name, default: []].append(KeyRow(item: item, group: name, usedBy: projects.failure == nil ? users.joined(separator: ", ") : "Projects could not be refreshed"))
             }
         }
         return groups.keys.sorted().map { KeySection(title: $0, rows: groups[$0] ?? []) }

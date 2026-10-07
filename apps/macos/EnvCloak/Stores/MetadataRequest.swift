@@ -33,5 +33,8 @@ enum MetadataRequest {
         // POSIX shell single-quote escaping, including a quote in a slug.
         "envcloak " + verb + " '" + slug.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
+    static func changeDirectoryCommand(_ directory: DaemonText) -> String {
+        "cd -- '" + directory.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
     static func path(_ directory: DaemonText) -> String { directory.unescaped }
 }

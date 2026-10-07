@@ -6,6 +6,7 @@ import Foundation
 /// ctime catches an in-place rewrite even when size and mtime are restored.
 struct ManifestSignal: Equatable {
     private let stamps: [[Int64]]
+    var fileMissing: Bool { stamps.last == [-1, Int64(ENOENT)] }
     init(directory: URL) {
         stamps = [directory, directory.appendingPathComponent("envcloak.toml")].map { url in
             var info = stat()
