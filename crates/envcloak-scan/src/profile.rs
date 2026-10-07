@@ -287,6 +287,15 @@ fn source_path(raw: &[u8]) -> Option<Include> {
 }
 
 pub fn scan_profiles(root: &ScanRoot) -> Result<ScanReport, ScanError> {
+    scan_profiles_selected(root, &|_| true)
+}
+
+/// Consult the caller before opening each conventional or sourced file.
+/// The path is absolute and still opened through the held root.
+pub fn scan_profiles_selected(
+    root: &ScanRoot,
+    allow: &dyn Fn(&Path) -> bool,
+) -> Result<ScanReport, ScanError> {
     let mut report = ScanReport::default();
     let mut seen = HashMap::new();
     for name in PROFILES {
@@ -302,10 +311,12 @@ pub fn scan_profiles(root: &ScanRoot) -> Result<ScanReport, ScanError> {
             true,
             &mut seen,
             &mut report,
+            allow,
         );
     }
     Ok(report)
 }
+#[allow(clippy::too_many_arguments)]
 fn visit(
     root: &ScanRoot,
     rel: &Path,
@@ -314,6 +325,7 @@ fn visit(
     optional: bool,
     seen: &mut HashMap<PathBuf, Option<crate::ScanErrorKind>>,
     report: &mut ScanReport,
+    allow: &dyn Fn(&Path) -> bool,
 ) {
     if depth > 4 {
         report.issue(rel, "too_deep");
@@ -330,6 +342,10 @@ fn visit(
         return;
     }
     seen.insert(rel.to_path_buf(), None);
+    if !allow(&root.path().join(rel)) {
+        report.issue(root.path().join(rel), "volume_opt_in");
+        return;
+    }
     // Missing conventional profiles are not an incomplete scan. A missing
     // explicit source is. Unsafe existing profiles are always reported.
     let (bytes, stamp) = match read_capped(root, rel, MAX_DOTENV) {
@@ -392,7 +408,7 @@ fn visit(
             report.issue(rel, "too_many_files");
             break;
         }
-        visit(root, &path, shell, depth + 1, false, seen, report);
+        visit(root, &path, shell, depth + 1, false, seen, report, allow);
     }
 }
 
@@ -414,6 +430,7 @@ mod attempt_tests {
             false,
             &mut seen,
             &mut report,
+            &|_| true,
         );
         std::fs::write(d.path().join("missing"), b"A=fixtureZlaterCreatedValue\n").expect("write");
         visit(
@@ -424,6 +441,7 @@ mod attempt_tests {
             false,
             &mut seen,
             &mut report,
+            &|_| true,
         );
         assert!(report.findings.is_empty());
         assert!(!report.complete());
@@ -437,6 +455,7 @@ mod attempt_tests {
             false,
             &mut HashMap::new(),
             &mut fresh,
+            &|_| true,
         );
         assert!(fresh.complete());
         assert_eq!(fresh.findings.len(), 1);

@@ -5,6 +5,52 @@ use envcloak_core::vault::Slug;
 use envcloak_core::{SecretBuf, SecretBytes};
 use secrecy::ExposeSecret;
 
+/// A validated environment name, never an arbitrary parser string.
+#[allow(clippy::disallowed_methods)] // Validate a name before returning metadata.
+pub fn assignment_name(found: &Found) -> Option<String> {
+    let text = std::str::from_utf8(found.name.expose_secret()).ok()?;
+    envcloak_policy::EnvName::new(text).ok()?;
+    (!envcloak_policy::value_shaped(text)).then(|| text.to_owned())
+}
+
+/// Header names become environment-safe import names; arbitrary strings and
+/// key-shaped names remain withheld. MCP config parsing supplies the names.
+#[allow(clippy::disallowed_methods)] // Validate header metadata, never return its value.
+pub fn mcp_assignment_name(found: &Found) -> Option<String> {
+    if let Some(name) = assignment_name(found) {
+        return Some(name);
+    }
+    let text = std::str::from_utf8(found.name.expose_secret()).ok()?;
+    if text.is_empty()
+        || text.len() > 128
+        || envcloak_policy::value_shaped(text)
+        || !text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    let name = format!("MCP_HEADER_{}", text.replace('-', "_").to_ascii_uppercase());
+    envcloak_policy::EnvName::new(&name).ok().map(|_| name)
+}
+
+/// Copy into another wiping owner for an independently verified IPC request.
+#[allow(clippy::disallowed_methods)] // No plain buffer escapes this boundary.
+pub fn secret_copy(value: &SecretBytes) -> SecretBytes {
+    SecretBytes::copy_from(value.expose_secret())
+}
+
+/// Backup v2 upload chunks, each with its own wiping owner.
+#[allow(clippy::disallowed_methods)] // Chunks go only to the verified daemon.
+pub fn backup_chunks(value: &SecretBytes, size: usize) -> Vec<SecretBytes> {
+    if value.is_empty() || size == 0 {
+        return vec![secret_copy(value)];
+    }
+    value
+        .expose_secret()
+        .chunks(size)
+        .map(SecretBytes::copy_from)
+        .collect()
+}
+
 /// Comment out proven, complete physical assignment lines. Selection carries
 /// only parser indices and daemon-produced slugs. Every other byte survives.
 #[allow(clippy::disallowed_methods)] // Copy retained spans into wiping storage.
