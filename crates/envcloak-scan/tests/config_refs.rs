@@ -55,3 +55,68 @@ fn envfile_templates_links_and_limits_remain_visible() {
     assert!(report.files <= 2);
     assert!(report.issues.iter().any(|i| i.reason == "file_budget"));
 }
+
+#[test]
+fn selection_never_removes_omission_policy_from_overlapping_sources() {
+    for kind in [SourceKind::Credentials, SourceKind::Database] {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let protected = home.path().join("protected.json");
+        std::fs::write(
+            &protected,
+            br#"{"mcpServers":{"fixture":{"env":{"SECRET_TOKEN":"fixture value"}}}}"#,
+        )
+        .unwrap();
+        let mut broad = source(home.path().to_path_buf());
+        broad.names = Some(".json".into());
+        let mut omitted = source(protected.clone());
+        omitted.source_kind = kind;
+        let report = envcloak_scan::agent_config::scan_config_sources_selected(
+            &[broad, omitted],
+            Budget::default(),
+            &|path| path != protected,
+        )
+        .unwrap();
+        assert!(report.findings.is_empty(), "selection removed an omission");
+        assert_eq!(report.files, 0);
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| matches!(n.reason, "manual_credentials" | "database"))
+        );
+    }
+}
+
+#[test]
+fn credential_store_case_aliases_are_conservatively_omitted() {
+    for directory in [false, true] {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let name = if directory {
+            "MCP-SECRETS/values"
+        } else {
+            "AUTH.JSON"
+        };
+        let target = home.path().join(name);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"SECRET_TOKEN=fixture value\n").unwrap();
+        let config = home.path().join("config.json");
+        std::fs::write(
+            &config,
+            format!(r#"{{"mcpServers":{{"fixture":{{"envFile":"{name}"}}}}}}"#),
+        )
+        .unwrap();
+        let mut omitted = source(home.path().join(if directory {
+            "mcp-secrets"
+        } else {
+            "auth.json"
+        }));
+        omitted.source_kind = SourceKind::Credentials;
+        let report = envcloak_scan::scan_config_sources(&[source(config), omitted]).unwrap();
+        assert!(
+            report.findings.is_empty(),
+            "case alias read a protected store"
+        );
+        assert!(report.issues.iter().any(|i| i.reason == "unread_env_file"));
+        assert_eq!(report.files, 1);
+    }
+}

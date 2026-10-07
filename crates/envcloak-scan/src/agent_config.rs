@@ -327,7 +327,11 @@ pub fn scan_config_sources_selected(
     let selected = sources
         .iter()
         .filter(|s| {
-            if allow(&s.path) {
+            if matches!(
+                s.source_kind,
+                crate::source::SourceKind::Credentials | crate::source::SourceKind::Database
+            ) || allow(&s.path)
+            {
                 true
             } else {
                 report.issue(&s.path, "volume_opt_in");
