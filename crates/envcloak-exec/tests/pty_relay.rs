@@ -879,7 +879,7 @@ impl Running {
     }
 
     fn signal(&self, sig: i32) {
-        envcloak_sys::signal_process(self.pid(), sig).unwrap();
+        assert_eq!(envcloak_sys::testing::kill_raw(self.pid(), sig), 0);
     }
 }
 

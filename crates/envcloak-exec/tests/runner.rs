@@ -2080,7 +2080,7 @@ fn a_signal_caught_after_the_forwarder_ended_still_stops_the_run() {
         "the runner was not held: {}",
         lossy(&p.captured(1))
     );
-    envcloak_sys::signal_process(p.pid(), libc::SIGTERM).unwrap();
+    assert_eq!(envcloak_sys::testing::kill_raw(p.pid(), libc::SIGTERM), 0);
     std::fs::write(&release, b"").unwrap();
     let (status, out, err) = p.finish(Duration::from_secs(60));
     assert!(
