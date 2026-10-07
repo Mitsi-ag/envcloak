@@ -249,23 +249,24 @@ fn gate37_open_elsewhere_refuses_aged_source_with_a_closed_control() {
         .read_line(&mut line)
         .unwrap();
     assert_eq!(line, "ready\n");
-    let refused = envcloak_scan::scrub::OpenFile::open(&plan);
     let held_check = opened.check();
     let held_validate = opened.validate(&plan, ConfigFormat::Raw);
     let held_apply = opened.apply(&plan, ConfigFormat::Raw);
+    // Only the Python holder may explain the fresh open's refusal on Linux.
+    drop(opened);
+    let refused = envcloak_scan::scrub::OpenFile::open(&plan);
     holder.stdin.take();
     assert!(holder.wait().unwrap().success());
-    assert!(matches!(refused, Err("open_elsewhere")));
     assert_eq!(held_check, Err("open_elsewhere"));
     assert_eq!(held_validate, Err("open_elsewhere"));
     assert_eq!(held_apply, Err("open_elsewhere"));
+    assert!(matches!(refused, Err("open_elsewhere")));
     assert_eq!(
         std::fs::read(&path).unwrap(),
         b"fixtureZheldByAnotherProcess"
     );
     assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
-    opened.check().unwrap();
-    opened.validate(&plan, ConfigFormat::Raw).unwrap();
-    drop(opened);
-    assert!(envcloak_scan::scrub::OpenFile::open(&plan).is_ok());
+    let mut closed = envcloak_scan::scrub::OpenFile::open(&plan).unwrap();
+    closed.check().unwrap();
+    closed.validate(&plan, ConfigFormat::Raw).unwrap();
 }
