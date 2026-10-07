@@ -211,7 +211,7 @@ the verifier's green `bfb0cab` CI is prior evidence, not a run of these commits.
 
 - **Plan deviation, M2-19 interface:** `RunSpec::pty(argv, injected, redactor, OuterTerminal)` replaces the planned `winsize` argument; the owned outer terminal supplies current dimensions at startup, SIGWINCH and resume instead of retaining a size snapshot.
 - **M2-28 follow-up, shared temporary-directory observations:** `probe_local.rs::probe_homes` scans machine-wide `/tmp/ecp*` state. Give each test a private root and count only its descendants. Sweep all three callers: `the_probe_runs_beside_the_persons_daemon_and_touches_nothing_of_theirs`, `a_version_outside_the_table_is_not_qualified`, and `the_probe_home_is_cleaned_after_kill_9`. Add a concurrent unrelated-root control that cannot affect the count, and retain a positive control proving that a probe created under the owned root is found. This is tracked here, with no M2-28 code change, as the verifier requested; the plan's task ownership and section 6 disjoint-lane rule keep that implementation with M2-28.
-- **Main integration:** merge `36f2c89f` incorporates all 59 missing commits through `origin/main` `689c55aa` without conflicts. The verifier's green PR and full runs on `0f8d7d89` predate this merge. Fresh GitHub CI on the merged head remains the driver's pre-merge gate under section 6 and the no-push instruction.
+- **Main integration:** merge `36f2c89f` incorporates main through `689c55aa`. Remote main is now `4f3059ba` (M2-14), confirmed again with `git ls-remote origin refs/heads/main` on 2026-10-07 at 03:15 UTC. The verifier reports green PR run `37552905954` tested merge ref `75587455`, whose parents are `8539acb0` and `4f3059ba`; manual full run `37552910397` also passed on both systems, including release. Those runs cover the newer integration baseline for the prior head. No redundant main merge is needed; fresh CI on this correction remains the driver's pre-merge check under section 6 and the no-push instruction.
 
 The stop-order finding was a temporal-oracle gap: the stopped state at the
 outer shell's prompt did not prove that the command was stopped when the
@@ -369,3 +369,137 @@ private short HOME/XDG directories and `--no-fail-fast -- --test-threads 3`.
 The scope and requirement ids above remain covered; this correction
 defers no implementation. Both-platform CI on this commit remains the
 driver's check under the no-push instruction.
+
+## Startup status and final contract review
+
+Commit `83e0e50c` fixes the startup completion contract. A command can
+execute before its monitor reports `Started`; loss of that report cannot
+prove that nothing ran. `SessionError::Unconfirmed` distinguishes an EOF,
+unreadable frame or unexpected first report from explicit `SetupFailed`
+and `ExecFailed` reports. Exec maps it to `Followed`, whose CLI completion
+record is `unknown`, exit 125 and `run_failed`. An ambiguous report drops
+the owned monitor through its kill-and-reap path instead of assuming it
+has already exited. Prelaunch refusals retain their existing codes and
+`not_started` records.
+
+The native real-CLI regression witnesses a file the command creates,
+while a testing-only seam withholds `Started`. Only after that independent
+side effect and the CLI's pause are observed does it release the CLI to
+kill its own unreaped monitor. It requires the exact `unknown` wire
+record, exit 125 and restored terminal settings. Successful execution,
+missing-command and non-executable controls check the other records.
+The release gate explicitly omits the injected loss, whose seam does not
+ship, but retains those controls. The sys test drives the actual channel
+reader with bytes written without the encoder: all partial-frame EOFs,
+bad padding, invalid pid, non-text garbage, unexpected stop/continue/exit
+reports and read errors remain uncertain. Only explicit refusal frames
+mean no launch. The wire vectors are protocol fixtures; the native side
+effect is the independent lifecycle evidence, following cycle287 and
+cycle289's distinction between constructed errors and observed execution.
+
+The second contract correction limits descriptor pass-through to pipe
+mode without `--status-fd`. PTY mode always replaces 0..2 with the slave
+and closes inherited descriptors above them. The CLI comment and RUN.md
+now agree with the existing foundation contract. A real command uses
+`fstat` identity to test inherited fixture files on descriptors 3 and 8,
+and `isatty` to independently establish pipe versus PTY mode. All four
+mode/status-option combinations are checked; only pipe mode without the
+status option inherits those files. These controls run on release builds
+as well as testing builds.
+
+The class sweep covers all 35 changed task files, with the foundation's
+`pty_spawn` callers also inspected:
+
+| Bug class | Instances swept and regression evidence |
+| --- | --- |
+| Treating missing lifecycle evidence as proof of no execution | Both startup error arms (unexpected report and channel error), the sys-to-exec conversion, `start_pty`, relay setup before and after launch, `ExecError::may_have_started`, CLI `Ended::exec`/status encoding, and the MCP diagnostic assertion. Explicit monitor refusals still occur before exec. Raw channel cases and the real-CLI side-effect gate protect the ambiguous paths; existing spawn and status controls protect known refusals. |
+| Applying a mode-specific descriptor promise to every mode | RUN.md's status paragraph and the CLI module comment were wrong; both are corrected. Monitor descriptor 3, closure above it, command-side control/exec-pipe closure, the foundation paragraph and existing topology/above-limit gates were checked. The four real-CLI descriptor cases cover the corrected promise. |
+| Assigning a temporal property to a test that observes only a later result | The e2e doc comment, RUN.md gate rows, validation receipt, unit order model and relay resume barrier were swept. Resume-before-raw is detected by `a_stop_restores_before_the_cli_stops_and_resumes_only_once_raw_again` and `the_command_is_resumed_only_once_the_outer_terminal_is_raw_again`; the real-CLI post-fg round trip alone is not a deterministic ordering oracle. This records the verifier's offered clarification instead of adding a redundant e2e seam. |
+| Stale integration evidence | The Main integration row now distinguishes the branch's `689c55aa` merge from PR CI's tested merge with main `4f3059ba`. A fresh remote-ref query confirms `4f3059ba`; the green CI claims are the verifier's supplied receipts, not new runs by this engineer. |
+
+New seam dependencies were included in the sweep: startup loss is testing
+only and explicit, like the restore witness and injected panic. All
+ordinary status and descriptor controls run in both binary modes. The
+existing native exec/sys seams still use their own testing executables.
+The sweep files and main-ref receipt are under `.collab/m2-19/review6/`.
+
+Mutation receipts, each Cargo exit 101 at the intended assertion:
+
+- `startup-channel-loss-is-not-started`: the original classification
+  writes `not_started/run_failed` after the side effect was observed.
+- `unexpected-startup-report-as-setup`: an unexpected first report is
+  wrongly a setup refusal; the sys wire gate fails.
+- `startup-channel-error-as-setup`: a channel error is wrongly a setup
+  refusal; the sys gate fails at the empty EOF case.
+- `unconfirmed-startup-as-setup`: the exec conversion loses uncertainty;
+  the real-CLI completion-record assertion fails.
+- `retain-inherited-fd-8`: the monitor preserves an inherited non-cloexec
+  descriptor 8; the PTY/no-status case sees it and fails, while the pipe
+  inheritance control passes.
+- `resume-before-raw`: move the Resume barrier and send ahead of raw-mode
+  reentry; both the unit order model and native relay barrier fail, the
+  latter with "the outer terminal is not raw before Resume".
+- `certain-start-diagnostic` (commit `b9585353`): restore the old "the
+  command was started" diagnostic. The MCP gate rejects that wording at
+  its stderr assertion.
+
+Every mutation was restored. All focused controls pass again. The first
+baseline attempt used `/bin/true`, absent on macOS, and failed its ordinary
+control; it is not mutation evidence. The corrected `/usr/bin/true`
+control passed before the original startup-status bug failed as intended.
+The first full CLI suite also exposed a stale MCP diagnostic assertion.
+It now expects "may have started"; its existing observed-side-effect and
+`execution_unknown` checks are unchanged. A repository-wide diagnostic
+search found this one stale assertion. The diagnostic mutation above
+checks the corrected expectation independently of the status assertions.
+
+Fresh macOS checks for this correction:
+
+- Full `envcloak-sys`, `envcloak-exec` and `envcloak-e2e` suites passed.
+  Sys ran 224 cases (two existing documentation examples ignored); exec
+  ran 33 unit tests, the allocator gate, 31 PTY relay cases, five PTY
+  spawn cases and 30 pipe runner cases. E2e reported 133 passed, including
+  both real-CLI PTY cases and the fixture story.
+- A fresh `cargo build --release` passed. Both `pty_job_control` cases
+  passed with `ENVCLOAK_E2E_BIN_DIR` pointing to target C's release
+  directory; `release_artifacts_carry_no_test_hook` also passed. The release
+  receipt explicitly excludes injected startup loss and the restore
+  barrier, while retaining ordinary status, all four descriptor cases,
+  job control and signal receipt checks. Direct and nested jobs received
+  each signal once; their shells received none.
+- `check-unsafe.sh`, `check-expose-lint.sh`, `check-unsafe-lint.sh`,
+  `check-reservations.py`, `check-spec-decisions.py`,
+  `check-crate-graph.py` and `check-sources.sh` passed.
+- The corrected full CLI suite passed all 222 cases, including all 27
+  MCP cases. Final `cargo fmt --all --check` and
+  `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` passed
+  again after the diagnostic mutation was restored.
+
+The focused Linux run also passed in the cached, offline container:
+startup wire classification, both real-CLI PTY cases, and the native
+relay's raw-before-Resume barrier. The startup receipt observed the
+command's side effect, then `unknown` and terminal restoration. All four
+descriptor combinations passed. At the restore barrier the command was
+already stopped (`Tl`); direct and nested signal receipts were job
+`[1, 1, 1, 1]`, shell `[0, 0, 0, 0]`. This was a scoped Linux run, not a
+full Linux suite or a fresh Linux release build.
+
+All test runs were detached with a minimal environment, private short
+HOME/XDG paths, three build jobs, incremental compilation disabled, and
+`--no-fail-fast -- --test-threads 3`. Native artifacts use target C; the
+Linux container maps target C's `linux19` subdirectory to its target C.
+Final logs and status files are under `.collab/m2-19/review6/`: `final.json`
+retains the initial CLI failure, `post.json` records its corrected full
+suite and final fmt/Clippy results, and `linux.json` records Linux's four
+successful steps. Expected mutation failures remain in `mutations.json`
+and `post.json`; none is counted as a passing control.
+
+The latest four findings are resolved, with none rejected. The optional
+real-CLI resume barrier is handled by the verifier's offered documentation
+clarification; the lower-level ordering gates were mutation-checked again.
+Gates 8 (PTY), 9, 13, 14 and 23 and requirements R-M2-03, R-M2-07 through
+R-M2-14, R-M2-79, R-M2-89 and T-12 retain the evidence mapped above. No
+M2-19 implementation is deferred. The previously recorded M2-28 private
+probe-root follow-up remains with its owner under section 6's disjoint-lane
+rule. Fresh CI on these corrections remains the driver's pre-merge check;
+this work was neither pushed nor submitted to GitHub.
