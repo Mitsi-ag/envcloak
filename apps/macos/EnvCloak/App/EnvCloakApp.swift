@@ -2,14 +2,15 @@ import EnvCloakDesign
 import EnvCloakKit
 import SwiftUI
 
-/// The macOS app (SPEC §12). Task M3-02 lays out the bundle with a
-/// placeholder main window and an About stub; the screens arrive with
-/// M3-05 onwards. The app reads nothing from how it was started: no launch
-/// argument, environment variable, standard stream or defaults domain
-/// (docs/APP.md "The app run by an agent", checked by
-/// scripts/macos/check-swift.sh).
+/// The EU-0 metadata workspace. Launch input never selects a vault or action.
 @main
 struct EnvCloakApp: App {
+    #if ENVCLOAK_SCREEN_TESTS
+    // A compile-only test host. It never connects to the person's daemon.
+    @State private var session = ScreenTestBootstrap.session()
+    #else
+    @State private var session = VaultSession.live()
+    #endif
     init() {
         let fonts: AppEvent = ECFonts.martianMonoRegistered ? .fontsRegistered : .fontsMissing
         ECLog.logger(.app).notice(
@@ -19,14 +20,20 @@ struct EnvCloakApp: App {
 
     var body: some Scene {
         Window("EnvCloak", id: WindowID.main) {
-            PlaceholderView()
+            MainView(session: session)
+                #if ENVCLOAK_SCREEN_TESTS
+                .task { await ScreenTestBootstrap.positionWindow() }
+                #endif
         }
-        .defaultSize(width: 720, height: 480)
+        .defaultSize(width: 1180, height: 740)
         .commands {
             CommandGroup(replacing: .appInfo) {
                 AboutCommand()
             }
             CommandGroup(replacing: .newItem) {}
+            SidebarCommands()
+            InspectorCommands()
+            WorkspaceCommands()
         }
 
         // Opened from the app menu only: no second "About EnvCloak" item in

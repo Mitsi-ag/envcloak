@@ -885,12 +885,10 @@ jobs:
       - name: The app's hosted tests
         run: |
           xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloak -destination 'platform=macOS' \
-            -derivedDataPath "$RUNNER_TEMP/dd-debug" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+            -derivedDataPath "$RUNNER_TEMP/dd-debug" "SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
       - name: The app's UI tests (main, nightly and manual)
         if: github.event_name != 'pull_request'
-        run: |
-          xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloakUITests -destination 'platform=macOS' \
-            -derivedDataPath "$RUNNER_TEMP/dd-debug" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+        run: python3 scripts/macos/tests/run_workspace.py
       - name: Compiled Swift sources are the scanned sources
         run: |
           for dd in "$RUNNER_TEMP"/dd-*; do
