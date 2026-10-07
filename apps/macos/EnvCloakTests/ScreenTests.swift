@@ -131,6 +131,17 @@ import XCTest
         await assertVisible("Field to replace", in: inspector)
     }
 
+    func testUpgradeReadOnlyBannerKeepsWorkspaceVisible() async {
+        let client = ScriptedClient(); await client.configure(readOnly: true)
+        let session = VaultSession(client: client); await session.poll()
+        let window = host(MainView(session: session))
+        await assertVisible("The vault opened read-only because an upgrade failed.", in: window)
+        await assertVisible("Keys and projects are still readable. Changes are disabled. The next unlock retries the upgrade.", in: window)
+        await assertVisible("project, /tmp/project, 0 adopted bindings", in: window)
+        XCTAssertFalse(labels(window).contains("How to recover"))
+        XCTAssertFalse(labels(window).contains("Metadata unavailable"))
+    }
+
     func testReadOnlyBannerExplainsMetadataRefusal() async {
         let client = ScriptedClient(); await client.configure(integrity: "tampered")
         let session = VaultSession(client: client); await session.poll()

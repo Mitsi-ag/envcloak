@@ -82,7 +82,7 @@ struct Change: OptionSet {
             next = switch status.vault.state {
             case .absent: .noVault
             case .locked: .locked
-            case .unlocked: status.vault.read_only || status.vault.integrity == .tampered ? .readOnly : .ready
+            case .unlocked: status.vault.integrity == .tampered ? .readOnly : (status.vault.read_only ? .upgradeReadOnly : .ready)
             case .unavailable: .unavailable
             }
             var change: Change = []

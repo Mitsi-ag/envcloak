@@ -12,6 +12,7 @@ actor ScriptedClient: WorkspaceClient {
     var pending = 0
     var vault = "unlocked"
     var integrity = "ok"
+    var readOnly = false
     var idleLimit: UInt64 = 3600
     var lockReason = "sleep"
     nonisolated let socketPath: DaemonText? = DaemonText("/tmp/ec05-fixture\u{202e}/envcloakd.sock")
@@ -31,13 +32,14 @@ actor ScriptedClient: WorkspaceClient {
     func pages(_ mode: String) { pageMode = mode }
     func loseRevokeResponse() { revokeFailure = true }
     func configure(head: UInt64? = nil, grants: Int? = nil, pending: Int? = nil,
-                   vault: String? = nil, integrity: String? = nil, failure: EnvCloakError? = nil,
+                   vault: String? = nil, integrity: String? = nil, readOnly: Bool? = nil, failure: EnvCloakError? = nil,
                    projectFailure: Bool = false, itemCount: Int = 1) {
         if let head { self.head = head }
         if let grants { self.grants = grants }
         if let pending { self.pending = pending }
         if let vault { self.vault = vault }
         if let integrity { self.integrity = integrity }
+        if let readOnly { self.readOnly = readOnly }
         self.failure = failure; self.projectFailure = projectFailure; self.itemCount = itemCount
     }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
@@ -54,7 +56,7 @@ actor ScriptedClient: WorkspaceClient {
         switch M.name {
         case "status": result = [
             "daemon": ["version": "fixture", "pid": 42, "hardening": ["core_dumps_off": true, "non_dumpable": false], "runtime_dir_fallback": false],
-            "vault": ["state": vault, "integrity": integrity, "read_only": integrity != "ok", "busy": false, "failed_unlocks": 0],
+            "vault": ["state": vault, "integrity": integrity, "read_only": readOnly, "busy": false, "failed_unlocks": 0],
             "lock": ["last_reason": lockReason, "idle_limit_secs": idleLimit],
             "approvals": ["grants": grants, "pending": pending, "proof_failures": 0, "proof_wait_secs": 0],
             "audit": ["open": true, "head_seq": head, "unanchored": 0, "anchor_failed": false, "queued": 0, "dropped": 0]]
@@ -229,6 +231,34 @@ final class SessionTests: XCTestCase {
         XCTAssertNotNil(items.failure)
         XCTAssertTrue(items.rows.isEmpty)
         XCTAssertNil(items.selectedItem)
+    }
+
+    @MainActor func testUpgradeReadOnlyKeepsMetadataAndRefusesWrites() async throws {
+        let client = ScriptedClient(); let session = VaultSession(client: client)
+        await client.configure(grants: 1, pending: 1, readOnly: true)
+        await session.poll()
+        XCTAssertTrue(session.state.canReadMetadata)
+        XCTAssertTrue(session.state.canLock)
+        XCTAssertNotEqual(session.state, .ready)
+        XCTAssertNotEqual(session.state, .readOnly)
+        XCTAssertEqual(session.items.rows.count, 1)
+        XCTAssertEqual(session.projects.rows.count, 1)
+        XCTAssertEqual(session.grants.rows.count, 1)
+        XCTAssertEqual(session.pendingCount, 0)
+        await session.selectKey(session.items.rows.first?.slug)
+        await session.openProject(DaemonText("/tmp/project"))
+        XCTAssertNotNil(session.items.selectedItem?.detail)
+        XCTAssertNotNil(session.projects.opened)
+        await session.revoke(DaemonText("fixture-grant"))
+        let revokes = await client.calls("grants.revoke")
+        XCTAssertEqual(revokes, 0)
+        await session.lock()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertTrue(session.items.rows.isEmpty)
+        await client.configure(vault: "unlocked", readOnly: false)
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(session.items.rows.count, 1)
     }
 
     @MainActor func testReadOnlyHonorsDaemonRefusalAndLockedWins() async {

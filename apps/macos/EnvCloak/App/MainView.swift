@@ -56,7 +56,16 @@ struct MainView: View {
                 if session.state == .readOnly {
                     ReadOnlyBanner()
                     ContentUnavailableView("Metadata unavailable", systemImage: "exclamationmark.triangle", description: Text("This build cannot read keys or projects from a vault that failed its integrity check. Recover from a backup to continue."))
-                } else if session.state.canReadMetadata { detail }
+                } else if session.state.canReadMetadata {
+                    if session.state == .upgradeReadOnly {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(session.state.title)
+                            Text(session.state.detail)
+                        }.padding(12).foregroundStyle(ECToken.warning.color)
+                            .accessibilityIdentifier("upgrade-read-only.banner")
+                    }
+                    detail
+                }
                 else { ConnectionView(session: session) }
             }.frame(minWidth: 420).background(ECToken.background.color)
         }
