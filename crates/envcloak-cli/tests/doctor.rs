@@ -17,8 +17,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_values(canaries(fresh_seed()))
+    }
+    fn with_values(mut values: Vec<Canary>) -> Self {
         let home = TestHome::new();
-        let mut values = canaries(fresh_seed());
         values.push(Canary::new("unicode", "é".repeat(8)));
         values.push(Canary::new(
             "pq",
@@ -158,8 +160,32 @@ fn grammar(v: &Value) {
 }
 #[test]
 fn gate36_report_grammar_floor_exposure_and_output_sweep() {
-    let f = Fixture::new();
+    // A trailing key character can also be prose punctuation. Its trimmed
+    // reading matches the provider pattern but is not the value in the vault.
+    // Cover both legal readings deliberately, not only when a seed ends so.
+    for suffix in ['A', '-', '_'] {
+        report_grammar_with_suffix(suffix);
+    }
+}
+
+fn report_grammar_with_suffix(suffix: char) {
+    let mut values = canaries(fresh_seed());
+    let index = values
+        .iter()
+        .position(|v| v.label == labels::OPENAI_API_KEY)
+        .unwrap();
+    let mut value = values[index].as_str().to_owned();
+    value.pop();
+    value.push(suffix);
+    values[index] = Canary::new(labels::OPENAI_API_KEY, value);
+    let f = Fixture::with_values(values);
     let path = f.transcript();
+    let display_path = path.canonicalize().unwrap().to_str().unwrap().to_owned();
+    let places = |count| json!([{"display_path": display_path, "count": count}]);
+    let mut unknown = vec![json!({"provider": "github", "places": places(1)})];
+    if suffix != 'A' {
+        unknown.push(json!({"provider": "openai", "places": places(2)}));
+    }
     // Positive control: the detector sees actual fixture exposures.
     assert!(!envcloak_testkit::sweep_dir(path.parent().unwrap(), &f.values).is_empty());
     let mut metadata = Value::Null;
@@ -175,52 +201,52 @@ fn gate36_report_grammar_floor_exposure_and_output_sweep() {
             "guessable value reported"
         );
         assert_eq!(v["items"][0]["slug"], "openai/doctor");
-        assert_eq!(v["items"][0]["places"][0]["count"], 2);
+        assert_eq!(v["items"][0]["places"], places(2));
         assert_eq!(
             v["items"][0]["rotate_url"],
             "https://platform.openai.com/api-keys"
         );
-        assert!(
-            v["unknown"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|x| x["provider"] == "github")
-        );
+        assert_eq!(v["unknown"], json!(unknown), "suffix {suffix}");
         metadata = v;
     }
     let out = f.doctor(false, false);
     assert!(out.status.success());
     let text = stdout(&out);
-    let mut allowed = std::collections::BTreeSet::from([
-        "doctor: complete".to_owned(),
-        "envcloak scrub: encrypted backup before rewriting".to_owned(),
+    // Check the whole grammar with multiplicity. Two finding sections may
+    // legitimately repeat a path/count or the same provider's rotation URL.
+    // Mutations: add a line-number field, drop an unknown-provider heading,
+    // or duplicate an item heading; each must still fail this exact oracle.
+    let mut expected = vec![
         "item openai/doctor".to_owned(),
-        "unknown github".to_owned(),
+        format!("  path {display_path} count 2"),
         "rotate https://platform.openai.com/api-keys".to_owned(),
-        "rotate https://github.com/settings/tokens".to_owned(),
-    ]);
-    for group in ["items", "unknown"] {
-        for item in metadata[group].as_array().unwrap() {
-            for place in item["places"].as_array().unwrap() {
-                allowed.insert(format!(
-                    "  path {} count {}",
-                    place["display_path"].as_str().unwrap(),
-                    place["count"].as_u64().unwrap()
-                ));
-            }
-        }
+        "unknown github".to_owned(),
+        format!("  path {display_path} count 1"),
+    ];
+    if suffix != 'A' {
+        expected.extend([
+            "unknown openai".to_owned(),
+            format!("  path {display_path} count 2"),
+        ]);
     }
+    expected.push("rotate https://github.com/settings/tokens".to_owned());
+    if suffix != 'A' {
+        expected.push("rotate https://platform.openai.com/api-keys".to_owned());
+    }
+    expected.push("envcloak scrub: encrypted backup before rewriting".to_owned());
     for note in metadata["not_scanned"].as_array().unwrap() {
-        allowed.insert(format!(
+        expected.push(format!(
             "not_scanned {} {}",
             note["display_path"].as_str().unwrap(),
             note["reason"].as_str().unwrap()
         ));
     }
-    let actual: std::collections::BTreeSet<_> = text.lines().map(str::to_owned).collect();
-    assert_eq!(actual, allowed, "human output exceeds its metadata grammar");
-    assert_eq!(text.lines().count(), allowed.len(), "duplicate report line");
+    expected.push("doctor: complete".to_owned());
+    let actual: Vec<_> = text.lines().map(str::to_owned).collect();
+    assert_eq!(
+        actual, expected,
+        "human output exceeds its metadata grammar; suffix {suffix}"
+    );
     assert!(text.find("rotate ").unwrap() < text.find("envcloak scrub").unwrap());
     let shown = run(&f.home, &["show", "openai/doctor", "--json"], &[]);
     let shown: Value = serde_json::from_slice(&shown.stdout).unwrap();
