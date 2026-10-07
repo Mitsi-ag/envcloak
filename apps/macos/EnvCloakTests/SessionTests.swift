@@ -315,6 +315,58 @@ final class SessionTests: XCTestCase {
         XCTAssertNil(try ProjectFolders(file: file).scope)
     }
 
+    @MainActor func testScopeWriteFailurePreservesInventoryAndRetriesLocally() async throws {
+        let fixture = try ScopeWriteFixture()
+        let client = ScriptedClient()
+        let session = VaultSession(client: client, folders: fixture.folders)
+        await session.projects.open(DaemonText("/tmp/project"))
+        try fixture.block()
+        await session.poll()
+        XCTAssertNil(session.projects.failure)
+        XCTAssertEqual(session.projects.rows.count, 1)
+        XCTAssertNotNil(session.projects.opened)
+        XCTAssertNil(session.projects.scope)
+        XCTAssertNotNil(session.notice)
+        let lists = await client.calls("projects.list")
+        await session.poll()
+        let repeatedLists = await client.calls("projects.list")
+        XCTAssertEqual(lists, repeatedLists)
+        XCTAssertEqual(session.filteredKeys(query: "provider:example", filter: .all, scope: session.projects.scope).count, 1)
+        session.setScope(DaemonText("/tmp/project"))
+        XCTAssertEqual(session.projects.scope, DaemonText("/tmp/project"))
+        session.setScope(nil)
+        XCTAssertNil(session.projects.scope)
+        XCTAssertNotNil(session.notice)
+        try fixture.restore()
+        await session.poll()
+        XCTAssertNil(session.notice)
+        XCTAssertNil(try ProjectFolders(file: fixture.file).scope)
+        let recoveredLists = await client.calls("projects.list")
+        XCTAssertEqual(recoveredLists, lists)
+        session.setScope(DaemonText("/tmp/project"))
+        await session.lock()
+        XCTAssertTrue(session.projects.rows.isEmpty)
+        XCTAssertEqual(session.projects.scope, DaemonText("/tmp/project"))
+        await client.configure(vault: "unlocked"); await session.poll()
+        XCTAssertEqual(session.projects.rows.count, 1)
+        XCTAssertEqual(session.projects.scope, DaemonText("/tmp/project"))
+    }
+
+    @MainActor func testObsoleteScopeClearsOnlyAfterCompleteInventory() async throws {
+        let fixture = try ScopeWriteFixture()
+        let client = ScriptedClient(); let session = VaultSession(client: client, folders: fixture.folders)
+        await client.pages("fail-second"); await session.poll()
+        XCTAssertNotNil(session.projects.failure)
+        XCTAssertTrue(session.projects.rows.isEmpty)
+        XCTAssertEqual(session.projects.scope, DaemonText("/tmp/obsolete"))
+        await client.pages("single"); await session.poll()
+        XCTAssertNil(session.projects.failure)
+        XCTAssertEqual(session.projects.rows.count, 1)
+        XCTAssertNil(session.projects.scope)
+        XCTAssertNil(try ProjectFolders(file: fixture.file).scope)
+        XCTAssertNil(session.notice)
+    }
+
     @MainActor func testCopiedCommandsAreAcceptedByBuiltDispatcher() async throws {
         guard let executable = ProcessInfo.processInfo.environment["ENVCLOAK_TEST_CLI"] else {
             throw XCTSkip("Set ENVCLOAK_TEST_CLI to the built CLI for the dispatcher oracle")
@@ -608,5 +660,27 @@ actor FailingRefreshClient: WorkspaceClient {
             }
         }
         return try await client.call(method)
+    }
+}
+
+/// Fail only the local scope write. Renames keep all fixture artifacts for inspection.
+@MainActor struct ScopeWriteFixture {
+    let file: URL
+    let folders: ProjectFolders
+    private var scopeFile: URL { file.appendingPathExtension("scope") }
+    private var savedFile: URL { file.appendingPathExtension("saved") }
+    init() throws {
+        let root = URL(fileURLWithPath: "/tmp/ec05-scope-write-" + UUID().uuidString.prefix(8))
+        file = root.appendingPathComponent("projects.json")
+        folders = try ProjectFolders(file: file)
+        try folders.saveScope(DaemonText("/tmp/obsolete"))
+    }
+    func block() throws {
+        try FileManager.default.moveItem(at: scopeFile, to: savedFile)
+        try FileManager.default.createDirectory(at: scopeFile, withIntermediateDirectories: false)
+    }
+    func restore() throws {
+        try FileManager.default.moveItem(at: scopeFile, to: file.appendingPathExtension("blocked"))
+        try FileManager.default.moveItem(at: savedFile, to: scopeFile)
     }
 }

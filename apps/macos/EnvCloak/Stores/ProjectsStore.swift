@@ -32,6 +32,8 @@ struct ProjectInventoryRow: Identifiable {
     private var manifestSignal: ManifestSignal?
     private var dirty = true
     private(set) var scope: DaemonText?
+    private(set) var scopeSaveFailed = false
+    static let scopeSaveWarning = "The project scope applies for this session but could not be saved. EnvCloak will retry."
     private(set) var rows: [ProjectView] = []
     private(set) var added: [DaemonText]
     private(set) var opened: OpenedProject?
@@ -44,9 +46,16 @@ struct ProjectInventoryRow: Identifiable {
     }
     var scopeDirectories: [DaemonText] { rows.map(\.dir).filter { MetadataRequest.directoryURL($0) != nil } }
     func setScope(_ scope: DaemonText?) throws {
-        guard let folders else { throw EnvCloakError.protocolError }
-        try folders.saveScope(scope)
+        guard scope == nil || scope.flatMap(MetadataRequest.directoryURL) != nil else { throw EnvCloakError.protocolError }
         self.scope = scope
+        do {
+            guard let folders else { throw EnvCloakError.protocolError }
+            try folders.saveScope(scope)
+            scopeSaveFailed = false
+        } catch {
+            scopeSaveFailed = true
+            throw error
+        }
     }
     var directories: [DaemonText] {
         var result = rows.map(\.dir).filter { MetadataRequest.directoryURL($0) != nil }
@@ -83,6 +92,8 @@ struct ProjectInventoryRow: Identifiable {
         }
     }
     func refetch(_ change: Change) async {
+        // Retry local persistence without manufacturing a remote inventory failure.
+        if scopeSaveFailed, folders != nil { try? setScope(scope) }
         guard change.contains(.projects) || dirty, let client else { return }
         let captured = revision
         do {
@@ -112,7 +123,10 @@ struct ProjectInventoryRow: Identifiable {
                 next = page.next
             } while next != nil
             rows = result; failure = nil; dirty = false
-            if let scope, !scopeDirectories.contains(scope) { try setScope(nil) }
+            if let scope, !scopeDirectories.contains(scope) {
+                // The new scope applies in memory even if saving it fails.
+                try? setScope(nil)
+            }
             if let openedDirectory { await open(openedDirectory) }
         } catch {
             guard captured == revision else { return }

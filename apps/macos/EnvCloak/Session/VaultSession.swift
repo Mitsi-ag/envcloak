@@ -103,6 +103,8 @@ struct Change: OptionSet {
             guard captured == generation, !Task.isCancelled else { return }
             await projects.refetch(change)
             guard captured == generation, !Task.isCancelled else { return }
+            if projects.scopeSaveFailed { notice = ProjectsStore.scopeSaveWarning }
+            else if notice == ProjectsStore.scopeSaveWarning { notice = nil }
             await projects.refreshOpenIfChanged()
             guard captured == generation, !Task.isCancelled else { return }
             await grants.refetch(change)
@@ -165,7 +167,7 @@ struct Change: OptionSet {
     }
     func setScope(_ scope: DaemonText?) {
         do { try projects.setScope(scope) }
-        catch { notice = "The project scope could not be saved. Try again." }
+        catch { notice = projects.scopeSaveFailed ? ProjectsStore.scopeSaveWarning : "The project scope could not be saved. Try again." }
     }
 
     func selectKey(_ slug: DaemonText?) async {
