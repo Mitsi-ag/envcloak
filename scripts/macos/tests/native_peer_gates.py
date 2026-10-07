@@ -12,6 +12,9 @@ import sys
 import tempfile
 import unittest
 
+sys.dont_write_bytecode = True
+from dyld_gate import emit, finish
+
 SUITE, BINARY, FIXTURES = sys.argv[1:]
 FIXTURES = Path(FIXTURES)
 IDENTITIES = json.loads((FIXTURES / "identities.json").read_text())
@@ -105,11 +108,14 @@ class Native(unittest.TestCase):
             args.append(str(FIXTURES / "unsigned-peer"))
         return self.child(args, extra)
 
-    def facts(self, name):
-        file = str(FIXTURES / (name + "-peer"))
+    def file_facts(self, file):
+        file = str(file)
         got = subprocess.run([str(FIXTURES / "facts"), file], env=self.env, check=True,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         return json.loads(got.stdout)[file]
+
+    def facts(self, name):
+        return self.file_facts(FIXTURES / (name + "-peer"))
 
 
 class App(Native):
@@ -216,16 +222,53 @@ class App(Native):
             self.assertEqual(child.wait(timeout=10), 0)
 
     def test_gate19_dyld_constructor_control(self):
-        self.daemon()
-        for name, expected in [("no-runtime", True), ("genuine", False)]:
-            marker = self.home / (name + ".marker")
-            child = self.peer(name, extra={"DYLD_INSERT_LIBRARIES": str(FIXTURES / "constructor.dylib"),
-                                          "EC_CONSTRUCTOR_MARKER": str(marker)})
-            send(child)
-            response(child) # proves the main ran after dyld completed
-            self.assertEqual(marker.exists(), expected)
-            child.stdin.close()
-            self.assertEqual(child.wait(timeout=10), 0)
+        report = {"status": "failed"}
+
+        def run(*args, extra=None):
+            return subprocess.run(args, env=self.env | (extra or {}), check=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30).stdout
+
+        def oracle(name):
+            return json.loads(run(str(FIXTURES / (name + "-oracle"))))
+
+        def injection(marker):
+            self.assertFalse(marker.exists(), "stale constructor marker")
+            return {"DYLD_INSERT_LIBRARIES": str(FIXTURES / "constructor.dylib"),
+                    "EC_CONSTRUCTOR_MARKER": str(marker)}
+
+        try:
+            report["os_build"] = run("/usr/bin/sw_vers", "-buildVersion").decode().strip()
+            report["architecture"] = run("/usr/bin/uname", "-m").decode().strip()
+            report["sip"] = run("/usr/bin/csrutil", "status").decode().strip()
+            files = {"genuine": FIXTURES / "genuine-peer", "no-runtime": FIXTURES / "no-runtime-peer",
+                     "hardened": FIXTURES / "hardened-oracle", "plain": FIXTURES / "plain-oracle",
+                     "library": FIXTURES / "constructor.dylib"}
+            report["artifacts"] = {name: self.file_facts(file) for name, file in files.items()}
+            # Query policy only in clean launches, never from injected processes.
+            report["before"] = {name: oracle(name) for name in ["plain", "hardened"]}
+            report["loaded"] = {}
+            for name in ["plain", "hardened"]:
+                marker = self.home / (name + ".marker")
+                json.loads(run(str(files[name]), extra=injection(marker)))
+                report["loaded"][name] = marker.exists()
+            self.daemon()
+            for name, kind in [("no-runtime", "role_denied"), ("genuine", "method_not_found")]:
+                marker = self.home / (name + ".marker")
+                child = self.peer(name, extra=injection(marker))
+                send(child)
+                reply = response(child) # main completed dyld and the daemon checked this peer
+                report["loaded"][name] = marker.exists()
+                self.assertEqual(reply["error"]["data"]["kind"], kind)
+                child.stdin.close()
+                self.assertEqual(child.wait(timeout=10), 0)
+            report["after"] = {name: oracle(name) for name in ["plain", "hardened"]}
+            self.assertEqual(report["artifacts"], {name: self.file_facts(file) for name, file in files.items()},
+                             "artifact signing changed during measurement")
+        except Exception as error:
+            report["error"] = str(error)
+            emit(report)
+            raise
+        finish(report)
 
 
 class Client(Native):

@@ -101,6 +101,18 @@ def prepare(root):
                      'const char *p = getenv("EC_CONSTRUCTOR_MARKER"); if (!p) return;\n'
                      'int fd = open(p, O_WRONLY|O_CREAT|O_EXCL, 0600); if (fd >= 0) close(fd); }\n')
     run("/usr/bin/clang", "-dynamiclib", str(dylib), "-o", str(root / "constructor.dylib"))
+    # Use Apple's signer independently of sign_peer and the app certificate.
+    # Pin the library's signing mode too, rather than relying on clang defaults.
+    run("/usr/bin/codesign", "--force", "--timestamp=none", "--sign", "-",
+        "--identifier", "ai.envcloak.constructor", str(root / "constructor.dylib"))
+    for name, runtime in [("hardened", True), ("plain", False)]:
+        file = root / (name + "-oracle")
+        run("/usr/bin/clang", "-Wall", "-Wextra", "-Werror",
+            str(ROOT / "crates/envcloak-sys/tests/fixtures/dyld_policy.c"), "-o", str(file))
+        run("/usr/bin/codesign", "--force", "--timestamp=none", "--sign", "-",
+            "--identifier", "ai.envcloak.dyld-oracle",
+            *(["--options", "runtime"] if runtime else []), str(file))
+        run("/usr/bin/codesign", "--verify", "--strict", str(file))
     # These are public certificate fingerprints, not credentials.
     print(identities[0]["sha1"])
 
