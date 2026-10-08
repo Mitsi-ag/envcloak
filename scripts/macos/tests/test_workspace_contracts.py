@@ -41,6 +41,51 @@ for key in ["eu-one", "fixture"] {
                                 text=True, capture_output=True, timeout=60)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_undo_menu_query_matches_recorded_command(self):
+        source = (ROOT / 'apps/macos/EnvCloakUITests/PasteTests.swift').read_text()
+        query = re.findall(r'let undo = .*?matching\((NSPredicate\(format: [^\n]+\))\)\.firstMatch', source)
+        ready = re.findall(r'let available = XCTNSPredicateExpectation\(predicate: (NSPredicate\(format: [^\n]+\)), object: undo\)', source)
+        self.assertEqual(len(query), 1)
+        self.assertEqual(len(ready), 1)
+        confirmation = re.findall(r'let confirmed = XCTNSPredicateExpectation\(predicate: (NSPredicate\(format: [^\n]+\)), object: notice\)', source)
+        self.assertEqual(len(confirmation), 1)
+        # Run 37826362088's open Edit menu: Undo, identifier undo:, enabled;
+        # Redo disabled. Decoys must never satisfy the actual UI predicate.
+        probe = '''import Foundation
+let query = QUERY
+let ready = READY
+let rows: [[String: Any]] = [
+    ["title": "Undo", "identifier": "undo:", "exists": true, "enabled": true],
+    ["title": "Redo", "identifier": "redo:", "exists": true, "enabled": false],
+    ["title": "Undo Binding", "identifier": "undo:", "exists": true, "enabled": true],
+    ["title": "Undo", "identifier": "other:", "exists": true, "enabled": true],
+    ["title": "Undo", "identifier": "undo:", "exists": true, "enabled": false],
+    ["title": "Undo", "identifier": "undo:", "exists": false, "enabled": true]
+]
+for (index, row) in rows.enumerated() {
+    let accepted = query.evaluate(with: row) && ready.evaluate(with: row)
+    guard accepted == (index == 0) else {
+        print("Undo command predicate accepted wrong state at index " + String(index))
+        exit(1)
+    }
+}
+// The snapshot's session.notice static text carries AXValue, no AXLabel.
+let confirmation = CONFIRMATION
+for (value, expected) in [
+    ("Binding undone. The original envcloak.toml bytes were restored.", true),
+    ("Saved to envcloak.toml. The next run still asks for approval.", false),
+    ("Undo stopped. The file may have changed or the write could not be confirmed. Inspect it before another edit.", false)
+] {
+    guard confirmation.evaluate(with: ["exists": true, "label": "", "value": value]) == expected else {
+        print("Undo confirmation accepted stale or missing state")
+        exit(1)
+    }
+}
+'''.replace('QUERY', query[0]).replace('READY', ready[0]).replace('CONFIRMATION', confirmation[0])
+        result = subprocess.run(['xcrun', 'swift', '-warnings-as-errors', '-'], input=probe,
+                                text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_binding_row_query_uses_recorded_outline_role(self):
         source = '\n'.join((ROOT / 'apps/macos/EnvCloakUITests' / name).read_text()
                            for name in ['BindingTests.swift', 'PasteTests.swift'])

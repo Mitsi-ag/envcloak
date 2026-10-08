@@ -59,7 +59,9 @@ extension PasteTests {
 
     @MainActor func recordBindingState(_ app: XCUIApplication, step: String) {
         var state = "EU-1 binding failure: " + step + "\n"
-        if let root = try? app.snapshot() {
+        if app.state == .notRunning || app.state == .unknown {
+            state += "application state: \(app.state); no running app or menus\n"
+        } else if let root = try? app.snapshot() {
             func descendants(_ node: any XCUIElementSnapshot) -> [any XCUIElementSnapshot] {
                 [node] + node.children.flatMap(descendants)
             }
@@ -75,6 +77,11 @@ extension PasteTests {
             let picker = nodes.first { $0.identifier == "binding.key" && $0.elementType == .popUpButton }
             let labels = picker.map { descendants($0).filter { $0.elementType == .menuItem }.map { $0.title.isEmpty ? $0.label : $0.title } } ?? []
             state += "key picker menu labels: \(labels)\n"
+            let edit = nodes.first { $0.elementType == .menuBarItem && $0.title == "Edit" }
+            let commands = edit.map { descendants($0).filter { $0.elementType == .menuItem }.map {
+                "title=\($0.title) enabled=\($0.isEnabled)"
+            } } ?? []
+            state += "Edit menu items: \(commands)\n"
         } else { state += "<accessibility snapshot unavailable>\n" }
         // The binding form holds metadata only. Never read AXValue while
         // dumping a tree, even if a failure leaves a different sheet open.
