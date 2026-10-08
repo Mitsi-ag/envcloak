@@ -74,9 +74,10 @@ final class PasteTests: XCTestCase {
         // focused sheet editor has gone and the table has processed Delete.
         let editMenu = app.menuBars.menuBarItems["Edit"]
         editMenu.click()
-        // SwiftUI's system command is titled Undo, even when its manager's
-        // undoMenuItemTitle is Undo Binding. Require that exact command.
-        let undo = editMenu.menuItems.matching(NSPredicate(format: "identifier == %@ AND title == %@", "undo:", "Undo")).firstMatch
+        // The system exposes either the generic title or this action's
+        // undoMenuItemTitle. Require the native action and either exact title;
+        // the physical Command-Z below proves its shortcut and exact result.
+        let undo = editMenu.menuItems.matching(NSPredicate(format: "identifier == %@ AND title IN %@", "undo:", ["Undo", "Undo Binding"])).firstMatch
         let available = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND enabled == true"), object: undo)
         try requireBinding(XCTWaiter.wait(for: [available], timeout: 5) == .completed, app: app, step: "Edit > Undo available")
         app.typeKey(.escape, modifierFlags: [])
