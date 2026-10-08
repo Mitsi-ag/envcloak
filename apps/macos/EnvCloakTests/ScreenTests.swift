@@ -37,7 +37,7 @@ import XCTest
         return window
     }
 
-    private func nodes(_ object: Any) -> [NSObject] {
+    private func nodes(_ object: Any, includingNativeViews: Bool = true) -> [NSObject] {
         var seen = Set<ObjectIdentifier>()
         func walk(_ object: Any, depth: Int) -> [NSObject] {
             guard depth < 40, let node = object as? NSObject, seen.insert(ObjectIdentifier(node)).inserted else { return [] }
@@ -49,8 +49,8 @@ import XCTest
                 return node.perform(selector)?.takeUnretainedValue()
             }
             var children = ["accessibilityChildren", "accessibilityRows", "accessibilityContents"].flatMap { (attribute($0) as? [Any]) ?? [] }
-            if let view = node as? NSView { children += view.subviews }
-            if let window = node as? NSWindow, let view = window.contentView { children.append(view) }
+            if includingNativeViews, let view = node as? NSView { children += view.subviews }
+            if includingNativeViews, let window = node as? NSWindow, let view = window.contentView { children.append(view) }
             return [node] + children.flatMap { walk($0, depth: depth + 1) }
         }
         return walk(object, depth: 0)
@@ -66,8 +66,8 @@ import XCTest
         }
     }
 
-    private func identified(_ id: String, in window: NSWindow) -> [NSObject] {
-        nodes(window).filter { node in
+    private func identified(_ id: String, in window: NSWindow, accessibilityOnly: Bool = false) -> [NSObject] {
+        nodes(window, includingNativeViews: !accessibilityOnly).filter { node in
             let selector = NSSelectorFromString("accessibilityIdentifier")
             return node.responds(to: selector) && node.perform(selector)?.takeUnretainedValue() as? String == id
         }
@@ -81,6 +81,24 @@ import XCTest
         await fulfillment(of: [found], timeout: 5)
         XCTAssertTrue(identified(identifier, in: window).contains { labels($0).contains { $0.contains(text) } },
                       "missing scoped accessibility text: " + identifier + " / " + text, file: file, line: line)
+    }
+
+    private func assertElementLabel(_ text: String, identifier: String, in window: NSWindow,
+                                    file: StaticString = #filePath, line: UInt = #line) async {
+        // Match XCUITest: one element with this identifier, and its own label.
+        // Only the public accessibility tree is searched, without native view
+        // subviews. Descendants, values and titles cannot supply the label.
+        func matches() -> Bool {
+            let elements = identified(identifier, in: window, accessibilityOnly: true)
+            guard elements.count == 1, let element = elements.first else { return false }
+            let selector = NSSelectorFromString("accessibilityLabel")
+            return element.responds(to: selector) && element.perform(selector)?.takeUnretainedValue() as? String == text
+        }
+        let found = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            MainActor.assumeIsolated { matches() }
+        }, object: nil)
+        await fulfillment(of: [found], timeout: 5)
+        XCTAssertTrue(matches(), "missing exact element label: " + identifier + " / " + text, file: file, line: line)
     }
 
     private func assertDisabled(_ title: String, in window: NSWindow, file: StaticString = #filePath, line: UInt = #line) {
@@ -325,18 +343,18 @@ import XCTest
         await assertVisible("Devices · M5", in: window)
         await assertVisible("Leak checks arrive with envcloak doctor", in: window)
         window.close()
-        for route in [Route.approvals, .activity, .agents, .keys(.exposed), .later(.spend), .later(.devices), .later(.dashboard)] {
+        for (route, expected) in [
+            (Route.approvals, "Approvals. Arrives with Touch ID approvals"),
+            (.activity, "Activity. Arrives with Touch ID approvals"),
+            (.agents, "Agents. Arrives with Touch ID approvals"),
+            (.keys(.exposed), "Keys. Leak checks arrive with envcloak doctor"),
+            (.later(.spend), "Spend. Spend arrives in M4"),
+            (.later(.devices), "Devices. Devices arrive in M5"),
+            (.later(.dashboard), "Dashboard. Spend arrives in M4"),
+        ] {
             let detail = host(MainView(session: session, initialRoute: route))
-            await assertScoped(route.title, identifier: "feature.unavailable", in: detail)
-            // Fixed expected copy is independent of Route.unavailableMessage.
-            let message: String
-            switch route {
-            case .keys: message = "Leak checks arrive with envcloak doctor"
-            case .later(.spend), .later(.dashboard): message = "Spend arrives in M4"
-            case .later(.devices): message = "Devices arrive in M5"
-            default: message = "Arrives with Touch ID approvals"
-            }
-            await assertScoped(message, identifier: "feature.unavailable", in: detail)
+            // Fixed expected labels are independent of Route's implementation.
+            await assertElementLabel(expected, identifier: "feature.unavailable", in: detail)
             detail.close()
         }
     }

@@ -133,7 +133,10 @@ struct MainView: View {
 
     @ViewBuilder private var detail: some View {
         if let message = route?.unavailableMessage {
-            ContentUnavailableView(route?.title ?? "Unavailable", systemImage: "clock", description: Text(message))
+            let title = route?.title ?? "Unavailable"
+            ContentUnavailableView(title, systemImage: "clock", description: Text(message))
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(Text(title + ". " + message))
                 .accessibilityIdentifier("feature.unavailable")
         } else {
             switch route ?? .projects {
