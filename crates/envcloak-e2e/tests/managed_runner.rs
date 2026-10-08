@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use envcloak_e2e::{python3, sha256_hex, text};
 use managed_common::{
-    KEY, World, appears, error_of, helper_main, pending_id, receipt_identity, report, report_at,
-    reported_identity, started,
+    KEY, World, appears, children_of, error_of, helper_main, pending_id, receipt_identity, report,
+    report_at, reported_identity, started,
 };
 use serde_json::{Value, json};
 
@@ -944,23 +944,44 @@ fn a_runner_whose_start_fails_leaves_no_process() {
     let answer = w.request(&launch);
     assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
     w.assert_released(0, 0, "nothing was released");
-    let daemon = i64::from(w.h.daemon.pid());
-    let ps = std::process::Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-        .unwrap();
-    let left: Vec<String> = String::from_utf8_lossy(&ps.stdout)
-        .lines()
-        .filter(|l| {
-            l.split_whitespace()
-                .nth(1)
-                .and_then(|p| p.parse::<i64>().ok())
-                == Some(daemon)
-        })
-        .map(str::to_owned)
-        .collect();
+    let left = children_of(w.h.daemon.pid());
     assert!(left.is_empty(), "the daemon left children: {left:?}");
     assert!(!w.marker.exists());
+}
+
+/// The process table the cleanup tests read cannot pass for an empty one
+/// (Codex review of M2-27): a failed `ps`, an empty listing and every
+/// malformed row are errors, and a well-formed listing is the control.
+///
+/// Mutation checked: the previous reading (exit status ignored, rows that
+/// did not parse dropped): the failed and malformed listings read as no
+/// children, and this fails.
+#[test]
+fn a_process_table_that_cannot_be_read_is_never_empty() {
+    use managed_common::parse_process_pairs as parse;
+    assert_eq!(parse(true, b" 1 0\n 42 1\n"), Ok(vec![(1, 0), (42, 1)]));
+    assert!(parse(false, b" 1 0\n").is_err(), "a failed ps");
+    assert!(parse(true, b"").is_err(), "an empty listing");
+    for bad in [
+        &b" 1\n"[..],
+        b" 1 x\n",
+        b" 1 0 7\n",
+        b"PID PPID\n 1 0\n",
+        b"\xff 1\n",
+    ] {
+        assert!(
+            parse(true, bad).is_err(),
+            "{:?}",
+            String::from_utf8_lossy(bad)
+        );
+    }
+    // The live table: readable, and holding this process under its parent.
+    let me = i32::try_from(std::process::id()).unwrap();
+    assert!(
+        managed_common::process_parents()
+            .iter()
+            .any(|(pid, _)| *pid == me)
+    );
 }
 
 /// macOS (D-36, Codex review of M2-27): a daemon that cannot read its own

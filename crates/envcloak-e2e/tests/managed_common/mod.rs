@@ -164,28 +164,66 @@ fn ask(
     }
 }
 
-/// Kernel observations only, never signal targets. A failed or malformed
-/// process listing cannot stand in for an empty server group.
-pub fn process_groups() -> Vec<(i32, i32)> {
+/// Parses a `ps -A -o pid=,<field>=` listing: each row exactly two
+/// integers. A failed `ps`, an empty listing or any row that is not two
+/// integers is an error, never an empty or a shortened table (Codex
+/// review of M2-27: a listing that failed read as "no process left").
+pub fn parse_process_pairs(succeeded: bool, stdout: &[u8]) -> Result<Vec<(i32, i32)>, String> {
+    if !succeeded {
+        return Err("ps failed".into());
+    }
+    let text = std::str::from_utf8(stdout).map_err(|_| "ps printed non-UTF-8".to_owned())?;
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let mut next = || -> Result<i32, String> {
+            fields
+                .next()
+                .ok_or_else(|| format!("short row {line:?}"))?
+                .parse()
+                .map_err(|_| format!("bad row {line:?}"))
+        };
+        let row = (next()?, next()?);
+        if fields.next().is_some() {
+            return Err(format!("long row {line:?}"));
+        }
+        rows.push(row);
+    }
+    if rows.is_empty() {
+        return Err("ps listed no process".into());
+    }
+    Ok(rows)
+}
+
+/// Kernel observations only, never signal targets: `(pid, <field>)` for
+/// every process. A failed or malformed process listing cannot stand in
+/// for an empty one.
+fn process_pairs(field: &str) -> Vec<(i32, i32)> {
     let ps = std::process::Command::new("/bin/ps")
         .env_clear()
-        .args(["-A", "-o", "pid=,pgid="])
+        .args(["-A", "-o", &format!("pid=,{field}=")])
         .output()
         .unwrap();
-    assert!(ps.status.success(), "cannot read the process groups");
-    let rows: Vec<_> = String::from_utf8(ps.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next().unwrap().parse().unwrap();
-            let group = fields.next().unwrap().parse().unwrap();
-            assert!(fields.next().is_none());
-            (pid, group)
-        })
-        .collect();
-    assert!(!rows.is_empty(), "the kernel returned no processes");
-    rows
+    parse_process_pairs(ps.status.success(), &ps.stdout)
+        .unwrap_or_else(|e| panic!("cannot read the process table: {e}"))
+}
+
+/// `(pid, process group)` for every process.
+pub fn process_groups() -> Vec<(i32, i32)> {
+    process_pairs("pgid")
+}
+
+/// `(pid, parent pid)` for every process.
+pub fn process_parents() -> Vec<(i32, i32)> {
+    process_pairs("ppid")
+}
+
+/// The children of `parent`, by the kernel's process table.
+pub fn children_of(parent: i32) -> Vec<i32> {
+    process_parents()
+        .into_iter()
+        .filter_map(|(pid, ppid)| (ppid == parent).then_some(pid))
+        .collect()
 }
 
 fn wait_group_exit(group: i32) {
