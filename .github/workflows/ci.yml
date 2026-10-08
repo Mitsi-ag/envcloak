@@ -827,6 +827,10 @@ jobs:
         run: python3 scripts/macos/tests/test_swift_literal_values.py
       - name: Workspace wire and test environment contracts
         run: python3 scripts/macos/tests/test_workspace_contracts.py
+      - name: EU-1 install restart and sweep controls
+        run: |
+          python3 scripts/macos/tests/test_build_restart.py
+          python3 scripts/macos/tests/test_sweep.py
       - name: The project's resolved settings
         run: python3 scripts/macos/tests/test_project_settings.py
       - name: sign-check's fixtures (gate 19 for the bundle)
@@ -890,9 +894,14 @@ jobs:
           TEST_RUNNER_ENVCLOAK_TEST_CLI="$RUNNER_TEMP/Applications/EnvCloak.app/Contents/MacOS/envcloak" \
           xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloak -destination 'platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/dd-debug" "SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS" SWIFT_SUPPRESS_WARNINGS=NO SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test
+      - name: EU-1 native control, real daemon and independent sweep
+        run: python3 scripts/macos/tests/run_workspace.py --eu1 --package
       - name: The app's UI tests (main, nightly and manual)
         if: github.event_name != 'pull_request'
         run: python3 scripts/macos/tests/run_workspace.py
+      - name: EU-1 paste, bindings, exact undo and canary sweep (main, nightly and manual)
+        if: github.event_name != 'pull_request'
+        run: python3 scripts/macos/tests/run_workspace.py --eu1
       - name: Compiled Swift sources are the scanned sources
         run: |
           for dd in "$RUNNER_TEMP"/dd-*; do

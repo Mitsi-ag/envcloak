@@ -1263,7 +1263,7 @@ def classify(rel):
         return "test"
     if len(parts) >= 5 and parts[2] == "Packages" and parts[4] == "Tests":
         return "test"
-    if len(parts) == 5 and parts[2] == "Packages" and parts[4] == "Package.swift":
+    if rel == APP + "/Package.swift" or (len(parts) == 5 and parts[2] == "Packages" and parts[4] == "Package.swift"):
         return "manifest"
     return "stray"
 
