@@ -93,9 +93,9 @@ class Native(unittest.TestCase):
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
         return str(dest)
 
-    def daemon(self):
+    def daemon(self, extra=None):
         daemon = self.signed_copy(BINARY, "ai.envcloak.agent")
-        child = self.child([daemon, "--foreground"], {"ENVCLOAK_TEST_TRACE": "1"})
+        child = self.child([daemon, "--foreground"], {"ENVCLOAK_TEST_TRACE": "1"} | (extra or {}))
         # The daemon's own listen receipt is the startup barrier.
         log = b""
         while b"listening" not in log:
@@ -117,8 +117,49 @@ class Native(unittest.TestCase):
     def facts(self, name):
         return self.file_facts(FIXTURES / (name + "-peer"))
 
+    def barrier(self):
+        listener = socket.socket(socket.AF_UNIX)
+        listener.settimeout(30)
+        path = str(self.home / "barrier.sock")
+        listener.bind(path)
+        listener.listen(1)
+        self.addCleanup(listener.close)
+        return listener, {"ENVCLOAK_TEST_PEER_BARRIER": path}
+
+    def alternate_at_token(self, listener, peer):
+        # Both peers stay alive. A is recorded; B owns the verified token;
+        # A is restored for the final peer_unchanged read. No scheduling race.
+        for stage, user in [(b"before-token", b"B"), (b"after-token", b"A")]:
+            connection, _ = listener.accept()
+            with connection:
+                self.assertEqual(read_exact(connection, len(stage)), stage)
+                peer.stdin.write(user)
+                peer.stdin.flush()
+                self.assertEqual(read_exact(peer.stdout, 2), user + b"\n")
+                connection.sendall(b"\1")
+
 
 class App(Native):
+    def test_test_support_is_marked_in_both_rust_artifacts(self):
+        for binary in [BINARY, os.environ["ENVCLOAK_CLI_PROBE"]]:
+            self.assertIn(b"ENVCLOAK_TEST_CERT_SHA1", Path(binary).read_bytes())
+
+    def test_g4_alternating_descriptor_users(self):
+        listener, extra = self.barrier()
+        self.daemon(extra)
+        peer = self.child([str(FIXTURES / "unsigned-peer"), "alternate-client", self.socket,
+                           str(FIXTURES / "genuine-peer")])
+        self.assertEqual(read_exact(peer.stdout, 7), b"SHARED\n")
+        peer.stdin.write(b"W")
+        send(peer)
+        self.alternate_at_token(listener, peer)
+        peer.stdin.write(b"R")
+        peer.stdin.flush()
+        self.assertEqual(response(peer)["error"]["data"]["kind"], "role_denied")
+        peer.stdin.write(b"Q")
+        peer.stdin.flush()
+        self.assertEqual(peer.wait(timeout=10), 0)
+
     def test_cli_status_uses_verified_connection(self):
         self.daemon()
         cli = self.child([os.environ["ENVCLOAK_CLI_PROBE"], "status", "--json"])
@@ -272,6 +313,56 @@ class App(Native):
 
 
 class Client(Native):
+    def test_late_identity_loss_reports_uncertain_delivery(self):
+        self.late_identity_loss(False)
+
+    def test_late_identity_loss_on_truncated_response(self):
+        self.late_identity_loss(True)
+
+    def late_identity_loss(self, truncated):
+        daemon = self.signed_copy(FIXTURES / "base", "ai.envcloak.agent")
+        server = self.child([daemon, "alternate-server", self.socket, str(FIXTURES / "unsigned-peer")])
+        self.assertEqual(read_exact(server.stdout, 6), b"READY\n")
+        probe = self.child([BINARY, str(self.run_dir)])
+        self.assertEqual(read_exact(server.stdout, 7), b"SHARED\n")
+        self.assertEqual(read_exact(probe.stdout, 9), b"verified\n")
+        # Read the actual request before asking unsigned B to send the response.
+        server.stdin.write(b"R")
+        server.stdin.flush()
+        self.assertEqual(response(server)["method"], "status")
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "error": {"code": -32601,
+                             "message": "method not found", "data": {"kind": "method_not_found"}}}).encode()
+        server.stdin.write(b"E" if truncated else b"D" + struct.pack("!I", len(payload)) + payload)
+        server.stdin.flush()
+        self.assertEqual(read_exact(server.stdout, 2), b"B\n")
+        out, err = probe.communicate(timeout=30)
+        self.assertEqual((probe.returncode, err), (124, b""), out)
+        self.assertIn(b"UnverifiedAfterSend", out)
+        self.assertIn(b"delivery is uncertain", out)
+        self.assertNotIn(b"nothing was sent", out)
+        server.stdin.write(b"Q")
+        server.stdin.flush()
+        self.assertEqual(server.wait(timeout=10), 0)
+
+    def test_g1_alternating_descriptor_users_send_nothing(self):
+        listener, extra = self.barrier()
+        signed = self.signed_copy(FIXTURES / "base", "ai.envcloak.agent")
+        server = self.child([str(FIXTURES / "unsigned-peer"), "alternate-server", self.socket, signed])
+        self.assertEqual(read_exact(server.stdout, 6), b"READY\n")
+        probe = self.child([BINARY, str(self.run_dir)], extra)
+        self.assertEqual(read_exact(server.stdout, 7), b"SHARED\n")
+        self.alternate_at_token(listener, server)
+        # Read any delivered request, then close the server side. This also
+        # releases a wrongly admitted probe, so the mutation fails on bytes
+        # received rather than timing out waiting for a response.
+        server.stdin.write(b"CQ")
+        server.stdin.flush()
+        server_out, server_err = server.communicate(timeout=30)
+        out, err = probe.communicate(timeout=30)
+        self.assertEqual(server.returncode, 0, server_err)
+        self.assertEqual((probe.returncode, int(server_out), err), (125, 0, b""), out)
+        self.assertIn(b"CodeIdentity", out)
+
     def test_g1_client_before_send(self):
         for foreign in [False, True]:
             with self.subTest(foreign=foreign):
@@ -292,7 +383,7 @@ class Client(Native):
                     self.assertEqual(count, 0)
                 else:
                     self.assertEqual(probe.returncode, 124, out)
-                    self.assertEqual(out, b"verified\n")
+                    self.assertTrue(out.startswith(b"verified\n"), out)
                     self.assertGreater(count, 4)
 
 

@@ -14,7 +14,7 @@ pub(crate) fn verified(stream: &UnixStream, peer: &PeerIdentity) -> bool {
         return false;
     };
     matches!(
-        peer_code::peer_satisfies(&token, &pin),
+        peer_code::peer_satisfies(&token, peer, &pin),
         Ok(CodeVerdict::Satisfies)
     ) && envcloak_sys::peer_unchanged(stream.as_fd(), peer).unwrap_or(false)
 }

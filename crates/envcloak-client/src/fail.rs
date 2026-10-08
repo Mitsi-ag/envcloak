@@ -77,7 +77,9 @@ impl From<ClientError> for Failure {
             ClientError::Unavailable => {
                 format!("the EnvCloak daemon is not running; {START_DAEMON}").into()
             }
-            ClientError::Unverified(u) => format!("{}; nothing was sent to it", u.message()).into(),
+            ClientError::Unverified(u) => {
+                format!("{}; this request was not sent", u.message()).into()
+            }
             ClientError::Rpc(r) => match r.reason {
                 Some(reason) => {
                     format!("{} ({})", r.kind.message(), reason_text_for(r.kind, reason)).into()
@@ -347,6 +349,20 @@ mod tests {
     use super::*;
     use envcloak_ipc::proto::REASONS;
     use envcloak_policy::DenyReason;
+
+    #[test]
+    fn identity_failure_words_distinguish_delivery_uncertainty() {
+        let before = Failure::from(ClientError::Unverified(
+            envcloak_ipc::Unverified::CodeIdentity,
+        ));
+        let after = Failure::from(ClientError::UnverifiedAfterSend);
+        assert_eq!(before.token(), "daemon_unverified");
+        assert_eq!(after.token(), "daemon_unverified");
+        assert!(before.message().contains("this request was not sent"));
+        assert!(after.message().contains("delivery is uncertain"));
+        assert!(!after.message().contains("not sent"));
+        assert!(!after.message().contains("nothing was sent"));
+    }
 
     /// A backup v2 over its caps says which caps; `too_large` elsewhere
     /// keeps the manifest's words.

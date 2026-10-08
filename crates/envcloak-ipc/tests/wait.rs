@@ -817,6 +817,7 @@ fn a_call_the_daemon_did_not_take_is_asked_again_until_the_deadline() {
     // never asked again, before an answer or after.
     for e in [
         ClientError::Unverified(envcloak_ipc::Unverified::ForeignServer),
+        ClientError::UnverifiedAfterSend,
         ClientError::Frame(FrameError::Truncated),
         ClientError::Protocol,
     ] {
