@@ -111,6 +111,21 @@ fn a_clean_fixture_passes() {
     assert_passes(&ws);
 }
 
+#[test]
+fn build_script_sources_are_scanned_in_both_profiles() {
+    let (_t, ws) = fixture("pub fn f() {}\n");
+    write(&ws, "crates/core/build.rs", "fn main() {}\n");
+    assert_passes(&ws);
+    // Reading generated data is subject to the same source boundary as a
+    // library. Do not skip custom-build artifacts just to accept build.rs.
+    write(
+        &ws,
+        "crates/core/build.rs",
+        "fn main() { let _ = include_str!(\"src/opener.txt\"); }\n",
+    );
+    assert_fails(&ws, OPENER);
+}
+
 /// The reviewer's bypasses of check-unsafe.sh, and a spelling with no `=`
 /// at all, which no text check can tell from an ordinary macro call.
 #[test]

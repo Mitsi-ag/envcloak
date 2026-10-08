@@ -211,9 +211,18 @@ def dep_info(path):
     return read
 
 
-def dep_info_file(filenames):
+def dep_info_file(filenames, kinds):
     """rustc writes deps/<stem>.d beside deps/lib<stem>.rmeta."""
     for name in filenames:
+        # Cargo reports build-script-build, but rustc writes the dep-info
+        # beside its original hashed executable in this same unit directory.
+        if "custom-build" in kinds and os.path.basename(name) == "build-script-build":
+            directory = os.path.dirname(name)
+            suffix = os.path.basename(directory).rsplit("-", 1)[-1]
+            if re.fullmatch(r"[0-9a-f]{16}", suffix):
+                candidate = os.path.join(directory, "build_script_build-" + suffix + ".d")
+                if os.path.isfile(candidate):
+                    return candidate
         base, _ = os.path.splitext(os.path.basename(name))
         for stem in (base[3:] if base.startswith("lib") else None, base):
             if stem:
@@ -253,7 +262,7 @@ for label, args in RUNS:
             continue
         units += 1
         unit = "%s (%s %s, %s)" % (target["name"], "/".join(target["kind"]), "test" if m["profile"]["test"] else "build", label)
-        d = dep_info_file(m.get("filenames") or [])
+        d = dep_info_file(m.get("filenames") or [], target["kind"])
         if d is None:
             fail("%s: rustc wrote no dep-info file, so its sources cannot be checked" % unit)
             continue

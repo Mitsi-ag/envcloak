@@ -268,6 +268,7 @@ Prints "check-reservations: ok" and exits 0, or names every problem on
 stderr and exits 1.
 """
 
+import hashlib
 import os
 import re
 import stat
@@ -373,6 +374,21 @@ COMPILE_TIME = re.compile(
 # The variables Cargo sets from a package's manifest, none of which can
 # hold a line of text (a version, a path, a package or crate name).
 CARGO_ENV = {"CARGO_PKG_VERSION", "CARGO_MANIFEST_DIR", "CARGO_PKG_NAME", "CARGO_CRATE_NAME", "CARGO_BIN_NAME"}
+
+
+def reviewed_test_pin(root):
+    """Only the reviewed build script can supply the bounded public test hash.
+
+    It emits either empty text or 40 hex digits, never a statement domain.
+    This is still an unknown value to the exit-token producer reader.
+    """
+    try:
+        with open(os.path.join(root, "crates/envcloak-sys/build.rs"), "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        with open(os.path.join(root, "security/sys-build-script.sha256")) as f:
+            return f.read().strip() == digest
+    except OSError:
+        return False
 # The ones that name the package, the crate or the binary.
 CARGO_NAMES = {"CARGO_PKG_NAME", "CARGO_CRATE_NAME", "CARGO_BIN_NAME"}
 FLOAT = re.compile(r"(-?)\s*([0-9][0-9_]*\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?|[0-9][0-9_]*[eE][+-]?[0-9_]+)(?:f32|f64)?")
@@ -540,7 +556,11 @@ class Source:
                 parts = self.split_top(open_at + 1, close)
                 var = self.only_string(parts[0][0], parts[0][1]) if parts else None
                 self.env_vars[m.start()] = var if len(parts) <= 2 else None
-                if var not in CARGO_ENV or len(parts) > 2:
+                if (self.rel == "crates/envcloak-sys/src/peer_code/pins.rs"
+                        and name == "env" and len(parts) == 1
+                        and var == "ENVCLOAK_COMPILED_TEST_CERT"):
+                    self.unreadable.append((m.start(), "test_pin", "unreviewed build-time test certificate input"))
+                elif var not in CARGO_ENV or len(parts) > 2:
                     self.unreadable.append((m.start(), "env", "`%s!` of a variable other than Cargo's own package variables (%s): its text comes from the build's environment, which the reader cannot see" % (name, ", ".join(sorted(CARGO_ENV)))))
         values = {}
 
@@ -2184,7 +2204,9 @@ def check_compile_time(root, sources):
     environment variable for `env!`, and a manifest that quiets the
     naming lints."""
     for src in sources:
-        for at, _, why in src.unreadable:
+        for at, kind, why in src.unreadable:
+            if kind == "test_pin" and reviewed_test_pin(root):
+                continue
             raise SourceError("%s line %d: %s" % (src.rel, src.skel.count("\n", 0, at) + 1, why))
         refuse_path_attributes(src)
         for m in LINT_OVERRIDE.finditer(src.skel):
@@ -2212,7 +2234,7 @@ def check_compile_time(root, sources):
         script = m.group(1) if m else "build.rs"
         if os.path.exists(os.path.join(base, name, script)):
             text = read(root, "%s/%s/%s" % (CRATES, name, script))
-            if "rustc-env" in text:
+            if "rustc-env" in text and not (name == "envcloak-sys" and script == "build.rs" and reviewed_test_pin(root)):
                 raise SourceError("%s/%s/%s sets an environment variable for `env!` (`rustc-env`), whose text the reader cannot see" % (CRATES, name, script))
 
 
@@ -3088,6 +3110,8 @@ def code_statement_domains(root):
         refuse_path_attributes(src)
         for at, kind, why in src.unreadable:
             line = "%s line %d" % (rel, src.skel.count("\n", 0, at) + 1)
+            if kind == "test_pin" and reviewed_test_pin(root):
+                continue
             if kind == "include_text":
                 # Text brought in from another file: read too, as text.
                 for text in included_text(root, src, at, line):
