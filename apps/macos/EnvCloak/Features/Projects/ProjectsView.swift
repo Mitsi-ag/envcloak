@@ -33,7 +33,7 @@ struct ProjectsOverview: View {
                     }.buttonStyle(.plain).accessibilityIdentifier("project.open." + directory.escaped)
                         .dropDestination(for: String.self) { slugs, _ in
                             guard session.state == .ready, slugs.count == 1,
-                                  let key = session.items.rows.first(where: { $0.slug.escaped == slugs[0] }) else { return false }
+                                  let key = session.items.rows.first(where: { $0.slug.escaped == slugs[0] && $0.class == .secret }) else { return false }
                             bind(BindingSelection(project: directory, key: key)); return true
                         }
                 } else {

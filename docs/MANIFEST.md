@@ -182,7 +182,7 @@ uncertain attempt is refreshed and never offered as a successful undo.
 
 A rename followed by a failed parent sync can leave the edit visible without
 confirmed durability. No receipt is published on that path. Failure to deliver
-a receipt after a successful write reports `undo_unavailable` and says the
+a receipt after a successful write reports `io` and says the
 binding was saved, so callers must inspect rather than automatically retry.
 The stamp check and rename are not an atomic compare-and-swap against another
 program writing concurrently. These memory-only receipts provide no crash
