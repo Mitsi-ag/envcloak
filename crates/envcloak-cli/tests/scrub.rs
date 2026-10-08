@@ -176,9 +176,10 @@ fn gate37_scrub_catalog_backup_scope_and_restore() {
             envcloak_agents::locations::Locations::new(&|k| vars.get(k).cloned()).unwrap();
         std::fs::create_dir_all(locations.codex_home()).unwrap();
         let logs = home.root().join("moved-logs");
+        let log_setting = format!("{}//./", logs.display());
         std::fs::write(
             locations.codex_config(),
-            format!("log_dir = {:?}\n", logs.to_str().unwrap()),
+            format!("log_dir = {log_setting:?}\n"),
         )
         .unwrap();
         let mut sources = locations.transcript_sources();
