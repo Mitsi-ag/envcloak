@@ -9,7 +9,7 @@ if cargo check --locked --release -p envcloak-sys --features testing >"$log" 2>&
   echo 'peer release: FAILED (testing feature compiled in release)' >&2
   exit 1
 fi
-if ! rg -q 'EnvCloak testing features must not be compiled into release artifacts' "$log"; then
+if ! grep -F -q 'EnvCloak testing features must not be compiled into release artifacts' "$log"; then
   echo 'peer release: FAILED (unrelated compiler error)' >&2
   exit 1
 fi
