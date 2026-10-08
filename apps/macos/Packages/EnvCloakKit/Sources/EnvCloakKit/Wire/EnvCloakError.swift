@@ -1,7 +1,8 @@
 // Fixed tokens from envcloak-ipc/proto.rs. The Rust vectors check parity.
 public enum PeerCheck: String, Sendable {
     case directoryType, directoryOwner, directoryMode, parent, socketType, socketOwner
-    case socketMode, socketOptions, peerUID, path, changed, codeIdentity
+    case socketMode, socketOptions, peerUID, path, changed
+    case codeIdentity = "code_identity"
 }
 
 public enum EnvCloakError: Error, Equatable, Sendable, CustomStringConvertible, CustomDebugStringConvertible {
@@ -191,4 +192,5 @@ public enum Reason: String, CaseIterable, Sendable {
     case created_by_agent
     case substituted
     case limited
+    case code_identity
 }
