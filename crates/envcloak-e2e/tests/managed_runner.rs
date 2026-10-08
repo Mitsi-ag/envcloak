@@ -191,19 +191,62 @@ fn foreign_client_under(grant: &[&str]) {
 }
 
 /// The test library the injected-library control loads into the client
-/// (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS): at exit it
-/// writes every readable and writable region of the process's memory (its
-/// heap, stacks and data: where anything it received at run time is) to
-/// the file `EC_M27_DUMP` names.
+/// (`LD_PRELOAD` on Linux, `DYLD_INSERT_LIBRARIES` on macOS). At start it
+/// plants the read-only control: `EC_M27_RO_CONTROL` reversed, in a page
+/// it then makes read-only (the reversed text is nowhere else). At exit it
+/// writes every readable region of the process's memory, read-only ones
+/// too (Codex review of M2-27: a value kept in a read-only mapping is
+/// still in the client), to the file `EC_M27_DUMP` names. Each region is
+/// read through the system (`/proc/self/mem` on Linux,
+/// `mach_vm_read_overwrite` on macOS), so a part that cannot be read
+/// (a guard page, a mapping past its file's end) is skipped explicitly
+/// rather than faulting, and counted in `EC_M27_DUMP.skipped`. The one
+/// exclusion is a read-only region no page of which this process ever
+/// wrote: code and constants as their file holds them (macOS's shared
+/// system library cache alone is gigabytes), or address space reserved
+/// and never touched. Nothing the client receives can be there unwritten.
+/// A region is kept when it is writable, when any page of it was written
+/// (macOS: `pages_dirtied`; Linux: `Private_Dirty` in `smaps`) or swapped
+/// out, and on Linux when it maps no file (anonymous memory).
 const DUMPER: &str = r#"#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #endif
+static char ec_buf[65536];
+static unsigned long long ec_skipped;
+__attribute__((constructor)) static void ec_plant(void) {
+    const char *c = getenv("EC_M27_RO_CONTROL");
+    if (!c) return;
+    size_t n = strlen(c);
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0 || n >= (size_t)page) abort();
+    char *p = mmap(NULL, (size_t)page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) abort();
+    for (size_t i = 0; i < n; i++) p[i] = c[n - 1 - i];
+    if (mprotect(p, (size_t)page, PROT_READ) != 0) abort();
+}
+static void ec_region(int fd, int mem, unsigned long long a, unsigned long long b) {
+    for (unsigned long long p = a; p < b; p += sizeof ec_buf) {
+        unsigned long long n = b - p < sizeof ec_buf ? b - p : sizeof ec_buf;
+#ifdef __APPLE__
+        (void)mem;
+        mach_vm_size_t got = 0;
+        if (mach_vm_read_overwrite(mach_task_self(), p, n, (mach_vm_address_t)ec_buf, &got)
+                != KERN_SUCCESS) { ec_skipped += n; continue; }
+#else
+        if (p > (unsigned long long)0x7fffffffffffffffULL) { ec_skipped += n; continue; }
+        ssize_t got = pread(mem, ec_buf, n, (off_t)p);
+        if (got <= 0) { ec_skipped += n; continue; }
+#endif
+        if (write(fd, ec_buf, (size_t)got) < 0) return;
+    }
+}
 __attribute__((destructor)) static void ec_dump(void) {
     const char *out = getenv("EC_M27_DUMP");
     if (!out) return;
@@ -213,35 +256,49 @@ __attribute__((destructor)) static void ec_dump(void) {
     mach_vm_address_t addr = 0;
     for (;;) {
         mach_vm_size_t size = 0;
-        vm_region_basic_info_data_64_t info;
-        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        vm_region_extended_info_data_t info;
+        mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT;
         mach_port_t obj = MACH_PORT_NULL;
-        if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+        if (mach_vm_region(mach_task_self(), &addr, &size, VM_REGION_EXTENDED_INFO,
                            (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS) break;
-        if ((info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE)) {
-            for (mach_vm_size_t off = 0; off < size; off += 65536) {
-                mach_vm_size_t n = size - off < 65536 ? size - off : 65536;
-                if (write(fd, (const void *)(addr + off), n) < 0) break;
-            }
-        }
+        int written = (info.protection & VM_PROT_WRITE) || info.pages_dirtied > 0
+            || info.pages_swapped_out > 0;
+        if ((info.protection & VM_PROT_READ) && written) ec_region(fd, -1, addr, addr + size);
         addr += size;
     }
 #else
-    FILE *maps = fopen("/proc/self/maps", "r");
+    int mem = open("/proc/self/mem", O_RDONLY);
+    FILE *maps = fopen("/proc/self/smaps", "r");
     char line[1024];
-    while (maps && fgets(line, sizeof line, maps)) {
-        unsigned long a, b;
-        char perms[8];
-        if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3) continue;
-        if (perms[0] != 'r' || perms[1] != 'w' || strstr(line, "[vvar")) continue;
-        for (unsigned long p = a; p < b; p += 65536) {
-            unsigned long n = b - p < 65536 ? b - p : 65536;
-            if (write(fd, (const void *)p, n) < 0) break;
+    unsigned long long a = 0, b = 0, dirty = 0;
+    int have = 0, readable = 0, writable = 0, anonymous = 0;
+    for (;;) {
+        char *got = maps && mem >= 0 ? fgets(line, sizeof line, maps) : NULL;
+        unsigned long long x, y, off, inode;
+        char perms[8], dev[16];
+        int header = got && sscanf(line, "%llx-%llx %7s %llx %15s %llu", &x, &y, perms, &off, dev,
+                                   &inode) == 6;
+        if (!got || header) {
+            if (have && readable && (writable || anonymous || dirty > 0)) ec_region(fd, mem, a, b);
+            if (!got) break;
+            a = x; b = y; dirty = 0; have = 1;
+            readable = perms[0] == 'r';
+            writable = perms[1] == 'w';
+            anonymous = inode == 0;
+            continue;
         }
+        unsigned long long kb;
+        if (sscanf(line, "Private_Dirty: %llu", &kb) == 1 || sscanf(line, "Swap: %llu", &kb) == 1)
+            dirty += kb;
     }
     if (maps) fclose(maps);
+    if (mem >= 0) close(mem);
 #endif
     close(fd);
+    char path[4096];
+    snprintf(path, sizeof path, "%s.skipped", out);
+    FILE *s = fopen(path, "w");
+    if (s) { fprintf(s, "%llu\n", ec_skipped); fclose(s); }
 }
 "#;
 
@@ -274,11 +331,14 @@ fn dumper(dir: &Path) -> PathBuf {
 /// `DYLD_INSERT_LIBRARIES` on macOS), which writes all of its readable
 /// memory to a file at exit, asks for the launch and is answered
 /// `started`; the dump holds the client's own positive control (a marker
-/// it kept in memory) and no encoding of the key.
+/// it kept in memory), the read-only control (a marker the library put in
+/// a read-only page) and no encoding of the key.
 ///
-/// Mutation checked: the runner writing the server's environment to its
+/// Mutations checked: the runner writing the server's environment to its
 /// client's output before starting the server: the dump holds the key, and
-/// this fails at its sweep (checked before the answer is).
+/// this fails at its sweep (checked before the answer is); the library
+/// dumping only readable and writable regions (the previous rule): the
+/// read-only control is not in the dump, and this fails.
 #[test]
 fn an_injected_library_finds_no_value_in_the_client() {
     let mut w = World::new(&[]);
@@ -287,7 +347,14 @@ fn an_injected_library_finds_no_value_in_the_client() {
     let first = w.request(&launch);
     w.approve(&pending_id(&first));
     let control = format!("ec-m27-control-{:016x}", envcloak_testkit::fresh_seed());
-    let dump = w.h.files().join("client.dump");
+    let read_only = format!("ec-m27-read-only-{:016x}", envcloak_testkit::fresh_seed());
+    // Large (every readable region): kept beside the build, not in the
+    // short-path home.
+    let dumps = tempfile::Builder::new()
+        .prefix("ecd")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dump = dumps.path().join("client.dump");
     let (input, output) = w.io_paths();
     std::fs::write(
         &input,
@@ -304,10 +371,11 @@ fn an_injected_library_finds_no_value_in_the_client() {
     let me = std::env::current_exe().unwrap();
     let q = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
     let line = format!(
-        "{preload}={} EC_M27_DUMP={} {}=request {}={} {}={} {} --exact helper --nocapture \
-         --test-threads 1",
+        "{preload}={} EC_M27_DUMP={} EC_M27_RO_CONTROL={} {}=request {}={} {}={} {} --exact \
+         helper --nocapture --test-threads 1",
         q(&lib),
         q(&dump),
+        read_only,
         managed_common::HELPER,
         managed_common::HELPER_IN,
         q(&input),
@@ -330,6 +398,21 @@ fn an_injected_library_finds_no_value_in_the_client() {
         held,
         "the dump does not hold the client's own control ({} bytes)",
         bytes.len()
+    );
+    // The read-only control: only the read-only page holds it reversed.
+    let reversed: Vec<u8> = read_only.bytes().rev().collect();
+    assert!(
+        bytes
+            .windows(reversed.len())
+            .any(|w| w == reversed.as_slice()),
+        "the dump does not hold the read-only control ({} bytes)",
+        bytes.len()
+    );
+    let skipped = std::fs::read_to_string(dump.with_extension("dump.skipped")).unwrap();
+    eprintln!(
+        "injected dump: {} bytes, {} unreadable skipped",
+        bytes.len(),
+        skipped.trim()
     );
     w.h.assert_clean("the client's memory", &bytes);
     let answer = w.read_out(&output, "the injected client's");
@@ -644,10 +727,13 @@ fn a_runner_not_started_by_the_daemon_receives_nothing() {
 
 /// `runner_unavailable` with nothing released (D-36): the daemon unable to
 /// start its runner answers so after the approval, and the fixture never
-/// starts.
+/// starts. The sealed log has the refusal under the grant that covered the
+/// request, and no delivery (`covered`) entry: nothing was released.
 ///
-/// Mutation checked: the runner's failed start answered `started` (the
-/// error dropped): this fails.
+/// Mutations checked: the runner's failed start answered `started` (the
+/// error dropped): this fails; the audit of the failed start removed
+/// (only the error returned): the log has no `runner_unavailable` entry,
+/// and this fails.
 #[test]
 fn a_runner_that_cannot_start_releases_nothing() {
     if managed_common::release_run("a_runner_that_cannot_start_releases_nothing") {
@@ -661,6 +747,16 @@ fn a_runner_that_cannot_start_releases_nothing() {
     assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
     w.assert_released(0, 0, "nothing was released");
     assert!(!w.marker.exists());
+    let runs = sealed_runs(&mut w);
+    assert!(
+        runs.iter()
+            .any(|(o, g)| o == "runner_unavailable" && g.is_some()),
+        "the failed start is not audited: {runs:?}"
+    );
+    assert!(
+        runs.iter().all(|(o, _)| o != "covered"),
+        "a delivery was recorded: {runs:?}"
+    );
 }
 
 /// A delivery whose values never reach the runner (the write to it
@@ -685,6 +781,31 @@ fn a_release_that_fails_after_delivery_is_audited() {
     assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
     w.assert_released(0, 0, "nothing reached the runner");
     assert!(!w.marker.exists());
+    assert_audited_after_delivery(&mut w, "runner_unavailable");
+}
+
+/// Stops the daemon, reads the sealed log with the vault's key, and
+/// requires a `covered` entry (the delivery: the positive control) with
+/// an `outcome` entry after it under the same grant.
+fn assert_audited_after_delivery(w: &mut World, outcome: &str) {
+    let runs = sealed_runs(w);
+    let covered = runs
+        .iter()
+        .position(|(o, _)| o == "covered")
+        .unwrap_or_else(|| panic!("no delivery entry: {runs:?}"));
+    let grant = runs[covered].1.clone();
+    assert!(grant.is_some(), "{runs:?}");
+    assert!(
+        runs[covered + 1..]
+            .iter()
+            .any(|(o, g)| o == outcome && *g == grant),
+        "the failure is not audited after its delivery: {runs:?}"
+    );
+}
+
+/// Stops the daemon and reads the `run` entries of its sealed log with
+/// the vault's key: each entry's outcome and grant.
+fn sealed_runs(w: &mut World) -> Vec<(String, Option<String>)> {
     let _ = w.h.stop_daemon();
     let pass = envcloak_core::SecretBytes::copy_from(
         w.h.value(envcloak_testkit::labels::VAULT_PASSPHRASE),
@@ -698,23 +819,82 @@ fn a_release_that_fails_after_delivery_is_audited() {
     .unwrap();
     let (entries, _) = vault.read_audit().unwrap();
     drop(vault);
-    let runs: Vec<_> = entries
+    let runs: Vec<(String, Option<String>)> = entries
         .iter()
         .filter(|e| e.record.kind == envcloak_core::audit::AuditKind::Run)
         .map(|e| (e.record.decision.outcome.clone(), e.record.grant_id.clone()))
         .collect();
-    let covered = runs
-        .iter()
-        .position(|(outcome, _)| outcome == "covered")
-        .unwrap_or_else(|| panic!("no delivery entry: {runs:?}"));
-    let grant = runs[covered].1.clone();
-    assert!(grant.is_some(), "{runs:?}");
-    assert!(
-        runs[covered + 1..]
-            .iter()
-            .any(|(outcome, g)| outcome == "runner_unavailable" && *g == grant),
-        "the failed release is not audited after its delivery: {runs:?}"
+    runs
+}
+
+/// A delivery whose grant cannot then be used (a test build fails the
+/// use, `run.grant_consume`) is `internal` for a managed launch: nothing
+/// reaches the runner, the fixture never starts, and the sealed log has
+/// the `internal` entry after the delivery's `covered` one, under the
+/// same grant.
+///
+/// Mutation checked: the audit in `prepare_runner`'s failed grant use
+/// removed (only the error returned): the log ends at `covered`, and this
+/// fails.
+#[test]
+fn a_managed_grant_that_cannot_be_used_is_audited() {
+    if managed_common::release_run("a_managed_grant_that_cannot_be_used_is_audited") {
+        return;
+    }
+    let mut w = World::new(&[("ENVCLOAK_TEST_FAIL", "run.grant_consume")]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert_eq!(error_of(&answer), "internal", "{answer}");
+    w.assert_released(0, 0, "nothing was released");
+    assert!(!w.marker.exists());
+    assert_audited_after_delivery(&mut w, "internal");
+}
+
+/// As [`a_managed_grant_that_cannot_be_used_is_audited`], for the agent's
+/// own `envcloak run` of the same project (no record named): the run
+/// fails `internal`, its client gets no value, and the sealed log has the
+/// `internal` entry after the delivery under the same grant.
+///
+/// Mutation checked: the audit in `run_request`'s failed grant use removed
+/// (only the error returned): the log ends at `covered`, and this fails.
+#[test]
+fn an_unmanaged_grant_that_cannot_be_used_is_audited() {
+    if managed_common::release_run("an_unmanaged_grant_that_cannot_be_used_is_audited") {
+        return;
+    }
+    let mut w = World::new(&[("ENVCLOAK_TEST_FAIL", "run.grant_consume")]);
+    let home = w.h.home.home();
+    let manifest = w.project.join("envcloak.toml");
+    let manifest = manifest.to_str().unwrap();
+    let args = ["run", "--manifest", manifest, "--", "true"];
+    let first = w.h.agent(&home, &args);
+    assert_eq!(
+        envcloak_e2e::token(&first.stderr),
+        "approval_required",
+        "{}",
+        text(&first)
     );
+    let err = String::from_utf8_lossy(&first.stderr).into_owned();
+    let id = err
+        .split("request=")
+        .nth(1)
+        .and_then(|r| r.get(..8))
+        .unwrap_or_else(|| panic!("no request id: {err}"))
+        .to_owned();
+    w.approve(&id);
+    let again = w.h.agent(&home, &args);
+    assert!(!again.status.success(), "{}", text(&again));
+    assert_eq!(
+        envcloak_e2e::token(&again.stderr),
+        "internal",
+        "{}",
+        text(&again)
+    );
+    w.assert_released(0, 0, "nothing was released");
+    w.h.assert_swept("after the failed use");
+    assert_audited_after_delivery(&mut w, "internal");
 }
 
 /// macOS (D-34, D-36): the anchor's runner, started suspended, whose
