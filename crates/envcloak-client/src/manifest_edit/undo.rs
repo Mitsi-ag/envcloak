@@ -199,7 +199,7 @@ pub fn restore_ref(path: &Path, record: UndoRecord) -> Result<(), EditError> {
             if (dir.dev(), dir.ino()) != (record.device, record.inode) {
                 return Err(EditError::Changed);
             }
-            if text.as_bytes() != &*record.after {
+            if text.as_bytes() != record.after.as_slice() {
                 return Err(EditError::Changed);
             }
             let original = std::str::from_utf8(&record.before)
@@ -210,4 +210,40 @@ pub fn restore_ref(path: &Path, record: UndoRecord) -> Result<(), EditError> {
         || {},
         None,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_captures_writer_input_and_failed_writes_publish_none() {
+        let dir = tempfile::Builder::new()
+            .prefix("ecu-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join(MANIFEST_NAME);
+        let preview = "[project]\nname='fixture'\n[env]\nA='first'\n";
+        std::fs::write(&path, preview).unwrap();
+        // Independent bytes replace the UI's earlier observation before the
+        // real writer reads. Its receipt must preserve this later comment.
+        let actual = preview.replace("A='first'", "A = { ref='first' } # writer input");
+        std::fs::write(&path, &actual).unwrap();
+        let binding = Binding::parse_arg("A=second").unwrap();
+        let (_, record) = record_ref(&path, &binding, None).unwrap();
+        restore_ref(&path, record.unwrap()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), actual.as_bytes());
+        let mut record = None;
+        let conflict = b"[project]\nname='later edit'\n";
+        let result = edit_with_record(
+            &path,
+            &binding,
+            None,
+            || std::fs::write(&path, conflict).unwrap(),
+            Some(&mut record),
+        );
+        assert_eq!(result.unwrap_err(), EditError::Changed);
+        assert!(record.is_none());
+        assert_eq!(std::fs::read(&path).unwrap(), conflict);
+    }
 }
