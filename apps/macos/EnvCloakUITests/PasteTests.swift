@@ -21,6 +21,9 @@ final class PasteTests: XCTestCase {
             app.terminate()
         }
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 20))
+        for project in ["workspace-fixture", "billing-fixture"] {
+            try check(cli: cli, home: home, project: project, variable: "OPENAI_API_KEY", slug: nil)
+        }
         let canary = ["sk", "proj", UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")].joined(separator: "-")
         let board = NSPasteboard.general
         board.clearContents(); XCTAssertTrue(board.setString(canary + "\r\n", forType: .string))
