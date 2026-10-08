@@ -150,6 +150,16 @@ fn fail(reason: &'static str) -> Failure {
 }
 fn selected_sources(path: PathBuf, catalog: &[ConfigSource]) -> Vec<ConfigSource> {
     use std::os::unix::ffi::OsStrExt;
+    let normalize = |p: PathBuf| envcloak_scan::sources::system_path(&p).unwrap_or(p);
+    let path = normalize(path);
+    let catalog: Vec<_> = catalog
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.path = normalize(s.path);
+            s
+        })
+        .collect();
     let mut selected: Vec<_> = catalog
         .iter()
         .filter(|s| s.path.starts_with(&path))
