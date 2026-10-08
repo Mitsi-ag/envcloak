@@ -6,6 +6,20 @@ use envcloak_scan::scrub::{Match, plan, preview};
 use envcloak_scan::{FileStamp, source::ConfigFormat};
 use std::path::PathBuf;
 
+#[test]
+fn gate37_format_provenance_debug_never_discloses_paths() {
+    let canaries = envcloak_testkit::canaries(envcloak_testkit::fresh_seed());
+    let value = envcloak_testkit::by_label(&canaries, envcloak_testkit::labels::OPENAI_API_KEY);
+    let mut report = envcloak_scan::candidates::ScanReport::default();
+    report.transcript_formats.insert(
+        PathBuf::from("/fixture").join(value.as_str()),
+        ConfigFormat::Raw,
+    );
+    let shown = format!("{report:?}");
+    envcloak_testkit::assert_no_canary(shown.as_bytes(), &canaries);
+    assert!(shown.contains("transcript_formats: 1"));
+}
+
 fn candidate(id: u64, range: std::ops::Range<u64>, size: u64) -> Candidate {
     Candidate {
         id,
