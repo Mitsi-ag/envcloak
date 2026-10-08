@@ -410,12 +410,25 @@ mod imp {
                 fail(report_at, STAGE_SETUP, errno());
             }
         }
-        // 6. Nothing else stays open.
+        // 6. Nothing else stays open: below the report pipe, every number
+        //    that is not a target (an inherited descriptor without
+        //    close-on-exec under a sparse mapping: handing over only 7
+        //    leaves no 5 open, Codex review of M2-27), then everything
+        //    above what the start itself still needs.
         let keep_to = if descriptor >= 0 {
             program_at
         } else {
             report_at
         };
+        let mut fd: libc::c_int = 0;
+        while fd < report_at {
+            if !p.fds[..p.nfds].iter().any(|(_, t)| *t == fd) {
+                // SAFETY: close on a number this child owns or that is
+                // not open (EBADF, ignored); no memory effect.
+                unsafe { libc::close(fd) };
+            }
+            fd += 1;
+        }
         if let Err(e) = close_from(keep_to + 1) {
             fail(report_at, STAGE_SETUP, e);
         }
@@ -502,6 +515,23 @@ mod imp {
             // SAFETY: just created; nothing else owns it.
             moved.push(unsafe { OwnedFd::from_raw_fd(n) });
         }
+        // The directory too: a file action filling a target numbered as
+        // the directory's descriptor would otherwise replace it before
+        // the change of directory, which would then use the replacement
+        // (Codex review of M2-27).
+        let cwd = match s.cwd {
+            Some(c) => {
+                // SAFETY: F_DUPFD_CLOEXEC makes a new descriptor or fails.
+                let n =
+                    unsafe { libc::fcntl(c.as_raw_fd(), libc::F_DUPFD_CLOEXEC, MAX_TARGET_FD + 1) };
+                if n < 0 {
+                    return Err(SpawnError::Setup(io::Error::last_os_error()));
+                }
+                // SAFETY: just created; nothing else owns it.
+                Some(unsafe { OwnedFd::from_raw_fd(n) })
+            }
+            None => None,
+        };
         // SAFETY: both are plain data, initialized by their init calls
         // before use and destroyed by `Actions`'s drop.
         let mut a: Actions = unsafe { std::mem::zeroed() };
@@ -545,7 +575,7 @@ mod imp {
                     *t,
                 ))?;
             }
-            if let Some(cwd) = s.cwd {
+            if let Some(cwd) = &cwd {
                 check(posix_spawn_file_actions_addfchdir_np(
                     &mut a.actions,
                     cwd.as_raw_fd(),
@@ -566,6 +596,7 @@ mod imp {
             )
         };
         drop(moved);
+        drop(cwd);
         if rc != 0 {
             return Err(SpawnError::Exec(io::Error::from_raw_os_error(rc)));
         }
