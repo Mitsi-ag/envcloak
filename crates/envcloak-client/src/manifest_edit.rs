@@ -40,6 +40,9 @@ use toml_edit::{DocumentMut, Item, Table, TableLike, Value};
 
 use crate::fail::Failure;
 
+mod undo;
+pub use undo::{UndoRecord, record_ref, record_unset, restore_ref};
+
 /// What an edit did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefEdit {
@@ -311,20 +314,31 @@ pub fn edit_manifest_ref(
     binding: &Binding,
     profile: Option<&ProfileName>,
 ) -> Result<RefEdit, EditError> {
-    edit_with(path, binding, profile, || {})
+    edit_with_record(path, binding, profile, || {}, None)
 }
 
 /// [`edit_manifest_ref`], with `before_replace` run just before the
 /// manifest is looked at again (step 4), so a test can change it there.
+#[cfg(test)]
 fn edit_with(
     path: &Path,
     binding: &Binding,
     profile: Option<&ProfileName>,
     before_replace: impl FnOnce(),
 ) -> Result<RefEdit, EditError> {
+    edit_with_record(path, binding, profile, before_replace, None)
+}
+
+fn edit_with_record(
+    path: &Path,
+    binding: &Binding,
+    profile: Option<&ProfileName>,
+    before_replace: impl FnOnce(),
+    record: Option<&mut Option<UndoRecord>>,
+) -> Result<RefEdit, EditError> {
     edit_document(
         path,
-        |old, text| {
+        |old, text, _| {
             let (new_text, edit) = edited_text(text, binding, profile)?;
             if let Some(text) = &new_text {
                 check_edit(old, text, binding, profile)?;
@@ -332,6 +346,7 @@ fn edit_with(
             Ok((new_text, edit))
         },
         before_replace,
+        record,
     )
 }
 
@@ -342,18 +357,29 @@ pub fn unset_manifest_ref(
     name: &EnvName,
     profile: Option<&ProfileName>,
 ) -> Result<Reference, EditError> {
-    unset_with(path, name, profile, || {})
+    unset_with_record(path, name, profile, || {}, None)
 }
 
+#[cfg(test)]
 fn unset_with(
     path: &Path,
     name: &EnvName,
     profile: Option<&ProfileName>,
     before_replace: impl FnOnce(),
 ) -> Result<Reference, EditError> {
+    unset_with_record(path, name, profile, before_replace, None)
+}
+
+fn unset_with_record(
+    path: &Path,
+    name: &EnvName,
+    profile: Option<&ProfileName>,
+    before_replace: impl FnOnce(),
+    record: Option<&mut Option<UndoRecord>>,
+) -> Result<Reference, EditError> {
     edit_document(
         path,
-        |old, text| {
+        |old, text, _| {
             let mut expected = old.clone();
             let list = match profile {
                 None => &mut expected.env,
@@ -385,6 +411,7 @@ fn unset_with(
             Ok((Some(new_text), removed))
         },
         before_replace,
+        record,
     )
 }
 
@@ -464,8 +491,9 @@ fn separator(gap: &str) -> Option<usize> {
 
 fn edit_document<T>(
     path: &Path,
-    edit: impl FnOnce(&Manifest, &str) -> Result<(Option<String>, T), EditError>,
+    edit: impl FnOnce(&Manifest, &str, &std::fs::Metadata) -> Result<(Option<String>, T), EditError>,
     before_replace: impl FnOnce(),
+    record: Option<&mut Option<UndoRecord>>,
 ) -> Result<T, EditError> {
     let parent = path
         .parent()
@@ -494,7 +522,7 @@ fn edit_document<T>(
     let old = parse_manifest(&bytes).map_err(EditError::Manifest)?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| EditError::Manifest(envcloak_policy::ManifestErrorKind::NotUtf8.into()))?;
-    let (new_text, edit) = edit(&old, text)?;
+    let (new_text, edit) = edit(&old, text, &dir_stamp)?;
     let Some(new_text) = new_text else {
         return Ok(edit);
     };
@@ -515,7 +543,16 @@ fn edit_document<T>(
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
-    result.map(|()| edit)
+    result?;
+    if let Some(record) = record {
+        *record = Some(UndoRecord::new(
+            dir_stamp.dev(),
+            dir_stamp.ino(),
+            bytes,
+            new_text,
+        ));
+    }
+    Ok(edit)
 }
 
 /// A new name beside the manifest: `.envcloak.toml.<hex>.tmp`, from a
