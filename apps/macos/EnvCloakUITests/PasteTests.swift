@@ -17,7 +17,10 @@ final class PasteTests: XCTestCase {
             "ENVCLOAK_TEST_RUNTIME": runtime, "ENVCLOAK_TEST_CLI": cli, "ENVCLOAK_TEST_HOME": home]
         app.launch()
         addTeardownBlock { @MainActor in
-            if (self.testRun?.totalFailureCount ?? 0) > 0 { self.recordPasteState(app) }
+            if (self.testRun?.totalFailureCount ?? 0) > 0 {
+                self.recordPasteState(app)
+                self.recordBindingState(app, step: "teardown")
+            }
             app.terminate()
         }
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 20))
@@ -50,27 +53,35 @@ final class PasteTests: XCTestCase {
         app.buttons["binding.add"].click()
         try bind(app, project: "billing-fixture", variable: "OPENAI_API_KEY", key: "eu-one")
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: "eu-one")
-        // An ordinary add on an existing variable is the Change key operation.
-        app.buttons["binding.add"].click()
+        let changedRow = try bindingRow(app, variable: "OPENAI_API_KEY")
+        changedRow.rightClick()
+        let change = app.menuItems.matching(NSPredicate(format: "title == %@", "Change key…")).firstMatch
+        try requireBinding(change.waitForExistence(timeout: 5), app: app, step: "Change key menu")
+        change.click()
         try bind(app, project: "billing-fixture", variable: "OPENAI_API_KEY", key: "fixture")
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: "fixture")
         let manifest = URL(fileURLWithPath: home + "/billing-fixture/envcloak.toml")
         let original = try Data(contentsOf: manifest)
-        let cell = app.tables["project.bindings"].staticTexts["OPENAI_API_KEY"].firstMatch
-        XCTAssertTrue(cell.waitForExistence(timeout: 10)); cell.click()
+        _ = try bindingRow(app, variable: "OPENAI_API_KEY")
         app.typeKey(.delete, modifierFlags: [])
         let absent = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             guard let bytes = try? Data(contentsOf: manifest) else { return false }
             return !bytes.elementsEqual(original)
         }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [absent], timeout: 10), .completed)
+        try requireBinding(XCTWaiter.wait(for: [absent], timeout: 10) == .completed, app: app, step: "Delete writes manifest")
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: nil)
+        // Validate the command that Command-Z will dispatch, after the
+        // focused sheet editor has gone and the table has processed Delete.
+        app.menuBars.menuBarItems["Edit"].click()
+        let undo = app.menuItems.matching(NSPredicate(format: "title == %@", "Undo Binding")).firstMatch
+        try requireBinding(undo.waitForExistence(timeout: 5) && undo.isEnabled, app: app, step: "Undo Binding available")
+        app.typeKey(.escape, modifierFlags: [])
         app.typeKey("z", modifierFlags: .command)
         let restored = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             guard let bytes = try? Data(contentsOf: manifest) else { return false }
             return SHA256.hash(data: bytes) == SHA256.hash(data: original)
         }, object: nil)
-        XCTAssertEqual(XCTWaiter.wait(for: [restored], timeout: 10), .completed)
+        try requireBinding(XCTWaiter.wait(for: [restored], timeout: 10) == .completed, app: app, step: "Command-Z exact undo")
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: "fixture")
         let running = try XCTUnwrap(NSRunningApplication.runningApplications(withBundleIdentifier: "ai.envcloak.app").first {
             $0.bundleURL?.path.hasSuffix("/m306-ui/Build/Products/Debug/EnvCloak.app") == true

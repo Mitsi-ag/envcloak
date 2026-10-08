@@ -10,19 +10,73 @@ extension PasteTests {
 
     @MainActor func bind(_ app: XCUIApplication, project: String, variable: String, key: String?) throws {
         let picker = app.popUpButtons["binding.project"]
-        XCTAssertTrue(picker.waitForExistence(timeout: 10))
-        picker.click(); app.menuItems[project].firstMatch.click()
+        try requireBinding(picker.waitForExistence(timeout: 10), app: app, step: "project picker")
+        picker.click()
+        let projectItem = picker.menuItems.matching(NSPredicate(format: "title == %@", project)).firstMatch
+        try requireBinding(projectItem.waitForExistence(timeout: 5), app: app, step: "project menu")
+        projectItem.click()
         let field = app.textFields["binding.variable"]
         field.click(); field.typeKey("a", modifierFlags: .command); field.typeText(variable)
+        try requireBinding(field.value as? String == variable, app: app, step: "variable input")
         if let key {
-            app.popUpButtons["binding.key"].click()
-            let item = app.menuItems.matching(NSPredicate(format: "label BEGINSWITH %@", key + " ·")).firstMatch
-            XCTAssertTrue(item.waitForExistence(timeout: 5)); item.click()
+            let keyPicker = app.popUpButtons["binding.key"]
+            try requireBinding(keyPicker.isEnabled, app: app, step: "key list available")
+            keyPicker.click()
+            // The macOS menu's AXTitle holds this metadata; AXLabel is empty.
+            let item = keyPicker.menuItems.matching(NSPredicate(format: "title BEGINSWITH %@", key + " ·")).firstMatch
+            try requireBinding(item.waitForExistence(timeout: 5), app: app, step: "key menu: " + key)
+            item.click()
+            try requireBinding((keyPicker.value as? String)?.hasPrefix(key + " ·") == true, app: app, step: "selected key")
         }
         let save = app.buttons["binding.save"]
-        XCTAssertTrue(save.isEnabled); save.click()
+        try requireBinding(save.isEnabled, app: app, step: "save enabled"); save.click()
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: save)
-        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 15), .completed)
+        try requireBinding(XCTWaiter.wait(for: [gone], timeout: 15) == .completed, app: app, step: "save confirmed")
+    }
+
+    @MainActor func bindingRow(_ app: XCUIApplication, variable: String) throws -> XCUIElement {
+        // SwiftUI's macOS Table is exposed as AXOutline on the pinned runner.
+        let row = app.outlines["project.bindings"].outlineRows.containing(.staticText, identifier: "binding.variable." + variable).firstMatch
+        try requireBinding(row.waitForExistence(timeout: 10), app: app, step: "binding row: " + variable)
+        row.click()
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == true"), object: row)
+        try requireBinding(XCTWaiter.wait(for: [selected], timeout: 5) == .completed, app: app, step: "binding row selected")
+        return row
+    }
+
+    @MainActor func requireBinding(_ condition: Bool, app: XCUIApplication, step: String,
+                                   file: StaticString = #filePath, line: UInt = #line) throws {
+        if !condition {
+            recordBindingState(app, step: step)
+            XCTFail("Binding step failed: " + step, file: file, line: line)
+            throw NSError(domain: "EU1Binding", code: 1)
+        }
+    }
+
+    @MainActor func recordBindingState(_ app: XCUIApplication, step: String) {
+        var state = "EU-1 binding failure: " + step + "\n"
+        if let root = try? app.snapshot() {
+            func descendants(_ node: any XCUIElementSnapshot) -> [any XCUIElementSnapshot] {
+                [node] + node.children.flatMap(descendants)
+            }
+            func tree(_ node: any XCUIElementSnapshot, depth: Int = 0) -> String {
+                let own = String(repeating: "  ", count: depth) + "\(node.elementType) id=\(node.identifier) title=\(node.title) label=\(node.label) enabled=\(node.isEnabled)\n"
+                return own + node.children.map { tree($0, depth: depth + 1) }.joined()
+            }
+            let nodes = descendants(root)
+            let sheet = nodes.first { $0.elementType == .sheet }
+            state += "binding sheet accessibility tree (no values):\n" + (sheet.map { tree($0) } ?? "<no sheet>\n")
+            let picker = nodes.first { $0.identifier == "binding.key" && $0.elementType == .popUpButton }
+            let labels = picker.map { descendants($0).filter { $0.elementType == .menuItem }.map { $0.title.isEmpty ? $0.label : $0.title } } ?? []
+            state += "key picker menu labels: \(labels)\n"
+        } else { state += "<accessibility snapshot unavailable>\n" }
+        // The binding form holds metadata only. Never read AXValue while
+        // dumping a tree, even if a failure leaves a different sheet open.
+        print(state)
+        let attachment = XCTAttachment(string: state)
+        attachment.name = "EU-1 binding sheet state"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     func check(cli: String, home: String, project: String, variable: String, slug: String?) throws {
