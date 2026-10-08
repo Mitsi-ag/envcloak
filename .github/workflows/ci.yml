@@ -267,7 +267,7 @@ jobs:
         with:
           path: ${{ runner.temp }}/managed-oracles
           key: managed-oracles-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/provision-managed-oracles.py') }}
-      - name: Build pinned PHP, debug CPython, npm, LuaJIT and Ruby oracles
+      - name: Build pinned PHP, debug CPython, npm, LuaJIT and Ruby oracles; fetch Deno
         run: python3 -B scripts/provision-managed-oracles.py "$RUNNER_TEMP/managed-oracles"
       - name: Require every runtime oracle and its execution controls
         run: |
