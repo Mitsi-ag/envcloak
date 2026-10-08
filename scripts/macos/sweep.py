@@ -13,6 +13,7 @@ import pathlib
 import stat
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 
 STORES = ('Library/Preferences', 'Library/Caches', 'Library/Saved Application State',
@@ -82,6 +83,22 @@ def scan(home, needles):
     return dict(file_hits=hits, files=files, bytes=size, absent_stores=missing)
 
 
+def positive_controls(home, needles):
+    # A separate private fixture exercises the same filesystem reader. It
+    # never removes or discounts a hit from the actual application stores.
+    control_home = pathlib.Path(tempfile.mkdtemp(prefix='.sweep-controls-', dir=home))
+    folder = control_home / 'cache'
+    folder.mkdir(mode=0o700)
+    controls = 0
+    for needle in needles:
+        (folder / 'control').write_bytes(b'prefix:' + needle + b':suffix')
+        result = scan(control_home, needles)
+        if result['files'] != 1 or result['file_hits'] == 0:
+            raise ValueError('positive control missed')
+        controls += 1
+    return controls
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--home', required=True, type=pathlib.Path)
@@ -96,7 +113,7 @@ def main():
             raise ValueError('invalid sweep input')
         needles = forms(value)
         # Every encoding is independently planted and must be detected.
-        controls = sum(count(b'prefix:' + n + b':suffix', needles) > 0 for n in needles)
+        controls = positive_controls(args.home, needles)
         if controls != len(needles):
             raise ValueError('positive control missed')
         result = scan(args.home, needles)

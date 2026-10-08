@@ -61,6 +61,13 @@ class Sweep(unittest.TestCase):
         with patch.object(sweep, 'LIMIT', 32), self.assertRaises(ValueError):
             sweep.scan(home, {os.urandom(32)})
 
+    def test_positive_controls_require_the_filesystem_observer(self):
+        home = pathlib.Path(tempfile.mkdtemp(prefix='ec05-sweep-', dir='/tmp'))
+        needles = sweep.forms(('fixture-' + os.urandom(30).hex()).encode())
+        self.assertEqual(sweep.positive_controls(home, needles), len(needles))
+        with patch.object(sweep, 'scan', return_value={'files': 1, 'file_hits': 0}), self.assertRaises(ValueError):
+            sweep.positive_controls(home, needles)
+
 
 if __name__ == '__main__':
     unittest.main()
