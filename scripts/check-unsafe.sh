@@ -11,7 +11,7 @@
 #    - every package inherits the workspace lints, except
 #      crates/envcloak-sys, whose own tables must equal the workspace's with
 #      `unsafe_code = "deny"`, so only its files can allow unsafe code;
-#    - no package has a build script, is a proc-macro crate or points a
+#    - no package has an unreviewed build script, is a proc-macro crate or points a
 #      target at a file that is not a `.rs` file inside it; no manifest sets
 #      rustflags, [patch] or [replace]; and the tree holds no cargo config.
 # 2. clippy.toml forbids secrecy's expose_secret methods, and no other clippy
@@ -103,7 +103,7 @@ fi
 # 1 and 2a. Manifests and clippy.toml. Reads the file list on stdin and
 # prints one "path: problem" line per problem.
 manifest_check='
-import os, sys, tomllib
+import hashlib, os, sys, tomllib
 
 ROOT = "Cargo.toml"
 SYS = "crates/envcloak-sys/Cargo.toml"
@@ -294,7 +294,17 @@ for m in manifests:
     here = os.path.dirname(m)
     build = pkg.get("build")
     if build is True or isinstance(build, str) or (build is None and os.path.exists(os.path.join(here, "build.rs"))):
-        fail(m, "build scripts are not allowed: one can change the environment its crate is linted in")
+        # Only the reviewed, dependency-free sys configuration script. A
+        # changed script needs an explicit hash review, not a path exception.
+        script = os.path.join(here, "build.rs")
+        receipt = "security/sys-build-script.sha256"
+        if (m != SYS or build != "build.rs" or not os.path.isfile(script)
+                or not os.path.isfile(receipt)
+                or open(receipt).read().strip() != hashlib.sha256(open(script, "rb").read()).hexdigest()
+                or any(doc.get(key) for key in ("build-dependencies", "build_dependencies"))
+                or any(keys_named(doc.get("target", {}), "build-dependencies"))
+                or any(keys_named(doc.get("target", {}), "build_dependencies"))):
+            fail(m, "build scripts are not allowed unless they match the reviewed sys configuration script")
     for kind in TARGETS:
         targets = doc.get(kind)
         targets = [targets] if isinstance(targets, dict) else targets if isinstance(targets, list) else []

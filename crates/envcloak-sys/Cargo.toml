@@ -1,5 +1,6 @@
 [package]
 name = "envcloak-sys"
+build = "build.rs"
 description = "The one EnvCloak crate allowed unsafe code: the wiping allocator, process hardening and OS interfaces"
 version.workspace = true
 edition.workspace = true

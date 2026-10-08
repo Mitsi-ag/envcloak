@@ -1,10 +1,8 @@
-"""Compile a fixture certificate pin, then restore the source even on failure.
+"""Pass a public fixture certificate to the build script without editing source.
 
-The pin is a literal in the one reviewed source file, so the reservation and
-source checkers see exactly what is compiled. No environment value reaches a
-production requirement. Use only in a checkout with no concurrent build.
+Cargo fingerprints the build-time input. Other builds neither inherit it nor
+reuse its outputs, even if this runner is killed before its children finish.
 """
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,7 +11,6 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[3]
-PINS = ROOT / "crates/envcloak-sys/src/peer_code/pins.rs"
 
 
 def run(fixtures, command):
@@ -21,26 +18,17 @@ def run(fixtures, command):
     fingerprint = identity["sha1"]
     if len(fingerprint) != 40 or any(c not in "0123456789abcdef" for c in fingerprint):
         raise ValueError("invalid fixture fingerprint")
-    original = PINS.read_bytes()
-    marker = b"const CI_CERT_SHA1: Option<&str> = None;"
-    if original.count(marker) != 1:
-        raise ValueError("fixture pin slot is not empty")
-    configured = original.replace(marker, f'const CI_CERT_SHA1: Option<&str> = Some("{fingerprint}");'.encode())
-    (fixtures / "pins-source-sha256").write_text(hashlib.sha256(configured).hexdigest() + "\n")
-    # SIGKILL cannot be handled; keep the original next to the test fixtures for
-    # that recovery case. An already occupied pin slot always refuses a new run.
-    (fixtures / "pins-original.rs").write_bytes(original)
     def interrupted(signum, frame):
         raise KeyboardInterrupt
     for sig in [signal.SIGTERM, signal.SIGHUP, signal.SIGINT]:
         signal.signal(sig, interrupted)
     child = None
     try:
-        PINS.write_bytes(configured)
         allowed = ["PATH", "HOME", "CARGO_HOME", "RUSTUP_HOME", "CARGO_TARGET_DIR",
-                   "CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "RUSTFLAGS", "DEVELOPER_DIR",
+                   "RUSTC_WRAPPER", "CARGO_INCREMENTAL", "CARGO_BUILD_JOBS", "RUSTFLAGS", "DEVELOPER_DIR",
                    "ENVCLOAK_PEER_FIXTURES", "ENVCLOAK_IDENTITY_PROBE", "ENVCLOAK_CLI_PROBE"]
         environment = {name: os.environ[name] for name in allowed if name in os.environ}
+        environment["ENVCLOAK_TEST_CERT_SHA1"] = fingerprint
         child = subprocess.Popen(command, cwd=ROOT, env=environment, start_new_session=True)
         return child.wait()
     finally:
@@ -54,7 +42,6 @@ def run(fixtures, command):
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-        PINS.write_bytes(original)
 
 
 if __name__ == "__main__":

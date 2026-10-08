@@ -18,17 +18,21 @@ class PeerRelease(unittest.TestCase):
             home = Path(directory)
             bins = home / "bin"
             bins.mkdir()
-            for name in ["dirname", "mktemp", "grep"]:
-                (bins / name).symlink_to(Path("/usr/bin") / name)
+            for name in ["dirname", "mktemp", "grep", "mkdir", "python3"]:
+                (bins / name).symlink_to(Path("/bin" if name == "mkdir" else "/usr/bin") / name)
             cargo = bins / "cargo"
             cargo.write_text('''#!/bin/bash
 printf '%s\\n' "$*" >> "$HOME/calls"
+if [[ "$1" == metadata ]]; then
+  printf '{"target_directory":"%s"}\\n' "$HOME/configured-target"
+  exit 0
+fi
 if [[ "$*" != *'--features testing'* ]]; then
   if [[ "$CASE" == normal-error ]]; then exit 17; fi
   exit 0
 fi
 case "$CASE" in
-  guard) echo 'error: ''' + GUARD + '''' >&2; exit 101 ;;
+  guard|override) if [[ "$CASE" == override && "$CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS" == true ]]; then exit 0; fi; echo 'error: ''' + GUARD + '''' >&2; exit 101 ;;
   removed) exit 0 ;;
   unrelated) echo 'error: unrelated compiler failure' >&2; exit 101 ;;
 esac
@@ -42,15 +46,22 @@ exit 99
                                     env=env, capture_output=True, text=True, timeout=30)
             calls = (home / "calls").read_text().splitlines()
         self.assertNotIn("command not found", result.stderr)
+        self.assertEqual(calls.pop(0), "metadata --locked --format-version 1 --no-deps")
         self.assertEqual(calls[0], "check --locked --release -p envcloak-sys")
         if mode != "normal-error":
-            self.assertEqual(calls, [calls[0], calls[0] + " --features testing"])
+            count = 2 if mode in ("guard", "override") else 1
+            self.assertEqual(calls, [calls[0]] + [calls[0] + " --features testing"] * count)
         return result, calls
 
     def test_guard_failure_passes_without_runner_extras(self):
         result, _ = self.check_release("guard")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("testing feature refused; normal release passed", result.stdout)
+
+    def test_debug_assertions_override_is_a_failure(self):
+        result, _ = self.check_release("override")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAILED (testing feature compiled in release)", result.stderr)
 
     def test_removed_guard_is_a_failure(self):
         result, _ = self.check_release("removed")

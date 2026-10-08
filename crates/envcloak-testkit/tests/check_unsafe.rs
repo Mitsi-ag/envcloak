@@ -159,6 +159,43 @@ fn assert_fails(t: &TestHome, expect_in_message: &str) {
 }
 
 #[test]
+fn only_the_reviewed_sys_build_configuration_is_allowed() {
+    let t = clean_tree();
+    let manifest = sys_manifest("", &clippy_body()).replace(
+        "name = \"envcloak-sys\"",
+        "name = \"envcloak-sys\"\nbuild = \"build.rs\"",
+    );
+    write(&t.home(), "crates/envcloak-sys/Cargo.toml", &manifest);
+    let source = std::fs::read_to_string(repo_root().join("crates/envcloak-sys/build.rs")).unwrap();
+    write(&t.home(), "crates/envcloak-sys/build.rs", &source);
+    write(
+        &t.home(),
+        "security/sys-build-script.sha256",
+        &std::fs::read_to_string(repo_root().join("security/sys-build-script.sha256")).unwrap(),
+    );
+    assert_passes(&t);
+    write(
+        &t.home(),
+        "crates/envcloak-sys/build.rs",
+        &(source.clone() + "\n// unreviewed edit\n"),
+    );
+    assert_fails(&t, "reviewed sys configuration script");
+    write(&t.home(), "crates/envcloak-sys/build.rs", &source);
+    write(
+        &t.home(),
+        "crates/envcloak-sys/Cargo.toml",
+        &(manifest.clone() + "\n[build-dependencies]\nsurprise = \"1\"\n"),
+    );
+    assert_fails(&t, "reviewed sys configuration script");
+    write(
+        &t.home(),
+        "crates/envcloak-sys/Cargo.toml",
+        &manifest.replace("build = \"build.rs\"", "build = \"other.rs\""),
+    );
+    assert_fails(&t, "reviewed sys configuration script");
+}
+
+#[test]
 fn the_real_workspace_passes() {
     let out = run(&repo_root());
     assert!(
