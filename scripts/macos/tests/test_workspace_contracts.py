@@ -49,22 +49,25 @@ for key in ["eu-one", "fixture"] {
         self.assertEqual(len(ready), 1)
         confirmation = re.findall(r'let confirmed = XCTNSPredicateExpectation\(predicate: (NSPredicate\(format: [^\n]+\)), object: notice\)', source)
         self.assertEqual(len(confirmation), 1)
-        # Run 37826362088's open Edit menu: Undo, identifier undo:, enabled;
-        # Redo disabled. Decoys must never satisfy the actual UI predicate.
+        # Run 37826362088 exposed Undo; run 37831276033's hosted test
+        # exposed Undo Binding. Both are valid for the same named action.
+        # Other titles, actions and disabled states must still be refused.
         probe = '''import Foundation
 let query = QUERY
 let ready = READY
 let rows: [[String: Any]] = [
     ["title": "Undo", "identifier": "undo:", "exists": true, "enabled": true],
-    ["title": "Redo", "identifier": "redo:", "exists": true, "enabled": false],
     ["title": "Undo Binding", "identifier": "undo:", "exists": true, "enabled": true],
+    ["title": "Redo", "identifier": "redo:", "exists": true, "enabled": false],
+    ["title": "Undo Other", "identifier": "undo:", "exists": true, "enabled": true],
     ["title": "Undo", "identifier": "other:", "exists": true, "enabled": true],
     ["title": "Undo", "identifier": "undo:", "exists": true, "enabled": false],
+    ["title": "Undo Binding", "identifier": "undo:", "exists": true, "enabled": false],
     ["title": "Undo", "identifier": "undo:", "exists": false, "enabled": true]
 ]
 for (index, row) in rows.enumerated() {
     let accepted = query.evaluate(with: row) && ready.evaluate(with: row)
-    guard accepted == (index == 0) else {
+    guard accepted == (index < 2) else {
         print("Undo command predicate accepted wrong state at index " + String(index))
         exit(1)
     }
