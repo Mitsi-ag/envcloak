@@ -245,7 +245,7 @@ fn python_startup_environment_cannot_select_unchecked_code() {
 }
 
 /// A real login shell loads a private startup file before the entry.
-/// Mutation: keep --login in BOOLEAN_LONG instead of CODE_LOADING_LONG.
+/// Mutation: list --login in bash's `boolean_long` instead of CODE_LOADING_LONG.
 #[test]
 fn bash_login_startup_is_refused_for_declarations_updates_and_shebangs() {
     use envcloak_core::vault::LaunchDecl;
@@ -465,4 +465,131 @@ fn ruby_short_values_read_the_rest_of_the_cluster_as_options() {
             "{options:?}"
         );
     }
+}
+
+/// Runs `bin` like [`run`], but returns whether it succeeded and what it
+/// printed, success or not.
+fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String) {
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env("HOME", home)
+        .env("TMPDIR", home)
+        .current_dir(home)
+        .args(args);
+    let result = run_capped(cmd, Duration::from_secs(20), 8192).unwrap();
+    assert!(
+        result.in_time && result.complete && !result.over_cap,
+        "{args:?} {result:?}"
+    );
+    (
+        result.output.status.success(),
+        String::from_utf8(result.output.stdout).unwrap(),
+    )
+}
+
+/// A real Node takes the next argument as the value of `--allow-fs-read`
+/// and `--disable-warning`, so the argument checked as the entry file is
+/// not what runs: `node --allow-fs-read <file> --permission -e <code>`
+/// and `node --disable-warning <file> -e <code>` run `<code>`. Each form is
+/// refused for a declaration, an update and a `#!` line. Then every long
+/// option Node 26.7.0 knows, and its `--no-` form, that the policy accepts
+/// bare before an entry file is run before two files: Node must run the
+/// first one (or refuse to start), never the second, which would mean the
+/// option took the first as its value. Mutation checked: one prefix list
+/// for every family in `boolean_long` (the previous rule): the injected
+/// forms register and this fails.
+#[test]
+#[ignore = "requires Node 26.7.0; run scripts/check-managed-oracles.sh"]
+fn node_long_options_take_values_as_node_does() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let node = runtime("ENVCLOAK_NODE_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert_eq!(run(&node, h, &["--version".into()], &[]), "v26.7.0\n");
+    let first = h.join("first.js");
+    let entry = h.join("entry.js");
+    std::fs::write(&first, "process.stdout.write('first\\n')\n").unwrap();
+    std::fs::write(&entry, "process.stdout.write('entry\\n')\n").unwrap();
+    let (f, e) = (first.to_str().unwrap(), entry.to_str().unwrap());
+    // The benign control: the entry runs, and registers.
+    assert_eq!(run(&node, h, &[e.into()], &[]), "entry\n");
+    let base = LaunchDecl {
+        argv: vec!["node".into(), e.into()],
+        cwd: None,
+        env: vec![],
+        path_env: None,
+    };
+    assert!(check_declaration(&base).is_ok());
+    let code = "process.stdout.write('injected\\n')";
+    for options in [
+        &["--allow-fs-read", f, "--permission", "-e", code][..],
+        &["--disable-warning", f, "-e", code],
+    ] {
+        let args: Vec<String> = options.iter().map(|o| (*o).to_owned()).collect();
+        assert_eq!(run(&node, h, &args, &[]), "injected\n", "{options:?}");
+        let argv = [vec!["node".to_owned()], args].concat();
+        assert_eq!(classify_argv(&argv), Err(DeclError::NoEntry), "{options:?}");
+        assert_eq!(
+            check_declaration(&LaunchDecl {
+                argv: argv.clone(),
+                ..base.clone()
+            }),
+            Err(DeclError::NoEntry),
+            "{options:?}"
+        );
+        assert!(
+            matches!(
+                apply_changes(
+                    &base,
+                    &LaunchChanges {
+                        argv: Some(argv),
+                        ..LaunchChanges::default()
+                    }
+                ),
+                Err(DeclError::NoEntry)
+            ),
+            "{options:?}"
+        );
+        let path = node.to_str().unwrap();
+        assert_eq!(
+            shebang_argv(path, Some(options[0]), f, &[], path),
+            Err(DeclError::NoEntry),
+            "{options:?}"
+        );
+    }
+    // Every option Node knows, by its own table, and each `--no-` form.
+    let names = run(
+        &node,
+        h,
+        &[
+            "--expose-internals".into(),
+            "-e".into(),
+            "const {options, aliases} = require('internal/options').getCLIOptionsInfo(); \
+             for (const n of [...options.keys(), ...aliases.keys()]) console.log(n);"
+                .into(),
+        ],
+        &[],
+    );
+    let mut tried = 0;
+    for name in names.lines().filter(|n| n.starts_with("--")) {
+        for option in [name.to_owned(), format!("--no-{}", &name[2..])] {
+            let argv = vec!["node".to_owned(), option.clone(), f.into(), e.into()];
+            if classify_argv(&argv) != Ok(ArgvClass::Interpreter { entry: 2 }) {
+                continue;
+            }
+            tried += 1;
+            let (ok, out) = run_any(&node, h, &argv[1..]);
+            assert!(!out.contains("entry"), "{option} took the next argument");
+            assert!(!ok || out == "first\n", "{option}: {out:?}");
+        }
+    }
+    // The measured booleans, and the `--no-` form of every option.
+    assert!(tried > 100, "{tried}");
 }

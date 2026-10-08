@@ -403,33 +403,59 @@ const VALUE_LONG: [&str; 14] = [
 /// `=` and load no code (deno's permission flags: `--allow-net=host`).
 const VALUE_LONG_PREFIXES: [&str; 2] = ["--allow-", "--deny-"];
 
-/// The long interpreter options that take no value, and so may stand
-/// before the entry file without `=`. Any other long option without `=`
-/// may take the next argument as its value (`node --title /a /b.js` runs
-/// `/b.js`), so which argument is the entry file is not known.
-const BOOLEAN_LONG: [&str; 17] = [
-    "--trace-warnings",
-    "--trace-deprecation",
-    "--trace-uncaught",
-    "--enable-source-maps",
-    "--expose-gc",
-    "--pending-deprecation",
-    "--throw-deprecation",
-    "--preserve-symlinks",
-    "--smol",
-    "--jit",
-    "--yjit",
-    "--norc",
-    "--noprofile",
-    "--posix",
-    "--verbose",
-    "--quiet",
-    "--unsafe-proto",
-];
-/// The prefixes of long interpreter options that take no value
-/// (`--no-warnings`, deno's `--allow-env`, ruby's `--disable-gems`).
-const BOOLEAN_LONG_PREFIXES: [&str; 5] =
-    ["--no-", "--allow-", "--deny-", "--enable-", "--disable-"];
+/// The long options of interpreter family `stem` that take no value, and
+/// so may stand before the entry file without `=`, exactly and by prefix.
+/// Any other long option without `=` may take the next argument as its
+/// value (`node --title /a /b.js` runs `/b.js`), so which argument is the
+/// entry file is not known. Each family's list is its own, measured on
+/// that interpreter: an option or a prefix that takes no value in one
+/// takes one in another (review of M2-27: Node's `--allow-fs-read`,
+/// `--allow-fs-write`, `--disable-warning` and `--disable-proto` take the
+/// next argument, so `node --allow-fs-read /a -e code` runs `code`, while
+/// deno's `--allow-read` takes a value only after `=`). Measured with
+/// Node 26.7.0 (its option table, and `--no-` refused on any option that
+/// is not a boolean one), Bun 1.3.13, Ruby 2.6, `/bin/bash` 3.2
+/// and `/bin/zsh` on macOS; deno's permission and `--no-` flags take a
+/// value only with `=` (`deno run --allow-net s.ts` runs `s.ts`).
+fn boolean_long(stem: &str) -> (&'static [&'static str], &'static [&'static str]) {
+    match stem {
+        "node" | "nodejs" => (
+            &[
+                "--trace-warnings",
+                "--trace-deprecation",
+                "--trace-uncaught",
+                "--enable-source-maps",
+                "--expose-gc",
+                "--pending-deprecation",
+                "--throw-deprecation",
+                "--preserve-symlinks",
+                "--allow-addons",
+                "--allow-child-process",
+                "--allow-wasi",
+                "--allow-worker",
+                "--allow-net",
+                "--allow-ffi",
+                "--allow-inspector",
+                "--allow-openssl-store",
+                "--disable-sigusr1",
+                "--disable-wasm-trap-handler",
+                "--enable-fips",
+                "--permission",
+                "--permission-audit",
+            ],
+            &["--no-"],
+        ),
+        "deno" => (&["--quiet"], &["--no-", "--allow-", "--deny-"]),
+        "bun" => (&["--smol"], &["--no-"]),
+        "ruby" => (
+            &["--verbose", "--jit", "--yjit"],
+            &["--enable-", "--disable-"],
+        ),
+        "bash" => (&["--norc", "--noprofile", "--posix", "--verbose"], &[]),
+        "zsh" => (&[], &["--no-"]),
+        _ => (&[], &[]),
+    }
+}
 
 /// The short options of an interpreter family whose value is the whole
 /// rest of their cluster, or, when nothing is attached, may be the next
@@ -557,7 +583,12 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
                 || VALUE_LONG_PREFIXES.iter().any(|p| name.starts_with(p));
             return if known { Ok(()) } else { loads };
         }
-        if BOOLEAN_LONG.contains(&arg) || BOOLEAN_LONG_PREFIXES.iter().any(|p| arg.starts_with(p)) {
+        let (exact, prefixes) = boolean_long(stem);
+        if exact.contains(&arg)
+            || prefixes
+                .iter()
+                .any(|p| arg.len() > p.len() && arg.starts_with(p))
+        {
             return Ok(());
         }
         return Err(DeclError::NoEntry);
@@ -1568,6 +1599,143 @@ mod tests {
                 check_declaration(&d),
                 Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
                 "{name}"
+            );
+        }
+    }
+
+    /// A long option registers bare before the entry file only when its
+    /// own interpreter takes no value for it. Node's `--allow-fs-read`,
+    /// `--allow-fs-write`, `--disable-warning` and `--disable-proto` take
+    /// the next argument, so `node --allow-fs-read /a -e code` runs `code`
+    /// with `/a` checked as the entry (measured with Node 26.7.0 in
+    /// `tests/managed_interpreter_oracle.rs`); a prefix that takes no value
+    /// in one family (deno's `--allow-`, ruby's `--disable-`) is no
+    /// evidence for another. The refusal holds for a declaration, an
+    /// update and a `#!` line; the daemon's stored-record check classes the
+    /// same argv. The measured booleans of each family are the controls.
+    ///
+    /// Mutation checked: one prefix list for every family (the previous
+    /// `BOOLEAN_LONG_PREFIXES`, `--no-`, `--allow-`, `--deny-`,
+    /// `--enable-`, `--disable-`): `node --allow-fs-read /srv/other.js -e
+    /// code` registers with `/srv/other.js` as its entry and this fails.
+    #[test]
+    fn long_options_take_values_as_their_own_interpreter_does() {
+        let v = |argv: &[&str]| argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for argv in [
+            &["node", "--allow-fs-read", "/srv/other.js", "-e", "code"][..],
+            &[
+                "node",
+                "--allow-fs-read",
+                "/srv/other.js",
+                "--permission",
+                "-e",
+                "code",
+            ],
+            &["node", "--allow-fs-write", "/srv/other.js", "/srv/s.js"],
+            &["node", "--disable-warning", "/srv/other.js", "/srv/s.js"],
+            &["node", "--disable-proto", "/srv/other.js", "/srv/s.js"],
+            &["nodejs22", "--allow-fs-read", "/srv/other.js", "/srv/s.js"],
+            &["node", "--allow-some-future", "/srv/other.js", "/srv/s.js"],
+            &["node", "--enable-some-future", "/srv/other.js", "/srv/s.js"],
+            &["node", "--no-", "/srv/other.js", "/srv/s.js"],
+            &["bun", "--allow-fs-read", "/srv/other.js", "/srv/s.js"],
+            &["bun", "--disable-x", "/srv/other.js", "/srv/s.js"],
+            &["deno", "run", "--enable-x", "/srv/other.ts", "/srv/s.ts"],
+            &["python3", "--no-x", "/srv/other.py", "/srv/s.py"],
+            &["python3", "--allow-x", "/srv/other.py", "/srv/s.py"],
+            &["ruby", "--allow-x", "/srv/other.rb", "/srv/s.rb"],
+            &["ruby", "--no-x", "/srv/other.rb", "/srv/s.rb"],
+            &["perl", "--verbose", "/srv/other.pl", "/srv/s.pl"],
+            &["php", "--no-x", "/srv/other.php", "/srv/s.php"],
+            &["fish", "--no-x", "/srv/other.fish", "/srv/s.fish"],
+            &["julia", "--quiet", "/srv/other.jl", "/srv/s.jl"],
+            &["zsh", "--norc", "/srv/other.sh", "/srv/s.sh"],
+        ] {
+            let argv = v(argv);
+            assert_eq!(classify_argv(&argv), Err(DeclError::NoEntry), "{argv:?}");
+            assert_eq!(
+                check_declaration(&LaunchDecl {
+                    argv: argv.clone(),
+                    ..decl(&[])
+                }),
+                Err(DeclError::NoEntry),
+                "{argv:?}"
+            );
+            assert!(
+                matches!(
+                    apply_changes(
+                        &decl(&["/srv/s.js"]),
+                        &LaunchChanges {
+                            argv: Some(argv.clone()),
+                            ..LaunchChanges::default()
+                        }
+                    ),
+                    Err(DeclError::NoEntry)
+                ),
+                "{argv:?}"
+            );
+            // A `#!` line naming the interpreter with the option.
+            if argv[1].starts_with("--") {
+                assert_eq!(
+                    shebang_argv(&argv[0], Some(&argv[1]), "/srv/s", &[], &argv[0]),
+                    Err(DeclError::NoEntry),
+                    "{argv:?}"
+                );
+            }
+        }
+        for (argv, entry) in [
+            (
+                &[
+                    "node",
+                    "--allow-child-process",
+                    "--allow-addons",
+                    "/srv/s.js",
+                ][..],
+                3,
+            ),
+            (
+                &["node", "--no-warnings", "--enable-source-maps", "/srv/s.js"],
+                3,
+            ),
+            (
+                &["node", "--allow-fs-read=/srv", "--permission", "/srv/s.js"],
+                3,
+            ),
+            (
+                &["node", "--disable-sigusr1", "--enable-fips", "/srv/s.js"],
+                3,
+            ),
+            (
+                &["deno", "run", "--allow-read", "--no-check", "/srv/s.ts"],
+                4,
+            ),
+            (&["bun", "--smol", "--no-install", "/srv/s.ts"], 3),
+            (
+                &[
+                    "ruby",
+                    "--disable-gems",
+                    "--enable-yjit",
+                    "--verbose",
+                    "/srv/s.rb",
+                ],
+                4,
+            ),
+            (&["bash", "--noprofile", "--norc", "/srv/s.sh"], 3),
+            (&["zsh", "--no-rcs", "/srv/s.sh"], 2),
+        ] {
+            let argv = v(argv);
+            assert_eq!(
+                classify_argv(&argv),
+                Ok(ArgvClass::Interpreter { entry }),
+                "{argv:?}"
+            );
+            assert!(
+                check_declaration(&LaunchDecl {
+                    argv: argv.clone(),
+                    ..decl(&[])
+                })
+                .is_ok(),
+                "{argv:?}"
             );
         }
     }
