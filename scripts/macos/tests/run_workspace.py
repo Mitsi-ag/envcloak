@@ -22,5 +22,8 @@ for suffix, folder in [('CONFIG', 'config'), ('DATA', 'data'), ('STATE', 'state'
 if 'DEVELOPER_DIR' in os.environ:
     env['DEVELOPER_DIR'] = os.environ['DEVELOPER_DIR']
 # Keep fixtures for diagnosis. The harness contains generated values only.
-result = subprocess.run([str(root / 'scripts/macos/test-workspace.sh')], cwd=root, env=env, stdin=subprocess.DEVNULL)
+command = [str(root / ('scripts/macos/test-eu1.sh' if '--eu1' in sys.argv else 'scripts/macos/test-workspace.sh'))]
+if '--eu1' in sys.argv and '--package' in sys.argv:
+    command.append('--package')
+result = subprocess.run(command, cwd=root, env=env, stdin=subprocess.DEVNULL)
 sys.exit(result.returncode)
