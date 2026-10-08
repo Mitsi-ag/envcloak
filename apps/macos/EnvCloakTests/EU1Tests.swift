@@ -57,6 +57,21 @@ import XCTest
             manager.endUndoGrouping(); XCTAssertTrue(ok, session.notice ?? "missing notice")
             try check(cli: cli, home: home, project: project.escaped, slug: "eu-one")
         }
+        let bindingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1024, height: 674), styleMask: [.titled], backing: .buffered, defer: false)
+        bindingsWindow.isReleasedWhenClosed = false
+        bindingsWindow.contentView = NSHostingView(rootView: ProjectDetail(session: session, directory: second, selectedKey: .constant(nil))
+            .frame(width: 1024, height: 674))
+        bindingsWindow.makeKeyAndOrderFront(nil)
+        bindingsWindow.contentView?.layoutSubtreeIfNeeded()
+        defer { bindingsWindow.close() }
+        let mounted = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            MainActor.assumeIsolated {
+                bindingTable(in: bindingsWindow).flatMap { bindingVariableRow("OPENAI_API_KEY", table: $0) } != nil
+            }
+        }, object: nil)
+        await fulfillment(of: [mounted], timeout: 5)
+        try selectNativeBindingVariable("OPENAI_API_KEY", in: bindingsWindow)
+        try await waitForBindingSelection("OPENAI_API_KEY", in: bindingsWindow)
         manager.beginUndoGrouping()
         let changed = await session.bindings.apply(BindingEdit(project: second, profile: nil, envName: "OPENAI_API_KEY", reference: "fixture", previous: .init("eu-one")), session: session, manager: manager)
         manager.endUndoGrouping(); XCTAssertTrue(changed)
@@ -64,7 +79,10 @@ import XCTest
         let manifest = URL(fileURLWithPath: second.escaped + "/envcloak.toml")
         let original = try Data(contentsOf: manifest)
         manager.beginUndoGrouping()
-        let removed = await session.bindings.apply(BindingEdit(project: second, profile: nil, envName: "OPENAI_API_KEY", reference: nil, previous: .init("fixture")), session: session, manager: manager)
+        try await waitForBindingSelection("OPENAI_API_KEY", in: bindingsWindow)
+        let current = try XCTUnwrap(session.projects.opened)
+        let removal = try XCTUnwrap(current.removal(of: "OPENAI_API_KEY", profile: nil))
+        let removed = await session.bindings.apply(removal, session: session, manager: manager)
         manager.endUndoGrouping(); XCTAssertTrue(removed)
         try check(cli: cli, home: home, project: second.escaped, slug: nil)
         manager.undo()
@@ -149,6 +167,9 @@ import XCTest
         XCTAssertEqual(task.terminationStatus, 0, diagnostic)
         let result = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let bindings = try XCTUnwrap((result["references"] as? [String: Any])?["bindings"] as? [[String: Any]])
+        let baseline = project.hasSuffix("/billing-fixture") ? "BASE" : "VARIABLE"
+        XCTAssertEqual(Set(bindings.compactMap { $0["env_name"] as? String }), Set(slug == nil ? [baseline] : [baseline, "OPENAI_API_KEY"]), diagnostic)
+        XCTAssertEqual(bindings.first { $0["env_name"] as? String == baseline }?["reference"] as? String, "fixture", diagnostic)
         let row = bindings.first { $0["env_name"] as? String == "OPENAI_API_KEY" }
         if let slug {
             XCTAssertEqual(row?["reference"] as? String, slug, diagnostic)
@@ -172,4 +193,49 @@ import XCTest
         let encoded = try JSONSerialization.data(withJSONObject: receipt)
         try encoded.write(to: URL(fileURLWithPath: home + "/eu1-sweep.json"))
     }
+}
+
+// Native AppKit selection exercises SwiftUI's binding and reload lifetime.
+// Physical hit testing remains the XCUITest's responsibility.
+@MainActor func bindingTable(in window: NSWindow) -> NSTableView? {
+    func find(_ view: NSView) -> NSTableView? {
+        if let table = view as? NSTableView { return table }
+        return view.subviews.lazy.compactMap(find).first
+    }
+    return window.contentView.flatMap(find)
+}
+
+@MainActor func bindingVariableRow(_ variable: String, table: NSTableView) -> Int? {
+    func contains(_ object: NSObject, seen: inout Set<ObjectIdentifier>) -> Bool {
+        guard seen.insert(ObjectIdentifier(object)).inserted else { return false }
+        func attribute(_ name: String) -> Any? {
+            let selector = NSSelectorFromString(name)
+            return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() : nil
+        }
+        if attribute("accessibilityIdentifier") as? String == "binding.variable." + variable { return true }
+        var children = attribute("accessibilityChildren") as? [NSObject] ?? []
+        if let view = object as? NSView { children += view.subviews }
+        return children.contains { contains($0, seen: &seen) }
+    }
+    return (0..<table.numberOfRows).first { index in
+        var seen = Set<ObjectIdentifier>()
+        return table.view(atColumn: 0, row: index, makeIfNecessary: true).map { contains($0, seen: &seen) } == true
+    }
+}
+
+@MainActor func selectNativeBindingVariable(_ variable: String, in window: NSWindow) throws {
+    let table = try XCTUnwrap(bindingTable(in: window))
+    let row = try XCTUnwrap(bindingVariableRow(variable, table: table))
+    table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+}
+
+@MainActor func waitForBindingSelection(_ variable: String, in window: NSWindow) async throws {
+    let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+        MainActor.assumeIsolated {
+            guard let table = bindingTable(in: window), let row = bindingVariableRow(variable, table: table) else { return false }
+            return table.selectedRowIndexes == IndexSet(integer: row)
+        }
+    }, object: nil)
+    let result = await XCTWaiter.fulfillment(of: [selected], timeout: 5)
+    XCTAssertEqual(result, .completed, "Native table must select only " + variable)
 }

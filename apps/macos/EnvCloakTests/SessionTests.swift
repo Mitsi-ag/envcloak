@@ -39,6 +39,13 @@ actor ScriptedClient: WorkspaceClient {
     var showFailure = false
     var wrongDetail = false
     func detailResponse(fails: Bool = false, wrong: Bool = false) { showFailure = fails; wrongDetail = wrong }
+    var bindingNames: [String]?
+    var bindingReference = "fixture-0"
+    private var holdCheck = false
+    private var checkContinuation: CheckedContinuation<Void, Never>?
+    func bindings(_ names: [String], reference: String = "fixture-0") { bindingNames = names; bindingReference = reference }
+    func holdNextCheck() { holdCheck = true }
+    func releaseCheck() { checkContinuation?.resume(); checkContinuation = nil }
     var adoptedBinding = false
     func adoptBinding() { adoptedBinding = true }
     func pages(_ mode: String) { pageMode = mode }
@@ -94,7 +101,18 @@ actor ScriptedClient: WorkspaceClient {
             let row: [String: Any] = ["dir": directory, "manifest_sha256": String(repeating: "a", count: 64), "bindings": adoptedBinding ? [["env_name": "VARIABLE", "reference": "envcloak://fixture-0\u{202e}\u{1b}[31m"]] : [], "last_seen_secs": nextPage ? 1 : 2]
             result = ["projects": ["hidden-one-page", "duplicate-real"].contains(pageMode) ? [row, row] : [row], "next": next]
 
-        case "items.check": result = ["project_dir": "/tmp/project" + hostileSuffix, "project_name": checkedName as Any? ?? NSNull(), "bindings": [
+        case "items.check":
+            if holdCheck {
+                holdCheck = false
+                await withCheckedContinuation { checkContinuation = $0 }
+            }
+            if let names = bindingNames {
+                result = ["project_dir": "/tmp/project", "project_name": "Fixture", "bindings": names.map {
+                    ["env_name": $0, "reference": "envcloak://" + bindingReference, "status": "ok"]
+                }, "refs": []]
+                break
+            }
+            result = ["project_dir": "/tmp/project" + hostileSuffix, "project_name": checkedName as Any? ?? NSNull(), "bindings": [
             ["env_name": "VARIABLE" + hostileSuffix, "reference": hostileSurfaceMetadata ? "envcloak://fixture-0" + hostileSuffix : hostileSlugs ? "envcloak://fixture" : "envcloak://fixture-0", "status": "ok"],
             ["profile": "test", "env_name": "VARIABLE", "reference": "envcloak://second", "status": "unknown_item"]], "refs": []]
         case "grants.list": result = ["grants": grants == 0 ? [] : [[
@@ -118,6 +136,21 @@ actor ScriptedClient: WorkspaceClient {
 }
 
 final class SessionTests: XCTestCase {
+    @MainActor func testRemovalRequiresAnExistingSelectionInTheCurrentProfile() async throws {
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        await session.openProject(DaemonText("/tmp/project"))
+        let project = try XCTUnwrap(session.projects.opened)
+        XCTAssertNil(project.removal(of: nil, profile: nil))
+        XCTAssertNil(project.removal(of: "ABSENT", profile: nil))
+        XCTAssertNil(project.removal(of: "VARIABLE", profile: "staging"), "Inherited rows cannot be removed from another profile")
+        let edit = try XCTUnwrap(project.removal(of: "VARIABLE", profile: "test"))
+        XCTAssertEqual(edit.envName, "VARIABLE")
+        XCTAssertEqual(edit.profile, "test")
+        XCTAssertEqual(edit.previous, DaemonText("envcloak://second"))
+        XCTAssertNil(edit.reference)
+    }
+
     @MainActor func testHiddenPathsAreRowsNotDirectoryIdentities() async {
         for mode in ["hidden-one-page", "hidden-pages"] {
             let client = ScriptedClient(); await client.pages(mode)
