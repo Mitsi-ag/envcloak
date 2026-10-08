@@ -61,6 +61,9 @@ pub struct ScanReport {
     /// These notes do not make an otherwise successful scan incomplete.
     pub notes: Vec<Issue>,
     pub leftovers: Vec<Leftover>,
+    /// The effective format used by transcript discovery for each opened file.
+    /// Consumers must not infer a different grammar from its extension or parent.
+    pub transcript_formats: std::collections::BTreeMap<PathBuf, crate::source::ConfigFormat>,
     pub files: u64,
     /// Budget charged: successful bytes, or the allowance of a failed config read.
     pub bytes: u64,
@@ -92,6 +95,8 @@ impl ScanReport {
         }
         self.notes.append(&mut other.notes);
         self.leftovers.append(&mut other.leftovers);
+        self.transcript_formats
+            .append(&mut other.transcript_formats);
         self.files += other.files;
         self.bytes += other.bytes;
     }

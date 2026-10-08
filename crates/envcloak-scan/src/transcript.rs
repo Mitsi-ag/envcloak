@@ -620,7 +620,8 @@ pub fn scan_transcript_sources(
                 }
                 return;
             }
-            scanned.insert(path, format);
+            scanned.insert(path.clone(), format);
+            report.transcript_formats.insert(path, format);
             scan_file(
                 root,
                 rel,

@@ -155,6 +155,76 @@ fn backup(out: &std::process::Output) -> String {
     v["files"][0]["backup"].as_str().unwrap().into()
 }
 #[test]
+fn gate37_catalog_formats_survive_file_and_directory_selection() {
+    let f = Fixture::new();
+    std::fs::remove_file(&f.path).unwrap();
+    let value = by_label(&f.values, labels::OPENAI_API_KEY).as_str();
+    let cases = [
+        (".claude/paste-cache/paste.txt", false),
+        (".claude/file-history/snapshot.json", false),
+        (".claude/projects/tool-output.json", false),
+        (".codex/log/session.log", false),
+        (".codex/sessions/session", true),
+        (".claude/projects/session.jsonl", true),
+    ];
+    for selection in ["catalog", "directory", "file"] {
+        for (relative, jsonl) in cases {
+            let path = f.home.home().join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = if jsonl {
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"text":value}),
+                    serde_json::json!({"text":value})
+                )
+            } else {
+                format!("pasted {value} here\n")
+            };
+            std::fs::write(&path, &original).unwrap();
+            age(&path);
+            let selected = if selection == "directory" {
+                path.parent().unwrap()
+            } else {
+                &path
+            };
+            let mut args = vec!["scrub", "--yes", "--json"];
+            if selection != "catalog" {
+                args.extend(["--path", selected.to_str().unwrap()]);
+            }
+            let mut cmd = on_terminal_command(&f.home, &args, &[]);
+            cmd.env("CLAUDE_CODE_TMPDIR", f.home.root().join("tmp"));
+            let out = finish_within(cmd, Duration::from_secs(180));
+            assert!(
+                out.status.success(),
+                "{selection} {relative}: {} {}",
+                stderr(&out),
+                stdout(&out)
+            );
+            let id = backup(&out);
+            let after = std::fs::read(&path).unwrap();
+            envcloak_testkit::assert_no_canary(&after, &f.values);
+            if jsonl {
+                assert_eq!(
+                    after
+                        .split(|b| *b == b'\n')
+                        .filter(|s| !s.is_empty())
+                        .count(),
+                    2
+                );
+                for line in after.split(|b| *b == b'\n').filter(|s| !s.is_empty()) {
+                    serde_json::from_slice::<Value>(line).unwrap();
+                }
+            } else {
+                assert_eq!(after, b"pasted [envcloak:redacted:openai/acme-web] here\n");
+            }
+            let undone = f.undo(&id, &[]);
+            assert!(undone.status.success(), "{}", stderr(&undone));
+            assert!(std::fs::read(&path).unwrap() == original.as_bytes());
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+#[test]
 fn gate37_short_values_untouched_output_swept_and_later_edits_refuse_undo() {
     let mut f = Fixture::new();
     let out = f.scrub(false);
