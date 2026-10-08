@@ -71,6 +71,7 @@
 		EC0000000000000000000018 /* envcloak-cli.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "envcloak-cli.entitlements"; sourceTree = "<group>"; };
 		EC0000000000000000000019 /* ai.envcloak.agent.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = ai.envcloak.agent.plist; sourceTree = "<group>"; };
 		EC000000000000000000001A /* EnvCloak.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = EnvCloak.icon; sourceTree = "<group>"; };
+		EC000000000000000000001B /* EnvCloakUITests.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = EnvCloakUITests.entitlements; sourceTree = "<group>"; };
 		EC0000000000000000000020 /* EnvCloak.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EnvCloak.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EC0000000000000000000021 /* EnvCloakAgent.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = EnvCloakAgent.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		EC0000000000000000000022 /* EnvCloakTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = EnvCloakTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -181,6 +182,7 @@
 				EC0000000000000000000016 /* EnvCloak.entitlements */,
 				EC0000000000000000000017 /* EnvCloakAgent.entitlements */,
 				EC0000000000000000000018 /* envcloak-cli.entitlements */,
+				EC000000000000000000001B /* EnvCloakUITests.entitlements */,
 				EC0000000000000000000007 /* LaunchAgents */,
 			);
 			path = Support;
@@ -559,6 +561,7 @@
 		EC00000000000000000000B8 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Support/EnvCloakUITests.entitlements;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.envcloak.app.uitests;
@@ -570,6 +573,7 @@
 		EC00000000000000000000B9 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CODE_SIGN_ENTITLEMENTS = Support/EnvCloakUITests.entitlements;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = YES;
 				PRODUCT_BUNDLE_IDENTIFIER = ai.envcloak.app.uitests;

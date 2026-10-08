@@ -58,6 +58,7 @@ TEST_SUPPORT = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKitTestSupport/F
 STREAM = "apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Stream.swift"
 INFO = "apps/macos/Support/EnvCloak-Info.plist"
 ENTITLEMENTS = "apps/macos/Support/EnvCloak.entitlements"
+UI_ENTITLEMENTS = "apps/macos/Support/EnvCloakUITests.entitlements"
 MANIFEST = "apps/macos/Packages/EnvCloakKit/Package.swift"
 PBXPROJ = "apps/macos/EnvCloak.xcodeproj/project.pbxproj"
 XCCONFIG = "apps/macos/Config/Base.xcconfig"
@@ -791,6 +792,26 @@ class CheckSwift(unittest.TestCase):
     def test_the_repository_passes(self):
         p = subprocess.run([CHECK], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(p.returncode, 0, p.stderr.decode())
+
+    def test_ui_runner_entitlements_are_exact_and_test_only(self):
+        sandbox = "com.apple.security.app-sandbox"
+        cases = [
+            (UI_ENTITLEMENTS, {sandbox: False}, 0),
+            (UI_ENTITLEMENTS, {sandbox: True}, 1),
+            (UI_ENTITLEMENTS, {sandbox: 0}, 1),
+            (UI_ENTITLEMENTS, {sandbox: "false"}, 1),
+            (UI_ENTITLEMENTS, {sandbox: False, "com.apple.security.get-task-allow": True}, 1),
+            (UI_ENTITLEMENTS, {sandbox: False, "com.apple.security.network.client": True}, 1),
+            (ENTITLEMENTS, {sandbox: False}, 1),
+        ]
+        for path, entitlements, expected in cases:
+            with self.subTest(path=path, entitlements=entitlements):
+                tree = Tree(self.base)
+                tree.write_bytes(path, plistlib.dumps(entitlements))
+                code, out = tree.check()
+                self.assertEqual(code, expected, out)
+                if expected:
+                    self.assertIn(("entitlement", path), self.findings(out), out)
 
     def refusal(self, name, rule, where, change):
         tree = Tree(self.base)

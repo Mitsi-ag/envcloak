@@ -274,6 +274,9 @@ Rules (the id is what a finding and an allowlist entry name):
                  any `com.apple.security.temporary-exception.` key are
                  never signed (D3-05, D3-06); a `CODE_SIGN_ENTITLEMENTS`
                  outside apps/macos or named through another setting.
+                 The UI runner's one test-only file may contain exactly
+                 `com.apple.security.app-sandbox = false`; resolved project
+                 settings and its built signature are checked separately.
   unreadable     a file a rule must read but cannot: a property list (by
                  name, `.plist` or `.entitlements`, or by its content) that
                  does not parse, a JSON file that does not parse, or a
@@ -2805,6 +2808,10 @@ def check_text_file(rel, data, text):
     if text is not None and rel.endswith(".pbxproj"):
         check_pbxproj(rel, searchable(rel, text))
     if rel.endswith(".entitlements"):
+        if (rel == APP + "/Support/EnvCloakUITests.entitlements"
+                and isinstance(parsed, dict) and len(parsed) == 1
+                and parsed.get("com.apple.security.app-sandbox") is False):
+            return
         if not isinstance(parsed, dict):
             find("entitlement", rel, 0, "not a property list dictionary this check can read")
         else:
