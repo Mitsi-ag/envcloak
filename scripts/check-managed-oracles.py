@@ -13,6 +13,8 @@ EXPECTED = frozenset((
     "luajit_module_options_load_code_before_the_entry",
     "ruby_short_values_read_the_rest_of_the_cluster_as_options",
     "node_long_options_take_values_as_node_does",
+    "npx_reads_its_options_after_an_option_value",
+    "deno_prefixed_options_take_values_only_with_equals",
 ))
 
 

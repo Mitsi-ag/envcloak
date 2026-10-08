@@ -1009,8 +1009,9 @@ mod tests {
     /// (Node takes `<file>` as the option's value and runs `<code>`), is
     /// refused by the launch check, which classes the stored argv again;
     /// the same record with Node's boolean `--allow-child-process` is the
-    /// control. Mutation checked: one prefix list for every family in
-    /// `boolean_long` (the previous rule): the stored record passes and
+    /// control. Mutations checked: one prefix list for every family in
+    /// `boolean_long` (the r3 rule), and Node's `--no-` prefix restored
+    /// (the r4 rule, `--no-print` stored): the stored record passes and
     /// this fails.
     #[test]
     fn a_stored_value_taking_long_option_cannot_keep_its_entry() {
@@ -1049,6 +1050,13 @@ mod tests {
                 "{option}"
             );
         }
+        // Stored under Node's `--no-` prefix (the r4 rule): `--no-print`
+        // still evaluates, so Node runs the entry's name as code.
+        assert!(check(&stored(&[n, "--no-warnings", o])).is_ok());
+        assert!(matches!(
+            check(&stored(&[n, "--no-print", o])),
+            Err(CheckError::Changed { .. })
+        ));
     }
 
     /// Mutation: validate only the original declaration, ignoring derived argv/env.
@@ -1144,6 +1152,37 @@ mod tests {
         )
         .unwrap();
         assert!(check(&package).is_ok());
+        // A runner record stored under the r4 scan, which stopped at an
+        // option's value: npm still reads the options after it, so each
+        // is refused now (Codex review of M2-27).
+        // The record keeps the `#!` line's interpreter before the
+        // declaration: its own arguments are the last two.
+        let head = package.argv.len() - 2;
+        let stored = |args: &[&str]| {
+            let mut old = package.clone();
+            old.declaration.argv.truncate(1);
+            old.declaration
+                .argv
+                .extend(args.iter().map(|a| (*a).to_owned()));
+            old.argv.truncate(head);
+            old.argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
+            old
+        };
+        assert!(check(&stored(&["--package", "foo", "fixture", "--call", "x"])).is_ok());
+        for args in [
+            &["--package", "foo", "--call", "echo CONTROL"][..],
+            &[
+                "--cache",
+                "/tmp/cache",
+                "--node-options=--require=/tmp/p.js",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                matches!(check(&stored(args)), Err(CheckError::Changed { .. })),
+                "{args:?}"
+            );
+        }
     }
 
     /// A bare name is found on the declared PATH, once, and the record

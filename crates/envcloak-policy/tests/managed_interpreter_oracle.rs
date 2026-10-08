@@ -182,6 +182,174 @@ fn npm_configuration_names_match_without_case() {
     }
 }
 
+/// npx (npm 11.19.0's `npx-cli.js`) takes an option's value and goes on
+/// reading its own options: `npx --package <pkg> --call <cmd>` and `npx
+/// --cache <dir> --node-options=... --call <cmd>` run `<cmd>`, so the
+/// value is never the package (Codex review of M2-27). Each is refused.
+/// The control: after the package, `--call` is the package's argument
+/// (`npx --yes --package <pkg> foo --call <cmd>` runs `foo`), and
+/// registers. Mutation checked: the runner scan stopped at the first word
+/// that is not an option (the r4 rule): the injected forms register and
+/// this fails.
+#[test]
+#[ignore = "requires npm 11.19.0; run scripts/check-managed-oracles.sh"]
+fn npx_reads_its_options_after_an_option_value() {
+    let npm = runtime("ENVCLOAK_NPM_ORACLE");
+    let npx = npm.canonicalize().unwrap().with_file_name("npx-cli.js");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let path = format!("{}:/usr/bin:/bin", npm.parent().unwrap().display());
+    let (user, global, cache, pkg) = (h.join("u"), h.join("g"), h.join("c"), h.join("pkg"));
+    std::fs::write(&user, b"").unwrap();
+    std::fs::write(&global, b"").unwrap();
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0","bin":{"foo":"foo.js"}}"#,
+    )
+    .unwrap();
+    let bin = pkg.join("foo.js");
+    std::fs::write(&bin, "#!/usr/bin/env node\nconsole.log('PKG')\n").unwrap();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let env = [
+        ("PATH", path.as_str()),
+        ("NPM_CONFIG_UPDATE_NOTIFIER", "false"),
+        ("NPM_CONFIG_OFFLINE", "true"),
+        ("NPM_CONFIG_USERCONFIG", user.to_str().unwrap()),
+        ("NPM_CONFIG_GLOBALCONFIG", global.to_str().unwrap()),
+    ];
+    let (p, c) = (pkg.to_str().unwrap(), cache.to_str().unwrap());
+    let argv = |args: &[&str]| -> Vec<String> {
+        std::iter::once("npx")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    let control = ["--yes", "--package", p, "foo", "--call", "echo CONTROL"];
+    assert_eq!(
+        run(&npx, h, &argv(&control)[1..], &env),
+        "PKG\n",
+        "the control"
+    );
+    assert!(matches!(
+        classify_argv(&argv(&control)),
+        Ok(ArgvClass::PackageRunner { .. })
+    ));
+    for args in [
+        &["--package", p, "--call", "echo CONTROL"][..],
+        &["--cache", c, "--call", "echo CONTROL"],
+        &[
+            "--cache",
+            c,
+            "--node-options=--no-warnings",
+            "--call",
+            "echo CONTROL",
+        ],
+    ] {
+        let out = run(&npx, h, &argv(args)[1..], &env);
+        assert_eq!(out, "CONTROL\n", "{args:?}");
+        assert_eq!(
+            classify_argv(&argv(args)),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+            "{args:?}"
+        );
+    }
+}
+
+/// Deno 2.9.7 takes no value for any `--allow-`, `--deny-` or `--no-`
+/// option of `deno run` without `=` (review of M2-27: the prefixes were
+/// documented, never measured): of every long option `deno run --help`
+/// names, each the policy accepts bare before an entry file, run before
+/// two files, runs the first or refuses the option itself, never the
+/// second; an unknown name under a prefix is an option error. With `=`,
+/// the permission values run the first file too. Mutation checked: deno's
+/// prefixes widened to every long option (`--`): `--cert <file>` and
+/// `--seed <n>` take the next argument, and this fails.
+#[test]
+#[ignore = "requires Deno 2.9.7; run scripts/check-managed-oracles.sh"]
+fn deno_prefixed_options_take_values_only_with_equals() {
+    let deno = runtime("ENVCLOAK_DENO_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let env = [
+        ("DENO_DIR", h.to_str().unwrap()),
+        ("DENO_NO_UPDATE_CHECK", "1"),
+        ("NO_COLOR", "1"),
+    ];
+    assert!(run(&deno, h, &["--version".into()], &env).starts_with("deno 2.9.7 "));
+    let first = h.join("first.ts");
+    let entry = h.join("entry.ts");
+    std::fs::write(&first, "console.log('first')\n").unwrap();
+    std::fs::write(&entry, "console.log('entry')\n").unwrap();
+    let (f, e) = (first.to_str().unwrap(), entry.to_str().unwrap());
+    assert_eq!(
+        run(&deno, h, &["run".into(), e.into()], &env),
+        "entry\n",
+        "the control"
+    );
+    // The help is longer than [`run`]'s cap.
+    let mut cmd = Command::new(&deno);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env("HOME", h)
+        .envs(env)
+        .current_dir(h)
+        .args(["run", "--help"]);
+    let result = run_capped(cmd, Duration::from_secs(20), 1 << 20).unwrap();
+    assert!(
+        result.in_time && result.complete && !result.over_cap && result.output.status.success(),
+        "{result:?}"
+    );
+    let help = String::from_utf8(result.output.stdout).unwrap();
+    let mut names: Vec<String> = help
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|w| w.len() > 2 && w.starts_with("--"))
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names.dedup();
+    assert!(names.len() > 20, "{names:?}");
+    // Unknown names under each prefix, and Node's `--no-print`.
+    names.extend(["--allow-x", "--deny-x", "--no-x", "--no-print"].map(str::to_owned));
+    let mut ran = 0;
+    for option in &names {
+        let argv: Vec<String> = ["deno", "run", option, f, e].map(str::to_owned).to_vec();
+        if classify_argv(&argv) != Ok(ArgvClass::Interpreter { entry: 3 }) {
+            continue;
+        }
+        let (ok, out, err) = run_any_with(&deno, h, &argv[1..], &env);
+        assert!(!out.contains("entry"), "{option} took the next argument");
+        let refused_option = err.contains("unexpected argument")
+            || err.contains("required arguments were not provided");
+        assert!(
+            (ok && out == "first\n") || (!ok && out.is_empty() && refused_option),
+            "{option}: {out:?} {err:?}"
+        );
+        ran += usize::from(ok);
+    }
+    assert!(ran > 20, "{ran}");
+    for option in [
+        "--allow-net=example.com",
+        "--allow-read=/",
+        "--deny-env=HOME",
+    ] {
+        let argv: Vec<String> = ["deno", "run", option, f, e].map(str::to_owned).to_vec();
+        assert_eq!(
+            classify_argv(&argv),
+            Ok(ArgvClass::Interpreter { entry: 3 })
+        );
+        assert_eq!(run(&deno, h, &argv[1..], &env), "first\n", "{option}");
+    }
+}
+
 /// The environment spellings must obey the same code-loading policy as
 /// their corresponding attached options. Mutation: omit both names from
 /// the environment refusal predicate.
@@ -468,8 +636,18 @@ fn ruby_short_values_read_the_rest_of_the_cluster_as_options() {
 }
 
 /// Runs `bin` like [`run`], but returns whether it succeeded and what it
-/// printed, success or not.
-fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String) {
+/// printed on standard output and standard error, success or not.
+fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String, String) {
+    run_any_with(bin, home, args, &[])
+}
+
+/// [`run_any`] with `extra` variables.
+fn run_any_with(
+    bin: &Path,
+    home: &Path,
+    args: &[String],
+    extra: &[(&str, &str)],
+) -> (bool, String, String) {
     let mut cmd = Command::new(bin);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -478,7 +656,8 @@ fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String) {
         .env("HOME", home)
         .env("TMPDIR", home)
         .current_dir(home)
-        .args(args);
+        .args(args)
+        .envs(extra.iter().copied());
     let result = run_capped(cmd, Duration::from_secs(20), 8192).unwrap();
     assert!(
         result.in_time && result.complete && !result.over_cap,
@@ -487,6 +666,7 @@ fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String) {
     (
         result.output.status.success(),
         String::from_utf8(result.output.stdout).unwrap(),
+        String::from_utf8_lossy(&result.output.stderr).into_owned(),
     )
 }
 
@@ -497,10 +677,14 @@ fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String) {
 /// refused for a declaration, an update and a `#!` line. Then every long
 /// option Node 26.7.0 knows, and its `--no-` form, that the policy accepts
 /// bare before an entry file is run before two files: Node must run the
-/// first one (or refuse to start), never the second, which would mean the
-/// option took the first as its value. Mutation checked: one prefix list
-/// for every family in `boolean_long` (the previous rule): the injected
-/// forms register and this fails.
+/// first one, or refuse the option itself (`bad option`, `invalid
+/// negation`); never the second, which would mean the option took the
+/// first as its value, and never anything else, such as evaluating the
+/// first file's name (`node --no-print <file>` does: review of M2-27).
+/// Mutations checked: one prefix list for every family in `boolean_long`
+/// (the r3 rule): the injected forms register and this fails; Node's
+/// `--no-` prefix restored (the r4 rule): `--no-print` registers, its
+/// run evaluates the file's name and the sweep fails.
 #[test]
 #[ignore = "requires Node 26.7.0; run scripts/check-managed-oracles.sh"]
 fn node_long_options_take_values_as_node_does() {
@@ -578,6 +762,7 @@ fn node_long_options_take_values_as_node_does() {
         &[],
     );
     let mut tried = 0;
+    let mut wrong = Vec::new();
     for name in names.lines().filter(|n| n.starts_with("--")) {
         for option in [name.to_owned(), format!("--no-{}", &name[2..])] {
             let argv = vec!["node".to_owned(), option.clone(), f.into(), e.into()];
@@ -585,11 +770,32 @@ fn node_long_options_take_values_as_node_does() {
                 continue;
             }
             tried += 1;
-            let (ok, out) = run_any(&node, h, &argv[1..]);
+            let (ok, out, err) = run_any(&node, h, &argv[1..]);
             assert!(!out.contains("entry"), "{option} took the next argument");
-            assert!(!ok || out == "first\n", "{option}: {out:?}");
+            // Node refuses the option before it runs anything: unknown,
+            // a negation of a valued one, or a permission option without
+            // `--permission`; or, under `--permission`, the reading of
+            // the main file (the first one) is denied.
+            let refused_option = err.contains("bad option")
+                || err.contains("is an invalid negation")
+                || err.contains("ERR_MISSING_OPTION")
+                || (err.contains("ERR_ACCESS_DENIED") && err.contains("resolveMainPath"))
+                || err.contains("OpenSSL error when trying to enable FIPS");
+            if !((ok && out == "first\n") || (!ok && out.is_empty() && refused_option)) {
+                wrong.push(format!("{option}: {out:?} {err:?}"));
+            }
         }
     }
-    // The measured booleans, and the `--no-` form of every option.
-    assert!(tried > 100, "{tried}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // The positive control for the sweep's failure rule: `--no-print`
+    // evaluates the first file's name as code (an `[eval]` error, never an
+    // option one), and is refused.
+    let (ok, out, err) = run_any(&node, h, &["--no-print".into(), f.into(), e.into()]);
+    assert!(!ok && out.is_empty() && err.contains("[eval]"), "{err:?}");
+    assert_eq!(
+        classify_argv(&["node".into(), "--no-print".into(), f.into(), e.into()]),
+        Err(DeclError::NoEntry)
+    );
+    // The measured booleans and negations: 58 of Node 26.7.0's forms.
+    assert!(tried >= 58, "{tried}");
 }

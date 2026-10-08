@@ -7,8 +7,10 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import platform
 import tarfile
 import urllib.request
+import zipfile
 
 # Upstream release archives, verified before extraction on every invocation.
 SOURCES = (
@@ -34,6 +36,41 @@ SOURCES = (
      "23815a6d095696f7919090fdc3e2f9459b2c83d57224b2e446ce1f5f7333ef36",
      ["--disable-install-doc"], "ruby"),
 )
+
+# Deno ships as a binary per platform: its release zip, verified before
+# extraction on every invocation. Deno 2.9.7.
+DENO_VERSION = "2.9.7"
+DENO = {
+    ("Darwin", "arm64"): ("deno-aarch64-apple-darwin.zip",
+                          "5cd46d6268f6f78f5d88bdc7159d20bd44cdaa4b3303474839f87ec6fe7ae25c"),
+    ("Darwin", "x86_64"): ("deno-x86_64-apple-darwin.zip",
+                           "95daaff11c116a52ad54785e7914c8e9c9cdcaba793c5ed929c74ca2d8e6259a"),
+    ("Linux", "x86_64"): ("deno-x86_64-unknown-linux-gnu.zip",
+                          "c6527f24f4b16031d3ae4fa9f658d5f11534c8d84ce7dc8502420280919c3490"),
+    ("Linux", "aarch64"): ("deno-aarch64-unknown-linux-gnu.zip",
+                           "c832298b1ad4422481334855f6003e0f54145762c5a134f20a489511d2f65bbf"),
+}
+
+
+def provision_deno(root):
+    name, digest = DENO[(platform.system(), platform.machine())]
+    archive = root / name
+    if not archive.exists():
+        url = f"https://github.com/denoland/deno/releases/download/v{DENO_VERSION}/{name}"
+        with urllib.request.urlopen(url, timeout=60) as response:
+            archive.write_bytes(response.read())
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+        raise ValueError("archive digest mismatch: deno")
+    target = root / f"deno-{DENO_VERSION}"
+    binary = target / "deno"
+    if not binary.is_file():
+        target.mkdir(exist_ok=True)
+        with zipfile.ZipFile(archive) as contents:
+            if contents.namelist() != ["deno"]:
+                raise ValueError("unexpected deno archive contents")
+            contents.extract("deno", target)
+        binary.chmod(0o755)
+    return binary
 
 
 def provision(root):
@@ -80,10 +117,11 @@ def provision(root):
         if link.is_symlink():
             link.unlink()
         link.symlink_to(target)
+    deno = provision_deno(root)
     return dict(zip(
         ("ENVCLOAK_PHP_ORACLE", "ENVCLOAK_PYTHON_DEBUG_ORACLE", "ENVCLOAK_NPM_ORACLE", "ENVCLOAK_LUAJIT_ORACLE",
-         "ENVCLOAK_RUBY_ORACLE", "ENVCLOAK_NODE_ORACLE"),
-        (binaries[0], binaries[1], bindir / "npm", binaries[3], binaries[4], bindir / "node")))
+         "ENVCLOAK_RUBY_ORACLE", "ENVCLOAK_NODE_ORACLE", "ENVCLOAK_DENO_ORACLE"),
+        (binaries[0], binaries[1], bindir / "npm", binaries[3], binaries[4], bindir / "node", deno)))
 
 
 def main():

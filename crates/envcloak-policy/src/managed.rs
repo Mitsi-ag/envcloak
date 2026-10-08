@@ -412,11 +412,15 @@ const VALUE_LONG_PREFIXES: [&str; 2] = ["--allow-", "--deny-"];
 /// takes one in another (review of M2-27: Node's `--allow-fs-read`,
 /// `--allow-fs-write`, `--disable-warning` and `--disable-proto` take the
 /// next argument, so `node --allow-fs-read /a -e code` runs `code`, while
-/// deno's `--allow-read` takes a value only after `=`). Measured with
-/// Node 26.7.0 (its option table, and `--no-` refused on any option that
-/// is not a boolean one), Bun 1.3.13, Ruby 2.6, `/bin/bash` 3.2
-/// and `/bin/zsh` on macOS; deno's permission and `--no-` flags take a
-/// value only with `=` (`deno run --allow-net s.ts` runs `s.ts`).
+/// deno's `--allow-read` takes a value only after `=`). A prefix stands
+/// only where every option it matches was measured, as a sweep of the
+/// interpreter's own option table: Node 26.7.0 has none (its `--no-print`
+/// still evaluates, so each negation is listed), Bun 1.3.13 runs the
+/// first file after any `--no-` form, `--no-print` and `--no-eval`
+/// included, Ruby 2.6, Deno 2.9.7 (its oracle sweeps every `--allow-`,
+/// `--deny-` and `--no-` option of `deno run`), `/bin/bash` 3.2
+/// and `/bin/zsh` on macOS (every zsh option's `--no-` form). TruffleRuby
+/// was never measured and has none.
 fn boolean_long(stem: &str) -> (&'static [&'static str], &'static [&'static str]) {
     match stem {
         "node" | "nodejs" => (
@@ -442,8 +446,51 @@ fn boolean_long(stem: &str) -> (&'static [&'static str], &'static [&'static str]
                 "--enable-fips",
                 "--permission",
                 "--permission-audit",
+                // Node takes `--no-` before a boolean option only, but
+                // `--print` is one, and `--no-print` still turns on eval
+                // mode (review of M2-27: `node --no-print <file>` evaluates
+                // the file's name as code). So each negation is listed:
+                // each turns off a feature, none names a mode, and each
+                // was measured to run the first file on Node 26.7.0.
+                "--no-warnings",
+                "--no-deprecation",
+                "--no-addons",
+                "--no-global-search-paths",
+                "--no-experimental-websocket",
+                "--no-experimental-global-navigator",
+                "--no-experimental-require-module",
+                "--no-require-module",
+                "--no-experimental-detect-module",
+                "--no-experimental-strip-types",
+                "--no-strip-types",
+                "--no-experimental-sqlite",
+                "--no-experimental-webstorage",
+                "--no-webstorage",
+                "--no-experimental-eventsource",
+                "--no-network-family-autoselection",
+                "--no-enable-network-family-autoselection",
+                "--no-extra-info-on-fatal-exception",
+                "--no-force-async-hooks-checks",
+                "--no-trace-warnings",
+                "--no-trace-deprecation",
+                "--no-trace-uncaught",
+                "--no-enable-source-maps",
+                "--no-pending-deprecation",
+                "--no-throw-deprecation",
+                "--no-preserve-symlinks",
+                "--no-preserve-symlinks-main",
+                "--no-insecure-http-parser",
+                "--no-use-env-proxy",
+                "--no-use-system-ca",
+                "--no-use-openssl-ca",
+                "--no-use-bundled-ca",
+                "--no-async-context-frame",
+                "--no-frozen-intrinsics",
+                "--no-zero-fill-buffers",
+                "--no-abort-on-uncaught-exception",
+                "--no-expose-gc",
             ],
-            &["--no-"],
+            &[],
         ),
         "deno" => (&["--quiet"], &["--no-", "--allow-", "--deny-"]),
         "bun" => (&["--smol"], &["--no-"]),
@@ -571,7 +618,7 @@ pub fn is_code_loading_option(arg: &str) -> bool {
 /// [`value_short`] ending its cluster, a long one without `=` that is not
 /// known to take none): which argument is the entry file is then not
 /// known, [`DeclError::NoEntry`].
-fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
+fn interpreter_option(stem: &str, long_family: &str, arg: &str) -> Result<(), DeclError> {
     let loads = Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
     if arg.starts_with("--") {
         if is_code_loading_option(arg) {
@@ -583,7 +630,7 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
                 || VALUE_LONG_PREFIXES.iter().any(|p| name.starts_with(p));
             return if known { Ok(()) } else { loads };
         }
-        let (exact, prefixes) = boolean_long(stem);
+        let (exact, prefixes) = boolean_long(long_family);
         if exact.contains(&arg)
             || prefixes
                 .iter()
@@ -864,25 +911,134 @@ fn interpreter_family(name: &str) -> Option<&'static str> {
         .find(|stem| name.strip_prefix(stem).is_some_and(versioned))
 }
 
-/// The first argument of `argv` after `from` that is not an option.
-fn first_word(argv: &[String], from: usize) -> Option<&str> {
-    argv.iter()
-        .skip(from)
-        .map(String::as_str)
-        .find(|a| !a.starts_with('-'))
+/// The first argument of `argv` after `from` that is not an option. For
+/// a Node package runner ([`NODE_RUNNERS`]), only when it is surely not
+/// an option's value: every option before it carries its value after
+/// `=`. After an option without one, which may take the next argument
+/// (`npm --cache /c exec`), the word is not known: `None`, and the label
+/// names the runner alone, never the value as its subcommand.
+fn first_word<'a>(name: &str, argv: &'a [String], from: usize) -> Option<&'a str> {
+    let strict = NODE_RUNNERS.contains(&name);
+    for a in argv.iter().skip(from).map(String::as_str) {
+        if strict && a == "--" {
+            return None;
+        }
+        if !a.starts_with('-') {
+            return Some(a);
+        }
+        if strict && !a.contains('=') {
+            return None;
+        }
+    }
+    None
+}
+
+/// The Node package runners, whose own options may run other code.
+const NODE_RUNNERS: [&str; 6] = ["npx", "pnpx", "bunx", "npm", "pnpm", "yarn"];
+
+/// The options of a Node package runner that run other code or choose
+/// it, besides [`is_code_loading_option`]: a command to run (`--call`),
+/// Node's options (`--node-options`), the shell that runs scripts
+/// (`--script-shell`, npx's `--shell`) and a configuration file that may
+/// set any of these (`--userconfig`, `--globalconfig`; the same
+/// configuration as the `npm_config_*` variables [`is_code_selecting`]
+/// refuses).
+const RUNNER_LOADING_LONG: [&str; 6] = [
+    "--call",
+    "--node-options",
+    "--script-shell",
+    "--shell",
+    "--userconfig",
+    "--globalconfig",
+];
+
+/// The options npx takes without a value (npm 11.19.0's `npx-cli.js`: its
+/// `switches`, npm's boolean configuration, and `-y`, which it expands to
+/// `--yes`). Each one is measured: an option here that npx gave a value
+/// would let that value pass for the package.
+const NPX_SWITCHES: [&str; 8] = [
+    "yes",
+    "y",
+    "quiet",
+    "q",
+    "prefer-offline",
+    "offline",
+    "prefer-online",
+    "no-install",
+];
+
+/// The options npx always gives a value: the next argument, when none is
+/// attached with `=` (npm 11.19.0's `npx-cli.js`: its `opts`).
+const NPX_VALUED: [&str; 10] = [
+    "package",
+    "p",
+    "cache",
+    "userconfig",
+    "call",
+    "c",
+    "shell",
+    "npm",
+    "node-arg",
+    "n",
+];
+
+/// Where a Node package runner's own options end in `argv`: the index of
+/// `--`, of npx's package, or the end. npx (npm 11.19.0's `npx-cli.js`)
+/// stops at its first argument that is neither an option nor an option's
+/// value; an option it does not know as a switch takes the next argument
+/// as its value unless that one starts with `-`. `npm` reads options on
+/// either side of its words until `--` (`npm exec pkg --call c` runs `c`),
+/// and the other runners are taken as `npm` is, never measured to stop
+/// sooner. An option value is never the package (Codex review of M2-27:
+/// `npx --package foo --call c` and `npx --cache /c --node-options=...`
+/// passed, the scan having stopped at `foo` and `/c`).
+fn runner_options_end(name: &str, argv: &[String]) -> usize {
+    let end = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    if name != "npx" {
+        return end;
+    }
+    let mut i = 1;
+    while i < end {
+        let a = argv[i].as_str();
+        if !a.starts_with('-') {
+            return i;
+        }
+        let (key, attached) = match a.trim_start_matches('-').split_once('=') {
+            Some((k, _)) => (k, true),
+            None => (a.trim_start_matches('-'), false),
+        };
+        let next_is_option = argv.get(i + 1).is_some_and(|n| n.starts_with('-'));
+        if !attached
+            && !NPX_SWITCHES.contains(&key)
+            && (NPX_VALUED.contains(&key) || !next_is_option)
+        {
+            i += 1;
+        }
+        i += 1;
+    }
+    end
+}
+
+/// Whether the runner's option `a` runs other code or chooses it
+/// ([`is_code_loading_option`], [`RUNNER_LOADING_LONG`]).
+fn runner_option_loads(a: &str) -> bool {
+    is_code_loading_option(a)
+        || RUNNER_LOADING_LONG
+            .iter()
+            .any(|o| a == *o || a.strip_prefix(o).is_some_and(|r| r.starts_with('=')))
 }
 
 /// The label of a package runner `name` with `argv` (see
 /// [`PACKAGE_RUNNERS`]), or `None` when `name` is not one.
 fn runner_label(name: &str, argv: &[String]) -> Option<String> {
     let has = |w: &str| argv.iter().skip(1).any(|a| a == w);
-    let sub = |n: &str| match first_word(argv, 1) {
+    let sub = |n: &str| match first_word(name, argv, 1) {
         Some(w) => format!("{n} {w}"),
         None => n.to_owned(),
     };
     Some(match name {
         "npx" | "pnpx" | "bunx" | "uvx" => name.to_owned(),
-        "npm" => match first_word(argv, 1) {
+        "npm" => match first_word(name, argv, 1) {
             Some("exec" | "x") => "npm exec".to_owned(),
             _ => sub("npm"),
         },
@@ -975,23 +1131,15 @@ fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
     }
     if let Some(label) = runner_label(name, argv) {
         // A Node package runner's own options that run other code (`npx
-        // -c`, `--call`, `--node-options`).
-        if matches!(name, "npx" | "pnpx" | "bunx" | "npm" | "pnpm" | "yarn") {
-            for a in argv.iter().skip(1) {
-                if a == "--" {
-                    break;
-                }
-                if is_code_loading_option(a)
-                    || ["--call", "--node-options"]
-                        .iter()
-                        .any(|o| a == *o || a.strip_prefix(o).is_some_and(|r| r.starts_with('=')))
-                {
-                    return Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
-                }
-                if !a.starts_with('-') && !label.split(' ').any(|w| w == a) {
-                    break;
-                }
-            }
+        // -c`, `--call`, `--node-options`), wherever the runner reads
+        // them: every argument up to the end of its options, option
+        // values included (a value that is an option is refused too).
+        if NODE_RUNNERS.contains(&name)
+            && argv[1..runner_options_end(name, argv)]
+                .iter()
+                .any(|a| runner_option_loads(a))
+        {
+            return Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
         }
         return Ok(ArgvClass::PackageRunner { label });
     }
@@ -1001,6 +1149,13 @@ fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
     // `deno run x.ts` and `bun run x.ts` name their entry after a
     // subcommand; any other subcommand of theirs (`bun x`, `deno task`)
     // runs a package or a task: a package runner.
+    // TruffleRuby takes Ruby's short options, but its long ones were never
+    // measured: none is taken as one without a value.
+    let long_family = if name.to_ascii_lowercase().starts_with("truffleruby") {
+        "truffleruby"
+    } else {
+        stem
+    };
     let mut i = 1;
     if matches!(stem, "deno" | "bun") {
         match argv.get(1).map(String::as_str) {
@@ -1021,7 +1176,7 @@ fn classify_named(argv: &[String], name: &str) -> Result<ArgvClass, DeclError> {
         if !a.starts_with('-') || a == "-" {
             break;
         }
-        interpreter_option(stem, a)?;
+        interpreter_option(stem, long_family, a)?;
         i += 1;
     }
     let entry = argv.get(i).ok_or(DeclError::NoEntry)?;
@@ -1493,7 +1648,10 @@ mod tests {
     /// without `=` taken as one that takes no value: `node --title
     /// /srv/other.js /srv/s.js` checks `/srv/other.js` and this fails; the
     /// Lua, PHP, gem and Perl debugger variables left out of
-    /// `CODE_SELECTING`: their declarations register and this fails.
+    /// `CODE_SELECTING`: their declarations register and this fails; a
+    /// Node package runner's scan stopped at its first word that is not an
+    /// option (the r4 rule, which took an option's value for the package):
+    /// `npx --package foo --call c` registers and this fails.
     #[test]
     fn code_selecting_declarations_are_refused() {
         let mut d = decl(&["/usr/bin/server"]);
@@ -1524,6 +1682,43 @@ mod tests {
             &["npx", "-yc", "echo"],
             &["npx", "--node-options=--require=/x.js", "pkg"],
             &["npm", "--node-options", "--require=/x.js", "exec", "pkg"],
+            // After an option's value, which is never the package (Codex
+            // review of M2-27), and wherever npm reads its options.
+            &["npx", "--package", "foo", "--call", "echo CONTROL"],
+            &["npx", "-p", "foo", "--call", "echo CONTROL"],
+            &[
+                "npx",
+                "--cache",
+                "/tmp/cache",
+                "--node-options=--require=/tmp/prelude.js",
+                "pkg",
+            ],
+            &[
+                "npx",
+                "--registry",
+                "https://r.example",
+                "-c",
+                "echo",
+                "pkg",
+            ],
+            &["npx", "--loglevel", "warn", "--call=echo", "pkg"],
+            &["npm", "exec", "pkg", "--call", "echo CONTROL"],
+            &[
+                "npm",
+                "--cache",
+                "/tmp/cache",
+                "exec",
+                "pkg",
+                "--node-options=--require=/x.js",
+            ],
+            &["pnpm", "dlx", "pkg", "--node-options=--require=/x.js"],
+            &["yarn", "dlx", "pkg", "--call", "echo"],
+            &["bunx", "pkg", "-e", "code"],
+            // The shell that runs scripts, and configuration files.
+            &["npx", "--shell", "/tmp/sh", "pkg"],
+            &["npm", "--script-shell=/tmp/sh", "start"],
+            &["npm", "--userconfig", "/tmp/npmrc", "start"],
+            &["npx", "--globalconfig=/tmp/npmrc", "pkg"],
             // An interpreter's own way of taking code from elsewhere.
             &["python3", "-i", "/srv/s.py"],
             &["sh", "-s", "/srv/s.sh"],
@@ -1617,7 +1812,11 @@ mod tests {
     /// Mutation checked: one prefix list for every family (the previous
     /// `BOOLEAN_LONG_PREFIXES`, `--no-`, `--allow-`, `--deny-`,
     /// `--enable-`, `--disable-`): `node --allow-fs-read /srv/other.js -e
-    /// code` registers with `/srv/other.js` as its entry and this fails.
+    /// code` registers with `/srv/other.js` as its entry and this fails;
+    /// Node's `--no-` prefix restored (the r4 rule): `node --no-print
+    /// /abs/x.js` registers, and Node evaluates the path, and this fails;
+    /// TruffleRuby given Ruby's long options: `truffleruby --disable-gems`
+    /// registers and this fails.
     #[test]
     fn long_options_take_values_as_their_own_interpreter_does() {
         let v = |argv: &[&str]| argv.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
@@ -1638,6 +1837,20 @@ mod tests {
             &["node", "--allow-some-future", "/srv/other.js", "/srv/s.js"],
             &["node", "--enable-some-future", "/srv/other.js", "/srv/s.js"],
             &["node", "--no-", "/srv/other.js", "/srv/s.js"],
+            // `--no-print` still turns on eval mode: Node evaluates the
+            // name of the file checked as the entry (review of M2-27).
+            &["node", "--no-print", "/abs/x.js"],
+            &["node", "--no-print", "/srv/other.js", "/srv/s.js"],
+            &["nodejs22", "--no-eval", "/srv/other.js", "/srv/s.js"],
+            &["node", "--no-some-future", "/srv/other.js", "/srv/s.js"],
+            // TruffleRuby's long options were never measured.
+            &[
+                "truffleruby",
+                "--disable-gems",
+                "/srv/other.rb",
+                "/srv/s.rb",
+            ],
+            &["truffleruby24.1", "--verbose", "/srv/other.rb", "/srv/s.rb"],
             &["bun", "--allow-fs-read", "/srv/other.js", "/srv/s.js"],
             &["bun", "--disable-x", "/srv/other.js", "/srv/s.js"],
             &["deno", "run", "--enable-x", "/srv/other.ts", "/srv/s.ts"],
@@ -2214,6 +2427,20 @@ mod tests {
             (&["pipx", "run", "pkg"], "pipx run"),
             (&["npm", "exec", "pkg"], "npm exec"),
             (&["uv", "tool", "run", "pkg"], "uv tool run"),
+            // npx's package ends its options: what follows is the
+            // package's (the controls for the refusals after an option's
+            // value).
+            (&["npx", "--yes", "pkg", "-c", "x", "--call", "y"], "npx"),
+            (
+                &["npx", "--package", "foo", "bar", "--config", "/c.json"],
+                "npx",
+            ),
+            (&["npx", "-y", "pkg", "--", "--call"], "npx"),
+            (&["npm", "exec", "pkg", "--", "--call", "x"], "npm exec"),
+            // A word after an option without `=` may be its value: the
+            // runner alone names the launch.
+            (&["npm", "--cache", "/tmp/c", "exec", "pkg"], "npm"),
+            (&["npm", "--cache=/tmp/c", "exec", "pkg"], "npm exec"),
         ] {
             assert_eq!(
                 c(argv),
@@ -2221,6 +2448,79 @@ mod tests {
                     label: label.to_owned()
                 }),
                 "{argv:?}"
+            );
+        }
+    }
+
+    /// A Node package runner's option that runs other code is refused
+    /// after an option's value as before one, for a declaration and an
+    /// update (Codex review of M2-27): npm reads `--package foo` and
+    /// `--cache /c` as option and value and goes on reading options, so
+    /// `foo` and `/c` are not the package. Its package's own arguments
+    /// (after npx's package, or after `--`) are the controls.
+    ///
+    /// Mutation checked: the scan stopped at the first word that is not
+    /// an option (the r4 rule): these register and this fails.
+    #[test]
+    fn runner_options_after_an_option_value_are_still_the_runners() {
+        let v = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let refused = Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+        let base = decl(&["npx", "-y", "pkg"]);
+        assert!(check_declaration(&base).is_ok());
+        for argv in [
+            &["npx", "--package", "foo", "--call", "echo CONTROL"][..],
+            &[
+                "npx",
+                "--cache",
+                "/tmp/cache",
+                "--node-options=--require=/tmp/p.js",
+                "pkg",
+            ],
+            &["npx", "--prefer-offline", "--userconfig", "/tmp/rc", "pkg"],
+            &["npm", "exec", "--package", "foo", "pkg", "--call", "echo"],
+            &[
+                "pnpm",
+                "--dir",
+                "/srv",
+                "dlx",
+                "pkg",
+                "--node-options=--require=/x.js",
+            ],
+        ] {
+            let argv = v(argv);
+            assert_eq!(
+                check_declaration(&LaunchDecl {
+                    argv: argv.clone(),
+                    ..base.clone()
+                }),
+                refused,
+                "{argv:?}"
+            );
+            assert_eq!(
+                apply_changes(
+                    &base,
+                    &LaunchChanges {
+                        argv: Some(argv.clone()),
+                        ..LaunchChanges::default()
+                    }
+                )
+                .map(|_| ()),
+                refused,
+                "{argv:?}"
+            );
+        }
+        for argv in [
+            &["npx", "--package", "foo", "bar", "--call", "x"][..],
+            &["npx", "--yes", "pkg", "--node-options=--require=/x.js"],
+            &["npm", "exec", "pkg", "--", "--call", "x"],
+        ] {
+            let argv = v(argv);
+            assert!(
+                check_declaration(&LaunchDecl {
+                    argv,
+                    ..base.clone()
+                })
+                .is_ok()
             );
         }
     }
