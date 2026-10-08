@@ -1004,6 +1004,53 @@ mod tests {
         }
     }
 
+    /// A record stored under the earlier shared prefix list, `node
+    /// --allow-fs-read <file> -e <code>` with `<file>` checked as its entry
+    /// (Node takes `<file>` as the option's value and runs `<code>`), is
+    /// refused by the launch check, which classes the stored argv again;
+    /// the same record with Node's boolean `--allow-child-process` is the
+    /// control. Mutation checked: one prefix list for every family in
+    /// `boolean_long` (the previous rule): the stored record passes and
+    /// this fails.
+    #[test]
+    fn a_stored_value_taking_long_option_cannot_keep_its_entry() {
+        let home = tempfile::Builder::new()
+            .prefix("ecl")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let base = resolve(&decl(&["true"]), &root, vec![], [24; 16], 1).unwrap();
+        let node = root.join("node");
+        std::fs::copy(
+            Path::new(std::ffi::OsStr::from_bytes(&base.executable.path)),
+            &node,
+        )
+        .unwrap();
+        let other = root.join("other.js");
+        std::fs::write(&other, "0\n").unwrap();
+        let (n, o) = (node.to_str().unwrap(), other.to_str().unwrap());
+        let stored = |argv: &[&str]| {
+            let mut l = base.clone();
+            l.declaration = decl(argv);
+            l.argv = argv.iter().map(|a| a.as_bytes().to_vec()).collect();
+            l.executable = file_identity(&node).unwrap();
+            l.entry = Some(file_identity(&other).unwrap());
+            l.class = LaunchClass::Script;
+            l.strength = BindingStrength::CheckedAtRest;
+            l
+        };
+        assert!(check(&stored(&[n, "--allow-child-process", o])).is_ok());
+        for option in ["--allow-fs-read", "--allow-fs-write", "--disable-warning"] {
+            assert!(
+                matches!(
+                    check(&stored(&[n, option, o, "-e", "0"])),
+                    Err(CheckError::Changed { .. })
+                ),
+                "{option}"
+            );
+        }
+    }
+
     /// Mutation: validate only the original declaration, ignoring derived argv/env.
     #[test]
     fn stored_effective_arguments_and_entries_obey_current_policy() {

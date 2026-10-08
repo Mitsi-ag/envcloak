@@ -12,6 +12,7 @@ EXPECTED = frozenset((
     "bash_login_startup_is_refused_for_declarations_updates_and_shebangs",
     "luajit_module_options_load_code_before_the_entry",
     "ruby_short_values_read_the_rest_of_the_cluster_as_options",
+    "node_long_options_take_values_as_node_does",
 ))
 
 

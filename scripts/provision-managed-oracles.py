@@ -82,8 +82,8 @@ def provision(root):
         link.symlink_to(target)
     return dict(zip(
         ("ENVCLOAK_PHP_ORACLE", "ENVCLOAK_PYTHON_DEBUG_ORACLE", "ENVCLOAK_NPM_ORACLE", "ENVCLOAK_LUAJIT_ORACLE",
-         "ENVCLOAK_RUBY_ORACLE"),
-        (binaries[0], binaries[1], bindir / "npm", binaries[3], binaries[4])))
+         "ENVCLOAK_RUBY_ORACLE", "ENVCLOAK_NODE_ORACLE"),
+        (binaries[0], binaries[1], bindir / "npm", binaries[3], binaries[4], bindir / "node")))
 
 
 def main():
