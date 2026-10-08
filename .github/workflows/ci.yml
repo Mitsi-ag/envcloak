@@ -815,7 +815,7 @@ jobs:
             exit 1
           fi
           xcodebuild -version
-          xcodebuild -version | grep -qx "Build version 17F113" || {
+          xcodebuild -version | grep -x "Build version 17F113" >/dev/null || {
             echo "::error title=macos-app::the selected Xcode is not 26.6 (17F113)"
             exit 1
           }
