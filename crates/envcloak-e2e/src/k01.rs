@@ -169,8 +169,13 @@ pub fn check_documented() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/ACCEPTANCE.md"),
     )
     .expect("read docs/ACCEPTANCE.md");
+    let message = RUNTIME_DIR
+        .strip_prefix("daemon_unverified: ")
+        .expect("K-01 runtime directory refusal token");
     assert!(
-        acceptance.contains(&format!("`envcloak: {RUNTIME_DIR}{NOTHING_SENT}`")),
+        acceptance.contains(&format!(
+            "`envcloak: daemon_unverified: {message}{NOTHING_SENT}`"
+        )),
         "K-01's full pre-send refusal differs from docs/ACCEPTANCE.md"
     );
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/AGENTS.md");
