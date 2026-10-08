@@ -217,7 +217,7 @@ class Build:
         write(os.path.join(self.fake, "hold.sh"), HOLD)
         write(os.path.join(self.fake, "moves"), "0\n")
         write(os.path.join(self.fake, "log"), "")
-        write(os.path.join(self.fake, "bin", "envcloak"), "#!/bin/sh\necho 'envcloak 9.9.9-test'\n", 0o755)
+        write(os.path.join(self.fake, "bin", "envcloak"), "#!/bin/sh\nif [ \"$1\" = status ]; then echo '{\"daemon\":{\"version\":\"9.9.9-test\"}}'; else echo 'envcloak 9.9.9-test'; fi\n", 0o755)
         write(os.path.join(self.fake, "bin", "envcloakd"), "#!/bin/sh\nexit 0\n", 0o755)
         data = os.urandom(32)
         with open(os.path.join(self.fake, "new-mark"), "wb") as f:

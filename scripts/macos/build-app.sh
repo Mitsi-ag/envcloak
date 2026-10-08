@@ -18,9 +18,9 @@
 #    version is the bundled CLI's. Only a bundle that passes replaces the
 #    previous one at the output path.
 # 6. With --install, a copy to /Applications (or --install-dir), checked
-#    again there before it replaces the installed app. Restarting the
-#    background process when its version changed is task M3-06's; this
-#    script says that it did not.
+#    again there before it replaces the installed app. The bundled CLI
+#    restarts the background process only when its running version differs
+#    (or starts it when absent), then verifies the resulting version.
 #
 # A replacement (steps 5 and 6) moves the previous app aside, then the new
 # one into place. If the second move fails, or the script stops between the
@@ -337,9 +337,45 @@ if [ "$install" = 1 ]; then
   make_dir incoming "$install_prefix"
   ditto "$app" "$incoming/EnvCloak.app"
   "$here/sign-check.sh" "$incoming/EnvCloak.app"
+  # Query through the verified bundled CLI. Malformed status is a failure,
+  # never evidence that restarting a process is safe or has succeeded.
+  restart=1
+  if "$incoming/EnvCloak.app/Contents/MacOS/envcloak" status --json >"$work/status.json" 2>"$work/status.err"; then
+    python3 - "$work/status.json" "$version" >"$work/restart" <<'PY_STATUS'
+import json, sys
+try:
+    version = json.load(open(sys.argv[1]))['daemon']['version']
+    if not isinstance(version, str) or not version or len(version) > 32:
+        raise ValueError()
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit('build-app: background process status was invalid; installation stopped')
+print('0' if version == sys.argv[2] else '1')
+PY_STATUS
+    first_line restart "$work/restart"
+  else
+    # status distinguishes absence from an unverified or broken peer.
+    if ! grep -q 'daemon_unavailable' "$work/status.err"; then
+      die "background process status failed; installation stopped"
+    fi
+  fi
   replace_app "$incoming/EnvCloak.app" "$dest/EnvCloak.app" "$incoming/previous.app"
   rm -rf "$incoming"
-  echo "build-app: installed $dest/EnvCloak.app (version $version, signed $sign); a running background process was not restarted (task M3-06)" >&2
+  if [ "$restart" = 1 ]; then
+    "$dest/EnvCloak.app/Contents/MacOS/envcloak" daemon install --daemon \
+      "$dest/EnvCloak.app/Contents/Helpers/EnvCloakAgent.app/Contents/MacOS/envcloakd" >&2 ||
+      die "the app was installed, but the background process could not be started"
+    "$dest/EnvCloak.app/Contents/MacOS/envcloak" status --json >"$work/started.json" ||
+      die "the app was installed, but background process startup could not be confirmed"
+    python3 - "$work/started.json" "$version" <<'PY_STARTED'
+import json, sys
+try:
+    if json.load(open(sys.argv[1]))['daemon']['version'] != sys.argv[2]:
+        raise ValueError()
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit('build-app: installed, but the expected background process version is not running')
+PY_STARTED
+  fi
+  echo "build-app: installed $dest/EnvCloak.app (version $version, signed $sign); background process version confirmed" >&2
   app="$dest/EnvCloak.app"
 fi
 
