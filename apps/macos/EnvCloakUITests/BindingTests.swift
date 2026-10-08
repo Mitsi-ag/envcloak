@@ -34,14 +34,18 @@ extension PasteTests {
         try requireBinding(XCTWaiter.wait(for: [gone], timeout: 15) == .completed, app: app, step: "save confirmed")
     }
 
-    @MainActor func bindingRow(_ app: XCUIApplication, variable: String) throws -> XCUIElement {
+    @MainActor func selectBindingVariable(_ app: XCUIApplication, variable: String) throws -> XCUIElement {
         // SwiftUI's macOS Table is exposed as AXOutline on the pinned runner.
         let row = app.outlines["project.bindings"].outlineRows.containing(.staticText, identifier: "binding.variable." + variable).firstMatch
         try requireBinding(row.waitForExistence(timeout: 10), app: app, step: "binding row: " + variable)
-        row.click()
+        // A clipped OutlineRow can advertise a hit point at the scroll
+        // view's right border. Target its visible variable cell instead.
+        let cell = row.staticTexts["binding.variable." + variable]
+        try requireBinding(cell.isHittable, app: app, step: "binding variable hittable")
+        cell.click()
         let selected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "selected == true"), object: row)
         try requireBinding(XCTWaiter.wait(for: [selected], timeout: 5) == .completed, app: app, step: "binding row selected")
-        return row
+        return cell
     }
 
     @MainActor func requireBinding(_ condition: Bool, app: XCUIApplication, step: String,
@@ -60,12 +64,14 @@ extension PasteTests {
                 [node] + node.children.flatMap(descendants)
             }
             func tree(_ node: any XCUIElementSnapshot, depth: Int = 0) -> String {
-                let own = String(repeating: "  ", count: depth) + "\(node.elementType) id=\(node.identifier) title=\(node.title) label=\(node.label) enabled=\(node.isEnabled)\n"
+                let own = String(repeating: "  ", count: depth) + "\(node.elementType) id=\(node.identifier) title=\(node.title) label=\(node.label) enabled=\(node.isEnabled) selected=\(node.isSelected) frame=\(node.frame)\n"
                 return own + node.children.map { tree($0, depth: depth + 1) }.joined()
             }
             let nodes = descendants(root)
             let sheet = nodes.first { $0.elementType == .sheet }
             state += "binding sheet accessibility tree (no values):\n" + (sheet.map { tree($0) } ?? "<no sheet>\n")
+            let outline = nodes.first { $0.identifier == "project.bindings" && $0.elementType == .outline }
+            state += "binding outline accessibility tree (no values):\n" + (outline.map { tree($0) } ?? "<no outline>\n")
             let picker = nodes.first { $0.identifier == "binding.key" && $0.elementType == .popUpButton }
             let labels = picker.map { descendants($0).filter { $0.elementType == .menuItem }.map { $0.title.isEmpty ? $0.label : $0.title } } ?? []
             state += "key picker menu labels: \(labels)\n"
@@ -98,6 +104,9 @@ extension PasteTests {
         XCTAssertEqual(task.terminationStatus, 0, diagnostic)
         let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
         let bindings = try XCTUnwrap((parsed["references"] as? [String: Any])?["bindings"] as? [[String: Any]])
+        let baseline = project == "billing-fixture" ? "BASE" : "VARIABLE"
+        XCTAssertEqual(Set(bindings.compactMap { $0["env_name"] as? String }), Set(slug == nil ? [baseline] : [baseline, variable]), diagnostic)
+        XCTAssertEqual(bindings.first { $0["env_name"] as? String == baseline }?["reference"] as? String, "fixture", diagnostic)
         let row = bindings.first { $0["env_name"] as? String == variable }
         if let slug {
             XCTAssertEqual(row?["reference"] as? String, slug, diagnostic)
