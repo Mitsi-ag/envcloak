@@ -616,7 +616,7 @@ while IFS= read -r file; do
     crates/envcloak-sys/*) in_sys=1 ;;
   esac
   listed=0
-  if printf '%s\n' "$allowed" | grep -qxF "$file"; then
+  if printf '%s\n' "$allowed" | grep -xF -- "$file" >/dev/null; then
     listed=1
   fi
   canary=0
