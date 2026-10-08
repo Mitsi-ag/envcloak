@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import pathlib
+import plistlib
 import pty
 import selectors
 import signal
@@ -20,13 +21,25 @@ import termios
 import time
 
 
-def xcode_command(cache, eu1, hosted):
-    command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloak' if hosted else 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / ('m306-ui' if eu1 else 'm305-ui')), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', 'test']
+def xcode_command(cache, eu1, hosted, action='test'):
+    command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloak' if hosted else 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / ('m306-ui' if eu1 else 'm305-ui')), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', action]
     if eu1:
         command += ['-only-testing:EnvCloakTests/EU1Tests' if hosted else '-only-testing:EnvCloakUITests/PasteTests']
     elif not hosted:
         command += ['-skip-testing:EnvCloakUITests/PasteTests']
     return command
+
+
+def verify_ui_runner(cache, eu1):
+    # The signed artifact is independent of xcodebuild's resolved settings.
+    # A sandboxed XCTest runner also sandboxes its CLI and sweep children.
+    runner = cache / ('m306-ui' if eu1 else 'm305-ui') / 'Build/Products/Debug/EnvCloakUITests-Runner.app'
+    result = subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', '--xml', str(runner)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=15)
+    entitlements = plistlib.loads(result.stdout)
+    if entitlements.get('com.apple.security.app-sandbox') is not False:
+        raise RuntimeError('UI test runner must disable App Sandbox for its fixture CLI children: ' + str(runner))
+    print('UI test runner signature: App Sandbox disabled for fixture CLI children', flush=True)
 
 
 def main():
@@ -128,6 +141,11 @@ def main():
                 test_env.update(ENVCLOAK_TEST_HOME=str(home), ENVCLOAK_TEST_RUNTIME=str(runtime),
                                 ENVCLOAK_TEST_CLI=str(cli), ENVCLOAK_TEST_REPO=str(pathlib.Path.cwd()),
                                 CFFIXED_USER_HOME=str(home))
+            if not hosted:
+                built = subprocess.run(xcode_command(cache, eu1, hosted, 'build-for-testing'), env=test_env, timeout=600)
+                if built.returncode: return built.returncode
+                verify_ui_runner(cache, eu1)
+                command = xcode_command(cache, eu1, hosted, 'test-without-building')
             tested = subprocess.run(command, env=test_env, timeout=300 if hosted else 600)
             if tested.returncode: return tested.returncode
             if eu1:

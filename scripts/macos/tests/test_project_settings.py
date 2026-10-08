@@ -11,6 +11,7 @@ Usage: python3 scripts/macos/tests/test_project_settings.py
 
 import json
 import os
+import plistlib
 import subprocess
 import unittest
 
@@ -62,6 +63,20 @@ class ProjectSettings(unittest.TestCase):
             with self.subTest(target=target):
                 self.assertEqual(self.release[target]["CODE_SIGN_IDENTITY"], "-")
                 self.assertEqual(self.release[target].get("DEVELOPMENT_TEAM", ""), "")
+
+    def test_ui_runner_explicitly_disables_sandbox_for_cli_children(self):
+        # ENABLE_APP_SANDBOX=NO does not override Xcode's generated runner
+        # entitlements. Check the test target's explicit signing input too.
+        for config, targets in (("Release", self.release), ("Debug", self.debug)):
+            with self.subTest(config=config):
+                s = targets["EnvCloakUITests"]
+                path = s.get("CODE_SIGN_ENTITLEMENTS")
+                self.assertTrue(path, "UI runner needs explicit sandbox entitlements")
+                with open(os.path.join(s["SRCROOT"], path), "rb") as source:
+                    entitlements = plistlib.load(source)
+                self.assertIs(entitlements.get("com.apple.security.app-sandbox"), False)
+                for target in SHIPPED:
+                    self.assertNotEqual(targets[target].get("CODE_SIGN_ENTITLEMENTS"), path)
 
     def test_identifiers_and_executables_are_the_layouts(self):
         app, agent = self.release["EnvCloak"], self.release["EnvCloakAgent"]
