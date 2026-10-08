@@ -402,7 +402,9 @@ fn gate37_short_values_untouched_output_swept_and_later_edits_refuse_undo() {
     );
     assert!(stdout(&out).contains("Short values are neither found nor scrubbed"));
     assert!(!stdout(&out).contains("except registry-recognized"));
-    let docs = include_str!("../../../docs/DOCTOR.md");
+    let docs =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/DOCTOR.md"))
+            .unwrap();
     assert!(docs.contains("Values under 16 characters are never found or scrubbed"));
     std::fs::write(&f.path, b"later edit\n").unwrap();
     let undo = f.undo(&id, &[]);
