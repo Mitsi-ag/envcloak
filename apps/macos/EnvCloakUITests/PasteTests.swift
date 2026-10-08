@@ -72,9 +72,13 @@ final class PasteTests: XCTestCase {
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: nil)
         // Validate the command that Command-Z will dispatch, after the
         // focused sheet editor has gone and the table has processed Delete.
-        app.menuBars.menuBarItems["Edit"].click()
-        let undo = app.menuItems.matching(NSPredicate(format: "title == %@", "Undo Binding")).firstMatch
-        try requireBinding(undo.waitForExistence(timeout: 5) && undo.isEnabled, app: app, step: "Undo Binding available")
+        let editMenu = app.menuBars.menuBarItems["Edit"]
+        editMenu.click()
+        // SwiftUI's system command is titled Undo, even when its manager's
+        // undoMenuItemTitle is Undo Binding. Require that exact command.
+        let undo = editMenu.menuItems.matching(NSPredicate(format: "identifier == %@ AND title == %@", "undo:", "Undo")).firstMatch
+        let available = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND enabled == true"), object: undo)
+        try requireBinding(XCTWaiter.wait(for: [available], timeout: 5) == .completed, app: app, step: "Edit > Undo available")
         app.typeKey(.escape, modifierFlags: [])
         app.typeKey("z", modifierFlags: .command)
         let restored = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
@@ -82,6 +86,11 @@ final class PasteTests: XCTestCase {
             return SHA256.hash(data: bytes) == SHA256.hash(data: original)
         }, object: nil)
         try requireBinding(XCTWaiter.wait(for: [restored], timeout: 10) == .completed, app: app, step: "Command-Z exact undo")
+        // The atomic write can finish before the async project refresh.
+        // Quit only after the product confirms the whole undo operation.
+        let notice = app.staticTexts["session.notice"]
+        let confirmed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == true AND value == %@", "Binding undone. The original envcloak.toml bytes were restored."), object: notice)
+        try requireBinding(XCTWaiter.wait(for: [confirmed], timeout: 10) == .completed, app: app, step: "Undo confirmed")
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: "fixture")
         let running = try XCTUnwrap(NSRunningApplication.runningApplications(withBundleIdentifier: "ai.envcloak.app").first {
             $0.bundleURL?.path.hasSuffix("/m306-ui/Build/Products/Debug/EnvCloak.app") == true
@@ -89,7 +98,7 @@ final class PasteTests: XCTestCase {
         let pid = running.processIdentifier
         // A graceful quit exercises the saved application state writer too.
         app.typeKey("q", modifierFlags: .command)
-        XCTAssertTrue(app.wait(for: .notRunning, timeout: 15))
+        try requireBinding(app.wait(for: .notRunning, timeout: 15), app: app, step: "Graceful quit before sweep")
         try sweep(repo: repo, home: home, pid: pid, canary: canary)
     }
 
