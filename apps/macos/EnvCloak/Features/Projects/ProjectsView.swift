@@ -53,6 +53,9 @@ struct ProjectDetail: View {
     @Binding var selectedKey: DaemonText?
     var bind: (BindingSelection) -> Void = { _ in }
     @State private var profile = ""
+    // The checked table is temporarily absent during reload. Its selection
+    // belongs to this project/profile, not to that transient table instance.
+    @State private var bindingSelection: String?
     private var opened: OpenedProject? {
         guard let project = session.projects.opened, project.directory == directory else { return nil }
         return project
@@ -87,16 +90,20 @@ struct ProjectDetail: View {
                 }.pickerStyle(.segmented)
                 Button("Add variable") { bind(BindingSelection(project: directory, profile: profile)) }
                     .accessibilityIdentifier("binding.add").disabled(session.state != .ready)
-                BindingsTable(session: session, project: project, profile: profile.isEmpty ? nil : profile, selectedKey: $selectedKey, bind: bind)
+                BindingsTable(session: session, project: project, profile: profile.isEmpty ? nil : profile, selectedKey: $selectedKey, bind: bind, selection: $bindingSelection)
                 Text("Grants in force in this project").font(.headline)
                 if let canonical = project.grantDirectory {
                     GrantRows(session: session, directory: canonical, slug: nil)
                 } else { Text("Project identity unavailable. Grants could not be matched.") }
             } else { Text("Not checked").foregroundStyle(ECToken.secondary.color); Spacer() }
         }.padding(16)
-        .task(id: directory) { profile = ""; await session.openProject(directory) }
+        .task(id: directory) { profile = ""; bindingSelection = nil; selectedKey = nil; await session.openProject(directory) }
+        .onChange(of: profile) { _, _ in bindingSelection = nil; selectedKey = nil }
+        .onChange(of: session.projects.checkFailure) { _, failure in
+            if failure != nil { bindingSelection = nil; selectedKey = nil }
+        }
         .onChange(of: session.projects.opened?.profiles) { _, profiles in
-            if !profile.isEmpty, !(profiles ?? []).contains(profile) { profile = "" }
+            if let profiles, !profile.isEmpty, !profiles.contains(profile) { profile = "" }
         }
     }
 }

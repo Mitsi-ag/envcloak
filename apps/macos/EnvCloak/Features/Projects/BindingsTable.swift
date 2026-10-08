@@ -22,7 +22,7 @@ struct BindingsTable: View {
     @Binding var selectedKey: DaemonText?
     var bind: (BindingSelection) -> Void = { _ in }
     @Environment(\.undoManager) private var undoManager
-    @State private var selection: String?
+    @Binding var selection: String?
     @State private var sortOrder = [KeyPathComparator(\BindingRowValue.variable)]
     private var rows: [BindingRowValue] {
         project.bindings(profile: profile).enumerated().map { index, binding in
@@ -30,6 +30,7 @@ struct BindingsTable: View {
             return BindingRowValue(id: binding.env_name?.escaped ?? "Unavailable \(index)", binding: binding, item: session.items.rows.first { $0.slug == slug }, inherited: profile != nil && binding.profile == nil)
         }.sorted(using: sortOrder)
     }
+    private var selectedSlug: DaemonText? { rows.first { $0.id == selection }?.item?.slug }
     var body: some View {
         Table(rows, selection: $selection, sortOrder: $sortOrder) {
             TableColumn("Variable", value: \.variable) {
@@ -56,22 +57,29 @@ struct BindingsTable: View {
         .contextMenu(forSelectionType: String.self) { ids in
             if let id = ids.first, let row = rows.first(where: { $0.id == id }) {
                 Button("Change key…") { change(row) }.disabled(session.state != .ready)
-                Button("Remove variable") { unbind(row) }.disabled(session.state != .ready || row.inherited)
+                Button("Remove variable") { unbind(row.id) }.disabled(session.state != .ready || row.inherited)
             }
         } primaryAction: { ids in
             if let id = ids.first, let row = rows.first(where: { $0.id == id }) { change(row) }
         }
-        .onDeleteCommand { if let row = rows.first(where: { $0.id == selection }) { unbind(row) } }
-        .onChange(of: selection) { _, id in selectedKey = rows.first { $0.id == id }?.item?.slug }
+        .onDeleteCommand { unbind(selection) }
+        .onChange(of: rows.map(\.id), initial: true) { _, ids in
+            if let selection, !ids.contains(selection) { self.selection = nil }
+        }
+        .onChange(of: selectedSlug, initial: true) { _, slug in selectedKey = slug }
         .onChange(of: profile) { _, _ in selection = nil }
         .onChange(of: project.directory) { _, _ in selection = nil }
     }
     private func change(_ row: BindingRowValue) {
         bind(BindingSelection(project: project.directory, key: row.item, variable: row.variable, profile: profile ?? ""))
     }
-    private func unbind(_ row: BindingRowValue) {
-        guard !row.inherited else { session.notice = "Switch to Default to remove this inherited variable."; return }
-        let edit = BindingEdit(project: project.directory, profile: profile, envName: row.variable, reference: nil, previous: row.binding.reference)
+    private func unbind(_ variable: String?) {
+        guard let edit = project.removal(of: variable, profile: profile) else {
+            if rows.first(where: { $0.id == variable })?.inherited == true {
+                session.notice = "Switch to Default to remove this inherited variable."
+            }
+            return
+        }
         Task { _ = await session.bindings.apply(edit, session: session, manager: undoManager) }
     }
 }

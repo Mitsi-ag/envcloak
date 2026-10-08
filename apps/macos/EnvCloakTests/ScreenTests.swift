@@ -176,12 +176,86 @@ import XCTest
         assertDisabled("Add to envcloak.toml", in: window)
     }
 
+    func testBindingProfileAndSelectionSurviveAnInFlightCheck() async throws {
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        let folder = URL(fileURLWithPath: "/tmp/ec05-profile-" + UUID().uuidString.prefix(8))
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        try Data("[env]\n".utf8).write(to: folder.appendingPathComponent("envcloak.toml"))
+        let directory = DaemonText(folder.path)
+        let window = host(ProjectDetail(session: session, directory: directory, selectedKey: .constant(nil)))
+        await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
+        func segmented(_ view: NSView) -> NSSegmentedControl? {
+            if let control = view as? NSSegmentedControl { return control }
+            return view.subviews.lazy.compactMap(segmented).first
+        }
+        let control = try XCTUnwrap(window.contentView.flatMap(segmented))
+        XCTAssertEqual(control.label(forSegment: 1), "test")
+        control.selectedSegment = 1
+        XCTAssertTrue(control.sendAction(try XCTUnwrap(control.action), to: control.target))
+        await assertVisible("envcloak://second", in: window)
+        try selectNativeBindingVariable("VARIABLE", in: window)
+        try await waitForBindingSelection("VARIABLE", in: window)
+        await client.holdNextCheck()
+        let refresh = Task { await session.openProject(directory) }
+        await assertVisible("Not checked", in: window)
+        await client.releaseCheck(); await refresh.value
+        await assertVisible("envcloak://second", in: window)
+        XCTAssertEqual(window.contentView.flatMap(segmented)?.selectedSegment, 1, "Refresh must keep the selected profile")
+        try await waitForBindingSelection("VARIABLE", in: window)
+    }
+
+    func testBindingSelectionSurvivesReloadAndClearsWhenRemoved() async throws {
+        let client = ScriptedClient(); await client.plainSlugs()
+        await client.configure(itemCount: 2); await client.bindings(["BASE", "VARIABLE"])
+        let session = VaultSession(client: client); await session.poll()
+        let folder = URL(fileURLWithPath: "/tmp/ec05-select-" + UUID().uuidString.prefix(8))
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        try Data("[env]\n".utf8).write(to: folder.appendingPathComponent("envcloak.toml"))
+        let directory = DaemonText(folder.path)
+        var selectedKey: DaemonText?
+        let window = host(ProjectDetail(session: session, directory: directory,
+            selectedKey: Binding(get: { selectedKey }, set: { selectedKey = $0 })))
+        await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
+        try selectNativeBindingVariable("VARIABLE", in: window)
+        try await waitForBindingSelection("VARIABLE", in: window)
+        XCTAssertEqual(selectedKey, DaemonText("fixture-0"))
+        await client.holdNextCheck()
+        let refresh = Task { await session.openProject(directory) }
+        await assertVisible("Not checked", in: window)
+        await client.bindings(["AAA", "BASE", "VARIABLE"], reference: "fixture-1")
+        await client.releaseCheck(); await refresh.value
+        await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
+        try await waitForBindingSelection("VARIABLE", in: window)
+        XCTAssertEqual(selectedKey, DaemonText("fixture-1"), "Inspector must follow the selected binding's new key")
+        await client.bindings(["AAA", "BASE"])
+        await session.openProject(directory)
+        await assertScoped("BASE", identifier: "binding.variable.BASE", in: window)
+        XCTAssertEqual(try XCTUnwrap(bindingTable(in: window)).selectedRow, -1)
+        XCTAssertNil(selectedKey)
+        await client.bindings(["AAA", "BASE", "VARIABLE"])
+        await session.openProject(directory)
+        await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
+        XCTAssertEqual(try XCTUnwrap(bindingTable(in: window)).selectedRow, -1, "A removed selection must not resurrect")
+        XCTAssertNil(selectedKey)
+        try selectNativeBindingVariable("VARIABLE", in: window)
+        try await waitForBindingSelection("VARIABLE", in: window)
+        await client.configure(failure: .protocolError)
+        await session.openProject(directory)
+        await assertVisible("envcloak.toml could not be read", in: window)
+        XCTAssertNil(selectedKey, "A failed check must discard the inspector selection")
+        await client.configure()
+        await session.openProject(directory)
+        await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
+        XCTAssertEqual(try XCTUnwrap(bindingTable(in: window)).selectedRow, -1, "Failure recovery requires a fresh selection")
+    }
+
     func testBindingRowsExposeTheirVariableIdentityInAnOutline() async throws {
         let client = ScriptedClient(); await client.plainSlugs()
         let session = VaultSession(client: client); await session.poll()
         await session.openProject(DaemonText("/tmp/project"))
         let project = try XCTUnwrap(session.projects.opened)
-        let window = host(BindingsTable(session: session, project: project, profile: nil, selectedKey: .constant(nil)))
+        let window = host(BindingsTable(session: session, project: project, profile: nil, selectedKey: .constant(nil), selection: .constant(nil)))
         await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
         let outline = try XCTUnwrap(identified("project.bindings", in: window, accessibilityOnly: true).first)
         XCTAssertEqual(outline.value(forKey: "accessibilityRole") as? String, NSAccessibility.Role.outline.rawValue)
@@ -209,7 +283,7 @@ import XCTest
              ["fixture-0\\u{202e}\\u{1b}[31m", "Fixture 0\\u{202e}\\u{1b}[31m", "example\\u{202e}\\u{1b}[31m", "fixture@example.invalid\\u{202e}\\u{1b}[31m"]),
             (AnyView(ProjectsOverview(session: session, route: .constant(.projects))),
              ["project\\u{202e}\\u{1b}[31m, /tmp/project\\u{202e}\\u{1b}[31m, 1 adopted bindings"]),
-            (AnyView(BindingsTable(session: session, project: project, profile: nil, selectedKey: .constant(nil))),
+            (AnyView(BindingsTable(session: session, project: project, profile: nil, selectedKey: .constant(nil), selection: .constant(nil))),
              ["VARIABLE\\u{202e}\\u{1b}[31m", "envcloak://fixture-0\\u{202e}\\u{1b}[31m", "example\\u{202e}\\u{1b}[31m, fixture@example.invalid\\u{202e}\\u{1b}[31m"]),
             (AnyView(GrantRows(session: session, directory: nil, slug: nil)),
              ["Fixture grant\\u{202e}\\u{1b}[31m", "/tmp/project\\u{202e}\\u{1b}[31m"]),
