@@ -30,7 +30,7 @@ struct BindingSheet: View {
             return left.slug.escaped < right.slug.escaped
         }
     }
-    private var key: ItemView? { session.items.rows.first { $0.slug.escaped == slug } }
+    private var key: ItemView? { keys.first { $0.slug.escaped == slug } }
     private var edit: BindingEdit? {
         guard let project, key != nil else { return nil }
         let previous = session.projects.opened?.directory == project

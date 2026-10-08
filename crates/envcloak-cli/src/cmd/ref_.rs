@@ -78,8 +78,16 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
                 );
             }
             "--json" if !json => json = true,
-            "--undo-fd" if undo_fd.is_none() => undo_fd = Some(private_fd(it.next())?),
-            "--restore-fd" if restore_fd.is_none() => restore_fd = Some(private_fd(it.next())?),
+            "--undo-fd" if undo_fd.is_none() => {
+                undo_fd = Some(
+                    private_fd(it.next()).ok_or("private undo descriptor must be 3 or greater")?,
+                );
+            }
+            "--restore-fd" if restore_fd.is_none() => {
+                restore_fd = Some(
+                    private_fd(it.next()).ok_or("private undo descriptor must be 3 or greater")?,
+                );
+            }
             "--profile" if profile.is_none() => {
                 let p = *it.next().ok_or("--profile needs a name")?;
                 profile = Some(ProfileName::new(p).map_err(|_| "invalid profile name")?);
@@ -122,10 +130,8 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
     })
 }
 
-fn private_fd(arg: Option<&&str>) -> Result<i32, &'static str> {
-    arg.and_then(|s| s.parse::<i32>().ok())
-        .filter(|n| *n >= 3)
-        .ok_or("private undo descriptor must be 3 or greater")
+fn private_fd(arg: Option<&&str>) -> Option<i32> {
+    arg.and_then(|s| s.parse::<i32>().ok()).filter(|n| *n >= 3)
 }
 
 pub fn run(args: &[&str]) -> ExitCode {
@@ -249,7 +255,7 @@ fn deliver_undo(
     output: &mut Option<std::fs::File>,
 ) -> Result<(), Failure> {
     if let (Some(record), Some(output)) = (record, output) {
-        record.write(output).map_err(|_| Failure::new("undo_unavailable",
+        record.write(output).map_err(|_| Failure::new("io",
             "the binding was saved, but its undo receipt could not be delivered; do not repeat the edit"))?;
     }
     Ok(())
