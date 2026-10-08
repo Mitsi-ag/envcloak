@@ -22,6 +22,7 @@ struct BindingSheet: View {
     @State private var field = ""
     @State private var query = ""
     @State private var busy = false
+    @State private var retryingKeys = false
     private var keys: [ItemView] {
         session.items.rows.filter { item in
             item.class == .secret && (query.isEmpty || [item.slug.escaped, item.provider?.escaped ?? "", item.account?.email?.escaped ?? "", item.classification.rawValue].joined(separator: " ").localizedCaseInsensitiveContains(query))
@@ -59,12 +60,23 @@ struct BindingSheet: View {
             }
             TextField("Variable", text: $variable).font(ECFont.martianMono(size: 12)).accessibilityIdentifier("binding.variable")
             TextField("Search keys, providers, accounts or class", text: $query)
+            if session.items.failure != nil {
+                Text("Keys could not be refreshed. Try again.")
+                    .foregroundStyle(ECToken.warning.color)
+                    .accessibilityLabel("Keys could not be refreshed. Try again.")
+                    .accessibilityIdentifier("binding.keys.error")
+                Button("Retry keys") {
+                    retryingKeys = true
+                    Task { await session.items.refetch(.items); retryingKeys = false }
+                }.accessibilityIdentifier("binding.keys.retry").disabled(retryingKeys)
+            }
             Picker("Key", selection: $slug) {
                 Text("Choose a key").tag("")
                 ForEach(keys, id: \.id) { item in
                     Text(keyLabel(item)).tag(item.slug.escaped)
                 }
             }.accessibilityIdentifier("binding.key")
+                .disabled(session.items.failure != nil || retryingKeys)
             if let key, key.fields.count > 1 {
                 Picker("Field", selection: $field) {
                     Text("Choose a field").tag("")
@@ -88,17 +100,18 @@ struct BindingSheet: View {
                         if saved { dismiss() }
                     }
                 }.keyboardShortcut(.return, modifiers: .command).accessibilityIdentifier("binding.save")
-                    .disabled(busy || edit?.cliArguments == nil || session.state != .ready || ((key?.fields.count ?? 0) > 1 && field.isEmpty))
+                    .disabled(busy || retryingKeys || session.items.failure != nil || edit?.cliArguments == nil || session.state != .ready || ((key?.fields.count ?? 0) > 1 && field.isEmpty))
             }
         }.padding(24).frame(width: 520).interactiveDismissDisabled(busy)
         .task {
             project = selection.project ?? session.projects.directories.first
             profile = selection.profile; variable = selection.variable
-            slug = selection.key?.slug.escaped ?? ""
+            slug = session.items.failure == nil ? (selection.key?.slug.escaped ?? "") : ""
             if variable.isEmpty { variable = selection.key?.env_hint?.escaped ?? "" }
         }
         .task(id: project) { if let project { await session.openProject(project) } }
         .onChange(of: slug) { _, _ in field = ""; if variable.isEmpty { variable = key?.env_hint?.escaped ?? "" } }
+        .onChange(of: session.items.failure) { _, failure in if failure != nil { slug = ""; field = "" } }
         .onChange(of: session.state) { _, state in if state != .ready { dismiss() } }
     }
 }

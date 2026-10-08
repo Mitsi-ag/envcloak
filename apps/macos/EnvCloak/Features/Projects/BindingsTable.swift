@@ -32,7 +32,9 @@ struct BindingsTable: View {
     }
     var body: some View {
         Table(rows, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Variable", value: \.variable) { Text($0.variable).font(ECFont.martianMono(size: 12)) }
+            TableColumn("Variable", value: \.variable) {
+                Text($0.variable).font(ECFont.martianMono(size: 12)).accessibilityIdentifier("binding.variable." + $0.variable)
+            }
             TableColumn("Key", value: \.key) { Text($0.key).font(ECFont.martianMono(size: 12)) }
             TableColumn("Provider and account", value: \.providerAccount)
             TableColumn("Class", value: \.classification)
