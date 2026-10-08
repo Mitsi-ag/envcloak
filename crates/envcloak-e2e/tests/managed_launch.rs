@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use envcloak_e2e::{python3, sha256_hex, text};
 use managed_common::{
-    KEY, World, appears, error_of, file_identity, helper_main, other_build, pending_id,
-    receipt_identity, report, reported_identity, started,
+    KEY, World, appears, children_of, error_of, file_identity, helper_main, other_build,
+    pending_id, process_parents, receipt_identity, report, reported_identity, started,
 };
 use serde_json::{Value, json};
 
@@ -1824,36 +1824,6 @@ fn a_suspended_server_runs_nothing_until_the_daemon_confirms() {
     assert_eq!(reported_identity(&report(&answer)), receipt_identity(&reg));
     assert!(w.marker.exists(), "the confirmed server never ran");
     w.h.assert_swept("after the confirmation");
-}
-
-/// The kernel's child list is an observation only, never a signal target.
-fn process_parents() -> Vec<(i32, i32)> {
-    let ps = std::process::Command::new("/bin/ps")
-        .env_clear()
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-        .unwrap();
-    assert!(ps.status.success());
-    let rows: Vec<_> = String::from_utf8(ps.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next().unwrap().parse().unwrap();
-            let ppid = fields.next().unwrap().parse().unwrap();
-            assert!(fields.next().is_none());
-            (pid, ppid)
-        })
-        .collect();
-    assert!(!rows.is_empty());
-    rows
-}
-
-fn children_of(parent: i32) -> Vec<i32> {
-    process_parents()
-        .into_iter()
-        .filter_map(|(pid, ppid)| (ppid == parent).then_some(pid))
-        .collect()
 }
 
 fn failed_confirmation(fault: &str) {
