@@ -431,19 +431,57 @@ const BOOLEAN_LONG: [&str; 17] = [
 const BOOLEAN_LONG_PREFIXES: [&str; 5] =
     ["--no-", "--allow-", "--deny-", "--enable-", "--disable-"];
 
-/// The short options of an interpreter family that take the next argument
-/// as their value when nothing is attached (`python -W ignore`, `python
-/// -X dev`, `bash -o posix`, `bash -O extglob`, `ruby -F :`, `php -t
-/// /root`, `php -f /x.php`).
+/// The short options of an interpreter family whose value is the whole
+/// rest of their cluster, or, when nothing is attached, may be the next
+/// argument (`python -W ignore`, `python -X dev`, `php -t /root`, `julia
+/// -t 4`; `ruby -F:` takes the rest and never the next one, so a bare
+/// `-F` is refused as [`DeclError::NoEntry`] too). Each parser listed here
+/// was read to consume the rest of the cluster as the value: an option
+/// whose parser reads a short value and then goes on reading the rest of
+/// the cluster as more options (ruby's `-W`, `-K`; review of M2-27:
+/// `ruby -We'code'` runs the code) is not one of these, and is handled
+/// in [`interpreter_option`] letter by letter.
 fn value_short(stem: &str) -> &'static [char] {
     match stem {
         "python" | "pypy" => &['W', 'X'],
-        "ruby" => &['F', 'K', 'T'],
-        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish" => &['o', 'O'],
+        "ruby" => &['F'],
         "php" => &['t'],
         "julia" => &['t', 'p', 'O', 'g'],
         _ => &[],
     }
+}
+
+/// The short options of a shell that set a shell option by name (`-o`,
+/// `-O`). Shells disagree on where the name is: bash and dash take the
+/// next argument whatever follows in the cluster (`bash -oposix /s.sh`
+/// reads `/s.sh` as the option's name and then `p`, `o`, `s`, `i`, `x` as
+/// more options; `bash -Oc extglob 'code'` runs `code`), zsh and ksh the
+/// rest of the cluster. Which argument is the entry file is not known
+/// either way: [`DeclError::NoEntry`], attached or not (measured with
+/// `/bin/bash` 3.2, `/bin/dash`, `/bin/zsh` and `/bin/ksh` on macOS).
+fn shell_named_option(stem: &str, c: char) -> bool {
+    matches!(
+        stem,
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish"
+    ) && matches!(c, 'o' | 'O')
+}
+
+/// Whether `category` is what ruby's `-W:` takes (`-W:no-deprecated`,
+/// `-W:exp`): an optional `no-` and a leading part of one of its warning
+/// categories. Ruby reads the whole rest of the cluster as the category,
+/// so nothing after it is an option; anything else is refused all the
+/// same rather than trusted to be harmless.
+fn ruby_warning_category(category: &str) -> bool {
+    let name = category.strip_prefix("no-").unwrap_or(category);
+    !name.is_empty()
+        && [
+            "deprecated",
+            "experimental",
+            "performance",
+            "strict_unused_block",
+        ]
+        .iter()
+        .any(|c| c.starts_with(name))
 }
 
 /// The short options of interpreter family `stem` known to load no code
@@ -471,12 +509,13 @@ fn harmless_short(stem: &str) -> &'static [char] {
 }
 
 /// The short options of interpreter family `stem` whose value, if any, is
-/// the rest of their cluster and never the next argument, and loads no
-/// code: a warning level (`ruby -W2`, `ruby -W:no-deprecated`), an
-/// optimisation setting (`luajit -O3`, `luajit -O+fold`).
+/// the whole rest of their argument and never the next argument, and
+/// loads no code: an optimisation setting (`luajit -O3`, `luajit
+/// -O+fold`; LuaJIT hands the whole argument after `-O` to `jit.opt`).
+/// Ruby's `-W` is not one: it reads one digit and goes on reading the rest
+/// as options ([`interpreter_option`]).
 fn attached_short(stem: &str) -> &'static [char] {
     match stem {
-        "ruby" => &['W'],
         "luajit" => &['O'],
         _ => &[],
     }
@@ -526,13 +565,45 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
     let cluster = arg.strip_prefix('-').unwrap_or(arg);
     let values = value_short(stem);
     let own = stem_loading_short(stem);
-    let mut letters = cluster.chars();
+    let mut letters = cluster.chars().peekable();
     while let Some(c) = letters.next() {
         if CODE_LOADING_SHORT.contains(&c)
             || INTERPRETER_LOADING_SHORT.contains(&c)
             || own.contains(&c)
         {
             return loads;
+        }
+        if shell_named_option(stem, c) {
+            return Err(DeclError::NoEntry);
+        }
+        if stem == "ruby" && matches!(c, 'W' | 'K') {
+            // Ruby reads a short value and then the rest of the cluster
+            // as more options (its `reswitch`): `-We'code'`, `-W1e'code'`
+            // and `-KUe'code'` run the code. Take the value as ruby does
+            // and go on checking the letters after it.
+            match (c, letters.peek().copied()) {
+                ('W', Some(':')) => {
+                    // `-W:category`: the rest is the category, whole.
+                    letters.next();
+                    let category: String = letters.collect();
+                    return if ruby_warning_category(&category) {
+                        Ok(())
+                    } else {
+                        loads
+                    };
+                }
+                ('W', Some('0'..='2')) => {
+                    letters.next();
+                }
+                ('K', Some(k)) => {
+                    if !"EeSsUuNnAa".contains(k) {
+                        return loads;
+                    }
+                    letters.next();
+                }
+                _ => {}
+            }
+            continue;
         }
         if values.contains(&c) {
             // The rest of the cluster is the value; none, and the next
@@ -1607,7 +1678,6 @@ mod tests {
             ("python3", "-Xutf8=1"),
             ("python3", "-Wignore"),
             ("ruby", "-F:"),
-            ("bash", "-oposix"),
             ("julia", "-O2"),
         ] {
             assert_eq!(
@@ -1616,6 +1686,153 @@ mod tests {
                 "{name} {option}"
             );
         }
+    }
+
+    /// Ruby's `-W` and `-K` read a short value (one digit, one encoding
+    /// letter) and then the rest of the cluster as more options, so the
+    /// letters after the value are checked like any others; `-T` is not a
+    /// known harmless letter. Measured with ruby 2.6 and the pinned 3.4 in
+    /// `tests/managed_interpreter_oracle.rs`: `ruby -We'code' /s.rb` and
+    /// `ruby -KUe'code' /s.rb` run the code. The refusal holds for a
+    /// declaration, an update and a `#!` line (the stored record's case is
+    /// in the daemon's `launch_check` tests).
+    ///
+    /// Mutation checked: ruby's `W` and `K` returning `Ok` at their letter
+    /// without checking the rest of the cluster (the previous rule, as an
+    /// `attached_short` entry): `ruby -We'puts 1' /srv/s.rb` registers.
+    #[test]
+    fn ruby_short_values_do_not_end_the_cluster() {
+        let loads = DeclError::CodeSelecting(CodeSelecting::InterpreterOption);
+        for option in [
+            "-We'puts 1'",
+            "-Wrevil",
+            "-WI.",
+            "-W1e'puts 1'",
+            "-W2r./evil",
+            "-W:deprecated-e",
+            "-W:",
+            "-KUe'puts 1'",
+            "-Kz",
+            "-Kx",
+            "-KUr./evil",
+            "-Te'puts 1'",
+            "-T",
+            "-T1",
+            "-wKUW0e1",
+        ] {
+            for name in ["ruby", "ruby3.4", "truffleruby"] {
+                let d = decl(&[name, option, "/srv/s.rb"]);
+                assert_eq!(classify_argv(&d.argv), Err(loads), "{name} {option}");
+                assert_eq!(check_declaration(&d), Err(loads), "{name} {option}");
+                assert!(
+                    matches!(
+                        apply_changes(
+                            &decl(&["/bin/server"]),
+                            &LaunchChanges {
+                                argv: Some(d.argv.clone()),
+                                ..LaunchChanges::default()
+                            }
+                        ),
+                        Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+                    ),
+                    "{name} {option}"
+                );
+                let path = format!("/usr/bin/{name}");
+                assert_eq!(
+                    shebang_argv(&path, Some(option), "/srv/s.rb", &[], &path),
+                    Err(loads),
+                    "{name} {option}"
+                );
+            }
+        }
+        // The positive controls: the value forms ruby reads, followed by
+        // nothing or by harmless letters.
+        for option in [
+            "-W",
+            "-W0",
+            "-W1",
+            "-W2",
+            "-W:no-deprecated",
+            "-W:exp",
+            "-W:performance",
+            "-KU",
+            "-Ku",
+            "-Kn",
+            "-Ke",
+            "-K",
+            "-KUw",
+            "-W2w",
+            "-wW1",
+            "-W0KU",
+            "-F:",
+        ] {
+            let d = decl(&["ruby", option, "/srv/s.rb"]);
+            assert_eq!(
+                classify_argv(&d.argv),
+                Ok(ArgvClass::Interpreter { entry: 2 }),
+                "{option}"
+            );
+            assert_eq!(
+                shebang_argv(
+                    "/usr/bin/ruby",
+                    Some(option),
+                    "/srv/s.rb",
+                    &[],
+                    "/usr/bin/ruby"
+                ),
+                Ok(vec![
+                    "/usr/bin/ruby".into(),
+                    option.into(),
+                    "/srv/s.rb".into()
+                ]),
+                "{option}"
+            );
+        }
+    }
+
+    /// A shell's `-o` and `-O` name a shell option: bash and dash take the
+    /// next argument as the name whatever follows in the cluster (`bash
+    /// -oposix /s.sh` reads `/s.sh` as the name; `bash -Oc extglob 'code'`
+    /// runs `code`), zsh and ksh the rest of the cluster. Which argument
+    /// is the entry file is not known, attached or not.
+    ///
+    /// Mutation checked: `o` and `O` back in `value_short` for the shells
+    /// (the previous rule): `bash -oposix /srv/s.sh` registers with
+    /// `/srv/s.sh` as its entry.
+    #[test]
+    fn shell_option_names_leave_the_entry_unknown() {
+        for (name, option) in [
+            ("bash", "-oposix"),
+            ("bash", "-Oextglob"),
+            ("bash", "-xo"),
+            ("bash", "-Oc"),
+            ("dash", "-oposix"),
+            ("sh", "-o"),
+            ("zsh", "-oshwordsplit"),
+            ("ksh", "-oposix"),
+        ] {
+            let d = decl(&[name, option, "/srv/s.sh"]);
+            assert_eq!(
+                classify_argv(&d.argv),
+                Err(DeclError::NoEntry),
+                "{name} {option}"
+            );
+            assert_eq!(
+                check_declaration(&d),
+                Err(DeclError::NoEntry),
+                "{name} {option}"
+            );
+            let path = format!("/bin/{name}");
+            assert_eq!(
+                shebang_argv(&path, Some(option), "/srv/s.sh", &[], &path),
+                Err(DeclError::NoEntry),
+                "{name} {option}"
+            );
+        }
+        assert_eq!(
+            classify_argv(&decl(&["bash", "-xv", "/srv/s.sh"]).argv),
+            Ok(ArgvClass::Interpreter { entry: 2 })
+        );
     }
 
     /// Mutation: omit alternate, architecture and build launcher names.

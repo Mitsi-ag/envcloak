@@ -376,3 +376,93 @@ fn luajit_module_options_load_code_before_the_entry() {
         );
     }
 }
+
+/// A real Ruby reads a short value after `-W` (one digit, or a whole
+/// `:category`) and after `-K` (one encoding letter), then reads the rest
+/// of the cluster as more options: `-We`, `-W1e` and `-KUe` run the code
+/// after them, `-Wr` and `-WI.` load a file from the working directory
+/// before the entry. Each form is refused for a declaration, an update
+/// and a `#!` line. The controls (`-W2`, `-w`, `-W0`, `-W:no-deprecated`,
+/// `-KU`) run only the entry and register. Mutation: ruby's `W` and `K`
+/// returning `Ok` at their letter without checking the rest of the
+/// cluster (the previous `attached_short` rule): `-We...` registers.
+#[test]
+#[ignore = "requires the pinned Ruby 3.4.7; run scripts/check-managed-oracles.sh"]
+fn ruby_short_values_read_the_rest_of_the_cluster_as_options() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let ruby = runtime("ENVCLOAK_RUBY_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert!(run(&ruby, h, &["-v".into()], &[]).starts_with("ruby 3.4.7 "));
+    std::fs::write(h.join("evil.rb"), "print \"prelude\\n\"\n").unwrap();
+    let entry = h.join("entry.rb");
+    std::fs::write(&entry, "print \"entry\\n\"\n").unwrap();
+    let e = entry.to_str().unwrap();
+    let base = LaunchDecl {
+        argv: vec!["ruby".into(), e.into()],
+        cwd: Some(h.to_str().unwrap().into()),
+        env: vec![],
+        path_env: None,
+    };
+    // The benign controls: the same working directory and files.
+    assert_eq!(run(&ruby, h, &[e.into()], &[]), "entry\n");
+    assert!(check_declaration(&base).is_ok());
+    for option in ["-W2", "-w", "-W0", "-W:no-deprecated", "-KU", "-W1KU"] {
+        assert_eq!(
+            run(&ruby, h, &[option.into(), e.into()], &[]),
+            "entry\n",
+            "{option}"
+        );
+        assert_eq!(
+            classify_argv(&["ruby".into(), option.into(), e.into()]),
+            Ok(ArgvClass::Interpreter { entry: 2 }),
+            "{option}"
+        );
+    }
+    let refusal = DeclError::CodeSelecting(CodeSelecting::InterpreterOption);
+    for (options, output) in [
+        (&["-Weprint(\"injected\\n\")"][..], "injected\n"),
+        (&["-W1eprint(\"injected\\n\")"], "injected\n"),
+        (&["-KUeprint(\"injected\\n\")"], "injected\n"),
+        (&["-Wr./evil"], "prelude\nentry\n"),
+        (&["-WI.", "-Wrevil"], "prelude\nentry\n"),
+    ] {
+        let options: Vec<String> = options.iter().map(|o| (*o).to_owned()).collect();
+        let args = [options.clone(), vec![e.to_owned()]].concat();
+        assert_eq!(run(&ruby, h, &args, &[]), output, "{options:?}");
+        refused("ruby", &options, e);
+        let argv = [vec!["ruby".to_owned()], args].concat();
+        assert_eq!(
+            check_declaration(&LaunchDecl {
+                argv: argv.clone(),
+                ..base.clone()
+            }),
+            Err(refusal),
+            "{options:?}"
+        );
+        assert!(
+            matches!(
+                apply_changes(
+                    &base,
+                    &LaunchChanges {
+                        argv: Some(argv),
+                        ..LaunchChanges::default()
+                    }
+                ),
+                Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+            ),
+            "{options:?}"
+        );
+        let path = ruby.to_str().unwrap();
+        // A `#!` line carries one option: the first one's form.
+        assert_eq!(
+            shebang_argv(path, Some(options[0].as_str()), e, &[], path),
+            Err(refusal),
+            "{options:?}"
+        );
+    }
+}

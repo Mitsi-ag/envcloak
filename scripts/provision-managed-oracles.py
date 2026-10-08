@@ -28,6 +28,11 @@ SOURCES = (
      "https://github.com/LuaJIT/LuaJIT/archive/c6ffc141a8762b41703f9287d63d93622a13dd8f.tar.gz",
      "6e5fec07750add912e7c3eae0c194d24cd6d023714e1f04a0298a5b4819e4457",
      None, "src/luajit"),
+    # Ruby 3.4.7: its option parser (ruby.c) is the oracle; the binary runs
+    # from the build tree, without its standard library installed.
+    ("ruby-3.4.7", "https://cache.ruby-lang.org/pub/ruby/3.4/ruby-3.4.7.tar.gz",
+     "23815a6d095696f7919090fdc3e2f9459b2c83d57224b2e446ce1f5f7333ef36",
+     ["--disable-install-doc"], "ruby"),
 )
 
 
@@ -76,8 +81,9 @@ def provision(root):
             link.unlink()
         link.symlink_to(target)
     return dict(zip(
-        ("ENVCLOAK_PHP_ORACLE", "ENVCLOAK_PYTHON_DEBUG_ORACLE", "ENVCLOAK_NPM_ORACLE", "ENVCLOAK_LUAJIT_ORACLE"),
-        (binaries[0], binaries[1], bindir / "npm", binaries[3])))
+        ("ENVCLOAK_PHP_ORACLE", "ENVCLOAK_PYTHON_DEBUG_ORACLE", "ENVCLOAK_NPM_ORACLE", "ENVCLOAK_LUAJIT_ORACLE",
+         "ENVCLOAK_RUBY_ORACLE"),
+        (binaries[0], binaries[1], bindir / "npm", binaries[3], binaries[4])))
 
 
 def main():
