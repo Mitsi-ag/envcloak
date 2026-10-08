@@ -479,7 +479,9 @@ impl Started {
             confirm,
         } = self;
         let mut w = &control;
-        if release.write_to(&mut w).is_err() {
+        // A test makes the write fail, as a runner gone before its values.
+        let lost = envcloak_sys::fail_point("launch.release_write").is_err();
+        if lost || release.write_to(&mut w).is_err() {
             retire_failed_runner(control, child);
             return Err(RpcError::new(ErrorKind::RunnerUnavailable));
         }
