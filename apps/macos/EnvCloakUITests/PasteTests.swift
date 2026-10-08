@@ -17,7 +17,7 @@ final class PasteTests: XCTestCase {
             "ENVCLOAK_TEST_RUNTIME": runtime, "ENVCLOAK_TEST_CLI": cli, "ENVCLOAK_TEST_HOME": home]
         app.launch()
         addTeardownBlock { @MainActor in
-            if self.testRun?.hasSucceeded == false { self.recordPasteState(app) }
+            if (self.testRun?.totalFailureCount ?? 0) > 0 { self.recordPasteState(app) }
             app.terminate()
         }
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 20))
@@ -80,16 +80,21 @@ final class PasteTests: XCTestCase {
     }
 
     @MainActor private func recordPasteState(_ app: XCUIApplication) {
-        let sheet = app.sheets.firstMatch
-        let saved = app.staticTexts["paste.saved"]
-        let error = app.staticTexts["paste.error"]
-        let state = """
-        EU-1 failure: visible paste state
-        saved exists: \(saved.exists); label: \(saved.exists ? saved.label : "<absent>"); value: \(saved.exists ? String(describing: saved.value) : "<absent>")
-        error exists: \(error.exists); text: \(error.exists ? String(describing: error.value) : "<absent>")
-        sheet accessibility tree:
-        \(sheet.exists ? sheet.debugDescription : "<no sheet>\n" + app.windows.debugDescription)
-        """
+        let state: String
+        if app.state == .notRunning || app.state == .unknown {
+            state = "EU-1 failure: application state \(app.state); no running app or visible sheet."
+        } else {
+            let sheet = app.sheets.firstMatch
+            let saved = app.staticTexts["paste.saved"]
+            let error = app.staticTexts["paste.error"]
+            state = """
+            EU-1 failure: visible paste state
+            saved exists: \(saved.exists); label: \(saved.exists ? saved.label : "<absent>"); value: \(saved.exists ? String(describing: saved.value) : "<absent>")
+            error exists: \(error.exists); text: \(error.exists ? String(describing: error.value) : "<absent>")
+            sheet accessibility tree:
+            \(sheet.exists ? sheet.debugDescription : "<no sheet>\n" + app.windows.debugDescription)
+            """
+        }
         // Only this isolated generated-value fixture prints a tree. Capture
         // before termination, including when an assertion aborts the test.
         print(state)
