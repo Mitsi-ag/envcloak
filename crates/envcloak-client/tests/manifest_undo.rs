@@ -7,9 +7,9 @@ fn fixture(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::Builder::new()
         .prefix("ecu-")
         .tempdir_in("/tmp")
-        .unwrap();
+        .expect("private fixture directory");
     let path = dir.path().join("envcloak.toml");
-    fs::write(&path, text).unwrap();
+    fs::write(&path, text).expect("fixture manifest");
     (dir, path)
 }
 
