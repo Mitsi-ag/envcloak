@@ -904,6 +904,10 @@ mod tests {
             ("python3", "-Wignore::observer.Notice"),
             ("luajit", "-jv"),
             ("luajit", "-b"),
+            ("ruby", "-We'puts 1'"),
+            ("ruby", "-KUe'puts 1'"),
+            ("ruby", "-Te'puts 1'"),
+            ("bash", "-oposix"),
         ] {
             let interpreter = fixture_root.as_path().join(name);
             std::fs::copy(
@@ -1024,6 +1028,8 @@ mod tests {
             ("php", "-f/selected.php"),
             ("python3", "-Xpresite=observer"),
             ("luajit", "-jv"),
+            ("ruby", "-We'puts 1'"),
+            ("ruby", "-KUe'puts 1'"),
         ] {
             let interpreter = fixture_root.as_path().join(name);
             std::fs::copy(
