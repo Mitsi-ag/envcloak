@@ -106,3 +106,31 @@ final class CLITests: XCTestCase, @unchecked Sendable {
         return (root, CLIRunner(executable: executable, home: root, timeout: timeout))
     }
 }
+
+extension CLITests {
+    func testPrivateUndoChannelNeverUsesArgvOrJSONAndStreamsBeyondPipeCapacity() async throws {
+        let fixture = try fixture("""
+        test "$1" = ref && test "$2" = VARIABLE=fixture && test "$3" = --json || exit 7
+        test "$4" = --undo-fd && test "$5" = 3 && test "$#" = 5 || exit 8
+        test -c /dev/fd/0 && test /dev/fd/0 -ef /dev/null || exit 9
+        /usr/bin/awk 'BEGIN { for (i=0; i<120000; i++) printf "x" }' >&3
+        printf '{"saved":true}'
+        """)
+        let (result, receipt) = try await fixture.runner.recordBinding(arguments: ["ref", "VARIABLE=fixture", "--json"], workingDirectory: fixture.root)
+        XCTAssertEqual(result.json, "{\"saved\":true}")
+        XCTAssertTrue(receipt.available)
+        let script = """
+        #!/bin/sh
+        test "$1" = ref && test "$2" = --restore-fd && test "$3" = 3 && test "$4" = --json && test "$#" = 4 || exit 7
+        test -c /dev/fd/0 && test /dev/fd/0 -ef /dev/null || exit 9
+        bytes=$(/usr/bin/wc -c <&3)
+        test "$bytes" -eq 120000 || exit 10
+        printf '{"restored":true}'
+        """
+        try script.write(toFile: fixture.root + "/envcloak", atomically: false, encoding: .utf8)
+        try await fixture.runner.undoBinding(receipt, workingDirectory: fixture.root)
+        XCTAssertFalse(receipt.available)
+        do { try await fixture.runner.undoBinding(receipt, workingDirectory: fixture.root); XCTFail("consumed receipt reused") }
+        catch { XCTAssertEqual(error as? CLIError, .invalidArguments) }
+    }
+}

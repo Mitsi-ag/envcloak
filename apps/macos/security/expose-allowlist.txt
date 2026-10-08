@@ -11,3 +11,4 @@ apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/SecretBuffer.swift  #
 apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/Base64.swift  # encodes and decodes directly between wiped buffers
 apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Wire/Frame.swift  # framing, in-place parsing and verified-socket I/O
 apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/CLI/CLIRunner.swift  # validates bounded metadata-only CLI stdout
+apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/PasteDraft.swift  # copies the transient SecureField binding into wiping storage and slices env lines
