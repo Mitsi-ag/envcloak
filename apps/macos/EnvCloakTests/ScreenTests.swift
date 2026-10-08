@@ -144,6 +144,49 @@ import XCTest
         await assertVisible("Open guarantees", in: banner)
     }
 
+    func testBindingSheetShowsKeyFailureAndRecoversWithoutStaleChoices() async throws {
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        let item = try XCTUnwrap(session.items.rows.first)
+        let window = host(BindingSheet(session: session, selection: BindingSelection(
+            project: DaemonText("/tmp/project"), key: item, variable: "VARIABLE")))
+        await assertScoped("fixture-0", identifier: "binding.key", in: window)
+        await client.configure(failure: .protocolError)
+        await session.items.refetch(.items)
+        await assertScoped("Keys could not be refreshed. Try again.", identifier: "binding.keys.error", in: window)
+        XCTAssertTrue(session.items.rows.isEmpty)
+        let picker = try XCTUnwrap(identified("binding.key", in: window, accessibilityOnly: true).first)
+        XCTAssertEqual(picker.value(forKey: "accessibilityEnabled") as? Bool, false)
+        assertDisabled("Add to envcloak.toml", in: window)
+        XCTAssertFalse(labels(window).contains("fixture-0 · Test · fixture@example.invalid"))
+        await client.configure()
+        let retry = try XCTUnwrap(identified("binding.keys.retry", in: window, accessibilityOnly: true).first)
+        XCTAssertTrue(retry.responds(to: NSSelectorFromString("accessibilityPerformPress")))
+        retry.perform(NSSelectorFromString("accessibilityPerformPress"))
+        let recovered = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            MainActor.assumeIsolated {
+                session.items.failure == nil && !session.items.rows.isEmpty &&
+                    self.identified("binding.keys.error", in: window, accessibilityOnly: true).isEmpty
+            }
+        }, object: nil)
+        await fulfillment(of: [recovered], timeout: 5)
+        await assertScoped("Choose a key", identifier: "binding.key", in: window)
+        let restoredPicker = try XCTUnwrap(identified("binding.key", in: window, accessibilityOnly: true).first)
+        XCTAssertEqual(restoredPicker.value(forKey: "accessibilityEnabled") as? Bool, true)
+        assertDisabled("Add to envcloak.toml", in: window)
+    }
+
+    func testBindingRowsExposeTheirVariableIdentityInAnOutline() async throws {
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        await session.openProject(DaemonText("/tmp/project"))
+        let project = try XCTUnwrap(session.projects.opened)
+        let window = host(BindingsTable(session: session, project: project, profile: nil, selectedKey: .constant(nil)))
+        await assertScoped("VARIABLE", identifier: "binding.variable.VARIABLE", in: window)
+        let outline = try XCTUnwrap(identified("project.bindings", in: window, accessibilityOnly: true).first)
+        XCTAssertEqual(outline.value(forKey: "accessibilityRole") as? String, NSAccessibility.Role.outline.rawValue)
+    }
+
     func testGate31HostileProjectNameAndSlugOnAccessibilityTree() async {
         let client = ScriptedClient(); let session = VaultSession(client: client)
         await session.poll(); await session.openProject(DaemonText("/tmp/project"))
