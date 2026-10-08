@@ -148,18 +148,49 @@ fn fail(reason: &'static str) -> Failure {
         "scrub did not complete; the file was kept or its backup needs recovery",
     )
 }
-fn format_for(path: &Path, sources: &[ConfigSource]) -> ConfigFormat {
-    if path.extension().is_some_and(|e| e == "jsonl") {
-        return ConfigFormat::Jsonl;
-    }
-    if path.extension().is_some_and(|e| e == "json") {
-        return ConfigFormat::Json;
-    }
-    sources
+fn selected_sources(path: PathBuf, catalog: &[ConfigSource]) -> Vec<ConfigSource> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut selected: Vec<_> = catalog
         .iter()
-        .filter(|s| path == s.path || path.starts_with(&s.path))
-        .find(|s| s.format == ConfigFormat::Json)
-        .map_or(ConfigFormat::Mixed, |s| s.format)
+        .filter(|s| s.path.starts_with(&path))
+        .cloned()
+        .collect();
+    // Named sources select direct children only, never the enclosing directory.
+    // A known store's grammar wins over an arbitrary file extension.
+    let enclosing = catalog
+        .iter()
+        .filter(|s| match &s.names {
+            Some(name) => {
+                path.parent() == Some(s.path.as_path())
+                    && path.file_name().is_some_and(|n| {
+                        n.as_bytes()
+                            .windows(name.len().max(1))
+                            .any(|w| w == name.as_bytes())
+                    })
+            }
+            None => path.starts_with(&s.path),
+        })
+        .max_by_key(|s| s.path.components().count());
+    let format = enclosing.map_or_else(
+        || {
+            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+                ConfigFormat::Mixed
+            } else if path.extension().is_some_and(|e| e == "json") {
+                ConfigFormat::Json
+            } else {
+                ConfigFormat::Mixed
+            }
+        },
+        |s| s.format,
+    );
+    selected.push(ConfigSource {
+        path,
+        format,
+        source_kind: SourceKind::Transcript,
+        label: "scrub path".into(),
+        names: None,
+    });
+    selected
 }
 fn execute(o: &Options) -> Result<bool, Failure> {
     let locations = Locations::from_env().map_err(|_| fail("invalid_home"))?;
@@ -192,13 +223,7 @@ fn execute(o: &Options) -> Result<bool, Failure> {
         } else {
             cwd.join(p)
         };
-        sources.push(ConfigSource {
-            format: format_for(&path, &catalog),
-            path,
-            source_kind: SourceKind::Transcript,
-            label: "scrub path".into(),
-            names: None,
-        });
+        sources.extend(selected_sources(path, &catalog));
     }
     let budget = Budget::default();
     let mut candidates = Candidates::new(budget).map_err(|_| fail("io"))?;
@@ -304,8 +329,10 @@ fn execute(o: &Options) -> Result<bool, Failure> {
             Err(fail("items_changed"))
         } else if let Some(reason) = f.reasons.first() {
             Err(fail(reason))
+        } else if let Some(format) = scan.transcript_formats.get(&f.path) {
+            apply_file(f, *format, &mut row, &compare_entries)
         } else {
-            apply_file(f, format_for(&f.path, &sources), &mut row, &compare_entries)
+            Err(fail("incomplete"))
         };
         match result {
             Ok(()) => row["state"] = json!("scrubbed"),
