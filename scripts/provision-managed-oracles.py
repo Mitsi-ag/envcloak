@@ -21,6 +21,13 @@ SOURCES = (
     ("package", "https://registry.npmjs.org/npm/-/npm-11.19.0.tgz",
      "31e9770f7dc71119a58509353b27917557aaf0ac9b5ef1a0465ee7d8ec67ae75",
      [], "bin/npm-cli.js"),
+    # LuaJIT 2.1 has rolling releases only: a pinned commit's archive. It
+    # builds with make alone (flags None), and needs a deployment target on
+    # macOS.
+    ("LuaJIT-c6ffc141a8762b41703f9287d63d93622a13dd8f",
+     "https://github.com/LuaJIT/LuaJIT/archive/c6ffc141a8762b41703f9287d63d93622a13dd8f.tar.gz",
+     "6e5fec07750add912e7c3eae0c194d24cd6d023714e1f04a0298a5b4819e4457",
+     None, "src/luajit"),
 )
 
 
@@ -46,9 +53,12 @@ def provision(root):
 
         stamp = source / ".envcloak-oracle-build"
         fingerprint = json.dumps([digest, flags])
-        if flags and (not stamp.exists() or stamp.read_text() != fingerprint or not built_binary().is_file()):
-            subprocess.run(["./configure", *flags], cwd=source, check=True)
-            subprocess.run(["make", "-j3"], cwd=source, check=True)
+        if flags != [] and (not stamp.exists() or stamp.read_text() != fingerprint or not built_binary().is_file()):
+            if flags is not None:
+                subprocess.run(["./configure", *flags], cwd=source, check=True)
+            env = dict(os.environ)
+            env.setdefault("MACOSX_DEPLOYMENT_TARGET", "11.0")
+            subprocess.run(["make", "-j3"], cwd=source, check=True, env=env)
             stamp.write_text(fingerprint)
         if not built_binary().is_file():
             raise ValueError(f"runtime missing: {name}")
@@ -65,7 +75,9 @@ def provision(root):
         if link.is_symlink():
             link.unlink()
         link.symlink_to(target)
-    return dict(zip(("ENVCLOAK_PHP_ORACLE", "ENVCLOAK_PYTHON_DEBUG_ORACLE", "ENVCLOAK_NPM_ORACLE"), (binaries[0], binaries[1], bindir / "npm")))
+    return dict(zip(
+        ("ENVCLOAK_PHP_ORACLE", "ENVCLOAK_PYTHON_DEBUG_ORACLE", "ENVCLOAK_NPM_ORACLE", "ENVCLOAK_LUAJIT_ORACLE"),
+        (binaries[0], binaries[1], bindir / "npm", binaries[3])))
 
 
 def main():
