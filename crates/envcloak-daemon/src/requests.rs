@@ -779,8 +779,11 @@ pub fn run_request(
                         });
                     }
                 };
-                // Under the lock since the decision: the grant is there.
-                if !s.grants().consume(g) {
+                // Under the lock since the decision: the grant is there. A
+                // test build fails the use on request (`run.grant_consume`),
+                // to show the failure is audited after the delivery.
+                if envcloak_sys::fail_point("run.grant_consume").is_err() || !s.grants().consume(g)
+                {
                     // The delivery's entry is on disk; the answer is never
                     // sent, and the log says so after it.
                     let e = RpcError::new(ErrorKind::Internal);
@@ -1144,12 +1147,13 @@ fn prepare_runner(
             };
         }
     };
-    if !s.grants().consume(c.grant) {
+    if envcloak_sys::fail_point("run.grant_consume").is_err() || !s.grants().consume(c.grant) {
         // The delivery's entry is on disk; the values never leave.
         started.abandon();
         let e = RpcError::new(ErrorKind::Internal);
         s.audit(AuditEvent::Request(Box::new(RequestAudit {
             decision: e.kind.token(),
+            grant_id: Some(c.grant.to_string()),
             ..entry
         })));
         return Prepared::Done(Err(e));
