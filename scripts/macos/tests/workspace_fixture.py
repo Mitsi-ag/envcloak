@@ -20,6 +20,15 @@ import termios
 import time
 
 
+def xcode_command(cache, eu1, hosted):
+    command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloak' if hosted else 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / ('m306-ui' if eu1 else 'm305-ui')), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', 'test']
+    if eu1:
+        command += ['-only-testing:EnvCloakTests/EU1Tests' if hosted else '-only-testing:EnvCloakUITests/PasteTests']
+    elif not hosted:
+        command += ['-skip-testing:EnvCloakUITests/PasteTests']
+    return command
+
+
 def main():
     eu1 = "--eu1" in sys.argv
     native_package = "--package" in sys.argv
@@ -108,10 +117,9 @@ def main():
                 (billing / 'envcloak.toml').write_bytes(b"[project]\r\nname='billing-fixture'\r\n[env]\r\nBASE='fixture' # keep formatting\r\n")
                 folders = [str(project), str(billing)]
             (runtime / 'test-folders.json').write_text(json.dumps(folders))
-            command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloak' if hosted else 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / ('m306-ui' if eu1 else 'm305-ui')), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', 'test']
-            if eu1:
-                command += ['-only-testing:EnvCloakTests/EU1Tests' if hosted else '-only-testing:EnvCloakUITests/PasteTests']
+            command = xcode_command(cache, eu1, hosted)
             test_env = dict(os.environ, TEST_RUNNER_ENVCLOAK_TEST_HOME=str(home), TEST_RUNNER_CFFIXED_USER_HOME=str(home),
+                            TEST_RUNNER_ENVCLOAK_TEST_STORY='eu1' if eu1 else 'eu0',
                             TEST_RUNNER_TMPDIR=str(home / "tmp") + "/", TEST_RUNNER_HOME=str(home),
                             TEST_RUNNER_ENVCLOAK_TEST_CLI=str(cli), TEST_RUNNER_ENVCLOAK_TEST_REPO=str(pathlib.Path.cwd()), TEST_RUNNER_ENVCLOAK_TEST_RUNTIME=str(runtime), TEST_RUNNER_ENVCLOAK_TEST_PROJECT=str(home / "selected-alias"))
             if native_package:
