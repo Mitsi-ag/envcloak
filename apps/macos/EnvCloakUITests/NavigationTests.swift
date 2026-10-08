@@ -38,9 +38,18 @@ final class NavigationTests: XCTestCase {
         let approvals = window.descendants(matching: .any)["sidebar.Approvals"].firstMatch
         XCTAssertTrue(approvals.waitForExistence(timeout: 10))
         XCTAssertTrue(approvals.staticTexts["Arrives with Touch ID approvals"].exists)
-        let unavailable = window.descendants(matching: .any)["feature.unavailable"].firstMatch
-        XCTAssertTrue(unavailable.waitForExistence(timeout: 10))
-        XCTAssertTrue(unavailable.staticTexts["Approvals"].exists)
-        XCTAssertTrue(unavailable.staticTexts["Arrives with Touch ID approvals"].exists)
+        assertElementLabel("Approvals. Arrives with Touch ID approvals", identifier: "feature.unavailable", in: window)
+    }
+
+    @MainActor private func assertElementLabel(_ text: String, identifier: String, in window: XCUIElement,
+                                               file: StaticString = #filePath, line: UInt = #line) {
+        // Same contract as ScreenTests: unique identifier, exact own label.
+        let matches = window.descendants(matching: .any).matching(identifier: identifier)
+        let element = matches.firstMatch
+        XCTAssertTrue(element.waitForExistence(timeout: 10), file: file, line: line)
+        XCTAssertEqual(matches.count, 1, file: file, line: line)
+        let labelled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", text), object: element)
+        XCTAssertEqual(XCTWaiter.wait(for: [labelled], timeout: 10), .completed, file: file, line: line)
+        XCTAssertEqual(element.label, text, file: file, line: line)
     }
 }
