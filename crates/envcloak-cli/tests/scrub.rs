@@ -79,15 +79,21 @@ struct Fixture {
     _outside: tempfile::TempDir,
     pass: std::path::PathBuf,
     path: std::path::PathBuf,
+    env: Vec<(&'static str, std::path::PathBuf)>,
 }
 impl Fixture {
     fn new() -> Self {
         let home = TestHome::new();
+        let env = vec![("CLAUDE_CODE_TMPDIR", home.root().join("tmp"))];
+        Self::configured(home, env)
+    }
+    fn configured(home: TestHome, env: Vec<(&'static str, std::path::PathBuf)>) -> Self {
         let values = canaries(fresh_seed());
         seed_vault(&home, &values);
         let mut command = std::process::Command::new(daemon_exe());
         home.apply(&mut command)
-            .env(envcloak_sys::testing::TRACE, "1");
+            .env(envcloak_sys::testing::TRACE, "1")
+            .envs(env.iter().map(|(k, v)| (*k, v)));
         let daemon = envcloak_testkit::Daemon::start_command(command, &[]);
         let outside = outside_dir();
         let pass = secret_file(
@@ -113,6 +119,7 @@ impl Fixture {
             _outside: outside,
             pass,
             path,
+            env,
         };
         f.write();
         f
@@ -139,6 +146,7 @@ impl Fixture {
         if agent {
             cmd.env("ENVCLOAK_FIXTURE_AGENT", "1");
         }
+        cmd.envs(self.env.iter().map(|(k, v)| (*k, v)));
         finish_within(cmd, Duration::from_secs(900))
     }
     fn undo(&self, id: &str, extra: &[&str]) -> std::process::Output {
@@ -148,6 +156,116 @@ impl Fixture {
             on_terminal_command(&self.home, &args, &[(3, &self.pass, true)]),
             Duration::from_secs(900),
         )
+    }
+}
+#[test]
+fn gate37_scrub_catalog_backup_scope_and_restore() {
+    use envcloak_scan::source::{ConfigFormat, SourceKind};
+    for relocated in [false, true] {
+        let home = TestHome::new();
+        let mut env = vec![("CLAUDE_CODE_TMPDIR", home.root().join("tmp"))];
+        if relocated {
+            env.extend([
+                ("CODEX_HOME", home.root().join("relocated-x")),
+                ("CLAUDE_CONFIG_DIR", home.root().join("relocated-c")),
+            ]);
+        }
+        let mut vars: std::collections::HashMap<_, _> = home.vars().into_iter().collect();
+        vars.extend(env.iter().map(|(k, v)| (*k, v.clone().into_os_string())));
+        let locations =
+            envcloak_agents::locations::Locations::new(&|k| vars.get(k).cloned()).unwrap();
+        std::fs::create_dir_all(locations.codex_home()).unwrap();
+        let logs = home.root().join("moved-logs");
+        std::fs::write(
+            locations.codex_config(),
+            format!("log_dir = {:?}\n", logs.to_str().unwrap()),
+        )
+        .unwrap();
+        let mut sources = locations.transcript_sources();
+        sources.extend(
+            locations
+                .config_sources()
+                .into_iter()
+                .filter(|s| s.source_kind == SourceKind::HostBackup),
+        );
+        let mut f = Fixture::configured(home, env);
+        std::fs::remove_file(&f.path).unwrap();
+        for source in sources.iter().filter(|s| {
+            !matches!(
+                s.source_kind,
+                SourceKind::Database | SourceKind::Credentials
+            )
+        }) {
+            f.path = if let Some(name) = &source.names {
+                source.path.join(format!("fixture{name}.snapshot"))
+            } else if source.path.extension().is_some_and(|e| e == "jsonl") {
+                source.path.clone()
+            } else {
+                source.path.join("capture")
+            };
+            std::fs::create_dir_all(f.path.parent().unwrap()).unwrap();
+            let value = by_label(&f.values, labels::OPENAI_API_KEY).as_str();
+            let before = match source.format {
+                ConfigFormat::Json | ConfigFormat::Jsonl => {
+                    format!("{}\n", serde_json::json!({"text":value}))
+                }
+                _ => format!("captured {value} here\n"),
+            };
+            std::fs::write(&f.path, &before).unwrap();
+            age(&f.path);
+            let agent = source.source_kind == SourceKind::HostBackup && source.names.is_some();
+            let out = f.scrub(agent);
+            assert!(
+                out.status.success(),
+                "relocated={relocated}, {}: {} {}",
+                source.label,
+                stderr(&out),
+                stdout(&out)
+            );
+            let id = backup(&out);
+            envcloak_testkit::assert_no_canary(&std::fs::read(&f.path).unwrap(), &f.values);
+            if agent {
+                let refused = f.undo(&id, &[]);
+                assert!(!refused.status.success());
+                assert!(stderr(&refused).contains("created_by_agent"));
+            }
+            let restored = f.undo(&id, if agent { &["--created-by-agent"] } else { &[] });
+            assert!(restored.status.success(), "{}", stderr(&restored));
+            assert!(std::fs::read(&f.path).unwrap() == before.as_bytes());
+            std::fs::remove_file(&f.path).unwrap();
+        }
+    }
+}
+#[test]
+fn gate37_scrub_refuses_client_only_catalog_roots() {
+    let mut f = Fixture::new();
+    std::fs::remove_file(&f.path).unwrap();
+    let client_root = f.home.root().join("client-only");
+    f.env.push(("CODEX_HOME", client_root.clone()));
+    for path in [
+        client_root.join("sessions/capture.jsonl"),
+        f.home.home().join("unrelated.jsonl"),
+        f.home.home().join("nested/.claude.json.backup.fixture"),
+    ] {
+        f.path = path;
+        std::fs::create_dir_all(f.path.parent().unwrap()).unwrap();
+        let value = by_label(&f.values, labels::OPENAI_API_KEY).as_str();
+        let body = if f.path.extension().is_some_and(|e| e == "jsonl") {
+            format!("{}\n", serde_json::json!({"text":value}))
+        } else {
+            format!("captured {value} here\n")
+        };
+        std::fs::write(&f.path, body).unwrap();
+        age(&f.path);
+        let before = std::fs::read(&f.path).unwrap();
+        let out = f.scrub(false);
+        assert!(!out.status.success(), "{}", stdout(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["files"].as_array().unwrap().len(), 1);
+        assert_eq!(report["files"][0]["reason"], "invalid_params");
+        assert!(report["files"][0]["backup"].is_null());
+        assert!(std::fs::read(&f.path).unwrap() == before);
+        std::fs::remove_file(&f.path).unwrap();
     }
 }
 fn backup(out: &std::process::Output) -> String {
@@ -319,6 +437,7 @@ fn paused(f: &Fixture, at: usize) -> (Owned, tempfile::TempDir) {
         &[],
     );
     cmd.env("ENVCLOAK_TEST_PAUSE_DIR", d.path());
+    cmd.envs(f.env.iter().map(|(k, v)| (*k, v)));
     let mut child = Owned(cmd.spawn().unwrap());
     let until = std::time::Instant::now() + Duration::from_secs(180);
     loop {

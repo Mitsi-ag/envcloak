@@ -62,6 +62,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
+mod catalog;
+
 use envcloak_core::audit::{AuditKind, SubjectSummary};
 use envcloak_core::file_backup::FileBackupId;
 use envcloak_core::file_backup_v2::{
@@ -181,16 +183,10 @@ const PROJECT_MCP_DIRS: [&str; 2] = [".vscode", ".github"];
 /// path as written: a restore writes it back without following a
 /// symlink.
 pub fn allowed_path(path: &str, home: Option<&Path>, data_dir: &Path) -> bool {
-    if path.is_empty() || path.len() > 4096 || path.contains('\0') || !path.starts_with('/') {
+    if !valid_path(path) {
         return false;
     }
     let parts: Vec<&str> = path[1..].split('/').collect();
-    if parts
-        .iter()
-        .any(|p| p.is_empty() || *p == "." || *p == "..")
-    {
-        return false;
-    }
     let Some(name) = parts.last() else {
         return false;
     };
@@ -228,6 +224,16 @@ pub fn allowed_path(path: &str, home: Option<&Path>, data_dir: &Path) -> bool {
         return true;
     }
     *name == "mcp.json" && dirs.last().is_some_and(|d| PROJECT_MCP_DIRS.contains(d))
+}
+
+fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 4096
+        && !path.contains('\0')
+        && path.strip_prefix('/').is_some_and(|rest| {
+            rest.split('/')
+                .all(|p| !p.is_empty() && p != "." && p != "..")
+        })
 }
 
 /// M2-16 adds only these conventional first-run sources, for import cleanup.
@@ -897,10 +903,14 @@ pub fn begin(
         .map(PathBuf::from)
         .filter(|h| h.is_absolute());
     let data_dir = locked(&shared.state).paths().data_dir.clone();
+    // Catalog settings can hold values, so refusal precedes even that read.
+    refuse_if_traced()?;
+    let catalog = catalog::Scope::new(&|k| std::env::var_os(k), purpose);
     let mut plan = Vec::with_capacity(p.files.len());
     for f in p.files {
         if !allowed_path(&f.path, home.as_deref(), &data_dir)
             && !allowed_first_run_path(&f.path, home.as_deref(), purpose)
+            && !catalog.allows(&f.path)
         {
             return Err(invalid());
         }
