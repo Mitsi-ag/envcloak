@@ -67,6 +67,21 @@ final class WireTests: XCTestCase {
         }
     }
 
+    func testCodeIdentityReasonAndPeerFailureUseDocumentedToken() {
+        XCTAssertEqual(Reason(rawValue: "code_identity")?.rawValue, "code_identity")
+        XCTAssertEqual(PeerCheck(rawValue: "code_identity"), .codeIdentity)
+        let failure = EnvCloakError.daemonUnverified(.codeIdentity)
+        XCTAssertEqual(failure.description, "daemon_unverified (code_identity)")
+        XCTAssertEqual(failure.debugDescription, "daemon_unverified (code_identity)")
+        // This is a local connection failure, not a daemon RPC error kind.
+        XCTAssertNil(ErrorKind(rawValue: "daemon_unverified"))
+        for token in ["codeIdentity", "CODE_IDENTITY", " code_identity", "code_identity\n",
+                      "code_identity\u{0}", "code_identity\u{202e}", "code_identity_extra"] {
+            XCTAssertNil(Reason(rawValue: token))
+            XCTAssertNil(PeerCheck(rawValue: token))
+        }
+    }
+
     func testBase64IsCanonicalAndDecodedInPlace() throws {
         for length in 0...128 {
             let bytes = (0..<length).map { _ in UInt8.random(in: .min ... .max) }
