@@ -29,4 +29,13 @@ final class PasteDraftTests: XCTestCase {
             draft.value.withUnsafeBytes { XCTAssertEqual(Array($0), Array(input.utf8)) }
         }
     }
+
+    func testPaddedOpaqueValueIsNeverOfferedAsMetadata() throws {
+        let generated = "A7" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        var text = generated + "="
+        let draft = try PasteDraft(taking: &text)
+        XCTAssertNil(draft.envName)
+        XCTAssertTrue(text.isEmpty)
+        draft.value.withUnsafeBytes { XCTAssertEqual(Array($0), Array((generated + "=").utf8)) }
+    }
 }

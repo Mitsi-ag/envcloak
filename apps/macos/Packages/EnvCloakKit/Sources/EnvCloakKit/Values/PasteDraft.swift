@@ -31,7 +31,7 @@ public struct PasteDraft: ~Copyable {
             let nameBytes = text.utf8[..<equal]
             if !nameBytes.isEmpty, nameBytes.count <= 128,
                nameBytes.allSatisfy({ (65...90).contains($0) || (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }),
-               let first = nameBytes.first, !(48...57).contains(first) {
+               let first = nameBytes.first, !(48...57).contains(first), !Self.valueShaped(nameBytes) {
                 envName = String(decoding: nameBytes, as: UTF8.self)
                 valueOffset = nameBytes.count + 1
             }
@@ -41,6 +41,25 @@ public struct PasteDraft: ~Copyable {
         self.droppedLineEnding = droppedLineEnding
         self.envName = envName
         self.valueOffset = valueOffset
+    }
+
+    // An '=' may be padding on an opaque value. Match the policy's long
+    // mixed alphanumeric run rule before copying a proposed variable name.
+    private static func valueShaped(_ bytes: Substring.UTF8View) -> Bool {
+        var run = 0
+        var classes: UInt8 = 0
+        for byte in bytes {
+            let kind: UInt8
+            switch byte {
+            case 97...122: kind = 1
+            case 65...90: kind = 2
+            case 48...57: kind = 4
+            default: run = 0; classes = 0; continue
+            }
+            run += 1; classes |= kind
+            if run >= 24 && classes.nonzeroBitCount >= 2 { return true }
+        }
+        return false
     }
 
     public mutating func useEnvLine() throws {
