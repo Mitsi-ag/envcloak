@@ -54,6 +54,31 @@ final class LaunchTests: XCTestCase {
         XCTAssertEqual(titles(menu).filter { $0 == "About EnvCloak" }.count, 1)
     }
 
+    @MainActor
+    func testSystemUndoMenuKeepsItsGenericTitle() throws {
+        let window = try XCTUnwrap(NSApp.windows.first { $0.title == "Projects" })
+        let manager = try XCTUnwrap(window.undoManager)
+        let target = NSObject()
+        var undone = false
+        manager.beginUndoGrouping()
+        manager.registerUndo(withTarget: target) { _ in undone = true }
+        manager.setActionName("Binding")
+        manager.endUndoGrouping()
+        defer { manager.removeAllActions(withTarget: target) }
+        let menu = try XCTUnwrap(NSApp.mainMenu?.item(withTitle: "Edit")?.submenu)
+        let item = try XCTUnwrap(menu.items.first { $0.action == NSSelectorFromString("undo:") })
+        menu.update()
+        // SwiftUI's system menu keeps its generic title even when the
+        // window's UndoManager has a named action. No custom undo command.
+        XCTAssertEqual(manager.undoMenuItemTitle, "Undo Binding")
+        XCTAssertEqual(item.title, "Undo")
+        XCTAssertEqual(item.keyEquivalent, "z")
+        XCTAssertEqual(item.keyEquivalentModifierMask, .command)
+        XCTAssertTrue(window.firstResponder?.undoManager === manager)
+        XCTAssertTrue(window.tryToPerform(try XCTUnwrap(item.action), with: item))
+        XCTAssertTrue(undone)
+    }
+
     func testTheBundleHasNoSideDoor() throws {
         let info = try XCTUnwrap(Bundle.main.infoDictionary)
         XCTAssertEqual(Self.sideDoors(in: info), [])

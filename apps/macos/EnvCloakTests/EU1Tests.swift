@@ -45,25 +45,31 @@ import XCTest
         XCTAssertEqual(saved.item.slug.escaped, "eu-one")
         XCTAssertTrue(session.items.rows.contains { $0.slug.escaped == "eu-one" })
         try await assertPasteValue("Saved as eu-one. openai, live.", identifier: "paste.saved", in: window)
-        let manager = UndoManager(); manager.groupsByEvent = false
         let first = DaemonText(home + "/workspace-fixture")
         let second = DaemonText(home + "/billing-fixture")
         for project in [first, second] {
             try check(cli: cli, home: home, project: project.escaped, slug: nil)
         }
-        for project in [first, second] {
-            manager.beginUndoGrouping()
-            let ok = await session.bindings.apply(BindingEdit(project: project, profile: nil, envName: "OPENAI_API_KEY", reference: "eu-one", previous: nil), session: session, manager: manager)
-            manager.endUndoGrouping(); XCTAssertTrue(ok, session.notice ?? "missing notice")
-            try check(cli: cli, home: home, project: project.escaped, slug: "eu-one")
-        }
         let bindingsWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1024, height: 674), styleMask: [.titled], backing: .buffered, defer: false)
         bindingsWindow.isReleasedWhenClosed = false
+        var environmentManager: UndoManager?
         bindingsWindow.contentView = NSHostingView(rootView: ProjectDetail(session: session, directory: second, selectedKey: .constant(nil))
+            .background(UndoEnvironmentProbe { environmentManager = $0 })
             .frame(width: 1024, height: 674))
         bindingsWindow.makeKeyAndOrderFront(nil)
         bindingsWindow.contentView?.layoutSubtreeIfNeeded()
         defer { bindingsWindow.close() }
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            MainActor.assumeIsolated { environmentManager != nil }
+        }, object: nil)
+        await fulfillment(of: [ready], timeout: 5)
+        let manager = try XCTUnwrap(environmentManager)
+        XCTAssertTrue(manager === bindingsWindow.undoManager)
+        for project in [first, second] {
+            let ok = await session.bindings.apply(BindingEdit(project: project, profile: nil, envName: "OPENAI_API_KEY", reference: "eu-one", previous: nil), session: session, manager: manager)
+            XCTAssertTrue(ok, session.notice ?? "missing notice")
+            try check(cli: cli, home: home, project: project.escaped, slug: "eu-one")
+        }
         let mounted = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             MainActor.assumeIsolated {
                 bindingTable(in: bindingsWindow).flatMap { bindingVariableRow("OPENAI_API_KEY", table: $0) } != nil
@@ -72,26 +78,41 @@ import XCTest
         await fulfillment(of: [mounted], timeout: 5)
         try selectNativeBindingVariable("OPENAI_API_KEY", in: bindingsWindow)
         try await waitForBindingSelection("OPENAI_API_KEY", in: bindingsWindow)
-        manager.beginUndoGrouping()
         let changed = await session.bindings.apply(BindingEdit(project: second, profile: nil, envName: "OPENAI_API_KEY", reference: "fixture", previous: .init("eu-one")), session: session, manager: manager)
-        manager.endUndoGrouping(); XCTAssertTrue(changed)
+        XCTAssertTrue(changed)
         try check(cli: cli, home: home, project: second.escaped, slug: "fixture")
         let manifest = URL(fileURLWithPath: second.escaped + "/envcloak.toml")
         let original = try Data(contentsOf: manifest)
-        manager.beginUndoGrouping()
         try await waitForBindingSelection("OPENAI_API_KEY", in: bindingsWindow)
         let current = try XCTUnwrap(session.projects.opened)
         let removal = try XCTUnwrap(current.removal(of: "OPENAI_API_KEY", profile: nil))
         let removed = await session.bindings.apply(removal, session: session, manager: manager)
-        manager.endUndoGrouping(); XCTAssertTrue(removed)
+        XCTAssertTrue(removed)
         try check(cli: cli, home: home, project: second.escaped, slug: nil)
-        manager.undo()
+        let remaining = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            MainActor.assumeIsolated {
+                guard let table = bindingTable(in: bindingsWindow) else { return false }
+                return table.numberOfRows == 1 && table.selectedRowIndexes.isEmpty
+            }
+        }, object: nil)
+        await fulfillment(of: [remaining], timeout: 5)
+        XCTAssertTrue(manager.canUndo)
+        XCTAssertEqual(manager.undoMenuItemTitle, "Undo Binding")
+        XCTAssertTrue(bindingsWindow.firstResponder?.undoManager === manager)
+        // Dispatch the same selector as Edit > Undo through the window,
+        // after the selected row and its table have been destroyed.
+        // Physical Command-Z and the focused menu remain XCUITest checks.
+        XCTAssertTrue(bindingsWindow.tryToPerform(NSSelectorFromString("undo:"), with: nil))
         let deadline = ContinuousClock.now.advanced(by: .seconds(10))
         while ContinuousClock.now < deadline {
             if let data = try? Data(contentsOf: manifest), SHA256.hash(data: data) == SHA256.hash(data: original) { break }
             try await Task.sleep(for: .milliseconds(20))
         }
         XCTAssertTrue(SHA256.hash(data: try Data(contentsOf: manifest)) == SHA256.hash(data: original))
+        let confirmed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            MainActor.assumeIsolated { session.notice == "Binding undone. The original envcloak.toml bytes were restored." }
+        }, object: nil)
+        await fulfillment(of: [confirmed], timeout: 5)
         try check(cli: cli, home: home, project: second.escaped, slug: "fixture")
         // A duplicate slug is refused by the real daemon. Neither the model
         // nor the mounted sheet may retain the previous success.
@@ -238,4 +259,12 @@ import XCTest
     }, object: nil)
     let result = await XCTWaiter.fulfillment(of: [selected], timeout: 5)
     XCTAssertEqual(result, .completed, "Native table must select only " + variable)
+}
+
+/// Read the actual hosting environment; never install a test UndoManager.
+private struct UndoEnvironmentProbe: NSViewRepresentable {
+    @Environment(\.undoManager) private var manager
+    let receive: (UndoManager?) -> Void
+    func makeNSView(context: Context) -> NSView { NSView() }
+    func updateNSView(_ view: NSView, context: Context) { receive(manager) }
 }
