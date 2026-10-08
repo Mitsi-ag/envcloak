@@ -259,3 +259,52 @@ cargo test -p envcloak --bin envcloak --test scrub --no-fail-fast -- --test-thre
 
 These are 293 distinct passing tests for this follow-up, not a rerun of the
 historical 918-test receipt above. No workspace-wide test command was run.
+
+## Reservation-fixture follow-up
+
+The five `envcloak-testkit` failures reported from PR 46's Linux test job
+were reproduced on macOS before the fix. Their fixtures assumed that
+`incomplete` was still reserved by M2-14, although scrub now emits it and its
+live row correctly says `landed`. Three tests tried to rename that reserved
+row; the constant and field/method cases expected it to produce a clash.
+
+`reserve_exit_token` now inserts a row owned by the fixture instead of
+renaming a live reservation. The existing M2 table entry locates the table
+without depending on a reservation's status; M3 has a second exit-token
+table. The constant and printed-token cases use `tst_required`. The method
+case uses separate synthetic tokens for its constant and literal arms, so
+it no longer depends on `not_started_by_daemon` remaining reserved either.
+Every negative assertion still requires both the exact token and the source
+file. The constant case keeps its landed-row passing control, and the
+field/method case now also passes only after all three synthetic rows land.
+
+The production checker and the live `docs/IPC.md` reservations are not
+changed by this fix. All detector mutations were temporary and restored.
+
+| Test | Named checker mutation observed failing |
+| --- | --- |
+| `a_failure_token_returned_by_another_crates_token_method_counts` | `skip_nonfailure_token_methods`: ignore methods outside `Failure` itself |
+| `a_failure_token_through_a_helper_function_counts` | `skip_token_helper_calls`: omit token arguments passed to helpers |
+| `a_failure_token_written_as_a_constant_in_another_crate_counts` | `discard_constant_values`: discard resolved constant-reference values |
+| `a_failure_token_in_a_field_or_a_token_method_counts` | `skip_nonfailure_token_methods` loses the method's literal token; `discard_method_constant_values` loses its constant token while the field and literal diagnostics still pass |
+| `a_token_printed_directly_as_envcloak_token_counts` | `disable_printed_token_detection`: disable the printed-token pattern |
+
+The method mutation preserves the reader for `Failure`'s own token field,
+so the failure is the missing method-token diagnostic, not an unrelated
+failure-field validation error. Each qualified mutation ran the Rust test
+and reached an assertion failure (exit 101). All five tests passed again
+after restoring the checker.
+
+Final local checks on macOS, with the same target E and build limits as
+above, and detached tests in isolated homes:
+
+| Check | Result |
+| --- | --- |
+| `cargo test -p envcloak-testkit --test check_reservations --no-fail-fast -- --test-threads 3` | 91 passed, zero failed or ignored, 1033.43 seconds |
+| Restored run of the five affected tests | 5 passed, zero failed or ignored |
+| `python3 scripts/check-reservations.py` | Passed, 276 rows in 17 tables, including the final restored rerun |
+| `cargo fmt --all --check` | Passed |
+| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Passed |
+| `scripts/check-unsafe.sh` | Passed |
+| `scripts/check-expose-lint.sh` | Passed, all 6 expected sites reported |
+| `git diff --check` | Passed |
