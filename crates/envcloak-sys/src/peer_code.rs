@@ -4,9 +4,6 @@ pub mod pins;
 
 use std::os::fd::BorrowedFd;
 
-#[cfg(all(feature = "testing", not(debug_assertions)))]
-compile_error!("EnvCloak testing features must not be compiled into release artifacts");
-
 /// Opaque kernel token. Only the socket reader can construct one.
 #[repr(C)]
 #[derive(Clone, Copy)]

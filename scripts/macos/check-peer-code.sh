@@ -6,7 +6,8 @@ if [[ $(uname -s) != Darwin ]]; then
   echo 'peer code: skipped (requires macOS)' >&2
   exit 0
 fi
-target="${CARGO_TARGET_DIR:-$PWD/target}"
+. scripts/macos/cargo-target.sh
+target=$(cargo_target_dir)
 mkdir -p "$target"
 target=$(cd "$target" && pwd)
 fixtures=$(mktemp -d "$target/peer-signing.XXXXXX")

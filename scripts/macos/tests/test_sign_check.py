@@ -70,6 +70,16 @@ class Workspace:
         self.x86 = os.path.join(self.dir, "x86")
         self.arm = os.path.join(self.dir, "arm")
         self.debug = os.path.join(self.dir, "debug")
+        self.peer_support = []
+        for token in ["CERT_SHA1", "PEER_BARRIER"]:
+            source = os.path.join(self.dir, "peer-" + token + ".c")
+            output = os.path.join(self.dir, "peer-" + token)
+            with open(source, "w") as f:
+                f.write('#include <stdlib.h>\nint main(void) { return getenv("ENVCLOAK_TEST_' + token + '") != 0; }\n')
+            p = run(["cc", "-O0", "-o", output, source])
+            if p.returncode != 0:
+                raise RuntimeError("cc failed: %s" % p.stderr.decode())
+            self.peer_support.append(output)
         for out, arch, source in ((self.native, None, src), (self.x86, "x86_64", src), (self.arm, "arm64", src), (self.debug, None, debug_src)):
             cmd = ["cc", "-O0", "-o", out, source]
             if arch:
@@ -425,6 +435,13 @@ class SignCheck(unittest.TestCase):
     def test_a_debug_resource_override_in_the_app_is_refused(self):
         b = Bundle(app_prog=WS.debug).sign()
         self.refused(b, APP_EXE + ": holds PACKAGE_RESOURCE_BUNDLE_PATH")
+
+    def test_testing_peer_support_is_refused_in_every_executable(self):
+        for program in WS.peer_support:
+            for argument, executable in [("app_prog", APP_EXE), ("cli_prog", CLI_EXE), ("daemon_prog", DAEMON_EXE)]:
+                with self.subTest(program=program, executable=executable):
+                    b = Bundle(**{argument: program}).sign()
+                    self.refused(b, executable + ": holds test-only peer identity support")
 
     def test_mixed_architectures_are_refused(self):
         b = Bundle(cli_arch="x86").sign()

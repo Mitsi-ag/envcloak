@@ -257,6 +257,9 @@ def signature(app, rel, want_id):
     for name in TEST_ONLY_INPUTS:
         if name in data:
             fail("%s: holds %s, a Debug build's environment override" % (rel, name.decode()))
+    for name in [b"ENVCLOAK_TEST_CERT_SHA1", b"ENVCLOAK_TEST_PEER_BARRIER"]:
+        if name in data:
+            fail("%s: holds test-only peer identity support" % rel)
     code, out, err = run(["lipo", "-archs", path])
     if code != 0:
         fail("%s: lipo cannot read its architectures (%s)" % (rel, err.decode("utf-8", "replace").strip()))
