@@ -93,8 +93,7 @@ percent-encoded token can be replaced; a value inside a longer encoded run is
 reported as unsupported and left alone. SQLite stores are named as not
 scrubbed. Unknown provider-pattern hits are not rewrite authority.
 
-Only values of at least 16 characters, or registry-recognized values, are
-compared for every caller. Short values are neither found nor scrubbed. The
+Values under 16 characters are never found or scrubbed, for any caller. The
 report lists slugs, sanitized paths, counts, rotation links, backup IDs and
 fixed reasons, without values, offsets or snippets. Every item scrubbed is
 marked exposed for rotation before publication.
