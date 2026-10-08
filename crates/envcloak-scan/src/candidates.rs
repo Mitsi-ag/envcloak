@@ -53,7 +53,7 @@ pub struct Issue {
     pub reason: &'static str,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ScanReport {
     pub findings: Vec<Found>,
     pub issues: Vec<Issue>,
@@ -67,6 +67,19 @@ pub struct ScanReport {
     pub files: u64,
     /// Budget charged: successful bytes, or the allowance of a failed config read.
     pub bytes: u64,
+}
+impl std::fmt::Debug for ScanReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanReport")
+            .field("findings", &self.findings.len())
+            .field("issues", &self.issues.len())
+            .field("notes", &self.notes.len())
+            .field("leftovers", &self.leftovers.len())
+            .field("transcript_formats", &self.transcript_formats.len())
+            .field("files", &self.files)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
 }
 impl ScanReport {
     pub fn complete(&self) -> bool {
