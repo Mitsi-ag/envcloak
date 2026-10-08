@@ -197,7 +197,7 @@ fn foreign_client_under(grant: &[&str]) {
 /// writes every readable region of the process's memory, read-only ones
 /// too (Codex review of M2-27: a value kept in a read-only mapping is
 /// still in the client), to the file `EC_M27_DUMP` names. Each region is
-/// read through the system (`/proc/self/mem` on Linux,
+/// read through the system (`process_vm_readv` on Linux,
 /// `mach_vm_read_overwrite` on macOS), so a part that cannot be read
 /// (a guard page, a mapping past its file's end) is skipped explicitly
 /// rather than faulting, and counted in `EC_M27_DUMP.skipped`. The one
@@ -217,6 +217,8 @@ const DUMPER: &str = r#"#include <fcntl.h>
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#else
+#include <sys/uio.h>
 #endif
 static char ec_buf[65536];
 static unsigned long long ec_skipped;
@@ -231,18 +233,36 @@ __attribute__((constructor)) static void ec_plant(void) {
     for (size_t i = 0; i < n; i++) p[i] = c[n - 1 - i];
     if (mprotect(p, (size_t)page, PROT_READ) != 0) abort();
 }
-static void ec_region(int fd, int mem, unsigned long long a, unsigned long long b) {
+#ifndef __APPLE__
+/* Reads [p, p + n) of this process into ec_buf: process_vm_readv, which
+   answers an unreadable page with an error rather than a fault and needs
+   no /proc file (a non-dumpable process's /proc/self/mem is root's). */
+static ssize_t ec_read(unsigned long long p, size_t n) {
+    struct iovec local = { ec_buf, n }, remote = { (void *)(unsigned long)p, n };
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+}
+#endif
+static void ec_region(int fd, unsigned long long a, unsigned long long b) {
     for (unsigned long long p = a; p < b; p += sizeof ec_buf) {
         unsigned long long n = b - p < sizeof ec_buf ? b - p : sizeof ec_buf;
 #ifdef __APPLE__
-        (void)mem;
         mach_vm_size_t got = 0;
         if (mach_vm_read_overwrite(mach_task_self(), p, n, (mach_vm_address_t)ec_buf, &got)
                 != KERN_SUCCESS) { ec_skipped += n; continue; }
 #else
-        if (p > (unsigned long long)0x7fffffffffffffffULL) { ec_skipped += n; continue; }
-        ssize_t got = pread(mem, ec_buf, n, (off_t)p);
-        if (got <= 0) { ec_skipped += n; continue; }
+        ssize_t got = ec_read(p, (size_t)n);
+        if (got != (ssize_t)n) {
+            /* A part is unreadable: page by page, skipping each such page. */
+            for (unsigned long long q = p; q < p + n; q += 4096) {
+                size_t m = p + n - q < 4096 ? (size_t)(p + n - q) : 4096;
+                if (ec_read(q, m) == (ssize_t)m) {
+                    if (write(fd, ec_buf, m) < 0) return;
+                } else {
+                    ec_skipped += m;
+                }
+            }
+            continue;
+        }
 #endif
         if (write(fd, ec_buf, (size_t)got) < 0) return;
     }
@@ -263,23 +283,22 @@ __attribute__((destructor)) static void ec_dump(void) {
                            (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS) break;
         int written = (info.protection & VM_PROT_WRITE) || info.pages_dirtied > 0
             || info.pages_swapped_out > 0;
-        if ((info.protection & VM_PROT_READ) && written) ec_region(fd, -1, addr, addr + size);
+        if ((info.protection & VM_PROT_READ) && written) ec_region(fd, addr, addr + size);
         addr += size;
     }
 #else
-    int mem = open("/proc/self/mem", O_RDONLY);
     FILE *maps = fopen("/proc/self/smaps", "r");
     char line[1024];
     unsigned long long a = 0, b = 0, dirty = 0;
     int have = 0, readable = 0, writable = 0, anonymous = 0;
     for (;;) {
-        char *got = maps && mem >= 0 ? fgets(line, sizeof line, maps) : NULL;
+        char *got = maps ? fgets(line, sizeof line, maps) : NULL;
         unsigned long long x, y, off, inode;
         char perms[8], dev[16];
         int header = got && sscanf(line, "%llx-%llx %7s %llx %15s %llu", &x, &y, perms, &off, dev,
                                    &inode) == 6;
         if (!got || header) {
-            if (have && readable && (writable || anonymous || dirty > 0)) ec_region(fd, mem, a, b);
+            if (have && readable && (writable || anonymous || dirty > 0)) ec_region(fd, a, b);
             if (!got) break;
             a = x; b = y; dirty = 0; have = 1;
             readable = perms[0] == 'r';
@@ -292,7 +311,6 @@ __attribute__((destructor)) static void ec_dump(void) {
             dirty += kb;
     }
     if (maps) fclose(maps);
-    if (mem >= 0) close(mem);
 #endif
     close(fd);
     char path[4096];
