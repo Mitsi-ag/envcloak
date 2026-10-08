@@ -65,8 +65,33 @@ public struct CLIRunner: Sendable {
         _ = try await perform(arguments: ["daemon", "install", "--daemon", path], directory: "/", expectsJSON: false)
     }
 
-    private func perform(arguments: [String], directory: String, expectsJSON: Bool) async throws -> CLIResult {
-        let operation: @Sendable () throws -> CLIResult = { try execute(arguments: arguments, directory: directory, expectsJSON: expectsJSON) }
+    /// The opaque receipt never enters JSON or the system UndoManager.
+    public func recordBinding(arguments: [String], workingDirectory: String) async throws -> (CLIResult, UndoReceipt) {
+        guard arguments.first == "ref", !arguments.contains(where: { $0.hasSuffix("-fd") }),
+              workingDirectory.hasPrefix("/"), !workingDirectory.utf8.contains(0),
+              arguments.allSatisfy({ !$0.utf8.contains(0) }) else { throw CLIError.invalidArguments }
+        let receipt = try UndoReceipt()
+        let result = try await perform(arguments: arguments + ["--undo-fd", "3"], directory: workingDirectory,
+                                       expectsJSON: true, receipt: receipt)
+        return (result, receipt)
+    }
+
+    public func undoBinding(_ receipt: UndoReceipt, workingDirectory: String) async throws {
+        guard workingDirectory.hasPrefix("/"), !workingDirectory.utf8.contains(0) else { throw CLIError.invalidArguments }
+        _ = try await perform(arguments: ["ref", "--restore-fd", "3", "--json"], directory: workingDirectory,
+                              expectsJSON: true, receipt: receipt, restoring: true)
+    }
+
+    private func perform(arguments: [String], directory: String, expectsJSON: Bool, receipt: UndoReceipt? = nil, restoring: Bool = false) async throws -> CLIResult {
+        let operation: @Sendable () throws -> CLIResult = {
+            if let receipt {
+                return try receipt.use(restoring: restoring) { buffer in
+                    try execute(arguments: arguments, directory: directory, expectsJSON: expectsJSON, undo: &buffer, restoring: restoring)
+                }
+            }
+            var empty = try SecretBuffer()
+            return try execute(arguments: arguments, directory: directory, expectsJSON: expectsJSON, undo: &empty, restoring: nil)
+        }
         #if DEBUG
         let hooks = CLIProbe.hooks
         let worker = Task.detached { try CLIProbe.$hooks.withValue(hooks, operation: operation) }
@@ -85,7 +110,7 @@ public struct CLIRunner: Sendable {
         return ContinuousClock.now
     }
 
-    private func execute(arguments: [String], directory: String, expectsJSON: Bool) throws -> CLIResult {
+    private func execute(arguments: [String], directory: String, expectsJSON: Bool, undo: inout SecretBuffer, restoring: Bool?) throws -> CLIResult {
         let deadline = Self.now.advanced(by: timeout)
         var out = [Int32](repeating: -1, count: 2)
         var err = [Int32](repeating: -1, count: 2)
@@ -93,7 +118,18 @@ public struct CLIRunner: Sendable {
         defer { for fd in out where fd >= 0 { close(fd) } }
         guard pipe(&err) == 0 else { throw CLIError.unavailable }
         defer { for fd in err where fd >= 0 { close(fd) } }
-        for fd in out + err {
+        var channel = [Int32](repeating: -1, count: 2)
+        if restoring != nil {
+            guard pipe(&channel) == 0 else { throw CLIError.unavailable }
+        }
+        defer { for fd in channel where fd >= 0 { close(fd) } }
+        let parentChannel = restoring == true ? channel[1] : channel[0]
+        if parentChannel >= 0 {
+            guard fcntl(parentChannel, F_SETFL, O_NONBLOCK) == 0 else { throw CLIError.unavailable }
+            // A closed child channel must be a failed write, never SIGPIPE.
+            if restoring == true { guard fcntl(parentChannel, F_SETNOSIGPIPE, 1) == 0 else { throw CLIError.unavailable } }
+        }
+        for fd in out + err + channel.filter({ $0 >= 0 }) {
             guard fcntl(fd, F_SETFD, FD_CLOEXEC) == 0 else { throw CLIError.unavailable }
         }
         for fd in [out[0], err[0]] {
@@ -117,6 +153,10 @@ public struct CLIRunner: Sendable {
               posix_spawn_file_actions_adddup2(&actions, out[1], 1) == 0,
               posix_spawn_file_actions_adddup2(&actions, err[1], 2) == 0,
               posix_spawn_file_actions_addchdir(&actions, directory) == 0 else { throw CLIError.unavailable }
+        if restoring != nil {
+            let childChannel = restoring == true ? channel[0] : channel[1]
+            guard posix_spawn_file_actions_adddup2(&actions, childChannel, 3) == 0 else { throw CLIError.unavailable }
+        }
         let argv = [executable] + arguments + (expectsJSON && !arguments.contains("--json") ? ["--json"] : [])
         let environment = ["HOME=" + home, "PATH=/usr/bin:/bin", "LANG=en_US.UTF-8"]
         var args = argv.map { strdup($0) } + [nil]
@@ -127,6 +167,10 @@ public struct CLIRunner: Sendable {
         guard posix_spawn(&pid, executable, &actions, &attributes, &args, &env) == 0 else { throw CLIError.unavailable }
         close(out[1]); out[1] = -1
         close(err[1]); err[1] = -1
+        if restoring != nil {
+            let childIndex = restoring == true ? 0 : 1
+            close(channel[childIndex]); channel[childIndex] = -1
+        }
         // This code is the only reaper. Keep the leader unreaped until
         // both pipes finish, so timeout/cancellation may safely kill its
         // process group, including descendants retaining a pipe.
@@ -140,15 +184,16 @@ public struct CLIRunner: Sendable {
         }
         var output: [UInt8] = []
         var total = 0
-        var open = [true, true]
+        var open = [true, true, restoring != nil]
+        var sent = 0
         var exited = false
         var status: Int32 = 0
         while !exited || open.contains(true) {
             guard !Task.isCancelled, Self.now < deadline else { throw CLIError.timedOut }
-            var pollers = [out[0], err[0]].enumerated().map {
-                pollfd(fd: open[$0.offset] ? $0.element : -1, events: Int16(POLLIN), revents: 0)
+            var pollers = [out[0], err[0], parentChannel].enumerated().map {
+                pollfd(fd: open[$0.offset] ? $0.element : -1, events: Int16($0.offset == 2 && restoring == true ? POLLOUT : POLLIN), revents: 0)
             }
-            let ready = poll(&pollers, 2, 20)
+            let ready = poll(&pollers, 3, 20)
             if ready < 0 && errno != EINTR { throw CLIError.unavailable }
             for index in 0..<2 where open[index] && pollers[index].revents != 0 {
                 var bytes = [UInt8](repeating: 0, count: 8192)
@@ -160,6 +205,29 @@ public struct CLIRunner: Sendable {
                     if index == 0 && expectsJSON { output += bytes.prefix(count) }
                 }
                 if count < 0 && errno != EINTR && errno != EAGAIN { throw CLIError.unavailable }
+            }
+            if open[2] && pollers[2].revents != 0 {
+                if restoring == true {
+                    let count = undo.withUnsafeBytes { bytes in
+                        write(parentChannel, bytes.baseAddress?.advanced(by: sent), bytes.count - sent)
+                    }
+                    if count > 0 { sent += count }
+                    if count < 0 && errno != EINTR && errno != EAGAIN { throw CLIError.unavailable }
+                    if sent == undo.count { close(channel[1]); channel[1] = -1; open[2] = false }
+                } else {
+                    guard undo.count < UndoReceipt.limit else { throw CLIError.outputLimit }
+                    try undo.reserveCapacity(min(UndoReceipt.limit, undo.count + 8192))
+                    var wouldBlock = false
+                    let got = try undo.read(upTo: min(8192, UndoReceipt.limit - undo.count)) { bytes in
+                        let count = read(parentChannel, bytes.baseAddress, bytes.count)
+                        if count < 0 {
+                            if errno == EINTR || errno == EAGAIN { wouldBlock = true; return 0 }
+                            throw CLIError.unavailable
+                        }
+                        return count
+                    }
+                    if got == 0 && !wouldBlock { open[2] = false }
+                }
             }
             var info = siginfo_t()
             guard waitid(P_PID, id_t(pid), &info, WEXITED | WNOHANG | WNOWAIT) == 0 else { throw CLIError.unavailable }
