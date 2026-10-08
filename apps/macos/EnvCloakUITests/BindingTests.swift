@@ -31,16 +31,23 @@ extension PasteTests {
         task.currentDirectoryURL = URL(fileURLWithPath: home + "/" + project)
         task.environment = ["HOME": home, "PATH": "/usr/bin:/bin", "TMPDIR": home + "/tmp/"]
         task.standardInput = FileHandle.nullDevice
-        let output = Pipe(); task.standardOutput = output; task.standardError = FileHandle.nullDevice
+        let output = Pipe(); let errors = Pipe()
+        task.standardOutput = output; task.standardError = errors
         try task.run()
         let bytes = output.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit(); XCTAssertEqual(task.terminationStatus, 0)
+        let stderr = errors.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        // check.rs emits metadata-only CheckReport JSON and a fixed failure
+        // message, never values. Its stderr is bounded to that failure line.
+        let diagnostic = "envcloak check in \(project): exit \(task.terminationStatus)\nstdout:\n\(String(decoding: bytes, as: UTF8.self))\nstderr:\n\(String(decoding: stderr, as: UTF8.self))"
+        if task.terminationStatus != 0 { print(diagnostic) }
+        XCTAssertEqual(task.terminationStatus, 0, diagnostic)
         let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: bytes) as? [String: Any])
         let bindings = try XCTUnwrap((parsed["references"] as? [String: Any])?["bindings"] as? [[String: Any]])
         let row = bindings.first { $0["env_name"] as? String == variable }
         if let slug {
-            XCTAssertEqual(row?["reference"] as? String, slug)
-            XCTAssertEqual(row?["status"] as? String, "ok")
-        } else { XCTAssertNil(row) }
+            XCTAssertEqual(row?["reference"] as? String, slug, diagnostic)
+            XCTAssertEqual(row?["status"] as? String, "ok", diagnostic)
+        } else { XCTAssertNil(row, diagnostic) }
     }
 }

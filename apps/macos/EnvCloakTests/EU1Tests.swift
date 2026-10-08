@@ -49,6 +49,9 @@ import XCTest
         let first = DaemonText(home + "/workspace-fixture")
         let second = DaemonText(home + "/billing-fixture")
         for project in [first, second] {
+            try check(cli: cli, home: home, project: project.escaped, slug: nil)
+        }
+        for project in [first, second] {
             manager.beginUndoGrouping()
             let ok = await session.bindings.apply(BindingEdit(project: project, profile: nil, envName: "OPENAI_API_KEY", reference: "eu-one", previous: nil), session: session, manager: manager)
             manager.endUndoGrouping(); XCTAssertTrue(ok, session.notice ?? "missing notice")
@@ -135,17 +138,22 @@ import XCTest
         let task = Process(); task.executableURL = URL(fileURLWithPath: cli)
         task.arguments = ["check", "--json"]; task.currentDirectoryURL = URL(fileURLWithPath: project)
         task.environment = ["HOME": home, "PATH": "/usr/bin:/bin", "TMPDIR": home + "/tmp/"]
-        task.standardInput = FileHandle.nullDevice; task.standardError = FileHandle.nullDevice
+        task.standardInput = FileHandle.nullDevice
+        let errors = Pipe(); task.standardError = errors
         let output = Pipe(); task.standardOutput = output
-        try task.run(); let data = output.fileHandleForReading.readDataToEndOfFile(); task.waitUntilExit()
-        XCTAssertEqual(task.terminationStatus, 0)
+        try task.run(); let data = output.fileHandleForReading.readDataToEndOfFile()
+        let stderr = errors.fileHandleForReading.readDataToEndOfFile(); task.waitUntilExit()
+        // check.rs reports metadata only; stderr is its fixed failure line.
+        let diagnostic = "envcloak check in \(project): exit \(task.terminationStatus)\nstdout:\n\(String(decoding: data, as: UTF8.self))\nstderr:\n\(String(decoding: stderr, as: UTF8.self))"
+        if task.terminationStatus != 0 { print(diagnostic) }
+        XCTAssertEqual(task.terminationStatus, 0, diagnostic)
         let result = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let bindings = try XCTUnwrap((result["references"] as? [String: Any])?["bindings"] as? [[String: Any]])
         let row = bindings.first { $0["env_name"] as? String == "OPENAI_API_KEY" }
         if let slug {
-            XCTAssertEqual(row?["reference"] as? String, slug)
-            XCTAssertEqual(row?["status"] as? String, "ok")
-        } else { XCTAssertNil(row) }
+            XCTAssertEqual(row?["reference"] as? String, slug, diagnostic)
+            XCTAssertEqual(row?["status"] as? String, "ok", diagnostic)
+        } else { XCTAssertNil(row, diagnostic) }
     }
 
     private func sweep(repo: String, home: String, canary: String) throws {
