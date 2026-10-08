@@ -174,6 +174,56 @@ fn a_clean_fixture_passes() {
 }
 
 #[test]
+fn allowlist_membership_does_not_depend_on_pipe_capacity() {
+    let t = clean_tree();
+    assert_passes(&t);
+    // Repeated valid entries keep the same membership but exceed a pipe's
+    // capacity. A reader that exits on its first match can break the writer.
+    let member = "crates/envcloak-core/src/secret.rs\n";
+    write(
+        &t.home(),
+        "security/expose-allowlist.txt",
+        &member.repeat(8192),
+    );
+    assert_passes(&t);
+    write(&t.home(), "security/expose-allowlist.txt", "# no members\n");
+    assert_fails(&t, "crates/envcloak-core/src/secret.rs");
+}
+
+#[test]
+fn ci_version_probe_consumes_the_producers_output() {
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    let line = workflow
+        .lines()
+        .find(|s| s.contains("xcodebuild -version | "))
+        .unwrap();
+    let reader = line
+        .split_once(" | ")
+        .unwrap()
+        .1
+        .split_once(" || {")
+        .unwrap()
+        .0;
+    let expected = reader.split('"').nth(1).unwrap();
+    let t = TestHome::new();
+    for (version, success) in [(expected, true), ("Build version fixture-mismatch", false)] {
+        let mut cmd = Command::new("bash");
+        t.apply(&mut cmd).env("FIXTURE_VERSION", version).args(["-c", &format!(
+            r#"set -o pipefail
+python3 -c 'import os,sys; sys.stdout.write(os.environ["FIXTURE_VERSION"]+"\n"); sys.stdout.flush(); sys.stdout.write("trailer\n"*131072)' | {reader}"#
+        )]);
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            out.status.success(),
+            success,
+            "version pipeline: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+    }
+}
+
+#[test]
 fn allow_unsafe_code_outside_sys_fails() {
     let uc = unsafe_lint();
     for (rel, text) in [
