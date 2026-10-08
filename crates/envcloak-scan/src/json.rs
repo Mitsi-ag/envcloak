@@ -15,7 +15,7 @@ pub(crate) enum Node {
     Text(Text),
     Object(Vec<(Text, Node)>),
     Array(Vec<Node>),
-    Scalar,
+    Scalar(SecretBytes),
 }
 impl Node {
     pub fn object(&self) -> Option<&[(Text, Node)]> {
@@ -134,7 +134,7 @@ impl Parser<'_> {
                 }
                 let token = &self.bytes[start..self.pos];
                 if matches!(token, b"true" | b"false" | b"null") || number(token) {
-                    Ok(Node::Scalar)
+                    Ok(Node::Scalar(SecretBytes::copy_from(token)))
                 } else {
                     Err(())
                 }
