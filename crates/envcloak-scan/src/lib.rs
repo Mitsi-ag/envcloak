@@ -41,6 +41,7 @@ pub mod candidates;
 pub mod delete;
 pub mod dotenv;
 pub mod first_run;
+pub mod formats;
 mod json;
 pub mod profile;
 pub mod restore;

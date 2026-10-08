@@ -338,7 +338,7 @@ fn json_tokens(
                 }
             }
         }
-        crate::json::Node::Scalar => {}
+        crate::json::Node::Scalar(_) => {}
     }
     true
 }
