@@ -78,10 +78,13 @@ impl Scope {
         let path = system_spelling(Path::new(path));
         self.0.iter().any(|rule| {
             let (Rule::Tree(root) | Rule::File(root) | Rule::Named(root, _)) = rule;
+            // Discovery walks components. Normalize only these daemon-owned
+            // roots the same way; parent components and symlinks stay intact.
+            let root: PathBuf = root.components().collect();
             if !root.to_str().is_some_and(super::valid_path) {
                 return false;
             }
-            let root = system_spelling(root);
+            let root = system_spelling(&root);
             match rule {
                 Rule::Tree(_) => path != root && path.starts_with(root),
                 Rule::File(_) => path == root,
@@ -174,6 +177,15 @@ mod tests {
         let d = tempfile::tempdir_in("/tmp").unwrap();
         let root = d.path();
         let scope = Scope::new(&|k| env(root, k), BackupPurpose::Scrub);
+        let spelled = Scope::new(
+            &|k| {
+                env(root, k).map(|mut value| {
+                    value.push("//./");
+                    value
+                })
+            },
+            BackupPurpose::Scrub,
+        );
         let uid = envcloak_sys::effective_uid();
         // Pure admission checks only; never enumerate the real host's /tmp stores.
         let defaults = Scope::new(
@@ -195,6 +207,7 @@ mod tests {
         ] {
             let p = root.join(relative);
             assert!(scope.allows(p.to_str().unwrap()));
+            assert!(spelled.allows(p.to_str().unwrap()), "catalog root spelling");
             assert!(scope.allows(system_spelling(&p).to_str().unwrap()));
             for purpose in [
                 BackupPurpose::Init,
@@ -248,7 +261,10 @@ mod tests {
         for setting in [
             "../logs",
             "~/logs",
+            "~/logs/",
+            "~/./logs//",
             root.join("absolute-logs").to_str().unwrap(),
+            root.join("absolute-logs/").to_str().unwrap(),
         ] {
             std::fs::write(&config, format!("log_dir = {setting:?}\n")).unwrap();
             // Parent components are refused by path admission, as by discovery.
