@@ -344,6 +344,49 @@ fn gate37_catalog_formats_survive_file_and_directory_selection() {
     }
 }
 #[test]
+fn gate37_canonical_selections_keep_catalog_jsonl_without_extensions() {
+    let mut f = Fixture::new();
+    std::fs::remove_file(&f.path).unwrap();
+    f.path = f.home.home().join(".codex/sessions/capture");
+    std::fs::create_dir_all(f.path.parent().unwrap()).unwrap();
+    let eligible = [by_label(&f.values, labels::OPENAI_API_KEY).clone()];
+    let before = encoded_transcript(&f, &eligible);
+    std::fs::write(&f.path, &before).unwrap();
+    let canonical = f.path.canonicalize().unwrap();
+    for selected in [canonical.parent().unwrap(), canonical.as_path()] {
+        std::fs::write(&f.path, &before).unwrap();
+        age(&f.path);
+        let mut cmd = on_terminal_command(
+            &f.home,
+            &[
+                "scrub",
+                "--path",
+                selected.to_str().unwrap(),
+                "--yes",
+                "--json",
+            ],
+            &[],
+        );
+        cmd.envs(f.env.iter().map(|(k, v)| (*k, v)));
+        let out = finish_within(cmd, Duration::from_secs(180));
+        assert!(out.status.success(), "{} {}", stderr(&out), stdout(&out));
+        let id = backup(&out);
+        let after = std::fs::read(&f.path).unwrap();
+        envcloak_testkit::assert_no_canary(&after, &f.values);
+        let lines: Vec<_> = after
+            .split(|b| *b == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for line in lines {
+            serde_json::from_slice::<Value>(line).unwrap();
+        }
+        let undo = f.undo(&id, &[]);
+        assert!(undo.status.success(), "{}", stderr(&undo));
+        assert!(std::fs::read(&f.path).unwrap() == before);
+    }
+}
+#[test]
 fn gate37_short_values_untouched_output_swept_and_later_edits_refuse_undo() {
     let mut f = Fixture::new();
     let out = f.scrub(false);
