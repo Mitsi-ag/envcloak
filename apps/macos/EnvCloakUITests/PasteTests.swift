@@ -53,8 +53,8 @@ final class PasteTests: XCTestCase {
         app.buttons["binding.add"].click()
         try bind(app, project: "billing-fixture", variable: "OPENAI_API_KEY", key: "eu-one")
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: "eu-one")
-        let changedRow = try bindingRow(app, variable: "OPENAI_API_KEY")
-        changedRow.rightClick()
+        let changedCell = try selectBindingVariable(app, variable: "OPENAI_API_KEY")
+        changedCell.rightClick()
         let change = app.menuItems.matching(NSPredicate(format: "title == %@", "Change key…")).firstMatch
         try requireBinding(change.waitForExistence(timeout: 5), app: app, step: "Change key menu")
         change.click()
@@ -62,7 +62,7 @@ final class PasteTests: XCTestCase {
         try check(cli: cli, home: home, project: "billing-fixture", variable: "OPENAI_API_KEY", slug: "fixture")
         let manifest = URL(fileURLWithPath: home + "/billing-fixture/envcloak.toml")
         let original = try Data(contentsOf: manifest)
-        _ = try bindingRow(app, variable: "OPENAI_API_KEY")
+        _ = try selectBindingVariable(app, variable: "OPENAI_API_KEY")
         app.typeKey(.delete, modifierFlags: [])
         let absent = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
             guard let bytes = try? Data(contentsOf: manifest) else { return false }
