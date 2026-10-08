@@ -39,7 +39,9 @@ mod crowded;
 mod exe_hash;
 mod import;
 mod items;
+mod launch_check;
 mod lock;
+mod managed;
 mod projects;
 mod redact;
 mod requests;
@@ -47,6 +49,7 @@ mod requests;
 mod reveal;
 mod scan_match;
 mod server;
+mod spawn_envcloak;
 mod state;
 
 use std::io::Write;

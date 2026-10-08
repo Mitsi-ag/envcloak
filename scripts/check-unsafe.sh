@@ -14,11 +14,20 @@
 #    - no package has a build script, is a proc-macro crate or points a
 #      target at a file that is not a `.rs` file inside it; no manifest sets
 #      rustflags, [patch] or [replace]; and the tree holds no cargo config.
-# 2. clippy.toml forbids secrecy's expose_secret methods, and no other clippy
-#    config exists. `disallowed_methods` may be allowed only in files listed
-#    in security/expose-allowlist.txt (whose entries must exist), and those
-#    files may not declare out-of-line modules that would inherit an allow,
-#    or macros that could carry a call into another file.
+# 2. clippy.toml forbids secrecy's expose_secret methods, `libc::kill`
+#    and `libc::killpg`, and EnvCloak's numeric wrappers around them,
+#    `envcloak_sys::signal_process` and `signal_group` (M2 plan D-34:
+#    signals go only through an owned handle, envcloak-sys/src/owned.rs),
+#    and no other clippy config exists.
+#    `disallowed_methods` may be allowed only in files listed in
+#    security/expose-allowlist.txt or security/signal-allowlist.txt (whose
+#    entries must exist), and those files may not declare out-of-line
+#    modules that would inherit an allow, or macros that could carry a call
+#    into another file. A file on the signal list alone still may not name
+#    expose_secret (below), and a file on the exposure list alone may not
+#    name a numeric signal call (libc or nix kill and killpg, kill_number,
+#    signal_process, signal_group) or import one: the two lists share the
+#    lint, never the names.
 #    Nothing may allow `warnings`, `clippy::all` or `clippy::style`.
 #    Clippy lints only the configurations CI compiles, so a call under
 #    another target's cfg (`#[cfg(target_arch = "x86")]`) needs no allow
@@ -110,6 +119,12 @@ SYS = "crates/envcloak-sys/Cargo.toml"
 TOOLS = ("rust", "clippy", "rustdoc")
 LEVELS = ("allow", "warn", "deny", "forbid")
 EXPOSE = ("secrecy::ExposeSecret::expose_secret", "secrecy::ExposeSecretMut::expose_secret_mut")
+SIGNALS = (
+    "libc::kill",
+    "libc::killpg",
+    "envcloak_sys::signal_process",
+    "envcloak_sys::signal_group",
+)
 TARGETS = ("lib", "bin", "test", "bench", "example")
 CANARIES = {"envcloak-lint-canary": "security/lint-canary", "envcloak-unsafe-canary": "security/unsafe-canary"}
 DEPS = ("dependencies", "dev-dependencies", "dev_dependencies", "build-dependencies", "build_dependencies")
@@ -324,7 +339,7 @@ else:
                     paths.add(entry["path"])
         elif len(keys) > 1:
             fail("clippy.toml", "set disallowed-methods once")
-        for need in EXPOSE:
+        for need in EXPOSE + SIGNALS:
             if need not in paths:
                 fail("clippy.toml", "disallowed-methods must list " + need)
 '
@@ -357,6 +372,19 @@ while IFS= read -r entry; do
   [ -n "$entry" ] || continue
   [ -f "$entry" ] || fail "$allowlist: listed file $entry does not exist"
 done <<<"$allowed"
+
+signal_allowlist=security/signal-allowlist.txt
+signal_allowed=""
+if [ -f "$signal_allowlist" ]; then
+  signal_allowed="$(sed -e 's/#.*//' -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' "$signal_allowlist" | grep -v '^$' || true)"
+else
+  fail "$signal_allowlist is missing"
+fi
+
+while IFS= read -r entry; do
+  [ -n "$entry" ] || continue
+  [ -f "$entry" ] || fail "$signal_allowlist: listed file $entry does not exist"
+done <<<"$signal_allowed"
 
 # 2 and 3. Rust source. Prints "LINE: problem" lines.
 rust_lints_awk='
@@ -407,7 +435,7 @@ function check(level, lint, ln, relax) {
   } else if (lint == "clippy::all" || lint == "clippy::style") {
     if (relax) report(ln, "clippy::all and clippy::style may not be allowed (they include disallowed_methods)")
   } else if (lint == "clippy::disallowed_methods" || lint == "clippy::disallowed_method") {
-    if (relax && !allowlisted) report(ln, "allows disallowed_methods but is not listed in " allowlist)
+    if (relax && !may_allow) report(ln, "allows disallowed_methods but is not listed in " allowlist " or " signal_allowlist)
   }
 }
 BEGIN { state = "code" }
@@ -571,19 +599,19 @@ END {
   }
   # An allow in a listed file would reach the modules it declares out of
   # line, and a macro it defines would put its calls in other files.
-  if (allowlisted) {
+  if (may_allow) {
     pos = 1
     while (match(substr(masked, pos), /mod[ \t\n]+[A-Za-z_][A-Za-z0-9_]*[ \t\n]*;/)) {
       s = pos + RSTART - 1
       if (s == 1 || !ident(substr(masked, s - 1, 1)))
-        report(line_of(s), "files listed in " allowlist " may not declare out-of-line modules")
+        report(line_of(s), "files listed in " allowlist " or " signal_allowlist " may not declare out-of-line modules")
       pos = s + RLENGTH
     }
     pos = 1
     while (match(substr(masked, pos), /macro_rules[ \t\n]*!/)) {
       s = pos + RSTART - 1
       if (s == 1 || !ident(substr(masked, s - 1, 1)))
-        report(line_of(s), "files listed in " allowlist " may not define macros (one could open a secret in another file)")
+        report(line_of(s), "files listed in " allowlist " or " signal_allowlist " may not define macros (one could carry a call into another file)")
       pos = s + RLENGTH
     }
   }
@@ -597,13 +625,45 @@ END {
         report(q, "names expose_secret or ExposeSecret but is not listed in " allowlist " (clippy lints only the configurations CI compiles; this check covers every cfg)")
     }
   }
+  # The signal names, the same way and on their own list (M2 plan D-34):
+  # a file on the exposure list alone may allow the shared lint, so the
+  # lint alone cannot keep it from signalling by number. Outside the
+  # signal list nothing may name libc or nix kill or killpg, the numeric
+  # wrappers kill_number, signal_process and signal_group (a call, a
+  # path or an import; a method of an owned handle, `.signal_group(`,
+  # and a definition, `fn signal_group`, are fine), or import any of them
+  # or a glob of the modules that hold them, in any cfg.
+  if (!signal_listed && !canary) {
+    n = split(text, tlines, "\n")
+    for (q = 1; q <= n; q++) {
+      t = tlines[q]
+      gsub(/fn[ \t]+signal_(process|group)/, "", t)
+      if (t ~ /(^|[^A-Za-z0-9_])(killpg|kill_number)([^A-Za-z0-9_]|$)/ ||
+          t ~ /(^|[^A-Za-z0-9_])(libc|signal)[ \t]*::[ \t]*kill([^A-Za-z0-9_]|$)/ ||
+          t ~ /(^|[^A-Za-z0-9_])(envcloak_sys|child)[ \t]*::[ \t]*signal_(process|group)([^A-Za-z0-9_]|$)/ ||
+          t ~ /(^|[^A-Za-z0-9_.])signal_(process|group)[ \t]*\(/)
+        report(q, "names a numeric signal call but is not listed in " signal_allowlist " (signal through envcloak_sys::owned::OwnedChild; this check covers every cfg)")
+    }
+    pos = 1
+    while (match(substr(text, pos), /use[ \t\n]+[^;]*;/)) {
+      s = pos + RSTART - 1
+      stmt = substr(text, s, RLENGTH)
+      pos = s + RLENGTH
+      if (s > 1 && ident(substr(text, s - 1, 1))) continue
+      if (stmt !~ /(^|[^A-Za-z0-9_])(libc|nix|envcloak_sys|child|owned|signal)([^A-Za-z0-9_]|$)/) continue
+      # envcloak-sys re-exports its own wrappers by name, calling nothing.
+      if (FILENAME == "crates/envcloak-sys/src/lib.rs" && stmt ~ /^use[ \t]+child[ \t]*::[ \t]*[{]/) continue
+      if (stmt ~ /(^|[^A-Za-z0-9_])(kill|killpg|kill_number|signal_process|signal_group)([^A-Za-z0-9_]|$)/ || stmt ~ /::[ \t\n]*[*]/)
+        report(line_of(s), "imports a numeric signal call but is not listed in " signal_allowlist)
+    }
+  }
   n = split(masked, lines, "\n")
   for (q = 1; q <= n; q++) {
     if (!in_sys && lines[q] ~ /(^|[^A-Za-z0-9_])unsafe_code([^A-Za-z0-9_]|$)/)
       report(q, "mentions unsafe_code outside a lint attribute")
     if (lines[q] ~ /(^|[^A-Za-z0-9_])clippy[ \t]*::[ \t]*(all|style)([^A-Za-z0-9_]|$)/)
       report(q, "mentions clippy::all or clippy::style outside a lint attribute")
-    if (!allowlisted && lines[q] ~ /(^|[^A-Za-z0-9_])disallowed_methods?([^A-Za-z0-9_]|$)/)
+    if (!may_allow && lines[q] ~ /(^|[^A-Za-z0-9_])disallowed_methods?([^A-Za-z0-9_]|$)/)
       report(q, "mentions disallowed_methods outside a lint attribute")
     if (lines[q] ~ /(^|[^A-Za-z0-9_])include([^A-Za-z0-9_]|$)/)
       report(q, "include! compiles a file this check does not read")
@@ -619,6 +679,12 @@ while IFS= read -r file; do
   if printf '%s\n' "$allowed" | grep -qxF "$file"; then
     listed=1
   fi
+  may_allow="$listed"
+  signal_listed=0
+  if printf '%s\n' "$signal_allowed" | grep -qxF "$file"; then
+    may_allow=1
+    signal_listed=1
+  fi
   canary=0
   if [ "$file" = security/lint-canary/src/lib.rs ]; then
     canary=1
@@ -626,6 +692,7 @@ while IFS= read -r file; do
   while IFS= read -r msg; do
     fail "$file:$msg"
   done < <(LC_ALL=C awk -v in_sys="$in_sys" -v allowlisted="$listed" -v allowlist="$allowlist" \
+    -v may_allow="$may_allow" -v signal_listed="$signal_listed" -v signal_allowlist="$signal_allowlist" \
     -v canary="$canary" "$rust_lints_awk" "$file")
 done < <(rust_files)
 

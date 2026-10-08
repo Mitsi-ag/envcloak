@@ -330,14 +330,7 @@ pub fn stop_own_job() -> io::Result<()> {
     // thread's mask changes.
     let rc = unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut mask) };
     let sent = if rc == 0 {
-        // SAFETY: kill(0, ..) signals the caller's own process group; it
-        // has no memory effects. Delivered to this thread before kill
-        // returns (POSIX), the default action stops the process here.
-        if unsafe { libc::kill(0, libc::SIGTSTP) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        crate::owned::stop_current_job()
     } else {
         Err(io::Error::from_raw_os_error(rc))
     };

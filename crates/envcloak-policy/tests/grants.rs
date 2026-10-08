@@ -175,6 +175,7 @@ fn request(subject: SubjectEvidence, bindings: Vec<BoundRef>, argv: &[&str]) -> 
         mode: Mode::Inject,
         argv_display: argv.iter().map(|a| (*a).to_owned()).collect(),
         new_project: false,
+        managed: None,
     }
 }
 
@@ -2426,5 +2427,178 @@ fn a_request_through_another_layer_is_pending_on_its_own() {
     assert!(matches!(
         s.decide(through(BindingSource::Env), &now),
         Decision::Covered(_)
+    ));
+}
+
+// ---------------------------------------------- managed servers (M2-27)
+
+fn managed(revision: u64) -> envcloak_policy::ManagedRequest {
+    envcloak_policy::ManagedRequest {
+        launch: Some(envcloak_core::vault::LaunchRef {
+            launch_id: [9u8; 16],
+            revision,
+        }),
+        name: "claude-code/fixture".to_owned(),
+        written_by_migrate_mcp: true,
+        registered_by: SubjectKind::Terminal,
+        class: Some("native"),
+        strength: Some("bound"),
+        origin: None,
+    }
+}
+
+/// SPEC §10b rule 6 for a managed project (M2-27, CR-2, CR-5): a session
+/// grant made for a registered launch's revision covers that revision,
+/// and nothing of the next revision (a fresh pending request), of another
+/// launch, or of the project asked without the launch; a grant made
+/// without a launch covers no managed request.
+///
+/// Mutation checked: `covers_project_and_mode` without the launch
+/// comparison (a grant that ignores the revision): the revision-2 and
+/// other-launch requests are covered and this fails.
+#[test]
+fn a_managed_grant_covers_only_its_launch_revision() {
+    let its = items();
+    let now = now_at(0);
+    let mut s = store();
+    let at = |rev: Option<u64>| {
+        let mut r = request(
+            under_agent(),
+            vec![bound("OPENAI_API_KEY", &its[0])],
+            &["fixture"],
+        );
+        r.managed = rev.map(managed);
+        r
+    };
+    approve(&mut s, at(Some(1)), session(3600), &now).unwrap();
+    // The positive control: revision 1 is covered.
+    covered(&s.decide(at(Some(1)), &now));
+    // The next revision is a fresh pending request.
+    assert!(matches!(s.decide(at(Some(2)), &now), Decision::Pending(_)));
+    // Another launch of the same revision number.
+    let mut other = at(Some(1));
+    other
+        .managed
+        .as_mut()
+        .unwrap()
+        .launch
+        .as_mut()
+        .unwrap()
+        .launch_id = [8u8; 16];
+    assert!(matches!(s.decide(other, &now), Decision::Pending(_)));
+    // The same project asked without the launch.
+    assert!(matches!(s.decide(at(None), &now), Decision::Pending(_)));
+    // A grant made without a launch covers no managed request.
+    let mut s = store();
+    approve(&mut s, at(None), session(3600), &now).unwrap();
+    covered(&s.decide(at(None), &now));
+    assert!(matches!(s.decide(at(Some(1)), &now), Decision::Pending(_)));
+}
+
+/// The adoption statement of a managed project (SPEC §6.4, §6.6) names
+/// the record: written by migrate-mcp or not, the launch and revision the
+/// approval covers, and D-05's sentence; its canonical bytes hold them,
+/// so a statement for another revision or without the mark is another
+/// digest, and a statement of an unmanaged project has no such part.
+#[test]
+fn the_adoption_statement_shows_the_managed_record() {
+    let its = items();
+    let now = now_at(0);
+    let mut s = store();
+    let mut r = request(
+        under_agent(),
+        vec![bound("OPENAI_API_KEY", &its[0])],
+        &["fixture"],
+    );
+    r.managed = Some(managed(3));
+    let id = pending_id(&s.decide(r, &now));
+    let d = s.shown(&id, &now).unwrap();
+    let text = render_statement(&d, &session(3600));
+    assert!(
+        text.contains(
+            "managed MCP server claude-code/fixture: written by migrate-mcp on this device"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("revision 3 (native, bound): this approval covers that revision only"),
+        "{text}"
+    );
+    assert!(
+        text.contains("can start that command and read the key from its environment"),
+        "{text}"
+    );
+    let digest = statement_digest(&d, &session(3600));
+    let mut other = d.clone();
+    other.managed.as_mut().unwrap().revision = Some(4);
+    assert_ne!(statement_digest(&other, &session(3600)), digest);
+    let mut unmarked = d.clone();
+    unmarked.managed.as_mut().unwrap().written_by_migrate_mcp = false;
+    assert_ne!(statement_digest(&unmarked, &session(3600)), digest);
+    let shown = render_statement(&unmarked, &session(3600));
+    assert!(
+        shown.contains("registered by an agent or unknown process"),
+        "{shown}"
+    );
+    let mut plain = d.clone();
+    plain.managed = None;
+    assert!(!render_statement(&plain, &session(3600)).contains("managed MCP server"));
+}
+
+fn bridged(origin: &str) -> envcloak_policy::ManagedRequest {
+    envcloak_policy::ManagedRequest {
+        launch: None,
+        name: "claude-code/remote".to_owned(),
+        written_by_migrate_mcp: true,
+        registered_by: SubjectKind::Terminal,
+        class: None,
+        strength: None,
+        origin: Some(origin.to_owned()),
+    }
+}
+
+/// SPEC §10b rule 6 for a bridged server's project (M2-27, D-18): a grant
+/// made for the bridged origin covers requests for that origin only. Once
+/// the record is removed (`managed.unregister`), the project's plain
+/// request names no origin, and the bridge-era session grant covers
+/// nothing of it (a fresh pending request); a grant made while the project
+/// was not bridged covers no bridged request; another origin is another
+/// grant.
+///
+/// Mutation checked: `covers_project_and_mode` without the origin
+/// comparison (bridge grants carry no record binding, as unmanaged ones
+/// do not): the plain request after the removal is covered, and this
+/// fails.
+#[test]
+fn a_bridged_grant_covers_only_its_origin() {
+    let its = items();
+    let now = now_at(0);
+    let at = |origin: Option<&str>| {
+        let mut r = request(
+            under_agent(),
+            vec![bound("OPENAI_API_KEY", &its[0])],
+            &["mcp-bridge"],
+        );
+        r.managed = origin.map(bridged);
+        r
+    };
+    let mut s = store();
+    approve(&mut s, at(Some("https://a.test")), session(3600), &now).unwrap();
+    // The positive control.
+    covered(&s.decide(at(Some("https://a.test")), &now));
+    // The record removed: a plain request of the project.
+    assert!(matches!(s.decide(at(None), &now), Decision::Pending(_)));
+    // Another origin.
+    assert!(matches!(
+        s.decide(at(Some("https://b.test")), &now),
+        Decision::Pending(_)
+    ));
+    // A grant made while the project was not bridged.
+    let mut s = store();
+    approve(&mut s, at(None), session(3600), &now).unwrap();
+    covered(&s.decide(at(None), &now));
+    assert!(matches!(
+        s.decide(at(Some("https://a.test")), &now),
+        Decision::Pending(_)
     ));
 }

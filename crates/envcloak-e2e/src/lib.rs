@@ -322,6 +322,21 @@ impl Person {
         steps: &[(&str, &str)],
         limit: Duration,
     ) -> Option<Human> {
+        let cli = self.cli.clone();
+        let mut argv = vec![cli.to_str().unwrap_or("")];
+        argv.extend_from_slice(args);
+        self.run_argv(cwd, &argv, steps, limit)
+    }
+
+    /// `argv` (a program and its arguments) in `cwd`, as [`Person::run`]
+    /// runs `envcloak`.
+    pub fn run_argv(
+        &self,
+        cwd: &Path,
+        argv: &[&str],
+        steps: &[(&str, &str)],
+        limit: Duration,
+    ) -> Option<Human> {
         let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let spec_path = self.files.join(format!("person-{n}.json"));
         let transcript = self.files.join(format!("person-{n}.tty"));
@@ -340,8 +355,7 @@ impl Person {
             .arg("-c")
             .arg(HUMAN)
             .arg(&spec_path)
-            .arg(&self.cli)
-            .args(args)
+            .args(argv)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -437,6 +451,16 @@ impl Harness {
     /// # Panics
     /// When the daemon does not start.
     pub fn start_with(env: &[(&str, &str)]) -> Harness {
+        Harness::start_from(bin_dir(), env)
+    }
+
+    /// As [`Harness::start_with`], with `envcloak` and `envcloakd` from
+    /// `bins`: a test's own copies, which it may replace while the daemon
+    /// runs (the daemon's anchor, M2 task M2-27).
+    ///
+    /// # Panics
+    /// When the daemon does not start.
+    pub fn start_from(bins: PathBuf, env: &[(&str, &str)]) -> Harness {
         let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         let mut cs = canaries(fresh_seed());
         // Passphrases of six random words, as `vault create` suggests.
@@ -456,7 +480,6 @@ impl Harness {
             .prefix("ecf")
             .tempdir_in("/tmp")
             .unwrap_or_else(|e| panic!("cannot create the files directory: {e}"));
-        let bins = bin_dir();
         let env: Vec<(String, OsString)> = env
             .iter()
             .map(|(k, v)| ((*k).to_owned(), OsString::from(v)))
@@ -843,6 +866,42 @@ impl Harness {
         self.keep(format!("the agent's command {n} (stdout)"), &o.stdout);
         self.keep(format!("the agent's command {n} (stderr)"), &o.stderr);
         o
+    }
+
+    /// Starts `line` in the background as a job of the agent's shell
+    /// itself, in `cwd`, and returns at once: the agent stays its
+    /// ancestor while it runs (a job of a subshell that exits would be
+    /// reparented, and leave the agent's tree). Its output goes nowhere.
+    ///
+    /// # Panics
+    /// When the agent's shell is gone.
+    pub fn agent_spawn(&mut self, cwd: &Path, line: &str) {
+        let agent = self.agent_session(cwd);
+        let written = writeln!(
+            agent.stdin,
+            "cd {}; {line} </dev/null >/dev/null 2>&1 &",
+            quoted(cwd.to_str().unwrap_or(""))
+        )
+        .and_then(|()| agent.stdin.flush());
+        if let Err(e) = written {
+            panic!("the agent's shell is gone: {e}");
+        }
+    }
+
+    /// Kills, with SIGKILL, the job [`Harness::agent_spawn`] started last:
+    /// the agent's shell signals its own child (`kill -KILL $!`), as an
+    /// agent ending a program it started would. Returns at once.
+    ///
+    /// # Panics
+    /// When the agent's shell is gone.
+    pub fn agent_kill_last(&mut self) {
+        let Some(agent) = self.agent.as_mut() else {
+            panic!("no agent");
+        };
+        let written = writeln!(agent.stdin, "kill -KILL $!").and_then(|()| agent.stdin.flush());
+        if let Err(e) = written {
+            panic!("the agent's shell is gone: {e}");
+        }
     }
 
     /// `envcloak <args>` run by the agent in `cwd`.

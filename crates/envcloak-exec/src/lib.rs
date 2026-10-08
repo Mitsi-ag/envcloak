@@ -68,6 +68,7 @@
 
 mod coverage;
 mod job_control;
+pub mod launch;
 mod pty;
 mod pump;
 mod signals;
@@ -546,7 +547,7 @@ fn follow(
         // the child's exit.
         let end_group = || {
             if waited.is_ok() && forwarder.ends_childs_group() {
-                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+                signals::end_group(pid);
             }
         };
         end_group();

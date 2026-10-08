@@ -322,6 +322,8 @@ name = "envcloak-e2e"
 version = "0.1.0"
 dependencies = [
  "envcloak-agents",
+ "envcloak-core",
+ "envcloak-ipc",
  "envcloak-policy",
  "envcloak-scan",
  "envcloak-sys",
@@ -373,6 +375,7 @@ dependencies = [
 name = "envcloak-lint-canary"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "secrecy",
 ]
 
@@ -489,6 +492,7 @@ dependencies = [
  "envcloak-sys",
  "libc",
  "proptest",
+ "sha2",
  "tempfile",
  "zeroize",
 ]

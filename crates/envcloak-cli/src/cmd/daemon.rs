@@ -82,7 +82,11 @@ pub const LAUNCHD_TEMPLATE: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 "#;
 
-/// `packaging/systemd/envcloakd.service`.
+/// `packaging/systemd/envcloakd.service`. `KillMode=process` (M2 task
+/// M2-27): stopping or restarting the daemon stops the daemon only, so the
+/// runners and relays it started for managed servers, each leading a
+/// session of its own, keep serving their clients; `install` writes the
+/// whole unit, so it rewrites an older one.
 pub const SYSTEMD_TEMPLATE: &str = "[Unit]
 Description=EnvCloak vault daemon
 Documentation=https://github.com/Mitsi-ag/envcloak
@@ -92,6 +96,7 @@ Type=simple
 ExecStart=@ENVCLOAKD@ --foreground
 @ENVIRONMENT@Restart=on-failure
 RestartSec=2
+KillMode=process
 UMask=0077
 LimitCORE=0
 NoNewPrivileges=true

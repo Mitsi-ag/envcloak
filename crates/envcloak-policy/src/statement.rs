@@ -96,6 +96,36 @@ pub struct PendingDescriptor {
     pub mode: Mode,
     /// The command line, as display text.
     pub argv: Vec<String>,
+    /// For a managed MCP server's project (SPEC §6.6): its record as the
+    /// adoption statement shows it. Absent for every other project, whose
+    /// canonical statement is byte for byte what it was before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedSummary>,
+}
+
+/// A managed MCP server's record, as an approval surface shows it (SPEC
+/// §6.4 "Adoption", §6.6): whether "written by migrate-mcp on this device"
+/// or "registered by an agent or unknown process", the registered launch
+/// and revision a grant for it covers, its class and binding strength, or
+/// a bridge's origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedSummary {
+    /// `<agent>/<server>`.
+    pub name: String,
+    pub written_by_migrate_mcp: bool,
+    /// The registered launch, 26 Crockford base32 characters, and its
+    /// revision; absent for a bridged server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// A test item proposed in place of a live one (SPEC §10b "Live-key
@@ -529,6 +559,22 @@ pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8
     for l in &o.live {
         e.str(l.as_str());
     }
+    // A managed server's record last, and only for one: every field
+    // before it is self-delimiting, so a statement with it never encodes
+    // as one without it, and every other statement is unchanged.
+    if let Some(m) = &p.managed {
+        e.str("managed")
+            .str(&m.name)
+            .flag(m.written_by_migrate_mcp)
+            .str(m.launch.as_deref().unwrap_or(""))
+            .flag(m.launch.is_some())
+            .num(m.revision.unwrap_or(0))
+            .flag(m.revision.is_some())
+            .str(m.class.as_deref().unwrap_or(""))
+            .str(m.strength.as_deref().unwrap_or(""))
+            .str(m.origin.as_deref().unwrap_or(""))
+            .flag(m.origin.is_some());
+    }
     e.0
 }
 
@@ -733,6 +779,40 @@ pub fn render_statement_with(
         e(&p.project.manifest),
         e(&p.project.manifest_sha256)
     );
+    if let Some(m) = &p.managed {
+        let _ = writeln!(
+            t,
+            "  managed MCP server {}: {}",
+            e(&m.name),
+            if m.written_by_migrate_mcp {
+                "written by migrate-mcp on this device"
+            } else {
+                "registered by an agent or unknown process"
+            }
+        );
+        if let (Some(l), Some(r)) = (&m.launch, m.revision) {
+            let _ = writeln!(
+                t,
+                "    its registered launch {} revision {r} ({}, {}): this approval covers that \
+                 revision only",
+                e(l),
+                e(m.class.as_deref().unwrap_or("")),
+                e(m.strength.as_deref().unwrap_or(""))
+            );
+        }
+        if let Some(o) = &m.origin {
+            let _ = writeln!(
+                t,
+                "    its origin {}: the relay sends the header there only",
+                e(o)
+            );
+        }
+        let agent = match (&p.subject.kind, &p.subject.label) {
+            (SubjectKind::Agent, Some(l)) => e(l),
+            _ => "the agent".to_owned(),
+        };
+        let _ = writeln!(t, "    {}", crate::managed::residual_sentence(&agent));
+    }
     // The test items first, before the live bindings and their ticks
     // (SPEC §10b "Live-key guard"): each with the line that binds it. The
     // daemon never swaps one in.

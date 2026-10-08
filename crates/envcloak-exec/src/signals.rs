@@ -80,6 +80,15 @@ use crate::pump::Cutoff;
 /// The signals the runner catches.
 pub(crate) const CAUGHT: [i32; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
+/// Kills what is left of the group the M1 runner's child `pid` led, once
+/// the child has exited and before it is reaped (so the number is still
+/// its own; `crate::follow`).
+pub(crate) fn end_group(pid: i32) {
+    // Listed in security/signal-allowlist.txt.
+    #[allow(clippy::disallowed_methods)]
+    let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+}
+
 /// Whether this process has a controlling terminal: `/dev/tty` opens only
 /// then.
 pub(crate) fn controlling_terminal() -> bool {
@@ -228,6 +237,10 @@ impl Forwarder {
                     if sig == libc::SIGTERM {
                         terms_passed = terms_passed.saturating_add(1);
                     }
+                    // The M1 runner's numbers, kept its child's by the lock
+                    // above (review R-9); listed in
+                    // security/signal-allowlist.txt.
+                    #[allow(clippy::disallowed_methods)]
                     let _ = if group {
                         envcloak_sys::signal_group(pid, sent)
                     } else {

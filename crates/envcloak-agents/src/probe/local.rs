@@ -906,7 +906,9 @@ impl ProbeDaemon {
             // child (`has_exited` answers only for one; it was started by
             // `spawn_unreaped`): a pid not known to be its own may be
             // another process's by now, and gets nothing.
+            // Listed in security/signal-allowlist.txt.
             if matches!(envcloak_sys::has_exited(pid), Ok(false)) {
+                #[allow(clippy::disallowed_methods)]
                 let _ = envcloak_sys::signal_process(pid, libc::SIGTERM);
             }
             let end = Instant::now() + DAEMON_STOP;

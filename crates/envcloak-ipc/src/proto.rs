@@ -35,6 +35,9 @@ use crate::view::{
     RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, ScanMatchView, StatusView,
     TargetView, UnlockedView, VerifyView,
 };
+use crate::view::{
+    ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
+};
 use crate::wire_secret::WireSecret;
 
 /// The protocol version string every message carries.
@@ -244,6 +247,78 @@ pub struct RunRequestParams {
     /// Marker names, never values (SPEC §10a "caller-asserted").
     #[serde(default)]
     pub claims: Vec<String>,
+    /// A managed stdio server's registered launch, by its id (26 Crockford
+    /// base32 characters; SPEC §6.6, M2 task M2-27). The request then
+    /// carries, as descriptors and never as data, the server-side pipe
+    /// ends and a lifeline ([`RunRequestParams::fds`] names them), and a
+    /// covered answer is `started`: the daemon starts EnvCloak's runner
+    /// with them and gives it the values; none comes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+    /// A bridged HTTP server's origin and header names (D-18), for its
+    /// relay's pipe ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<BridgeDecl>,
+    /// The descriptors the request's frame carries (`SCM_RIGHTS`), in the
+    /// order they were attached: with `launch`, `stdin`, `stdout`,
+    /// optionally `stderr`, and `lifeline`; with `bridge`, `stdin`,
+    /// `stdout` and `lifeline`. Empty for every other request, which
+    /// carries none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fds: Vec<FdRole>,
+}
+
+/// What one descriptor a managed request hands over is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FdRole {
+    /// What the server (or relay) reads: the read end of a pipe whose
+    /// write end the client keeps.
+    Stdin,
+    /// What the server (or relay) writes, redacted by the runner.
+    Stdout,
+    /// The server's standard error, redacted by the runner.
+    Stderr,
+    /// The read end of a pipe the client keeps the write end of and never
+    /// writes: its end of file, when the client is gone, stops the server.
+    Lifeline,
+}
+
+impl FdRole {
+    /// The roles a launch or a bridge request may carry, in order: each
+    /// once, `stdin`, `stdout` and `lifeline` always, `stderr` only for a
+    /// launch, in this order.
+    pub fn well_formed(roles: &[FdRole], launch: bool) -> bool {
+        match roles {
+            [FdRole::Stdin, FdRole::Stdout, FdRole::Lifeline] => true,
+            [
+                FdRole::Stdin,
+                FdRole::Stdout,
+                FdRole::Stderr,
+                FdRole::Lifeline,
+            ] => launch,
+            _ => false,
+        }
+    }
+}
+
+/// A bridged HTTP server as its request names it (D-18): the exact origin
+/// it is configured for and the header names its relay inserts. The daemon
+/// compares both with the server's record, never the bridge.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BridgeDecl {
+    pub origin: String,
+    pub header_names: Vec<String>,
+}
+
+impl core::fmt::Debug for BridgeDecl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BridgeDecl")
+            .field("origin", &self.origin.len())
+            .field("header_names", &self.header_names)
+            .finish()
+    }
 }
 
 /// What `envcloak run` sends of an `--env-file` (SPEC §6.1 step 2): what
@@ -1471,8 +1546,220 @@ impl Method for BackupList {
     type Output = BackupListView;
 }
 
+/// `managed.register`: registers a managed MCP server (SPEC §6.6; M2 plan
+/// D-05, D-18, D-33; task M2-27): its managed project, and for a stdio
+/// server the launch declaration the daemon resolves into a sealed
+/// registered launch (the absolute executable and its identity, argv,
+/// working directory and environment, with its class and binding
+/// strength), or for a bridged HTTP server its origin and header names. A
+/// proof, from a terminal subject only; a declaration with a variable or
+/// an interpreter option that selects code is `code_selecting_env`. A
+/// record of the same name, or of the same project, is replaced (the
+/// server registered again with a proof, which `migrate-mcp` does after a
+/// change).
+#[derive(Debug)]
+pub struct ManagedRegister;
+
+impl Method for ManagedRegister {
+    const NAME: &'static str = "managed.register";
+    type Params = ManagedRegisterParams;
+    type Output = ManagedRegisteredView;
+}
+
+/// What `managed.register` takes. Its `Debug` shows names and counts, never
+/// the declaration's values or the passphrase.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRegisterParams {
+    /// `<agent>/<server>`.
+    pub name: String,
+    /// The absolute path of the managed project's `envcloak.toml`.
+    pub manifest: String,
+    pub server: ManagedServerDecl,
+    pub passphrase: WireSecret,
+    #[serde(default)]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for ManagedRegisterParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ManagedRegisterParams")
+            .field("name", &self.name)
+            .field("server", &self.server)
+            .field("claims", &self.claims)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How a managed server is reached, as registered.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ManagedServerDecl {
+    /// A stdio server and the launch `migrate-mcp` read from its host's
+    /// config.
+    Stdio { launch: LaunchDeclParams },
+    /// An HTTP server reached through `mcp-bridge`.
+    Bridge {
+        origin: String,
+        header_names: Vec<String>,
+    },
+}
+
+impl core::fmt::Debug for ManagedServerDecl {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ManagedServerDecl::Stdio { launch } => {
+                f.debug_struct("Stdio").field("launch", launch).finish()
+            }
+            ManagedServerDecl::Bridge {
+                origin,
+                header_names,
+            } => f
+                .debug_struct("Bridge")
+                .field("origin", &origin.len())
+                .field("header_names", header_names)
+                .finish(),
+        }
+    }
+}
+
+/// A stdio server's launch declaration, exactly as a host config gave it
+/// (CR-2: the record keeps it, so `migrate-mcp --update` can resolve it
+/// again after the host config holds only the bridge): argv, the config's
+/// working directory, its non-secret variables and the `PATH` the host
+/// would use. Its `Debug` shows counts and names, never a value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchDeclParams {
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_env: Option<String>,
+}
+
+impl core::fmt::Debug for LaunchDeclParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let names: Vec<&str> = self.env.iter().map(|(n, _)| n.as_str()).collect();
+        f.debug_struct("LaunchDeclParams")
+            .field("argv", &self.argv.len())
+            .field("cwd", &self.cwd.is_some())
+            .field("env", &names)
+            .field("path_env", &self.path_env.is_some())
+            .finish()
+    }
+}
+
+impl From<&LaunchDeclParams> for envcloak_core::vault::LaunchDecl {
+    fn from(d: &LaunchDeclParams) -> Self {
+        envcloak_core::vault::LaunchDecl {
+            argv: d.argv.clone(),
+            cwd: d.cwd.clone(),
+            env: d.env.clone(),
+            path_env: d.path_env.clone(),
+        }
+    }
+}
+
+/// `managed.unregister`: removes a managed server's record, with a proof
+/// (`migrate-mcp --undo`, `agents uninstall`). The grants made for its
+/// launch end with it.
+#[derive(Debug)]
+pub struct ManagedUnregister;
+
+impl Method for ManagedUnregister {
+    const NAME: &'static str = "managed.unregister";
+    type Params = ManagedUnregisterParams;
+    type Output = ManagedUnregisteredView;
+}
+
+/// What `managed.unregister` takes: the record's id, or its
+/// `<agent>/<server>` name.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedUnregisterParams {
+    pub id: String,
+    pub passphrase: WireSecret,
+    #[serde(default)]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for ManagedUnregisterParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ManagedUnregisterParams")
+            .field("id", &self.id)
+            .field("claims", &self.claims)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `managed.update_plan`: the statement of an update of a registered
+/// launch (CR-2), built from the declaration stored in its record and the
+/// explicit changes, resolved in the daemon as a registration is: the old
+/// and the new launch and the digest `managed.update` must send. Answered
+/// only to a caller whose proof the daemon would accept (the
+/// `pending.list` rule); anyone else gets no statement, as does a launch
+/// id no record has.
+#[derive(Debug)]
+pub struct ManagedUpdatePlan;
+
+impl Method for ManagedUpdatePlan {
+    const NAME: &'static str = "managed.update_plan";
+    type Params = ManagedUpdatePlanParams;
+    type Output = ManagedUpdatePlanView;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedUpdatePlanParams {
+    /// The launch id (26 Crockford base32 characters).
+    pub launch: String,
+    #[serde(default)]
+    pub changes: envcloak_policy::managed::LaunchChanges,
+    #[serde(default)]
+    pub claims: Vec<String>,
+}
+
+/// `managed.update`: commits an update as the launch's next revision, with
+/// a proof, after making the plan again: `statement_mismatch` when its
+/// digest is not `digest` (something changed since the statement was
+/// shown). The grants made for the old revision cover nothing of the new.
+#[derive(Debug)]
+pub struct ManagedUpdate;
+
+impl Method for ManagedUpdate {
+    const NAME: &'static str = "managed.update";
+    type Params = ManagedUpdateParams;
+    type Output = ManagedUpdatedView;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedUpdateParams {
+    pub launch: String,
+    #[serde(default)]
+    pub changes: envcloak_policy::managed::LaunchChanges,
+    /// SHA-256 of the update statement, 64 hex characters.
+    pub digest: String,
+    pub passphrase: WireSecret,
+    #[serde(default)]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for ManagedUpdateParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ManagedUpdateParams")
+            .field("launch", &self.launch)
+            .field("changes", &self.changes)
+            .field("claims", &self.claims)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 41] = [
+pub const CLIENT_METHODS: [&str; 45] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1513,6 +1800,10 @@ pub const CLIENT_METHODS: [&str; 41] = [
     BackupOpenRestore::NAME,
     BackupRead::NAME,
     BackupList::NAME,
+    ManagedRegister::NAME,
+    ManagedUnregister::NAME,
+    ManagedUpdatePlan::NAME,
+    ManagedUpdate::NAME,
     ProjectsList::NAME,
 ];
 
@@ -1678,12 +1969,28 @@ pub enum ErrorKind {
     /// unknown subject's request whose statement leaves a live binding
     /// unticked creates no grant.
     LiveNotTicked,
+    /// A request against a managed MCP server's project that is not its
+    /// registered launch, or its registered origin and header names, or
+    /// that does not hand over the pipe ends a launch needs (SPEC §6.6):
+    /// refused before any pending request exists.
+    ManagedCommandMismatch,
+    /// A registered launch whose executable, entry file or working
+    /// directory changed since it was registered (SPEC §6.6): refused
+    /// before any pending request exists or any grant is consulted.
+    ManagedLaunchChanged,
+    /// A launch declaration with a variable or an interpreter option that
+    /// selects the code the server runs; `reason` says which.
+    CodeSelectingEnv,
+    /// The daemon cannot start its own runner (or relay) for a managed
+    /// server (on Linux, the sealed copy of the `envcloak` beside it, made
+    /// when it started, cannot be made or run); nothing is released.
+    RunnerUnavailable,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 46] = [
+    pub const ALL: [ErrorKind; 50] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -1729,6 +2036,10 @@ impl ErrorKind {
         ErrorKind::BackupFrozen,
         ErrorKind::LoginReference,
         ErrorKind::LiveNotTicked,
+        ErrorKind::ManagedCommandMismatch,
+        ErrorKind::ManagedLaunchChanged,
+        ErrorKind::CodeSelectingEnv,
+        ErrorKind::RunnerUnavailable,
         ErrorKind::Internal,
     ];
 
@@ -1780,6 +2091,10 @@ impl ErrorKind {
             ErrorKind::BackupFrozen => -32050,
             ErrorKind::LoginReference => -32037,
             ErrorKind::LiveNotTicked => -32038,
+            ErrorKind::ManagedCommandMismatch => -32039,
+            ErrorKind::ManagedLaunchChanged => -32040,
+            ErrorKind::CodeSelectingEnv => -32041,
+            ErrorKind::RunnerUnavailable => -32042,
             ErrorKind::Internal => -32099,
         }
     }
@@ -1832,6 +2147,10 @@ impl ErrorKind {
             ErrorKind::BackupFrozen => "backup_frozen",
             ErrorKind::LoginReference => "login_reference",
             ErrorKind::LiveNotTicked => "live_not_ticked",
+            ErrorKind::ManagedCommandMismatch => "managed_command_mismatch",
+            ErrorKind::ManagedLaunchChanged => "managed_launch_changed",
+            ErrorKind::CodeSelectingEnv => "code_selecting_env",
+            ErrorKind::RunnerUnavailable => "runner_unavailable",
             ErrorKind::Internal => "internal",
         }
     }
@@ -1949,6 +2268,24 @@ impl ErrorKind {
                 "the request is an agent's or an unknown process's, and the approval leaves a live \
                  key unticked, so no grant was made: tick each live binding with --live NAME"
             }
+            ErrorKind::ManagedCommandMismatch => {
+                "this project is a managed MCP server's, and only its registered launch (started \
+                 through `envcloak mcp-bridge`) receives its keys; nothing was asked or released"
+            }
+            ErrorKind::ManagedLaunchChanged => {
+                "This server changed since you approved it. Run `envcloak agents migrate-mcp \
+                 --update <agent>/<server>` in your own terminal to review and approve its new \
+                 version"
+            }
+            ErrorKind::CodeSelectingEnv => {
+                "the launch sets a variable or an interpreter option that selects the code the \
+                 server runs, which EnvCloak refuses; the server is reported as manual"
+            }
+            ErrorKind::RunnerUnavailable => {
+                "EnvCloak could not start its own runner for this server (on Linux it runs from a \
+                 sealed copy, which this system's policy may refuse); nothing was released, and \
+                 the server is reported as manual"
+            }
             ErrorKind::Internal => "the daemon failed",
         }
     }
@@ -2057,6 +2394,22 @@ pub const REASONS: &[&str] = &[
     // A comparison budget of the caller's subject root stopped `scan.match`
     // before it compared anything (`too_many_checks`).
     "limited",
+    // A launch declaration that selects code (`code_selecting_env`, M2-27):
+    // a variable, or an interpreter option.
+    "code_selecting_variable",
+    "interpreter_option",
+    // A launch declaration naming a program that starts another one its
+    // arguments name, or a launcher known by another name (M2-27).
+    "wrapper_program",
+    "disguised_launcher",
+    // A launch declaration's argument or variable value shaped like a key
+    // (`invalid_params`, gate 13 in the daemon, M2-27).
+    "key_shaped",
+    // A bridged server's registration whose headers cannot each have a
+    // binding of their own, or whose manifest does not bind exactly those
+    // (`invalid_params`, M2-27).
+    "invalid_header",
+    "header_bindings",
 ];
 
 /// An error response. Built from fixed tokens only.

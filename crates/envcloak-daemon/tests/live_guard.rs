@@ -317,6 +317,9 @@ fn live_child() {
                 env_file: None,
                 argv: vec!["./child".to_owned()],
                 claims: claims.clone(),
+                launch: None,
+                bridge: None,
+                fds: Vec::new(),
             });
         let (said, proposals) = match answer {
             Ok(a) => (
@@ -324,6 +327,7 @@ fn live_child() {
                     DecisionView::Covered { .. } => "covered".to_owned(),
                     DecisionView::Pending { request } => format!("pending {request}"),
                     DecisionView::Denied { reason } => format!("denied {reason}"),
+                    DecisionView::Started {} => "started".to_owned(),
                 },
                 serde_json::to_string(&a.proposals).unwrap(),
             ),
@@ -573,6 +577,9 @@ fn a_terminal_subject_needs_no_live_tick() {
         env_file: None,
         argv: vec!["./emit".to_owned()],
         claims: Vec::new(),
+        launch: None,
+        bridge: None,
+        fds: Vec::new(),
     };
     let DecisionView::Pending { request } = client(&f.home).run_request(&params).unwrap().decision
     else {

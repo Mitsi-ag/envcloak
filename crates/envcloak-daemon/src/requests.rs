@@ -89,12 +89,15 @@
 //! one that may give a proof, none whose requester's session or terminal
 //! it shares. Neither is activity: polling never keeps the vault open.
 
-use std::path::Path;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::PathBuf;
 
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::{ProjectSummary, SubjectSummary};
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{FieldId, ItemId, ItemMeta, Slug, Vault, VaultErrorKind};
+use envcloak_ipc::control::{ExecSpec, LaunchSpec, Recipient, Release, ToRunner};
 use envcloak_ipc::proto::{
     ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
     PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequest,
@@ -116,8 +119,11 @@ use envcloak_sys::PeerIdentity;
 
 use crate::audit::{AuditEvent, RequestAudit};
 use crate::clock::now_of;
+use crate::launch_check::CheckedExec;
 use crate::lock::Reading;
+use crate::managed::{self, Checked};
 use crate::server::{Shared, locked, refuse_if_traced, result_framed};
+use crate::spawn_envcloak::{self, ClientEnds, Role};
 use crate::state::{Delivery, vault_reason};
 
 /// How many times one `run.request` is decided at most: a second decision
@@ -146,6 +152,63 @@ pub(crate) fn refuse_unless_prover(
                 reason: r.token(),
             });
             Err(RpcError::new(ErrorKind::ProofRefused))
+        }
+    }
+}
+
+/// Why `caller` may not give a proof that answers no pending request of
+/// its own (a managed server's registration, update or removal, M2-27),
+/// or `None` when it may: every refusal of
+/// [`SubjectEvidence::proof_refusal`], and
+/// [`envcloak_policy::ProofRefusal::RequesterTerminal`] when it shares a
+/// session or a terminal with any waiting request's requester that is not
+/// a terminal subject ([`SubjectEvidence::approval_refusal`], the
+/// `pending.list` rule). A process on an agent's terminal, the agent
+/// recognised only by its markers (F-70), is a terminal subject by its
+/// own chain; what is typed there may be the agent's, so no proof is
+/// read there while that agent waits.
+pub(crate) fn proof_refusal_beside_pending(
+    shared: &Shared,
+    caller: &SubjectEvidence,
+) -> Option<envcloak_policy::ProofRefusal> {
+    caller.proof_refusal().or_else(|| {
+        let mut s = locked(&shared.state);
+        let now = now_of(&shared.clocks);
+        requester_terminal_in(&mut s, caller, &now)
+    })
+}
+
+/// [`proof_refusal_beside_pending`]'s test of the waiting requests, under
+/// the state lock `s` the caller holds: checked again once the proof is
+/// verified, so a request made while the passphrase was read is seen.
+pub(crate) fn requester_terminal_in(
+    s: &mut crate::state::State,
+    caller: &SubjectEvidence,
+    now: &envcloak_policy::Now,
+) -> Option<envcloak_policy::ProofRefusal> {
+    s.grants()
+        .pending_all(now)
+        .find_map(|p| caller.approval_refusal(&p.request.subject, &alive))
+}
+
+/// [`refuse_unless_prover`] for a proof that answers no pending request
+/// of its own ([`proof_refusal_beside_pending`]): refused `proof_refused`
+/// with the reason, and audited.
+pub(crate) fn refuse_unless_prover_beside_pending(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    evidence: &SubjectEvidence,
+    method: &'static str,
+) -> Result<(), RpcError> {
+    match proof_refusal_beside_pending(shared, evidence) {
+        None => Ok(()),
+        Some(r) => {
+            shared.audit(AuditEvent::ProofRefused {
+                pid: peer.pid,
+                method,
+                reason: r.token(),
+            });
+            Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()))
         }
     }
 }
@@ -199,7 +262,7 @@ pub(crate) fn evidence(
 }
 
 /// A manifest or resolution error as the protocol reports it.
-fn manifest_error(e: ManifestError) -> RpcError {
+pub(crate) fn manifest_error(e: ManifestError) -> RpcError {
     let kind = if e.token() == "binding_unresolved" {
         ErrorKind::BindingUnresolved
     } else {
@@ -360,6 +423,7 @@ pub fn run_request(
     peer: &PeerIdentity,
     id: u64,
     p: RunRequestParams,
+    fds: Vec<OwnedFd>,
 ) -> Result<Frame, RpcError> {
     let subject = evidence(shared, peer, &p.claims)?;
     let profile = p
@@ -382,7 +446,12 @@ pub fn run_request(
         .map(EnvFileParams::names)
         .transpose()
         .map_err(|_| RpcError::with_reason(ErrorKind::BindingUnresolved, "invalid_reference"))?;
-    let manifest_path = Path::new(&p.manifest);
+    // A managed launch's request may name only its launch: the record
+    // names the project (`envcloak mcp-bridge --stdio --launch <id>`).
+    let manifest_path = match (&p.launch, p.manifest.is_empty()) {
+        (Some(launch), true) => launch_manifest(shared, peer, &subject, launch)?,
+        _ => PathBuf::from(&p.manifest),
+    };
     if !manifest_path.is_absolute() {
         return Err(RpcError::with_reason(
             ErrorKind::ManifestInvalid,
@@ -391,7 +460,7 @@ pub fn run_request(
     }
     // The daemon opens the manifest itself; nothing the caller sent about
     // its contents is used.
-    let project = load_project(manifest_path).map_err(manifest_error)?;
+    let project = load_project(&manifest_path).map_err(manifest_error)?;
     let bindings = resolve_sourced(
         &project.manifest,
         profile.as_ref(),
@@ -431,8 +500,85 @@ pub fn run_request(
     if policy.mode == Mode::Proxy {
         return Err(RpcError::new(ErrorKind::ModeUnsupported));
     }
+    // A managed project (SPEC §6.6, task M2-27): its record, found by the
+    // project's identity however the manifest was found, and the checks
+    // of its launch or bridge, all before any grant is consulted or any
+    // pending request exists (`crate::managed`).
+    let mut record = {
+        let s = locked(&shared.state);
+        managed::by_project(s.unlocked()?, &project.identity)?.map(|(_, r)| r)
+    };
+    // A managed project's request without a well-formed set of ends (none,
+    // too few, of the wrong kind or the wrong access) has no ends: it is
+    // refused `managed_command_mismatch` below, audited, as any request
+    // that is not its registered launch's or bridge's. The descriptors
+    // that came are closed.
+    let ends = match &record {
+        Some(r) if !fds.is_empty() => ClientEnds::from_request(
+            fds,
+            &p.fds,
+            matches!(
+                r.transport,
+                envcloak_core::vault::ManagedTransport::Stdio(_)
+            ),
+        )
+        .ok(),
+        Some(_) => None,
+        // No record: a request that names a launch or a bridge is refused
+        // `managed_command_mismatch` below, descriptors or not; any other
+        // takes none.
+        None if (fds.is_empty() && p.fds.is_empty())
+            || p.launch.is_some()
+            || p.bridge.is_some() =>
+        {
+            None
+        }
+        None => {
+            return Err(RpcError::new(ErrorKind::InvalidParams));
+        }
+    };
+    // The check runs without the state lock, so a registration, an update
+    // or a removal can commit meanwhile. The decision is taken only on the
+    // record the check passed: under the lock the decision holds, the
+    // record must still be the one checked, or the check runs again on the
+    // current one. A request is never decided on a record that is no longer
+    // the project's (a new registration, another revision, or none).
+    let requested: Vec<&str> = bindings.iter().map(|(b, _)| b.env_name.as_str()).collect();
+    let mut rechecks = 0;
+    let (checked, mut s) = loop {
+        let checked = managed::check_request(
+            shared,
+            peer,
+            &subject,
+            &project,
+            record.as_ref(),
+            &p,
+            ends.is_some(),
+            &requested,
+        )?;
+        // A test stops here, between the check and the decision.
+        envcloak_sys::pause_point("launch.checked_before_decision");
+        let s = locked(&shared.state);
+        let current = managed::by_project(s.unlocked()?, &project.identity)?.map(|(_, r)| r);
+        if current == record {
+            break (checked, s);
+        }
+        drop(s);
+        rechecks += 1;
+        if rechecks > MAX_DECISIONS {
+            return Err(RpcError::new(ErrorKind::Busy));
+        }
+        // The descriptors were taken for the record's transport; a record
+        // of another transport refuses a request made for the first one
+        // (`managed_command_mismatch`), whatever they are.
+        record = current;
+    };
+    let managed_request = record.as_ref().map(managed::managed_request);
+    // Where a covered request's values go, settled before any decision: a
+    // managed project's only to the runner or relay on its checked ends,
+    // never to the client, whatever let a request this far.
+    let route = route(record.is_some(), checked, ends)?;
 
-    let mut s = locked(&shared.state);
     let vault = s.unlocked()?;
     let (bound, new_project) = bind_request(vault, &bindings, &project.identity.vault_key())?;
     // What every entry for this request records.
@@ -468,6 +614,7 @@ pub fn run_request(
         mode: policy.mode,
         argv_display: p.argv,
         new_project,
+        managed: managed_request,
     };
     // A `once` grant is consumed under the same lock as the decision, so
     // of concurrent requests exactly one is covered by it (gate 30).
@@ -508,6 +655,47 @@ pub fn run_request(
                 // The daemon hands out no value under a tracer.
                 refuse_if_traced()?;
                 let (fields, released) = release_plan(s.unlocked()?, &again.bindings)?;
+                let adopted_project = envcloak_core::vault::ProjectRecord {
+                    key: again.project.vault_key(),
+                    display_path: project_dir.clone(),
+                    manifest_sha256: project.manifest.sha256,
+                    bindings: bindings
+                        .iter()
+                        .filter(|(_, source)| {
+                            matches!(source, BindingSource::Env | BindingSource::Profile { .. })
+                        })
+                        .map(|(b, _)| envcloak_core::vault::ProjectBinding {
+                            env_name: b.env_name.as_str().to_owned(),
+                            reference: b.reference.to_string(),
+                        })
+                        .collect(),
+                    last_seen: 0, // Read at commit, after framing.
+                };
+                if let Some((checked, ends)) = &route {
+                    // A managed server's values go to the runner or relay
+                    // the daemon starts, never to the client (D-36).
+                    let c = Covered {
+                        grant: g,
+                        entry: covered,
+                        fields,
+                        released,
+                        project: adopted_project,
+                    };
+                    match prepare_runner(shared, id, &mut s, c, checked, ends) {
+                        Prepared::Lapsed => {
+                            request = Some(again);
+                            continue;
+                        }
+                        Prepared::Done(r) => return r,
+                        Prepared::Ready(ready) => {
+                            // The values go out with the state lock
+                            // released: on macOS the daemon then waits for
+                            // the runner's `ConfirmSpawn`.
+                            drop(s);
+                            return ready.send(shared, peer);
+                        }
+                    }
+                }
                 let decision = DecisionView::Covered {
                     grant: g.to_string(),
                     redact,
@@ -544,22 +732,7 @@ pub fn run_request(
                     &alive,
                     AuditEvent::Request(Box::new(covered)),
                     &fields,
-                    Some(envcloak_core::vault::ProjectRecord {
-                        key: again.project.vault_key(),
-                        display_path: project_dir.clone(),
-                        manifest_sha256: project.manifest.sha256,
-                        bindings: bindings
-                            .iter()
-                            .filter(|(_, source)| {
-                                matches!(source, BindingSource::Env | BindingSource::Profile { .. })
-                            })
-                            .map(|(b, _)| envcloak_core::vault::ProjectBinding {
-                                env_name: b.env_name.as_str().to_owned(),
-                                reference: b.reference.to_string(),
-                            })
-                            .collect(),
-                        last_seen: 0, // Read at commit, after framing.
-                    }),
+                    Some(adopted_project),
                     answer,
                 );
                 let frame = match delivered {
@@ -606,14 +779,26 @@ pub fn run_request(
                         });
                     }
                 };
-                // Under the lock since the decision: the grant is there.
-                if !s.grants().consume(g) {
-                    return Err(RpcError::new(ErrorKind::Internal));
+                // Under the lock since the decision: the grant is there. A
+                // test build fails the use on request (`run.grant_consume`),
+                // to show the failure is audited after the delivery.
+                if envcloak_sys::fail_point("run.grant_consume").is_err() || !s.grants().consume(g)
+                {
+                    // The delivery's entry is on disk; the answer is never
+                    // sent, and the log says so after it.
+                    let e = RpcError::new(ErrorKind::Internal);
+                    s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                        decision: e.kind.token(),
+                        grant_id: Some(g.to_string()),
+                        ..entry
+                    })));
+                    return Err(e);
                 }
                 s.touch(Reading::now(&shared.clocks));
                 // Gate 12: a test build panics here on request, holding the
                 // answer about to be sent and the state lock.
                 envcloak_sys::panic_point("daemon.release");
+                envcloak_sys::test_event("run.request released values to the client");
                 return Ok(frame);
             }
             Decision::Pending(id) => {
@@ -663,6 +848,324 @@ pub fn run_request(
         }
     };
     result_framed::<RunRequest>(id, &decision)
+}
+
+/// The manifest of the project whose record has launch `launch`: a
+/// request that names only its launch. No record has it:
+/// `managed_command_mismatch`, audited.
+fn launch_manifest(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    subject: &SubjectEvidence,
+    launch: &str,
+) -> Result<PathBuf, RpcError> {
+    let id = envcloak_policy::managed::parse_launch_id(launch)
+        .ok_or(RpcError::new(ErrorKind::InvalidParams))?;
+    let mut s = locked(&shared.state);
+    match managed::by_launch(s.unlocked()?, &id)? {
+        Some((_, r)) => Ok(
+            PathBuf::from(std::ffi::OsStr::from_bytes(&r.project.canonical_dir))
+                .join(envcloak_policy::MANIFEST_NAME),
+        ),
+        None => {
+            let kind = ErrorKind::ManagedCommandMismatch;
+            s.audit(AuditEvent::ManagedLaunch {
+                pid: peer.pid,
+                subject: subject_summary(peer, subject),
+                outcome: kind.token(),
+                part: None,
+                launch: Some(envcloak_policy::managed::launch_id_text(&id)),
+                project: None,
+                revision: None,
+                old: None,
+                new: None,
+            });
+            Err(RpcError::new(kind))
+        }
+    }
+}
+
+/// A covered request's delivery, as [`run_request`] prepared it.
+struct Covered {
+    grant: GrantId,
+    entry: RequestAudit,
+    project: envcloak_core::vault::ProjectRecord,
+    fields: Vec<FieldId>,
+    released: Vec<(String, String, bool)>,
+}
+
+/// The launch description the runner receives (`envcloak_ipc::control`).
+fn launch_spec(l: &envcloak_core::vault::RegisteredLaunch, exec: &CheckedExec) -> LaunchSpec {
+    let lossy = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+    let (executable, exec) = match exec {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        CheckedExec::Image(_) => (lossy(&l.executable.path), ExecSpec::Image),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        CheckedExec::Descriptor { stamp, .. } => (
+            lossy(&l.executable.path),
+            ExecSpec::Descriptor { stamp: *stamp },
+        ),
+        CheckedExec::Path { path, confirm } => (
+            path.to_string_lossy().into_owned(),
+            ExecSpec::Path {
+                confirm: confirm.is_some(),
+            },
+        ),
+    };
+    LaunchSpec {
+        argv: l.argv.iter().map(|a| lossy(a)).collect(),
+        path_env: lossy(&l.env.path_env),
+        vars: l.env.vars.clone(),
+        executable,
+        exec,
+    }
+}
+
+/// The headers a relay inserts, from the record's (`headers`, each with
+/// its binding) and the bindings released (`env_name` first): `None`
+/// unless each header's binding is released exactly once and each binding
+/// released is a header's.
+fn relay_headers(
+    headers: &[(String, String)],
+    released: &[(String, String, bool)],
+) -> Option<Vec<envcloak_ipc::control::RelayHeader>> {
+    let once = |b: &str| released.iter().filter(|(n, _, _)| n == b).count() == 1;
+    if released.len() != headers.len() || !headers.iter().all(|(_, b)| once(b)) {
+        return None;
+    }
+    Some(
+        headers
+            .iter()
+            .map(|(name, binding)| envcloak_ipc::control::RelayHeader {
+                name: name.clone(),
+                binding: binding.clone(),
+            })
+            .collect(),
+    )
+}
+
+/// How a covered managed request's delivery went ([`prepare_runner`]).
+enum Prepared {
+    /// Delivered: the entry is on disk and the grant used; the values are
+    /// to be sent to the runner.
+    Ready(Box<Ready>),
+    /// The grant ran out meanwhile: nothing was recorded or released, and
+    /// the runner was killed; the request is decided again.
+    Lapsed,
+    /// Answered: refused, or denied (`audit_failed`).
+    Done(Result<Frame, RpcError>),
+}
+
+/// A delivery made, whose values are still to go to the runner.
+struct Ready {
+    started: spawn_envcloak::Started,
+    release: Frame,
+    answer: Frame,
+    entry: RequestAudit,
+    launch: Option<String>,
+}
+
+impl Ready {
+    /// Sends the values to the runner and answers the client `started`.
+    ///
+    /// The delivery's entry is on disk and its grant used before this
+    /// runs. When the values do not reach a server, the outcome the client
+    /// is answered is audited after it, under the same grant, whatever it
+    /// is (`runner_unavailable`, `managed_launch_changed`): the log never
+    /// shows only a delivery the client was told failed.
+    fn send(self, shared: &Shared, peer: &PeerIdentity) -> Result<Frame, RpcError> {
+        let sent = self.started.release(&self.release);
+        drop(self.release);
+        if let Err(e) = sent {
+            shared.audit(AuditEvent::Request(Box::new(RequestAudit {
+                decision: e.kind.token(),
+                ..self.entry.clone()
+            })));
+            if e.kind == ErrorKind::ManagedLaunchChanged {
+                shared.audit(AuditEvent::ManagedLaunch {
+                    pid: peer.pid,
+                    subject: self.entry.subject.clone(),
+                    outcome: e.kind.token(),
+                    part: Some("executable"),
+                    launch: self.launch,
+                    project: self.entry.project.clone(),
+                    revision: None,
+                    old: None,
+                    new: None,
+                });
+            }
+            return Err(e);
+        }
+        envcloak_sys::test_event("run.request released values to a runner");
+        Ok(self.answer)
+    }
+}
+
+/// Where a request's covered values may go: `None` to the client, for an
+/// unmanaged project only; `Some` to the runner or relay of a managed
+/// project's checked launch or bridge, on the request's ends. A managed
+/// project's request that reaches this without both is refused
+/// `internal`, never answered as an unmanaged one: the request check
+/// refuses it first (`managed_command_mismatch`), and this holds when it
+/// does not.
+fn route<C, E>(
+    managed: bool,
+    checked: Option<C>,
+    ends: Option<E>,
+) -> Result<Option<(C, E)>, RpcError> {
+    match (managed, checked, ends) {
+        (false, None, _) => Ok(None),
+        (true, Some(c), Some(e)) => Ok(Some((c, e))),
+        _ => Err(RpcError::new(ErrorKind::Internal)),
+    }
+}
+
+/// A covered managed request (D-36): the daemon starts EnvCloak's runner
+/// or relay from its anchor on the pipe ends the request handed over, then
+/// delivers as for any covered request (the values read from the verified
+/// vault, the entry on disk first), framing the values as the runner's
+/// `Release`, not as the answer; the client is answered `started`. A
+/// runner that cannot be started is `runner_unavailable` with nothing
+/// released; one started before a delivery that did not happen is killed,
+/// having received nothing.
+fn prepare_runner(
+    shared: &Shared,
+    id: u64,
+    s: &mut crate::state::State,
+    c: Covered,
+    checked: &Checked,
+    ends: &ClientEnds,
+) -> Prepared {
+    let (launch, to) = match checked {
+        Checked::Stdio { launch, checked } => {
+            let text = envcloak_policy::managed::launch_id_text(&launch.launch_id);
+            let spec = launch_spec(launch, &checked.exec);
+            (Some(text.clone()), Recipient::Runner { launch: text, spec })
+        }
+        Checked::Bridge { origin, headers } => {
+            // Every value released goes in one header, and every header
+            // gets one: anything else was never registered.
+            let Some(headers) = relay_headers(headers, &c.released) else {
+                return Prepared::Done(Err(RpcError::new(ErrorKind::Internal)));
+            };
+            (
+                None,
+                Recipient::Relay {
+                    origin: origin.clone(),
+                    headers,
+                },
+            )
+        }
+    };
+    // The role follows the check's transport alone: a checked launch is
+    // never started as a relay, whatever else holds.
+    let role = match (checked, launch.as_deref()) {
+        (Checked::Stdio { checked, .. }, Some(text)) => Role::Runner {
+            launch: text,
+            checked,
+        },
+        (Checked::Bridge { .. }, None) => Role::Relay,
+        _ => return Prepared::Done(Err(RpcError::new(ErrorKind::Internal))),
+    };
+    let started = match spawn_envcloak::start(&shared.anchor, role, ends) {
+        Ok(st) => st,
+        Err(e) => {
+            s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                decision: e.kind.token(),
+                grant_id: Some(c.grant.to_string()),
+                ..c.entry
+            })));
+            return Prepared::Done(Err(e));
+        }
+    };
+    // The client's answer, framed before anything is committed (F-77).
+    let answer =
+        match result_framed::<RunRequest>(id, &RunAnswer::decided(DecisionView::Started {})) {
+            Ok(a) => a,
+            Err(e) => {
+                started.abandon();
+                return Prepared::Done(Err(e));
+            }
+        };
+    let released = c.released;
+    let release = move |values: Vec<SecretBytes>| {
+        let msg = ToRunner::Release(Box::new(Release {
+            bindings: released
+                .into_iter()
+                .zip(values)
+                .map(|((env_name, slug, allow_short), value)| ReleasedValue {
+                    env_name,
+                    slug,
+                    allow_short,
+                    value: WireSecret::new(value),
+                })
+                .collect(),
+            to,
+        }));
+        Frame::encode(&msg).map_err(|_| RpcError::new(ErrorKind::FrameTooLarge))
+    };
+    let entry = c.entry.clone();
+    let delivered = s.deliver(
+        c.grant,
+        &shared.clocks,
+        &alive,
+        AuditEvent::Request(Box::new(c.entry)),
+        &c.fields,
+        Some(c.project),
+        release,
+    );
+    let release = match delivered {
+        Ok(frame) => frame,
+        Err(e) => {
+            started.abandon();
+            return match e {
+                Delivery::Refused(e) => Prepared::Done(Err(e)),
+                Delivery::Lapsed => Prepared::Lapsed,
+                Delivery::Unsendable(e) => {
+                    s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                        decision: e.kind.token(),
+                        grant_id: Some(c.grant.to_string()),
+                        ..entry
+                    })));
+                    Prepared::Done(Err(e))
+                }
+                Delivery::AuditFailed => {
+                    let reason = DenyReason::AuditFailed.token();
+                    s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                        decision: "denied",
+                        grant_id: Some(c.grant.to_string()),
+                        reason: Some(reason),
+                        ..entry
+                    })));
+                    Prepared::Done(result_framed::<RunRequest>(
+                        id,
+                        &RunAnswer::decided(DecisionView::Denied {
+                            reason: reason.to_owned(),
+                        }),
+                    ))
+                }
+            };
+        }
+    };
+    if envcloak_sys::fail_point("run.grant_consume").is_err() || !s.grants().consume(c.grant) {
+        // The delivery's entry is on disk; the values never leave.
+        started.abandon();
+        let e = RpcError::new(ErrorKind::Internal);
+        s.audit(AuditEvent::Request(Box::new(RequestAudit {
+            decision: e.kind.token(),
+            grant_id: Some(c.grant.to_string()),
+            ..entry
+        })));
+        return Prepared::Done(Err(e));
+    }
+    s.touch(Reading::now(&shared.clocks));
+    Prepared::Ready(Box::new(Ready {
+        started,
+        release,
+        answer,
+        entry,
+        launch,
+    }))
 }
 
 fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {
@@ -821,7 +1324,7 @@ fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
 }
 
 /// Decodes 64 hex characters.
-fn digest_of(hex: &str) -> Option<[u8; 32]> {
+pub(crate) fn digest_of(hex: &str) -> Option<[u8; 32]> {
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
@@ -1041,6 +1544,78 @@ pub fn grants_revoke(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gate 39, the backstop: a managed project's covered values go to its
+    /// runner or relay on checked ends, or nowhere. A managed request that
+    /// reaches the decision without a check or without ends is refused,
+    /// never routed to the client; an unmanaged one goes to the client,
+    /// any ends it brought unused. Mutation checked: the fall-through to
+    /// the client release when either half is missing (`route` answering
+    /// `Ok(None)` for a managed project): the managed cases fail.
+    #[test]
+    fn a_managed_request_is_routed_to_its_runner_or_refused() {
+        let kind = |r: Result<Option<((), ())>, RpcError>| r.map_err(|e| e.kind);
+        assert_eq!(kind(route(true, Some(()), Some(()))), Ok(Some(((), ()))));
+        for (checked, ends) in [(Some(()), None), (None, Some(())), (None, None)] {
+            assert_eq!(
+                kind(route(true, checked, ends)),
+                Err(ErrorKind::Internal),
+                "{checked:?} {ends:?}"
+            );
+        }
+        assert_eq!(kind(route(false, None, None)), Ok(None));
+        assert_eq!(kind(route(false, None, Some(()))), Ok(None));
+        assert_eq!(
+            kind(route(false, Some(()), Some(()))),
+            Err(ErrorKind::Internal)
+        );
+    }
+
+    /// A relay's release names each header with the binding it carries,
+    /// as the record registered them, for any number of headers; a
+    /// release whose bindings are not exactly the headers' (one missing,
+    /// one extra, one twice, a header renamed so its binding is another)
+    /// has no relay headers and is refused. Mutation checked: the headers
+    /// left out of the release (the previous `Recipient::Relay { origin
+    /// }`): this does not compile; the binding check removed (any release
+    /// mapped): the refused cases pass, and this fails.
+    #[test]
+    fn a_relay_is_told_which_value_goes_in_which_header() {
+        let o = "https://api.example.test";
+        let headers = envcloak_policy::managed::bridge_headers(
+            &["Authorization".to_owned(), "X-Api-Key".to_owned()],
+            o,
+        )
+        .unwrap();
+        let rel = |names: &[&str]| -> Vec<(String, String, bool)> {
+            names
+                .iter()
+                .map(|n| ((*n).to_owned(), "acme/key".to_owned(), false))
+                .collect()
+        };
+        let auth = headers[0].1.as_str();
+        let key = headers[1].1.as_str();
+        let got = relay_headers(&headers, &rel(&[key, auth])).unwrap();
+        assert_eq!(
+            got.iter()
+                .map(|h| (h.name.as_str(), h.binding.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("Authorization", auth), ("X-Api-Key", key)]
+        );
+        let renamed = envcloak_policy::managed::bridge_headers(
+            &["Authorization".to_owned(), "X-Other-Key".to_owned()],
+            o,
+        )
+        .unwrap();
+        for released in [
+            rel(&[auth]),
+            rel(&[auth, key, "PLAIN_KEY"]),
+            rel(&[auth, auth]),
+        ] {
+            assert!(relay_headers(&headers, &released).is_none(), "{released:?}");
+        }
+        assert!(relay_headers(&renamed, &rel(&[auth, key])).is_none());
+    }
 
     /// Gate 27, the sweep's half: a root is alive only while its pid has
     /// the start time the grant recorded. A pid in use by another process

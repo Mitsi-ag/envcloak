@@ -68,7 +68,7 @@ fn fixture() -> TestHome {
             }
         }
     }
-    // Synthetic reservations keep these mutations independent of features landing.
+    // Audit and terminal-reveal fixtures must also survive product landing.
     edit(
         &t,
         VAULT,
@@ -80,6 +80,20 @@ fn fixture() -> TestHome {
         IPC,
         "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `not_in_this_build`",
         "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `tst_required` | M2-21 | reserved | test fixture |\n| `not_in_this_build`",
+    );
+    // Generic token-reader cases own their reservations. Borrowing an
+    // unlanded product token makes them depend on other lanes' progress.
+    let header = concat!(
+        "**The CLI's own failure tokens** (`envcloak: <token>:` lines that are not error kinds, reasons or sign-in tokens):\n\n",
+        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|"
+    );
+    edit(
+        &t,
+        IPC,
+        header,
+        &format!(
+            "{header}\n| `zz_reserved_exit` | M2-01 | reserved | fixture |\n| `zz_reserved_method` | M2-01 | reserved | fixture |\n| `zz_reserved_plan` | M2-01 | reserved | fixture |"
+        ),
     );
     t
 }
@@ -417,13 +431,13 @@ fn a_code_source_it_cannot_read_fails() {
 
 const PROTO: &str = "crates/envcloak-ipc/src/proto.rs";
 
-/// Points the `incomplete` row of the failure-token table at `token`.
+/// Points the fixture-owned spare failure-token row at `token`.
 fn reserve_exit_token(t: &TestHome, token: &str) {
     edit(
         t,
         IPC,
-        "| `incomplete` | M2-14 | reserved |",
-        &format!("| `{token}` | M2-14 | reserved |"),
+        "| `zz_reserved_plan` | M2-01 | reserved |",
+        &format!("| `{token}` | M2-01 | reserved |"),
     );
 }
 
@@ -456,14 +470,14 @@ const CLIENT_STUB: &str = "crates/envcloak-client/src/stub.rs";
 
 #[test]
 fn a_failure_token_written_as_a_constant_in_another_crate_counts() {
-    // `incomplete` is still `reserved` (M2-14), so a constant that holds it
-    // in another crate is a clash until its task marks the row `landed`.
+    // The fixture owns this reservation; another task landing a real
+    // token cannot change the positive or negative control.
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
         "/// The token of a job that did not finish.\n\
-         pub const INCOMPLETE: &str = \"incomplete\";\n\
+         pub const INCOMPLETE: &str = \"zz_reserved_plan\";\n\
          \n\
          pub fn stopped() -> Failure {\n    \
              Failure::new(\n        \
@@ -474,14 +488,14 @@ fn a_failure_token_written_as_a_constant_in_another_crate_counts() {
     );
     assert_fails(
         &t,
-        &format!("`incomplete` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`zz_reserved_plan` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
     // The task that lands it marks the row `landed`, and then it passes.
     edit(
         &t,
         IPC,
-        "| `incomplete` | M2-14 | reserved |",
-        "| `incomplete` | M2-14 | landed |",
+        "| `zz_reserved_plan` | M2-01 | reserved |",
+        "| `zz_reserved_plan` | M2-01 | landed |",
     );
     assert_passes(&t.home());
 }
@@ -509,11 +523,11 @@ fn a_failure_token_in_a_field_or_a_token_method_counts() {
     add_file(
         &t,
         CLIENT_STUB,
-        "const APP: &'static str = \"incomplete\";\n\
-         pub fn a() -> Failure { Failure { token: \"tst_required\", message: \"\".into() } }\n\
-         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"not_started_by_daemon\" } } }\n",
+        "const APP: &'static str = \"zz_reserved_plan\";\n\
+         pub fn a() -> Failure { Failure { token: \"zz_reserved_exit\", message: \"\".into() } }\n\
+         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"zz_reserved_method\" } } }\n",
     );
-    for token in ["tst_required", "not_started_by_daemon", "incomplete"] {
+    for token in ["zz_reserved_exit", "zz_reserved_method", "zz_reserved_plan"] {
         assert_fails(
             &t,
             &format!("`{token}` is reserved, but the code already has it ({CLIENT_STUB})"),
@@ -548,12 +562,12 @@ fn a_token_printed_directly_as_envcloak_token_counts() {
         &t,
         CLIENT_STUB,
         "pub fn stopped() -> String {\n    \
-             format!(\"envcloak: incomplete: {} files not read\", 3)\n\
+             format!(\"envcloak: zz_reserved_plan: {} files not read\", 3)\n\
          }\n",
     );
     assert_fails(
         &t,
-        &format!("`incomplete` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`zz_reserved_plan` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
 }
 
@@ -570,8 +584,8 @@ fn text_that_only_mentions_envcloak_is_not_a_printed_token() {
         &t,
         CLIENT_STUB,
         "pub fn a() { eprintln!(\"envcloak: pty unavailable: no terminal\"); }\n\
-         pub fn b() { eprintln!(\"envcloak: tst_required because\"); }\n\
-         pub fn c() -> String { format!(\"[envcloak: {} incomplete: cut]\", 3) }\n",
+         pub fn b() { eprintln!(\"envcloak: zz_reserved_exit because\"); }\n\
+         pub fn c() -> String { format!(\"[envcloak: {} zz_reserved_plan: cut]\", 3) }\n",
     );
     assert_passes(&t.home());
 }
@@ -582,12 +596,12 @@ fn a_token_in_a_comment_a_string_or_a_test_module_does_not_count() {
     add_file(
         &t,
         CLIENT_STUB,
-        "// Failure::new(\"tst_required\", \"\")\n\
-         /* token: \"tst_required\" */\n\
-         const TEXT: &str = \"Failure::new(\\\"not_started_by_daemon\\\", x)\";\n\
+        "// Failure::new(\"zz_reserved_exit\", \"\")\n\
+         /* token: \"zz_reserved_exit\" */\n\
+         const TEXT: &str = \"Failure::new(\\\"zz_reserved_method\\\", x)\";\n\
          #[cfg(test)]\n\
          mod tests {\n    \
-             fn t() { let _ = Failure::new(\"not_in_this_build\", \"\"); }\n\
+             fn t() { let _ = Failure::new(\"zz_reserved_plan\", \"\"); }\n\
          }\n",
     );
     assert_passes(&t.home());
@@ -600,11 +614,11 @@ fn a_name_reserved_in_two_printed_tables_fails() {
         &t,
         IPC,
         "| `limited` | M2-11 | landed |",
-        "| `incomplete` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
+        "| `zz_reserved_plan` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
     );
     assert_fails(
         &t,
-        "`incomplete` is reserved in both `reason` and `exit_token`",
+        "`zz_reserved_plan` is reserved in both `reason` and `exit_token`",
     );
 }
 
@@ -630,7 +644,7 @@ fn a_name_the_shared_list_names_with_both_tables_passes() {
         &t,
         IPC,
         "| `limited` | M2-11 | landed |",
-        "| `incomplete` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
+        "| `zz_reserved_plan` | M2-11 | reserved | a test row |\n| `limited` | M2-11 | landed |",
     );
     let script = t.home().join("check.py");
     let text = std::fs::read_to_string(repo_root().join(SCRIPT)).unwrap();
@@ -639,7 +653,7 @@ fn a_name_the_shared_list_names_with_both_tables_passes() {
         &script,
         text.replacen(
             "\nSHARED = {}\n",
-            "\nSHARED = {\"incomplete\": (\"reason\", \"exit_token\")}\n",
+            "\nSHARED = {\"zz_reserved_plan\": (\"reason\", \"exit_token\")}\n",
             1,
         ),
     )
@@ -1366,19 +1380,19 @@ fn an_arm_whose_value_goes_on_past_its_literal_fails() {
 #[test]
 fn failure_tokens_in_every_form_the_code_can_write_count() {
     for body in [
-        "pub fn a() -> Failure { Failure::new(concat!(\"tst_\", \"required\"), \"refused\") }\n",
-        "pub fn a() -> Failure { Failure::new(const { \"tst_required\" }, \"refused\") }\n",
-        "pub fn a() -> Failure { Failure::new(if true { \"io\" } else { \"tst_required\" }, \"x\") }\n",
-        "pub fn a() -> crate::Fail { crate::Fail::new(\"tst_required\", \"refused\") }\n",
-        "pub fn a() -> Fail { envcloak_client::Fail::new(\"tst_required\", \"refused\") }\n",
-        "use crate::fail::Failure as Oops;\npub fn a() -> Oops { Oops::new(\"tst_required\", \"x\") }\n",
-        "type Bad = crate::Fail;\npub fn a() -> Bad { Bad::new(\"tst_required\", \"x\") }\n",
+        "pub fn a() -> Failure { Failure::new(concat!(\"zz_reserved_\", \"exit\"), \"refused\") }\n",
+        "pub fn a() -> Failure { Failure::new(const { \"zz_reserved_exit\" }, \"refused\") }\n",
+        "pub fn a() -> Failure { Failure::new(if true { \"io\" } else { \"zz_reserved_exit\" }, \"x\") }\n",
+        "pub fn a() -> crate::Fail { crate::Fail::new(\"zz_reserved_exit\", \"refused\") }\n",
+        "pub fn a() -> Fail { envcloak_client::Fail::new(\"zz_reserved_exit\", \"refused\") }\n",
+        "use crate::fail::Failure as Oops;\npub fn a() -> Oops { Oops::new(\"zz_reserved_exit\", \"x\") }\n",
+        "type Bad = crate::Fail;\npub fn a() -> Bad { Bad::new(\"zz_reserved_exit\", \"x\") }\n",
     ] {
         let t = fixture();
         add_file(&t, CLIENT_STUB, body);
         assert_fails(
             &t,
-            &format!("`tst_required` is reserved, but the code already has it ({CLIENT_STUB})"),
+            &format!("`zz_reserved_exit` is reserved, but the code already has it ({CLIENT_STUB})"),
         );
     }
     for body in [
@@ -1414,11 +1428,11 @@ fn a_failure_token_the_reader_cannot_read_fails() {
             "a failure token names `UNKNOWN_TOKEN`, which is no `&str` constant the reader knows",
         ),
         (
-            "pub fn a(x: &'static str) -> Failure { Failure::new(concat!(\"tst_\", x), \"x\") }\n",
+            "pub fn a(x: &'static str) -> Failure { Failure::new(concat!(\"zz_reserved_\", x), \"x\") }\n",
             "`concat!` of something other than literals",
         ),
         (
-            "pub fn a() -> Failure { Failure::new(stringify!(tst_required), \"x\") }\n",
+            "pub fn a() -> Failure { Failure::new(stringify!(zz_reserved_exit), \"x\") }\n",
             "a macro other than `concat!` of literals",
         ),
     ] {
@@ -1484,8 +1498,8 @@ fn a_failure_token_covered_only_by_an_unrelated_table_fails() {
 fn assert_counted(body: &str, file: &str) {
     for (token, expect) in [
         (
-            "tst_required",
-            format!("`tst_required` is reserved, but the code already has it ({file})"),
+            "zz_reserved_exit",
+            format!("`zz_reserved_exit` is reserved, but the code already has it ({file})"),
         ),
         (
             "zz_unreserved",
@@ -1563,7 +1577,7 @@ fn a_failure_literal_token_is_read_in_every_form_or_refused() {
     add_file(
         &t,
         CLIENT_STUB,
-        "pub fn a() -> Failure { let token = \"tst_required\"; Failure { token, message: \"x\".into() } }\n",
+        "pub fn a() -> Failure { let token = \"zz_reserved_exit\"; Failure { token, message: \"x\".into() } }\n",
     );
     assert_fails(&t, "a failure token the reader cannot read (`token`)");
 }
@@ -1578,8 +1592,8 @@ fn a_failure_literal_token_is_read_in_every_form_or_refused() {
 #[test]
 fn a_helpers_token_used_other_than_handed_on_fails() {
     for body in [
-        "pub fn zz_h(token: &'static str) -> Failure { let token = \"tst_required\"; Failure::new(token, \"x\") }\n",
-        "pub fn zz_h(token: &'static str) -> Failure { let f = |token| Failure::new(token, \"x\"); f(\"tst_required\") }\n",
+        "pub fn zz_h(token: &'static str) -> Failure { let token = \"zz_reserved_exit\"; Failure::new(token, \"x\") }\n",
+        "pub fn zz_h(token: &'static str) -> Failure { let f = |token| Failure::new(token, \"x\"); f(\"zz_reserved_exit\") }\n",
         "pub fn zz_h(token: &'static str, o: Option<&'static str>) -> Failure { if let Some(token) = o { return Failure::new(token, \"x\"); } Failure::new(token, \"y\") }\n",
     ] {
         let t = fixture();
@@ -1613,15 +1627,15 @@ fn a_private_helpers_calls_in_its_modules_children_are_read() {
     let helper = "fn zz_h(token: &'static str) -> crate::fail::Failure { crate::fail::Failure::new(token, \"x\") }\nmod child;\n";
     for (body, expect) in [
         (
-            "pub fn g() -> crate::fail::Failure { super::zz_h(\"tst_required\") }\n",
-            format!("`tst_required` is reserved, but the code already has it ({child})"),
+            "pub fn g() -> crate::fail::Failure { super::zz_h(\"zz_reserved_exit\") }\n",
+            format!("`zz_reserved_exit` is reserved, but the code already has it ({child})"),
         ),
         (
-            "use super::zz_h;\npub fn g() -> crate::fail::Failure { zz_h(\"tst_required\") }\n",
-            format!("`tst_required` is reserved, but the code already has it ({child})"),
+            "use super::zz_h;\npub fn g() -> crate::fail::Failure { zz_h(\"zz_reserved_exit\") }\n",
+            format!("`zz_reserved_exit` is reserved, but the code already has it ({child})"),
         ),
         (
-            "use super::*;\npub fn g() -> Option<crate::fail::Failure> { Some(\"tst_required\").map(zz_h) }\n",
+            "use super::*;\npub fn g() -> Option<crate::fail::Failure> { Some(\"zz_reserved_exit\").map(zz_h) }\n",
             "the token helper `zz_h` is used other than called by name".to_owned(),
         ),
     ] {
@@ -1651,16 +1665,16 @@ fn a_token_helper_or_failure_new_named_other_than_called_fails() {
     for (body, expect) in [
         (
             "pub fn zz_h(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
-             pub fn zz_g() -> Option<Failure> { Some(\"tst_required\").map(zz_h) }\n",
+             pub fn zz_g() -> Option<Failure> { Some(\"zz_reserved_exit\").map(zz_h) }\n",
             "the token helper `zz_h` is used other than called by name",
         ),
         (
             "pub fn zz_h(token: &'static str) -> Failure { Failure::new(token, \"x\") }\n\
-             mod inner { use super::zz_h as other; pub fn g() -> crate::fail::Failure { other(\"tst_required\") } }\n",
+             mod inner { use super::zz_h as other; pub fn g() -> crate::fail::Failure { other(\"zz_reserved_exit\") } }\n",
             "the token helper `zz_h` is used other than called by name",
         ),
         (
-            "pub fn zz_g() -> Failure { let f = Failure::new; f(\"tst_required\", \"x\") }\n",
+            "pub fn zz_g() -> Failure { let f = Failure::new; f(\"zz_reserved_exit\", \"x\") }\n",
             "`Failure::new` is used other than called",
         ),
     ] {
@@ -1698,8 +1712,8 @@ fn a_failures_token_is_set_only_where_it_is_made() {
     );
     assert_fails(&t, "`Failure`'s `token` field is public");
     for change in [
-        "impl Failure { pub fn zz(&mut self) { self.token = \"tst_required\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { let _ = std::mem::replace(&mut self.token, \"tst_required\"); } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.token = \"zz_reserved_exit\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { let _ = std::mem::replace(&mut self.token, \"zz_reserved_exit\"); } }\n",
     ] {
         let t = fixture();
         let path = t.home().join(FAIL);
@@ -1740,7 +1754,7 @@ fn a_token_method_the_reader_cannot_read_fails() {
             "a failure token the reader cannot read (`self.name`)",
         ),
         (
-            "pub enum K { A }\nconst NAMES: [&str; 1] = [\"tst_required\"];\n\
+            "pub enum K { A }\nconst NAMES: [&str; 1] = [\"zz_reserved_exit\"];\n\
              impl K { pub fn token(self) -> crate::fail::ExitToken { match self { K::A => NAMES[0] } } }\n",
             "a failure token the reader cannot read (`NAMES[0]`)",
         ),
@@ -1795,14 +1809,14 @@ fn a_token_printed_from_a_placeholder_is_read_or_refused() {
             "a line printed as `envcloak: {t}:` takes its token from a variable",
         ),
         (
-            "pub fn d() { let why = \"tst_required: x\"; eprintln!(\"envcloak: {why}\"); }\n",
+            "pub fn d() { let why = \"zz_reserved_exit: x\"; eprintln!(\"envcloak: {why}\"); }\n",
             "a usage line `envcloak: {why}` whose message the reader cannot trace",
         ),
         // In a function that calls `parse`, but printing another call's
         // message.
         (
             "fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(\"bad option\") }\n\
-             fn other() -> Result<(), &'static str> { Err(\"tst_required: x\") }\n\
+             fn other() -> Result<(), &'static str> { Err(\"zz_reserved_exit: x\") }\n\
              pub fn run(a: &[&str]) { let _ = parse(a); match other() { Ok(()) => {}, Err(why) => eprintln!(\"envcloak: {why}\") } }\n",
             "a usage line `envcloak: {why}` whose message the reader cannot trace",
         ),
@@ -1828,11 +1842,11 @@ fn a_token_printed_from_a_placeholder_is_read_or_refused() {
         &t,
         "crates/envcloak-cli/src/cmd/add.rs",
         "Err(\"unknown or repeated option\")",
-        "Err(\"tst_required: unknown or repeated option\")",
+        "Err(\"zz_reserved_exit: unknown or repeated option\")",
     );
     assert_fails(
         &t,
-        "`tst_required` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/add.rs)",
+        "`zz_reserved_exit` is reserved, but the code already has it (crates/envcloak-cli/src/cmd/add.rs)",
     );
 }
 
@@ -1869,7 +1883,7 @@ fn append_to(t: &TestHome, rel: &str, text: &str) {
 /// fail.rs names `Failure`'s token only where the reader has read it or
 /// knows it changes nothing (verifier review of M2-RES1: a destructuring
 /// `let Failure { token, .. } = &mut f; *token = t;` changed a made
-/// failure's token unseen, so `from_parts("tst_required")` passed).
+/// failure's token unseen, so `from_parts("zz_reserved_exit")` passed).
 /// Every way to reach the field is refused: a pattern that binds it
 /// (against `&mut`, with `ref mut`, `token: ref mut`, in an `if let`), an
 /// assignment through a parenthesized place, `clone_from`, a macro that
@@ -1890,17 +1904,17 @@ fn fail_rs_names_a_failures_token_only_where_it_is_read() {
     add_file(
         &t,
         CLIENT_STUB,
-        "pub fn g() -> crate::fail::Failure { crate::fail::Failure::from_parts(\"tst_required\") }\n",
+        "pub fn g() -> crate::fail::Failure { crate::fail::Failure::from_parts(\"zz_reserved_exit\") }\n",
     );
     let named = "`Failure`'s `token` is named where the reader cannot tell it is not changed";
     assert_fails(&t, named);
     for change in [
-        "impl Failure { pub fn zz(&mut self) { let Failure { ref mut token, .. } = *self; *token = \"tst_required\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { let Failure { token: ref mut x, .. } = *self; *x = \"tst_required\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { if let Failure { token, .. } = self { *token = \"tst_required\"; } } }\n",
-        "impl Failure { pub fn zz(&mut self) { (self.token) = \"tst_required\"; } }\n",
-        "impl Failure { pub fn zz(&mut self) { self.token.clone_from(&\"tst_required\"); } }\n",
-        "macro_rules! zz_set { ($f:expr) => { let Failure { token, .. } = $f; *token = \"tst_required\"; }; }\n\
+        "impl Failure { pub fn zz(&mut self) { let Failure { ref mut token, .. } = *self; *token = \"zz_reserved_exit\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { let Failure { token: ref mut x, .. } = *self; *x = \"zz_reserved_exit\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { if let Failure { token, .. } = self { *token = \"zz_reserved_exit\"; } } }\n",
+        "impl Failure { pub fn zz(&mut self) { (self.token) = \"zz_reserved_exit\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.token.clone_from(&\"zz_reserved_exit\"); } }\n",
+        "macro_rules! zz_set { ($f:expr) => { let Failure { token, .. } = $f; *token = \"zz_reserved_exit\"; }; }\n\
          impl Failure { pub fn zz(&mut self) { zz_set!(self); } }\n",
         "struct Zz { token: &'static str }\n\
          pub fn zz(t: &'static str) { let z = Zz { token: t }; eprintln!(\"envcloak: {}: x\", z.token); }\n",
@@ -1950,7 +1964,7 @@ fn a_failure_is_made_no_way_the_reader_does_not_read() {
     add_file(
         &t,
         "crates/envcloak-client/src/fail/zz_child.rs",
-        "impl super::Failure { pub fn zz(&mut self) { self.token = \"tst_required\"; } }\n",
+        "impl super::Failure { pub fn zz(&mut self) { self.token = \"zz_reserved_exit\"; } }\n",
     );
     assert_fails(&t, "fail.rs declares a module in another file");
 }
@@ -1971,7 +1985,7 @@ fn a_raw_identifier_is_read_as_its_name() {
     append_to(
         &t,
         FAIL,
-        "impl Failure { pub fn zz(&mut self) { self.r#token = \"tst_required\"; } }\n",
+        "impl Failure { pub fn zz(&mut self) { self.r#token = \"zz_reserved_exit\"; } }\n",
     );
     assert_fails(&t, "`Failure`'s token is changed after it is made");
 }
@@ -1981,8 +1995,8 @@ const ADD_RS: &str = "crates/envcloak-cli/src/cmd/add.rs";
 
 /// Every message `fn parse` can give a usage line, `envcloak: {why}`, is
 /// read as a token argument (verifier review of M2-RES1: `concat!`, a
-/// constant and a helper's `ParseError::Usage("tst_required: ...")`
-/// each printed `envcloak: tst_required: ...` and passed). A message
+/// constant and a helper's `ParseError::Usage("zz_reserved_exit: ...")`
+/// each printed `envcloak: zz_reserved_exit: ...` and passed). A message
 /// from `concat!` or a constant counts; one from a helper, a `?` on a
 /// helper's result, a `From` that makes its own message (in run.rs or in
 /// another file) or a last expression other than `Ok`/`Err` is refused.
@@ -1993,26 +2007,27 @@ const ADD_RS: &str = "crates/envcloak-cli/src/cmd/add.rs";
 #[test]
 fn every_message_fn_parse_can_give_is_read() {
     let grace = "return Err(\"--wait-grace needs --wait\".into());";
-    let reserved = format!("`tst_required` is reserved, but the code already has it ({RUN_RS})");
+    let reserved =
+        format!("`zz_reserved_exit` is reserved, but the code already has it ({RUN_RS})");
     for (to, extra, expect) in [
         (
-            "return Err(concat!(\"tst_required\", \": no terminal\").into());",
+            "return Err(concat!(\"zz_reserved_exit\", \": no terminal\").into());",
             "",
             reserved.as_str(),
         ),
         (
             "return Err(ZZ_WHY.into());",
-            "const ZZ_WHY: &str = \"tst_required: no terminal\";\n",
+            "const ZZ_WHY: &str = \"zz_reserved_exit: no terminal\";\n",
             reserved.as_str(),
         ),
         (
             "return Err(zz_why());",
-            "fn zz_why() -> ParseError { ParseError::Usage(\"tst_required: no terminal\") }\n",
+            "fn zz_why() -> ParseError { ParseError::Usage(\"zz_reserved_exit: no terminal\") }\n",
             "`fn parse` gives an error the reader cannot read",
         ),
         (
             "zz_check()?;",
-            "fn zz_check() -> Result<(), &'static str> { Err(\"tst_required: x\") }\n",
+            "fn zz_check() -> Result<(), &'static str> { Err(\"zz_reserved_exit: x\") }\n",
             "`fn parse` has a `?` whose error the reader cannot read",
         ),
     ] {
@@ -2026,7 +2041,7 @@ fn every_message_fn_parse_can_give_is_read() {
         &t,
         RUN_RS,
         "        ParseError::Usage(why)\n",
-        "        let _ = why;\n        ParseError::Usage(\"tst_required: x\")\n",
+        "        let _ = why;\n        ParseError::Usage(\"zz_reserved_exit: x\")\n",
     );
     assert_fails(
         &t,
@@ -2036,7 +2051,7 @@ fn every_message_fn_parse_can_give_is_read() {
     append_to(
         &t,
         "crates/envcloak-cli/src/main.rs",
-        "impl From<u8> for crate::cmd::run::ParseError { fn from(_: u8) -> Self { Self::Usage(\"tst_required: x\") } }\n",
+        "impl From<u8> for crate::cmd::run::ParseError { fn from(_: u8) -> Self { Self::Usage(\"zz_reserved_exit: x\") } }\n",
     );
     assert_fails(&t, &format!("the error of `fn parse`, outside {RUN_RS}"));
     let t = fixture();
@@ -2044,7 +2059,7 @@ fn every_message_fn_parse_can_give_is_read() {
         &t,
         ADD_RS,
         "    Ok(a)\n}\n\npub fn run",
-        "    zz(a)\n}\n\nfn zz(a: AddArgs) -> Result<AddArgs, &'static str> { let _ = a; Err(\"tst_required: x\") }\n\npub fn run",
+        "    zz(a)\n}\n\nfn zz(a: AddArgs) -> Result<AddArgs, &'static str> { let _ = a; Err(\"zz_reserved_exit: x\") }\n\npub fn run",
     );
     assert_fails(
         &t,
@@ -2057,16 +2072,20 @@ fn every_message_fn_parse_can_give_is_read() {
         ".ok_or(\"an option needs a name after it\")?",
         ".ok_or(ZZ_WHY)?",
     );
-    append_to(&t, ADD_RS, "const ZZ_WHY: &str = \"tst_required: x\";\n");
+    append_to(
+        &t,
+        ADD_RS,
+        "const ZZ_WHY: &str = \"zz_reserved_exit: x\";\n",
+    );
     assert_fails(
         &t,
-        &format!("`tst_required` is reserved, but the code already has it ({ADD_RS})"),
+        &format!("`zz_reserved_exit` is reserved, but the code already has it ({ADD_RS})"),
     );
 }
 
 /// A line made at compile time is read wherever its text is, or refused
 /// (verifier review of M2-RES1: `eprintln!(concat!("envcloak: ",
-/// "tst_required", ": x"))` passed). `concat!` in any brackets is read
+/// "zz_reserved_exit", ": x"))` passed). `concat!` in any brackets is read
 /// joined; a literal holding the line anywhere counts (a slice of it
 /// prints it), with any white space after `envcloak:`; a placeholder
 /// after a newline takes the argument its place among the placeholders
@@ -2102,7 +2121,7 @@ fn a_line_made_at_compile_time_is_read_or_refused() {
             "a failure token the reader cannot read (`t`)",
         ),
         (
-            "pub fn zz_d() { eprintln!(stringify!(envcloak: tst_required: x)); }\n",
+            "pub fn zz_d() { eprintln!(stringify!(envcloak: zz_reserved_exit: x)); }\n",
             "`stringify!` of text that holds `envcloak`",
         ),
         (
@@ -2114,7 +2133,7 @@ fn a_line_made_at_compile_time_is_read_or_refused() {
             "`env!` of a variable other than Cargo's own package variables",
         ),
         (
-            "pub fn zz_d() { eprintln!(concat!(env!(\"CARGO_PKG_NAME\"), \": tst_required: x\")); }\n",
+            "pub fn zz_d() { eprintln!(concat!(env!(\"CARGO_PKG_NAME\"), \": zz_reserved_exit: x\")); }\n",
             "`concat!` of something other than literals",
         ),
     ] {
@@ -2180,7 +2199,7 @@ fn a_constant_is_read_by_its_whole_value() {
         &t,
         CLIENT_STUB,
         "mod zz_m { pub const ZZ_T: &str = \"io\"; }\n\
-         #[allow(non_snake_case)]\npub fn zz_a() -> Failure { let ZZ_T = \"tst_required\"; Failure::new(ZZ_T, \"x\") }\n",
+         #[allow(non_snake_case)]\npub fn zz_a() -> Failure { let ZZ_T = \"zz_reserved_exit\"; Failure::new(ZZ_T, \"x\") }\n",
     );
     assert_fails(&t, "`non_snake_case` is allowed");
     let t = fixture();
@@ -2296,7 +2315,7 @@ fn fn_parse_is_read_as_narrowly_as_a_token() {
         &t,
         "crates/envcloak-client/src/zz_other.rs",
         "pub fn parse(a: &[&str]) -> Result<(), &'static str> { let _ = a; Err(ZZ_WHY) }\n\
-         const ZZ_WHY: &str = \"tst_required: x\";\n",
+         const ZZ_WHY: &str = \"zz_reserved_exit: x\";\n",
     );
     add_file(
         &t,
@@ -2319,14 +2338,14 @@ fn fn_parse_is_read_as_narrowly_as_a_token() {
     append_to(
         &t,
         ADD_RS,
-        "macro_rules! zz_bail { () => { return Err(zz_why()) }; }\nfn zz_why() -> &'static str { \"tst_required: x\" }\n",
+        "macro_rules! zz_bail { () => { return Err(zz_why()) }; }\nfn zz_why() -> &'static str { \"zz_reserved_exit: x\" }\n",
     );
     assert_fails(&t, "`fn parse` calls a macro (`zz_bail!(`)");
     let t = fixture();
     append_to(
         &t,
         RUN_RS,
-        "macro_rules! zz_conv { ($t:ty) => { impl From<u8> for $t { fn from(_: u8) -> Self { ParseError::Usage(\"tst_required: x\") } } }; }\n\
+        "macro_rules! zz_conv { ($t:ty) => { impl From<u8> for $t { fn from(_: u8) -> Self { ParseError::Usage(\"zz_reserved_exit: x\") } } }; }\n\
          zz_conv!(ParseError);\n",
     );
     assert_fails(&t, "a conversion a macro makes for a type it is given");
@@ -2348,7 +2367,7 @@ fn a_source_directory_that_cannot_be_listed_fails() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("mod.rs"),
-        "pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(\"tst_required\", \"x\") }\n",
+        "pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(\"zz_reserved_exit\", \"x\") }\n",
     )
     .unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -2378,12 +2397,12 @@ fn a_source_directory_that_cannot_be_listed_fails() {
 #[test]
 fn non_ascii_code_is_refused_without_rejecting_unicode_text() {
     for body in [
-        r#"use crate::fail::Failure as Φ; pub fn make()->Φ { Φ::new("tst_required", "") }"#,
-        r#"type Φ=crate::fail::Failure; pub fn make()->Φ { Φ::new("tst_required", "") }"#,
-        r#"use crate::fail::Failure as AliasΦ; pub fn make()->AliasΦ { AliasΦ::new("tst_required", "") }"#,
-        r#"type AliasΦ=crate::fail::Failure; pub fn make()->AliasΦ { AliasΦ::new("tst_required", "") }"#,
-        r#"mod δοκιμή { pub use crate::fail::Failure; } pub fn make()->δοκιμή::Failure { δοκιμή::Failure::new("tst_required", "") }"#,
-        r#"use crate::fail::Failure as r#Φ; pub fn make()->r#Φ { r#Φ::new("tst_required", "") }"#,
+        r#"use crate::fail::Failure as Φ; pub fn make()->Φ { Φ::new("zz_reserved_exit", "") }"#,
+        r#"type Φ=crate::fail::Failure; pub fn make()->Φ { Φ::new("zz_reserved_exit", "") }"#,
+        r#"use crate::fail::Failure as AliasΦ; pub fn make()->AliasΦ { AliasΦ::new("zz_reserved_exit", "") }"#,
+        r#"type AliasΦ=crate::fail::Failure; pub fn make()->AliasΦ { AliasΦ::new("zz_reserved_exit", "") }"#,
+        r#"mod δοκιμή { pub use crate::fail::Failure; } pub fn make()->δοκιμή::Failure { δοκιμή::Failure::new("zz_reserved_exit", "") }"#,
+        r#"use crate::fail::Failure as r#Φ; pub fn make()->r#Φ { r#Φ::new("zz_reserved_exit", "") }"#,
         r#"type é=crate::fail::Failure;"#,
         r#"type é=crate::fail::Failure;"#,
         r#"pub fn borrowed<'α>(value: &'α str)->&'α str { value }"#,
@@ -2398,7 +2417,7 @@ fn non_ascii_code_is_refused_without_rejecting_unicode_text() {
         pub fn text()->&'static str { "Φ δοκιμή" }"#,
         r###"pub const TEXT: &str = r##"Φ δοκιμή"##; pub const LETTER: char = 'Φ';"###,
         r#"#[doc = "Φ"] pub fn make()->crate::fail::Failure { crate::fail::Failure::new("daemon_unavailable", "Φ") }"#,
-        r#"#[cfg(test)] mod tests { type Φ=crate::fail::Failure; fn make()->Φ { Φ::new("tst_required", "") } }"#,
+        r#"#[cfg(test)] mod tests { type Φ=crate::fail::Failure; fn make()->Φ { Φ::new("zz_reserved_exit", "") } }"#,
     ] {
         let t = fixture();
         add_file(&t, CLIENT_STUB, body);
@@ -2451,25 +2470,25 @@ fn a_constructor_is_read_however_its_path_is_written() {
         ),
         (
             STATUS_RS,
-            "\npub fn zz() -> Option<envcloak_client::Failure> { Some(\"tst_required\").map(|t| (t, \"x\")).map(|(t, m)| (::envcloak_client::Fail::new)(t, m)) }\n",
+            "\npub fn zz() -> Option<envcloak_client::Failure> { Some(\"zz_reserved_exit\").map(|t| (t, \"x\")).map(|(t, m)| (::envcloak_client::Fail::new)(t, m)) }\n",
             "`Fail::new` is used other than called",
         ),
         (
             CLIENT_STUB,
-            "macro_rules! zz_mk { ($t:ty) => { <$t>::new(\"tst_required\", \"x\") }; }\n\
+            "macro_rules! zz_mk { ($t:ty) => { <$t>::new(\"zz_reserved_exit\", \"x\") }; }\n\
              pub fn zz() -> crate::fail::Failure { zz_mk!(crate::fail::Failure) }\n",
             "`<$t>::new` is called on a macro's metavariable",
         ),
         (
             CLIENT_STUB,
-            "macro_rules! zz_mk { ($t:ident) => { $t::new(\"tst_required\", \"x\") }; }\n\
+            "macro_rules! zz_mk { ($t:ident) => { $t::new(\"zz_reserved_exit\", \"x\") }; }\n\
              pub fn zz() -> crate::fail::Failure { use crate::fail::Failure; zz_mk!(Failure) }\n",
             "`$t::new` is called on a macro's metavariable",
         ),
         (
             CLIENT_STUB,
             "macro_rules! zz_ty { () => { crate::fail::Failure }; }\n\
-             pub fn zz() -> crate::fail::Failure { <zz_ty!()>::new(\"tst_required\", \"x\") }\n",
+             pub fn zz() -> crate::fail::Failure { <zz_ty!()>::new(\"zz_reserved_exit\", \"x\") }\n",
             "`<zz_ty!()>::new` is called on a type the reader cannot read",
         ),
         (
@@ -2507,14 +2526,14 @@ fn a_function_a_trait_calls_unnamed_takes_no_token() {
         (
             CLIENT_STUB,
             "impl From<&'static str> for crate::fail::Failure { fn from(token: &'static str) -> Self { Self::new(token, \"x\") } }\n\
-             pub fn zz() -> crate::fail::Failure { \"tst_required\".into() }\n",
+             pub fn zz() -> crate::fail::Failure { \"zz_reserved_exit\".into() }\n",
             "from",
         ),
         (
             FAIL,
             "pub trait ZzCtor { fn new(token: ExitToken) -> Self; }\n\
              impl ZzCtor for Failure { fn new(token: ExitToken) -> Self { Failure::new(token, \"x\") } }\n\
-             pub fn zz<T: ZzCtor>() -> T { T::new(\"tst_required\") }\n",
+             pub fn zz<T: ZzCtor>() -> T { T::new(\"zz_reserved_exit\") }\n",
             "new",
         ),
         (
@@ -2553,32 +2572,32 @@ fn a_name_or_type_a_macro_gives_is_refused() {
     for (body, expect) in [
         (
             "macro_rules! zz_imp { ($n:ident) => { use crate::fail::Failure as $n; }; }\nzz_imp!(Q);\n\
-             pub fn zz() -> Q { Q::new(\"tst_required\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"zz_reserved_exit\", \"x\") }\n",
             "an import built from a macro's metavariable",
         ),
         (
             "macro_rules! zz_imp { ($p:path) => { use $p as Q; }; }\nzz_imp!(crate::fail::Failure);\n\
-             pub fn zz() -> Q { Q::new(\"tst_required\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"zz_reserved_exit\", \"x\") }\n",
             "an import built from a macro's metavariable",
         ),
         (
             "macro_rules! zz_al { ($t:ty) => { type Q = $t; }; }\nzz_al!(crate::fail::Failure);\n\
-             pub fn zz() -> Q { Q::new(\"tst_required\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"zz_reserved_exit\", \"x\") }\n",
             "the type alias `Q` is of a type a macro gives (`$t`)",
         ),
         (
             "macro_rules! zz_ty { () => { crate::fail::Failure }; }\ntype Q = zz_ty!();\n\
-             pub fn zz() -> Q { Q::new(\"tst_required\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"zz_reserved_exit\", \"x\") }\n",
             "the type alias `Q` is of a type a macro gives (`zz_ty!()`)",
         ),
         (
             "macro_rules! zz_al { ($n:ident) => { type $n = crate::fail::Failure; }; }\nzz_al!(Q);\n\
-             pub fn zz() -> Q { Q::new(\"tst_required\", \"x\") }\n",
+             pub fn zz() -> Q { Q::new(\"zz_reserved_exit\", \"x\") }\n",
             "a type alias named by a macro's metavariable",
         ),
         (
             "pub const ZZ_T: &str = \"io\";\n\
-             mod zz_m { macro_rules! zz_c { ($n:ident) => { const $n: &str = \"tst_required\"; }; }\n\
+             mod zz_m { macro_rules! zz_c { ($n:ident) => { const $n: &str = \"zz_reserved_exit\"; }; }\n\
              zz_c!(ZZ_T); pub fn zz() -> crate::fail::Failure { crate::fail::Failure::new(ZZ_T, \"x\") } }\n",
             "a `fn`, `const` or `static` named by a macro's metavariable",
         ),
@@ -2613,7 +2632,7 @@ fn a_name_or_type_a_macro_gives_is_refused() {
 /// this fails.
 #[test]
 fn the_compiler_reads_no_rust_the_reader_does_not() {
-    let hidden = "pub fn h() -> envcloak_client::Failure { envcloak_client::Failure::new(\"tst_required\", \"x\") }\n";
+    let hidden = "pub fn h() -> envcloak_client::Failure { envcloak_client::Failure::new(\"zz_reserved_exit\", \"x\") }\n";
     // A macro can make the attribute from `path = ".."` it is given.
     let t = fixture();
     append_to(
@@ -2786,11 +2805,11 @@ fn the_statement_domain_reader_reads_what_tests_bring_in() {
 /// A placeholder right after `envcloak:` prints its value where a token
 /// goes, with or without white space before it: padding (`{:>16}`) or the
 /// value itself can give the space (verifier review of M2-RES1:
-/// `envcloak:{:>16}: x` printed `envcloak:  tst_required: x` and
+/// `envcloak:{:>16}: x` printed `envcloak:  zz_reserved_exit: x` and
 /// passed). It is read, its value counted without the white space around
 /// it; a value printed mid-line, not followed by `:`, counts by the token
 /// it starts with when the reader can read it. A token put together from
-/// pieces (`{}{}:`, `tst_{}:`) or a colon a value brings after `envcloak`
+/// pieces (`{}{}:`, `zz_reserved_{}:`) or a colon a value brings after `envcloak`
 /// (`envcloak{}`) is refused. A count printed mid-line passes.
 ///
 /// Mutation checked: placeholders read only after `envcloak:` and white
@@ -2805,9 +2824,9 @@ fn a_placeholder_right_after_envcloak_is_read() {
         assert_counted(body, CLIENT_STUB);
     }
     for body in [
-        "pub fn d() { eprintln!(\"envcloak: {}{}: x\", \"tst_\", \"required\"); }\n",
-        "pub fn d() { eprintln!(\"envcloak: tst_{}: x\", \"required\"); }\n",
-        "pub fn d() { eprintln!(\"envcloak{} x\", \": tst_required:\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak: {}{}: x\", \"zz_reserved_\", \"exit\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak: zz_reserved_{}: x\", \"exit\"); }\n",
+        "pub fn d() { eprintln!(\"envcloak{} x\", \": zz_reserved_exit:\"); }\n",
     ] {
         let t = fixture();
         add_file(&t, CLIENT_STUB, body);
@@ -2961,7 +2980,7 @@ fn compile_and_run(main: &Path, libs: &[(String, PathBuf)], deps: &Path, label: 
 #[test]
 fn a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused() {
     let (libs, deps) = client_libraries();
-    let (reserved, landed, unknown) = ("tst_required", "daemon_unavailable", "zz_unregistered");
+    let (reserved, landed, unknown) = ("zz_reserved_exit", "daemon_unavailable", "zz_unregistered");
     let direct = |form: &str, value: &str| {
         format!(
             "pub fn make() -> envcloak_client::fail::Failure {{ {form}({value}, String::new()) }}\n"
@@ -3243,6 +3262,7 @@ fn a_compiled_corpus_of_constructors_and_layouts_is_read_or_refused() {
 }
 
 const MONITOR: &str = "crates/envcloak-sys/src/pty_monitor.rs";
+const CONTROL: &str = "crates/envcloak-ipc/src/control.rs";
 
 /// The control-message reader (M2-17, Codex's review of PR #27): the PTY
 /// monitor's messages are the variants of its `Report` and `Command`
@@ -3325,13 +3345,37 @@ fn a_control_message_the_reader_cannot_read_is_refused() {
     edit(
         &t,
         IPC,
-        "| `runner` | `Release` | M2-27 | reserved |",
-        "| `runner` | `Release` | M2-27 | landed |",
+        "| `supervisor` | `Publish` | M2b-05 | reserved |",
+        "| `supervisor` | `Publish` | M2b-05 | landed |",
     );
     assert_fails(
         &t,
-        "`runner Release` is `landed`, but the code has no such entry",
+        "`supervisor Publish` is `landed`, but the code has no such entry",
     );
+}
+
+/// The runner's channel (M2-27) has a reader: its messages are the
+/// variants of `ToRunner` and `FromRunner` in envcloak-ipc's `control`
+/// module, and the table's `landed` rows must name exactly those. A
+/// variant renamed in the code leaves its row naming nothing (and the new
+/// name unlisted); the tree as it is passes (the positive control).
+#[test]
+fn the_runner_channel_is_read_from_its_enums() {
+    assert_passes(&fixture().home());
+    let t = fixture();
+    edit(&t, CONTROL, "    Confirmed,\n", "    Accepted,\n");
+    assert_fails(
+        &t,
+        "`runner Confirmed` is `landed`, but the code has no such entry",
+    );
+    let t = fixture();
+    edit(
+        &t,
+        CONTROL,
+        "    ConfirmSpawn(u32),\n",
+        "    ConfirmSpawn(u32),\n    Spawned(u32),\n",
+    );
+    assert_fails(&t, "runner Spawned");
 }
 
 /// A same-named enum in an inactive item, unused module or unexpanded

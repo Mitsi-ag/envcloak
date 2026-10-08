@@ -638,7 +638,9 @@ impl Prober<'_, '_> {
             // The host is this process's unreaped child (it was started by
             // `spawn_unreaped`, and nothing has waited for it): its group's
             // number is still its own (D-34). What is left there goes now.
+            // Listed in security/signal-allowlist.txt.
             if own {
+                #[allow(clippy::disallowed_methods)]
                 let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
             }
             let status = child.wait().ok();

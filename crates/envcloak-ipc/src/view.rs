@@ -303,6 +303,11 @@ pub enum DecisionView {
     },
     /// Denied without a prompt; `reason` is a `DenyReason` token.
     Denied { reason: String },
+    /// A grant covers a managed server's request (SPEC §6.6, M2 task
+    /// M2-27): the daemon started EnvCloak's runner (or relay) on the pipe
+    /// ends the request handed over and gave it the values. None comes
+    /// back to the client.
+    Started {},
 }
 
 impl DecisionView {
@@ -1875,6 +1880,124 @@ pub struct BackupListView {
     pub truncated: bool,
     /// Restore leases open now, for any process.
     pub open_leases: u32,
+}
+
+/// A managed server's launch receipt (SPEC §6.6, M2 plan D-33): what was
+/// registered and what its binding strength binds, never a value. The
+/// person reads it when `migrate-mcp` registers or updates a server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchReceiptView {
+    /// `<agent>/<server>`.
+    pub server: String,
+    /// `stdio` or `bridge`.
+    pub transport: String,
+    /// `native`, `script` or `package_runner`, for a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    /// `bound` or `checked_at_rest`, for a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<String>,
+    /// The absolute executable the launch was resolved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<String>,
+    /// Its identity: `sha256:<hex>` or `cdhash:<hex>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// A script's entry file and its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_identity: Option<String>,
+    /// The working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// The launch environment's variables, by name.
+    #[serde(default)]
+    pub env_names: Vec<String>,
+    /// The variables the managed project binds.
+    #[serde(default)]
+    pub bindings: Vec<String>,
+    /// A bridged server's origin and header names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub header_names: Vec<String>,
+    /// What the strength binds and does not (`envcloak_policy::managed::
+    /// receipt_sentences`), and what no registration stops.
+    pub sentences: Vec<String>,
+}
+
+/// `managed.register`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRegisteredView {
+    /// The record's id (26 Crockford base32 characters).
+    pub id: String,
+    /// A stdio server's launch id and revision (1 for a new launch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    pub receipt: LaunchReceiptView,
+}
+
+/// `managed.unregister`'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedUnregisteredView {
+    pub removed: bool,
+}
+
+/// A launch declaration as the record stores it (CR-2): its argv, working
+/// directory, variables with their values (never a secret: a key-shaped
+/// value is refused before it is stored) and `PATH`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchDeclarationView {
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_env: Option<String>,
+}
+
+/// An update statement (CR-2): the launch as it is and as the update would
+/// make it, and the digest `managed.update` sends back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateStatementView {
+    pub launch: String,
+    /// The revision now; the update makes the next.
+    pub revision: u64,
+    pub old: LaunchReceiptView,
+    pub new: LaunchReceiptView,
+    /// The declaration as it is stored and as the update would store it,
+    /// whole (CR-2): a change to an argument, `PATH` or a variable's value
+    /// shows here even when the receipts read alike.
+    pub old_declaration: LaunchDeclarationView,
+    pub new_declaration: LaunchDeclarationView,
+    /// SHA-256 of `envcloak-update-statement/1`, 64 hex characters.
+    pub digest: String,
+}
+
+/// `managed.update_plan`'s answer: no statement for a caller whose proof
+/// the daemon would refuse, or for a launch id no record has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedUpdatePlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub statement: Option<UpdateStatementView>,
+}
+
+/// `managed.update`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedUpdatedView {
+    pub revision: u64,
+    pub receipt: LaunchReceiptView,
 }
 
 /// Position in descending `(last_seen, id)` order, exclusive on continuation.

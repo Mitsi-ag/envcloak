@@ -127,9 +127,7 @@ impl Group {
     /// was sent.
     pub(crate) fn signal(&self, sig: i32) -> bool {
         let leader = lock(&self.leader);
-        leader
-            .pid
-            .is_some_and(|pid| envcloak_sys::signal_group(pid, sig).is_ok())
+        leader.pid.is_some_and(|pid| group_signal(pid, sig).is_ok())
     }
 
     /// The first step of a stop: `SIGTERM` while the leader runs; `SIGKILL`
@@ -139,11 +137,9 @@ impl Group {
     fn first_stop(&self) -> FirstStop {
         let leader = lock(&self.leader);
         match (leader.pid, leader.exited) {
-            (Some(pid), false) if envcloak_sys::signal_group(pid, libc::SIGTERM).is_ok() => {
-                FirstStop::Asked
-            }
+            (Some(pid), false) if group_signal(pid, libc::SIGTERM).is_ok() => FirstStop::Asked,
             (Some(pid), true) => {
-                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+                let _ = group_signal(pid, libc::SIGKILL);
                 FirstStop::Done
             }
             _ => FirstStop::Done,
@@ -158,7 +154,7 @@ impl Group {
         leader.exited = true;
         if let Some(pid) = leader.pid {
             if stopped() {
-                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+                let _ = group_signal(pid, libc::SIGKILL);
             }
         }
     }
@@ -171,7 +167,7 @@ impl Group {
         let mut leader = lock(&self.leader);
         if let Some(pid) = leader.pid {
             if stopped() {
-                let _ = envcloak_sys::signal_group(pid, libc::SIGKILL);
+                let _ = group_signal(pid, libc::SIGKILL);
             }
         }
         leader.pid = None;
@@ -535,6 +531,14 @@ fn follow(
         cut,
     };
     Ok((captured, report))
+}
+
+/// Sends `sig` to the group that `pid`, an unreaped leader this module
+/// holds under its lock, leads (D-34: the number is still its own).
+/// Listed in security/signal-allowlist.txt.
+fn group_signal(pid: i32, sig: i32) -> std::io::Result<()> {
+    #[allow(clippy::disallowed_methods)]
+    envcloak_sys::signal_group(pid, sig)
 }
 
 #[cfg(test)]

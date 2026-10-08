@@ -20,6 +20,16 @@
 //! 5. R's project identity (canonical directory, device, inode) equals
 //!    G's;
 //! 6. R's bindings are a subset of G's, by (env name, item id, field id);
+//!    and for a managed MCP server's project (SPEC §6.6, M2 task M2-27),
+//!    G was made for the registered launch and revision R names
+//!    ([`ManagedRequest::launch`]): a grant or a later standing record
+//!    made for another revision covers nothing of this one; for a bridged
+//!    server's project, G was made for the origin R names
+//!    ([`ManagedRequest::origin`]). A grant made for a project while it
+//!    was managed covers nothing once it is not (or is managed another
+//!    way), and one made while it was not covers nothing once it is. The daemon's
+//!    own launch check, which refuses a request that is not the registered
+//!    launch before any of this runs, is not the store's.
 //! 7. R's mode is at least as strict as G's.
 //!
 //! A manifest change that leaves the bindings a subset does not prompt;
@@ -69,7 +79,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, ItemMeta, Slug};
+use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, ItemMeta, LaunchRef, Slug};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -232,6 +242,45 @@ pub struct AccessRequest {
     pub argv_display: Vec<String>,
     /// The vault has no record of the project (SPEC §6.4 "Adoption").
     pub new_project: bool,
+    /// For a managed MCP server's project: its record, as the request
+    /// names it (SPEC §6.6). `None` for every other project.
+    pub managed: Option<ManagedRequest>,
+}
+
+/// A request against a managed MCP server's project, as the daemon checked
+/// it against the server's sealed record (SPEC §6.6, §10b; M2 plan D-05,
+/// D-33): what a grant for it is bound to, and what the adoption statement
+/// shows of the record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRequest {
+    /// The registered launch and the revision the request was checked
+    /// against, for a stdio server; `None` for a bridged HTTP server,
+    /// whose binding names its origin (D-18).
+    pub launch: Option<LaunchRef>,
+    /// `<agent>/<server>`.
+    pub name: String,
+    /// The record says "written by migrate-mcp on this device".
+    pub written_by_migrate_mcp: bool,
+    /// Who registered it, as the daemon classed the caller.
+    pub registered_by: SubjectKind,
+    /// The launch's class and binding strength (`native`, `bound`, ...),
+    /// for a stdio server.
+    pub class: Option<&'static str>,
+    pub strength: Option<&'static str>,
+    /// A bridged server's origin.
+    pub origin: Option<String>,
+}
+
+impl ManagedRequest {
+    /// The launch a grant for this request is bound to.
+    pub fn launch(r: &AccessRequest) -> Option<LaunchRef> {
+        r.managed.as_ref().and_then(|m| m.launch)
+    }
+
+    /// The bridged origin a grant for this request is bound to.
+    pub fn origin(r: &AccessRequest) -> Option<&str> {
+        r.managed.as_ref().and_then(|m| m.origin.as_deref())
+    }
 }
 
 /// One binding a grant covers (SPEC §10b `bindings`): item ids, never
@@ -268,6 +317,12 @@ pub struct Grant {
     pub not_after_awake: Duration,
     pub vault_epoch: u32,
     pub policy_epoch: u64,
+    /// For a managed stdio server: the launch and revision the grant was
+    /// made for (rule 6); it covers no other.
+    pub launch: Option<LaunchRef>,
+    /// For a bridged server: the origin the grant was made for (rule 6);
+    /// it covers no other, and no request of a project not bridged.
+    pub origin: Option<String>,
 }
 
 impl Grant {
@@ -292,9 +347,13 @@ impl Grant {
         self.covers_project_and_mode(r) && r.bindings.iter().all(|b| self.holds(b, r))
     }
 
-    /// Rules 5 and 7: the same project, and a mode at least as strict.
+    /// Rules 5 and 7: the same project, and a mode at least as strict; and
+    /// for a managed server, the same launch revision (rule 6).
     fn covers_project_and_mode(&self, r: &AccessRequest) -> bool {
-        self.project == r.project && r.mode >= self.mode
+        self.project == r.project
+            && r.mode >= self.mode
+            && self.launch == ManagedRequest::launch(r)
+            && self.origin.as_deref() == ManagedRequest::origin(r)
     }
 
     /// Whether the grant holds binding `b` of request `r`: by (env name,
@@ -542,6 +601,20 @@ fn fingerprint(r: &AccessRequest) -> [u8; 32] {
     });
     for a in &r.argv_display {
         str(a.as_bytes());
+    }
+    match ManagedRequest::launch(r) {
+        None => str(b""),
+        Some(l) => {
+            str(&l.launch_id);
+            str(&l.revision.to_be_bytes());
+        }
+    }
+    match ManagedRequest::origin(r) {
+        None => str(b""),
+        Some(o) => {
+            str(b"origin");
+            str(o.as_bytes());
+        }
     }
     h.finalize().into()
 }
@@ -860,6 +933,7 @@ impl GrantStore {
                 break id;
             }
         };
+        let origin = ManagedRequest::origin(&r).map(str::to_owned);
         let grant = Grant {
             id,
             root: r.subject.root(),
@@ -885,6 +959,8 @@ impl GrantStore {
             not_after_awake: now.awake + ttl,
             vault_epoch: self.vault_epoch,
             policy_epoch: self.policy_epoch,
+            launch: r.managed.as_ref().and_then(|m| m.launch),
+            origin,
         };
         self.grants.insert(id, grant);
         Ok(id)

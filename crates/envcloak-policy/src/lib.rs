@@ -26,6 +26,9 @@
 //!   ([`AttemptLimiter`]), and how a request stands for the process tree
 //!   that waits on it ([`PendingState`], `GrantStore::poll`). The store
 //!   holds no value and is never written to disk.
+//! - [`managed`]: managed MCP servers' launch declarations, their argv
+//!   classes, updates, the server's environment, the update statement and
+//!   the launch receipt's sentences (SPEC §6.6, M2 task M2-27).
 //! - [`PendingDescriptor`], [`canonical_statement`] and
 //!   [`render_statement`]: what an approval surface shows for a pending
 //!   request, and the bytes the proof approves; the live-key guard
@@ -44,6 +47,7 @@ pub mod flood;
 mod grants;
 mod ids;
 mod limiter;
+pub mod managed;
 mod manifest;
 mod names;
 mod pending;
@@ -72,8 +76,8 @@ pub use flood::{
 pub use grants::{
     AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BoundRef, DEFAULT_TTL, Decision,
     DenyOutcome, DenyReason, Grant, GrantBinding, GrantId, GrantStore, MAX_AGENT_TTL, MAX_GRANTS,
-    MAX_TERMINAL_TTL, NoSuchRequest, Now, OptionsError, PendingCap, ProofKind, RevokeSelector,
-    Uses,
+    MAX_TERMINAL_TTL, ManagedRequest, NoSuchRequest, Now, OptionsError, PendingCap, ProofKind,
+    RevokeSelector, Uses,
 };
 pub use limiter::{AttemptLimiter, FIRST_WAIT, FREE_ATTEMPTS, MAX_WAIT};
 pub use manifest::{
@@ -89,8 +93,8 @@ pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
 };
 pub use statement::{
-    BindingSummary, HIDDEN, PendingDescriptor, ProcessSummary, ProjectSummary, Proposal,
-    RENDER_LIMIT, STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped,
+    BindingSummary, HIDDEN, ManagedSummary, PendingDescriptor, ProcessSummary, ProjectSummary,
+    Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped,
     escape_for_display, live_guarded, proposals, proposed_for, render_statement,
     render_statement_with, shell_word, shown_name, statement_digest, unticked_live,
 };

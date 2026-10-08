@@ -30,6 +30,11 @@ fn warnings_lint() -> String {
     ["warn", "ings"].concat()
 }
 
+/// `clippy::disallowed_methods`, the lint both allowlists may relax.
+fn disallowed_lint() -> String {
+    ["clippy::disallowed", "_methods"].concat()
+}
+
 /// `expose_secret`, the method clippy.toml forbids.
 fn expose_method() -> String {
     ["expose", "_secret"].concat()
@@ -105,12 +110,25 @@ fn clean_tree() -> TestHome {
     write(
         &r,
         "clippy.toml",
-        "disallowed-methods = [\n  { path = \"secrecy::ExposeSecret::expose_secret\" },\n  { path = \"secrecy::ExposeSecretMut::expose_secret_mut\" },\n]\n",
+        "disallowed-methods = [\n  { path = \"secrecy::ExposeSecret::expose_secret\" },\n  { path = \"secrecy::ExposeSecretMut::expose_secret_mut\" },\n  { path = \"libc::kill\" },\n  { path = \"libc::killpg\" },\n  { path = \"envcloak_sys::signal_process\" },\n  { path = \"envcloak_sys::signal_group\" },\n]\n",
     );
     write(
         &r,
         "security/expose-allowlist.txt",
         "# comment\n\ncrates/envcloak-core/src/secret.rs  # the secret types\n",
+    );
+    write(
+        &r,
+        "security/signal-allowlist.txt",
+        "# comment\n\ncrates/envcloak-sys/src/owned.rs  # the one signal call\n",
+    );
+    write(
+        &r,
+        "crates/envcloak-sys/src/owned.rs",
+        &format!(
+            "#[allow({})]\npub fn kill_number() {{}}\n",
+            disallowed_lint()
+        ),
     );
     write(
         &r,
@@ -809,7 +827,7 @@ fn listed_files_may_not_define_macros() {
     );
     assert_fails(
         &t,
-        "crates/envcloak-core/src/secret.rs:4: files listed in security/expose-allowlist.txt may not define macros",
+        "crates/envcloak-core/src/secret.rs:4: files listed in security/expose-allowlist.txt or security/signal-allowlist.txt may not define macros",
     );
 
     // Elsewhere a macro is fine.
@@ -835,7 +853,7 @@ fn listed_files_may_not_declare_out_of_line_modules() {
     write(&r, "crates/envcloak-core/src/secret/leak.rs", "fn f() {}\n");
     assert_fails(
         &t,
-        "crates/envcloak-core/src/secret.rs:3: files listed in security/expose-allowlist.txt may not declare out-of-line modules",
+        "crates/envcloak-core/src/secret.rs:3: files listed in security/expose-allowlist.txt or security/signal-allowlist.txt may not declare out-of-line modules",
     );
 
     // The same declaration in an unlisted file is fine.
@@ -921,6 +939,162 @@ fn the_clippy_cfg_fails() {
         &t.home(),
         "crates/envcloak-core/src/fine.rs",
         "#![allow(clippy::unwrap_used)]\n#[cfg_attr(test, allow(clippy\n    ::too_many_lines))]\n#[clippy::msrv = \"1.85\"]\nfn f() {\n    let clippy_lints = 1;\n    let _ = clippy_lints;\n}\n",
+    );
+    assert_passes(&t);
+}
+
+/// M2 plan D-34: clippy.toml forbids `libc::kill` and `libc::killpg` too,
+/// and EnvCloak's own numeric wrappers around them
+/// (`envcloak_sys::signal_process`, `signal_group`),
+/// and only files on security/signal-allowlist.txt (which must exist, and
+/// whose entries must) may allow `disallowed_methods` for them; a file on
+/// that list alone still may not name `expose_secret`, so the two lists
+/// share the lint and never the names. The clean tree, with its one listed
+/// signal file, passes (the positive control).
+#[test]
+fn signal_calls_are_allowed_only_on_the_signal_list() {
+    assert_passes(&clean_tree());
+    for missing in [
+        "libc::kill\" }",
+        "libc::killpg\" }",
+        "envcloak_sys::signal_process\" }",
+        "envcloak_sys::signal_group\" }",
+    ] {
+        let t = clean_tree();
+        let path = t.home().join("clippy.toml");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let line = format!("  {{ path = \"{missing},\n");
+        assert_eq!(text.matches(line.as_str()).count(), 1, "{line}");
+        std::fs::write(&path, text.replacen(line.as_str(), "", 1)).unwrap();
+        let name = missing.trim_end_matches("\" }");
+        assert_fails(
+            &t,
+            &format!("clippy.toml: disallowed-methods must list {name}\n"),
+        );
+    }
+
+    let t = clean_tree();
+    std::fs::remove_file(t.home().join("security/signal-allowlist.txt")).unwrap();
+    assert_fails(&t, "security/signal-allowlist.txt is missing");
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "security/signal-allowlist.txt",
+        "crates/envcloak-sys/src/owned.rs\ncrates/gone/src/lib.rs\n",
+    );
+    assert_fails(
+        &t,
+        "security/signal-allowlist.txt: listed file crates/gone/src/lib.rs does not exist",
+    );
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/child.rs",
+        &format!("#[allow({})]\npub fn kill() {{}}\n", disallowed_lint()),
+    );
+    assert_fails(
+        &t,
+        "crates/envcloak-sys/src/child.rs:1: allows disallowed_methods but is not listed in security/expose-allowlist.txt or security/signal-allowlist.txt",
+    );
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/owned.rs",
+        &format!(
+            "#[allow({})]\npub fn kill_number() {{}}\npub fn open(s: &S) {{ s.{}(); }}\n",
+            disallowed_lint(),
+            expose_method()
+        ),
+    );
+    assert_fails(&t, "crates/envcloak-sys/src/owned.rs");
+}
+
+/// Review of M2-27: the two lists share clippy's lint, so a file on the
+/// exposure list alone may allow it, and the lint alone would let that
+/// file signal by number. The names are checked on the signal list's own:
+/// outside it no file may call, name or import libc's or nix's `kill` or
+/// `killpg`, `kill_number`, `signal_process` or `signal_group`, whether it
+/// allows the lint (a file on the exposure list) or the call sits under a
+/// configuration clippy does not lint (`cfg(target_arch = "x86")`), or it
+/// is renamed by an import. The positive controls: an owned handle's
+/// method (`.signal_group(`), a trait method's definition, and a name
+/// that merely holds the word (`skill`, `killer`) pass; envcloak-sys's
+/// re-export of its own wrappers passes; the listed file calls freely.
+///
+/// Mutation checked: the signal names left to the lint (no name check, as
+/// before): the exposure-listed file's call by number passes, and this
+/// fails.
+#[test]
+fn a_file_on_the_exposure_list_alone_may_not_signal_by_number() {
+    let dm = disallowed_lint();
+    let secret = |body: &str| format!("#[allow({})]\npub fn open() {{}}\n{body}", exposure_lint());
+    for (rel, text, want) in [
+        (
+            "crates/envcloak-core/src/secret.rs",
+            secret(&format!(
+                "#[allow({dm})]\npub fn stop(p: i32) {{ let _ = envcloak_sys::signal_process(p, 9); }}\n"
+            )),
+            "crates/envcloak-core/src/secret.rs:4: names a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/secret.rs",
+            secret("pub fn stop(p: i32) { unsafe { libc::kill(p, 9); } }\n"),
+            "crates/envcloak-core/src/secret.rs:3: names a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/x86.rs",
+            "#[cfg(target_arch = \"x86\")]\npub fn stop(p: i32) { let _ = envcloak_sys::signal_group(p, 9); }\n".to_owned(),
+            "crates/envcloak-core/src/x86.rs:2: names a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/alias.rs",
+            "use libc::{\n    getpid,\n    kill as end,\n};\n".to_owned(),
+            "crates/envcloak-core/src/alias.rs:1: imports a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/alias.rs",
+            "use envcloak_sys::signal_process as s;\npub fn stop(p: i32) { let _ = s(p, 9); }\n".to_owned(),
+            "crates/envcloak-core/src/alias.rs:1: imports a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/glob.rs",
+            "use nix::sys::signal::*;\n".to_owned(),
+            "crates/envcloak-core/src/glob.rs:1: imports a numeric signal call",
+        ),
+        (
+            "crates/envcloak-core/src/nix.rs",
+            "pub fn stop(p: Pid) { let _ = nix::sys::signal::killpg(p, None); }\n".to_owned(),
+            "crates/envcloak-core/src/nix.rs:1: names a numeric signal call",
+        ),
+    ] {
+        let t = clean_tree();
+        write(&t.home(), rel, &text);
+        assert_fails(&t, want);
+    }
+
+    let t = clean_tree();
+    write(
+        &t.home(),
+        "crates/envcloak-core/src/fine.rs",
+        "pub trait Ops { fn signal_group(&self, sig: i32); }\npub fn stop(h: &dyn Ops, skill: i32) {\n    h\n        .signal_group(9);\n    let killer = skill;\n    let _ = killer;\n}\n",
+    );
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/lib.rs",
+        &format!(
+            "#![allow({})]\npub use child::{{has_exited, signal_group, signal_process}};\n",
+            unsafe_lint()
+        ),
+    );
+    write(
+        &t.home(),
+        "crates/envcloak-sys/src/owned.rs",
+        &format!(
+            "#[allow({dm})]\npub fn kill_number(p: i32) {{ unsafe {{ libc::kill(p, 9); }} }}\n"
+        ),
     );
     assert_passes(&t);
 }

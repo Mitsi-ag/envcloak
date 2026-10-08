@@ -62,6 +62,7 @@ fn descriptor(argv: Vec<String>) -> PendingDescriptor {
         proposals: Vec::new(),
         mode: Mode::Inject,
         argv,
+        managed: None,
     }
 }
 

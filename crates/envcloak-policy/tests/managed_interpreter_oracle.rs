@@ -1,0 +1,801 @@
+//! Real interpreter entry selection, independent of the policy tables.
+//! Run with scripts/check-managed-oracles.sh and the pinned runtimes named
+//! there. Fixtures print fixed words only and use an isolated HOME.
+#![allow(clippy::unwrap_used)]
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use envcloak_policy::managed::{ArgvClass, CodeSelecting, DeclError, classify_argv};
+use envcloak_testkit::agents::run_capped;
+use sha2::{Digest, Sha256};
+
+fn runtime(variable: &str) -> PathBuf {
+    let path = PathBuf::from(std::env::var_os(variable).expect("pinned oracle path required"));
+    assert!(path.is_absolute());
+    let digest: String = Sha256::digest(std::fs::read(&path).unwrap())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    eprintln!("{variable} sha256={digest}");
+    path
+}
+
+fn run(bin: &Path, home: &Path, args: &[String], extra: &[(&str, &str)]) -> String {
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", home)
+        .env("XDG_DATA_HOME", home)
+        .env("XDG_CACHE_HOME", home)
+        .env("TMPDIR", home)
+        .current_dir(home)
+        .args(args)
+        .envs(extra.iter().copied());
+    let result = run_capped(cmd, Duration::from_secs(20), 8192).unwrap();
+    assert!(
+        result.in_time && result.complete && !result.over_cap,
+        "{result:?}"
+    );
+    assert!(
+        result.output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.output.stderr)
+    );
+    String::from_utf8(result.output.stdout).unwrap()
+}
+
+fn refused(bin: &str, options: &[String], entry: &str) {
+    let argv = [
+        vec![bin.to_owned()],
+        options.to_vec(),
+        vec![entry.to_owned()],
+    ]
+    .concat();
+    assert_eq!(
+        classify_argv(&argv),
+        Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+    );
+}
+
+#[test]
+#[ignore = "requires PHP 8.4.5; run scripts/check-managed-oracles.sh"]
+fn php_attached_file_selects_the_actual_entry() {
+    let php = runtime("ENVCLOAK_PHP_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert!(run(&php, h, &["-n".into(), "-v".into()], &[]).starts_with("PHP 8.4.5 "));
+    let entry = h.join("entry.php");
+    let selected = h.join("selected.php");
+    std::fs::write(&entry, "<?php echo 'entry';").unwrap();
+    std::fs::write(&selected, "<?php echo 'selected';").unwrap();
+    let e = entry.to_str().unwrap();
+    assert_eq!(run(&php, h, &["-n".into(), e.into()], &[]), "entry");
+    assert_eq!(
+        classify_argv(&["php".into(), "-n".into(), e.into()]),
+        Ok(ArgvClass::Interpreter { entry: 2 })
+    );
+    for options in [
+        vec!["-n".into(), format!("-f{}", selected.display())],
+        vec![format!("-nf{}", selected.display())],
+    ] {
+        let args = [options.clone(), vec![e.into()]].concat();
+        assert_eq!(run(&php, h, &args, &[]), "selected");
+        refused("php", &options, e);
+    }
+}
+
+#[test]
+#[ignore = "requires debug CPython 3.14.0; run scripts/check-managed-oracles.sh"]
+fn python_attached_options_can_import_before_the_entry() {
+    let python = runtime("ENVCLOAK_PYTHON_DEBUG_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let entry = h.join("entry.py");
+    std::fs::write(&entry, "print('entry')\n").unwrap();
+    std::fs::write(
+        h.join("observer.py"),
+        "print('prelude')\nclass Notice(Warning): pass\n",
+    )
+    .unwrap();
+    let extra = [("PYTHONPATH", h.to_str().unwrap())];
+    let version = run(
+        &python,
+        h,
+        &[
+            "-c".into(),
+            "import sys; print(sys.version_info[:3]); print(hasattr(sys, 'gettotalrefcount'))"
+                .into(),
+        ],
+        &[],
+    );
+    assert_eq!(version, "(3, 14, 0)\nTrue\n");
+    let e = entry.to_str().unwrap();
+    assert_eq!(
+        run(&python, h, &["-Xdev".into(), e.into()], &extra),
+        "entry\n"
+    );
+    for option in [
+        "-Xpresite=observer",
+        "-uXpresite=observer",
+        "-Wignore::observer.Notice",
+    ] {
+        let options = vec![option.to_owned()];
+        assert_eq!(
+            run(&python, h, &[option.into(), e.into()], &extra),
+            "prelude\nentry\n"
+        );
+        refused("python3.14d", &options, e);
+    }
+}
+
+#[test]
+#[ignore = "requires npm 11.19.0; run scripts/check-managed-oracles.sh"]
+fn npm_configuration_names_match_without_case() {
+    let npm = runtime("ENVCLOAK_NPM_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let path = format!("{}:/usr/bin:/bin", npm.parent().unwrap().display());
+    let user = h.join("user");
+    let global = h.join("global");
+    std::fs::write(&user, b"").unwrap();
+    std::fs::write(&global, b"").unwrap();
+    let base = [
+        ("PATH", path.as_str()),
+        ("NPM_CONFIG_UPDATE_NOTIFIER", "false"),
+        ("NPM_CONFIG_USERCONFIG", user.to_str().unwrap()),
+        ("NPM_CONFIG_GLOBALCONFIG", global.to_str().unwrap()),
+    ];
+    assert_eq!(run(&npm, h, &["--version".into()], &base), "11.19.0\n");
+    let args = vec![
+        "--userconfig".into(),
+        user.to_str().unwrap().into(),
+        "--globalconfig".into(),
+        global.to_str().unwrap().into(),
+        "config".into(),
+        "get".into(),
+        "script-shell".into(),
+    ];
+    assert_eq!(run(&npm, h, &args, &base), "null\n");
+    for name in [
+        "npm_config_script_shell",
+        "NPM_CONFIG_SCRIPT_SHELL",
+        "NpM_cOnFiG_sCrIpT_ShElL",
+    ] {
+        let mut extra = base.to_vec();
+        extra.push((name, "/fixture/shell"));
+        assert_eq!(run(&npm, h, &args, &extra), "/fixture/shell\n");
+        assert!(envcloak_policy::managed::is_code_selecting(name), "{name}");
+    }
+}
+
+/// npx (npm 11.19.0's `npx-cli.js`) takes an option's value and goes on
+/// reading its own options: `npx --package <pkg> --call <cmd>` and `npx
+/// --cache <dir> --node-options=... --call <cmd>` run `<cmd>`, so the
+/// value is never the package (Codex review of M2-27). Each is refused.
+/// The control: after the package, `--call` is the package's argument
+/// (`npx --yes --package <pkg> foo --call <cmd>` runs `foo`), and
+/// registers. Mutation checked: the runner scan stopped at the first word
+/// that is not an option (the r4 rule): the injected forms register and
+/// this fails.
+#[test]
+#[ignore = "requires npm 11.19.0; run scripts/check-managed-oracles.sh"]
+fn npx_reads_its_options_after_an_option_value() {
+    let npm = runtime("ENVCLOAK_NPM_ORACLE");
+    let npx = npm.canonicalize().unwrap().with_file_name("npx-cli.js");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let path = format!("{}:/usr/bin:/bin", npm.parent().unwrap().display());
+    let (user, global, cache, pkg) = (h.join("u"), h.join("g"), h.join("c"), h.join("pkg"));
+    std::fs::write(&user, b"").unwrap();
+    std::fs::write(&global, b"").unwrap();
+    std::fs::create_dir(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0","bin":{"foo":"foo.js"}}"#,
+    )
+    .unwrap();
+    let bin = pkg.join("foo.js");
+    std::fs::write(&bin, "#!/usr/bin/env node\nconsole.log('PKG')\n").unwrap();
+    std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let env = [
+        ("PATH", path.as_str()),
+        ("NPM_CONFIG_UPDATE_NOTIFIER", "false"),
+        ("NPM_CONFIG_OFFLINE", "true"),
+        ("NPM_CONFIG_USERCONFIG", user.to_str().unwrap()),
+        ("NPM_CONFIG_GLOBALCONFIG", global.to_str().unwrap()),
+    ];
+    let (p, c) = (pkg.to_str().unwrap(), cache.to_str().unwrap());
+    let argv = |args: &[&str]| -> Vec<String> {
+        std::iter::once("npx")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect()
+    };
+    let control = ["--yes", "--package", p, "foo", "--call", "echo CONTROL"];
+    assert_eq!(
+        run(&npx, h, &argv(&control)[1..], &env),
+        "PKG\n",
+        "the control"
+    );
+    assert!(matches!(
+        classify_argv(&argv(&control)),
+        Ok(ArgvClass::PackageRunner { .. })
+    ));
+    for args in [
+        &["--package", p, "--call", "echo CONTROL"][..],
+        &["--cache", c, "--call", "echo CONTROL"],
+        &[
+            "--cache",
+            c,
+            "--node-options=--no-warnings",
+            "--call",
+            "echo CONTROL",
+        ],
+    ] {
+        let out = run(&npx, h, &argv(args)[1..], &env);
+        assert_eq!(out, "CONTROL\n", "{args:?}");
+        assert_eq!(
+            classify_argv(&argv(args)),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+            "{args:?}"
+        );
+    }
+}
+
+/// Deno 2.9.7 takes no value for any `--allow-`, `--deny-` or `--no-`
+/// option of `deno run` without `=` (review of M2-27: the prefixes were
+/// documented, never measured): of every long option `deno run --help`
+/// names, each the policy accepts bare before an entry file, run before
+/// two files, runs the first or refuses the option itself, never the
+/// second; an unknown name under a prefix is an option error. With `=`,
+/// the permission values run the first file too. Mutation checked: deno's
+/// prefixes widened to every long option (`--`): `--cert <file>` and
+/// `--seed <n>` take the next argument, and this fails.
+#[test]
+#[ignore = "requires Deno 2.9.7; run scripts/check-managed-oracles.sh"]
+fn deno_prefixed_options_take_values_only_with_equals() {
+    let deno = runtime("ENVCLOAK_DENO_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let env = [
+        ("DENO_DIR", h.to_str().unwrap()),
+        ("DENO_NO_UPDATE_CHECK", "1"),
+        ("NO_COLOR", "1"),
+    ];
+    assert!(run(&deno, h, &["--version".into()], &env).starts_with("deno 2.9.7 "));
+    let first = h.join("first.ts");
+    let entry = h.join("entry.ts");
+    std::fs::write(&first, "console.log('first')\n").unwrap();
+    std::fs::write(&entry, "console.log('entry')\n").unwrap();
+    let (f, e) = (first.to_str().unwrap(), entry.to_str().unwrap());
+    assert_eq!(
+        run(&deno, h, &["run".into(), e.into()], &env),
+        "entry\n",
+        "the control"
+    );
+    // The help is longer than [`run`]'s cap.
+    let mut cmd = Command::new(&deno);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env("HOME", h)
+        .envs(env)
+        .current_dir(h)
+        .args(["run", "--help"]);
+    let result = run_capped(cmd, Duration::from_secs(20), 1 << 20).unwrap();
+    assert!(
+        result.in_time && result.complete && !result.over_cap && result.output.status.success(),
+        "{result:?}"
+    );
+    let help = String::from_utf8(result.output.stdout).unwrap();
+    let mut names: Vec<String> = help
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter(|w| w.len() > 2 && w.starts_with("--"))
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names.dedup();
+    assert!(names.len() > 20, "{names:?}");
+    // Unknown names under each prefix, and Node's `--no-print`.
+    names.extend(["--allow-x", "--deny-x", "--no-x", "--no-print"].map(str::to_owned));
+    let mut ran = 0;
+    for option in &names {
+        let argv: Vec<String> = ["deno", "run", option, f, e].map(str::to_owned).to_vec();
+        if classify_argv(&argv) != Ok(ArgvClass::Interpreter { entry: 3 }) {
+            continue;
+        }
+        let (ok, out, err) = run_any_with(&deno, h, &argv[1..], &env);
+        assert!(!out.contains("entry"), "{option} took the next argument");
+        let refused_option = err.contains("unexpected argument")
+            || err.contains("required arguments were not provided");
+        assert!(
+            (ok && out == "first\n") || (!ok && out.is_empty() && refused_option),
+            "{option}: {out:?} {err:?}"
+        );
+        ran += usize::from(ok);
+    }
+    assert!(ran > 20, "{ran}");
+    for option in [
+        "--allow-net=example.com",
+        "--allow-read=/",
+        "--deny-env=HOME",
+    ] {
+        let argv: Vec<String> = ["deno", "run", option, f, e].map(str::to_owned).to_vec();
+        assert_eq!(
+            classify_argv(&argv),
+            Ok(ArgvClass::Interpreter { entry: 3 })
+        );
+        assert_eq!(run(&deno, h, &argv[1..], &env), "first\n", "{option}");
+    }
+}
+
+/// The environment spellings must obey the same code-loading policy as
+/// their corresponding attached options. Mutation: omit both names from
+/// the environment refusal predicate.
+#[test]
+#[ignore = "requires debug CPython 3.14.0; run scripts/check-managed-oracles.sh"]
+fn python_startup_environment_cannot_select_unchecked_code() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{
+        LaunchChanges, apply_changes, check_declaration, launch_environment,
+    };
+    let python = runtime("ENVCLOAK_PYTHON_DEBUG_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let entry = h.join("entry.py");
+    std::fs::write(&entry, "print('entry')\n").unwrap();
+    std::fs::write(
+        h.join("observer.py"),
+        "print('prelude')\nclass Notice(Warning): pass\n",
+    )
+    .unwrap();
+    let args = vec![entry.to_str().unwrap().to_owned()];
+    let base = [("PYTHONPATH", h.to_str().unwrap())];
+    assert_eq!(run(&python, h, &args, &base), "entry\n");
+    let declared = LaunchDecl {
+        argv: vec!["python3.14d".into(), args[0].clone()],
+        cwd: None,
+        env: Vec::new(),
+        path_env: None,
+    };
+    assert!(check_declaration(&declared).is_ok());
+    for (name, value) in [
+        ("PYTHON_PRESITE", "observer"),
+        ("PYTHONWARNINGS", "ignore::observer.Notice"),
+    ] {
+        let mut extra = base.to_vec();
+        extra.push((name, value));
+        assert_eq!(run(&python, h, &args, &extra), "prelude\nentry\n");
+        let mut d = declared.clone();
+        d.env.push((name.into(), value.into()));
+        let refusal = Err(DeclError::CodeSelecting(CodeSelecting::Variable));
+        assert_eq!(check_declaration(&d), refusal, "{name}");
+        let changes = LaunchChanges {
+            set_env: d.env.clone(),
+            ..LaunchChanges::default()
+        };
+        assert!(matches!(
+            apply_changes(&declared, &changes),
+            Err(DeclError::CodeSelecting(CodeSelecting::Variable))
+        ));
+        let environment = launch_environment(
+            [(name.as_bytes(), value.as_bytes())],
+            b"/bin",
+            &d.env,
+            &[(name, value.as_bytes())],
+        );
+        assert!(environment.iter().all(|(n, _)| n != name.as_bytes()));
+    }
+}
+
+/// A real login shell loads a private startup file before the entry.
+/// Mutation: list --login in bash's `boolean_long` instead of CODE_LOADING_LONG.
+#[test]
+fn bash_login_startup_is_refused_for_declarations_updates_and_shebangs() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    let bash = Path::new("/bin/bash");
+    let entry = h.join("entry.sh");
+    std::fs::write(&entry, "printf 'entry\\n'\n").unwrap();
+    std::fs::write(h.join(".bash_profile"), "printf 'startup\\n'\n").unwrap();
+    let e = entry.to_str().unwrap();
+    assert_eq!(run(bash, h, &[e.into()], &[]), "entry\n");
+    let base = LaunchDecl {
+        argv: vec!["/bin/bash".into(), e.into()],
+        cwd: None,
+        env: vec![],
+        path_env: None,
+    };
+    assert!(check_declaration(&base).is_ok());
+    for option in ["--login", "-l", "-lx"] {
+        assert_eq!(
+            run(bash, h, &[option.into(), e.into()], &[]),
+            "startup\nentry\n"
+        );
+        let argv = vec!["/bin/bash".into(), option.into(), e.into()];
+        let declaration = LaunchDecl {
+            argv: argv.clone(),
+            ..base.clone()
+        };
+        assert_eq!(
+            check_declaration(&declaration),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+        assert!(matches!(
+            apply_changes(
+                &base,
+                &LaunchChanges {
+                    argv: Some(argv),
+                    ..LaunchChanges::default()
+                }
+            ),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        ));
+        assert_eq!(
+            shebang_argv("/bin/bash", Some(option), e, &[], "/bin/bash"),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+    }
+}
+
+/// A real LuaJIT loads a `jit.*` module through its search path, whose
+/// first entry is `./?.lua`, before the entry file runs: `-jv` loads
+/// `jit.v` and `-b` loads `jit.bcsave` from the working directory. Each
+/// such form is refused for a declaration, an update and a `#!` line; the
+/// benign entry, `-v` and `-O3` beside the same modules run only the entry
+/// and register (the controls). Mutation: drop the `harmless_short` check,
+/// refusing only listed letters (the previous rule): `-jv` registers.
+#[test]
+#[ignore = "requires the pinned LuaJIT 2.1; run scripts/check-managed-oracles.sh"]
+fn luajit_module_options_load_code_before_the_entry() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let luajit = runtime("ENVCLOAK_LUAJIT_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert!(run(&luajit, h, &["-v".into()], &[]).starts_with("LuaJIT 2.1."));
+    let modules = h.join("jit");
+    std::fs::create_dir(&modules).unwrap();
+    for module in ["v", "bcsave"] {
+        std::fs::write(
+            modules.join(format!("{module}.lua")),
+            "io.write('prelude\\n')\nreturn { start = function() end }\n",
+        )
+        .unwrap();
+    }
+    let entry = h.join("entry.lua");
+    std::fs::write(&entry, "io.write('entry\\n')\n").unwrap();
+    let e = entry.to_str().unwrap();
+    let base = LaunchDecl {
+        argv: vec!["luajit".into(), e.into()],
+        cwd: Some(h.to_str().unwrap().into()),
+        env: vec![],
+        path_env: None,
+    };
+    // The benign controls: the same working directory and modules.
+    assert_eq!(run(&luajit, h, &[e.into()], &[]), "entry\n");
+    assert!(check_declaration(&base).is_ok());
+    assert!(run(&luajit, h, &["-v".into(), e.into()], &[]).ends_with("\nentry\n"));
+    assert_eq!(run(&luajit, h, &["-O3".into(), e.into()], &[]), "entry\n");
+    for option in ["-v", "-O3"] {
+        assert_eq!(
+            classify_argv(&["luajit".into(), option.into(), e.into()]),
+            Ok(ArgvClass::Interpreter { entry: 2 })
+        );
+    }
+    for (option, output) in [("-jv", "prelude\nentry\n"), ("-b", "prelude\n")] {
+        assert_eq!(run(&luajit, h, &[option.into(), e.into()], &[]), output);
+        refused("luajit", &[option.to_owned()], e);
+        let argv = vec!["luajit".into(), option.into(), e.into()];
+        let refusal = Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+        assert_eq!(
+            check_declaration(&LaunchDecl {
+                argv: argv.clone(),
+                ..base.clone()
+            }),
+            refusal
+        );
+        assert!(matches!(
+            apply_changes(
+                &base,
+                &LaunchChanges {
+                    argv: Some(argv),
+                    ..LaunchChanges::default()
+                }
+            ),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        ));
+        let path = luajit.to_str().unwrap();
+        assert_eq!(
+            shebang_argv(path, Some(option), e, &[], path),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+    }
+}
+
+/// A real Ruby reads a short value after `-W` (one digit, or a whole
+/// `:category`) and after `-K` (one encoding letter), then reads the rest
+/// of the cluster as more options: `-We`, `-W1e` and `-KUe` run the code
+/// after them, `-Wr` and `-WI.` load a file from the working directory
+/// before the entry. Each form is refused for a declaration, an update
+/// and a `#!` line. The controls (`-W2`, `-w`, `-W0`, `-W:no-deprecated`,
+/// `-KU`) run only the entry and register. Mutation: ruby's `W` and `K`
+/// returning `Ok` at their letter without checking the rest of the
+/// cluster (the previous `attached_short` rule): `-We...` registers.
+#[test]
+#[ignore = "requires the pinned Ruby 3.4.7; run scripts/check-managed-oracles.sh"]
+fn ruby_short_values_read_the_rest_of_the_cluster_as_options() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let ruby = runtime("ENVCLOAK_RUBY_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert!(run(&ruby, h, &["-v".into()], &[]).starts_with("ruby 3.4.7 "));
+    std::fs::write(h.join("evil.rb"), "print \"prelude\\n\"\n").unwrap();
+    let entry = h.join("entry.rb");
+    std::fs::write(&entry, "print \"entry\\n\"\n").unwrap();
+    let e = entry.to_str().unwrap();
+    let base = LaunchDecl {
+        argv: vec!["ruby".into(), e.into()],
+        cwd: Some(h.to_str().unwrap().into()),
+        env: vec![],
+        path_env: None,
+    };
+    // The benign controls: the same working directory and files.
+    assert_eq!(run(&ruby, h, &[e.into()], &[]), "entry\n");
+    assert!(check_declaration(&base).is_ok());
+    for option in ["-W2", "-w", "-W0", "-W:no-deprecated", "-KU", "-W1KU"] {
+        assert_eq!(
+            run(&ruby, h, &[option.into(), e.into()], &[]),
+            "entry\n",
+            "{option}"
+        );
+        assert_eq!(
+            classify_argv(&["ruby".into(), option.into(), e.into()]),
+            Ok(ArgvClass::Interpreter { entry: 2 }),
+            "{option}"
+        );
+    }
+    let refusal = DeclError::CodeSelecting(CodeSelecting::InterpreterOption);
+    for (options, output) in [
+        (&["-Weprint(\"injected\\n\")"][..], "injected\n"),
+        (&["-W1eprint(\"injected\\n\")"], "injected\n"),
+        (&["-KUeprint(\"injected\\n\")"], "injected\n"),
+        (&["-Wr./evil"], "prelude\nentry\n"),
+        (&["-WI.", "-Wrevil"], "prelude\nentry\n"),
+    ] {
+        let options: Vec<String> = options.iter().map(|o| (*o).to_owned()).collect();
+        let args = [options.clone(), vec![e.to_owned()]].concat();
+        assert_eq!(run(&ruby, h, &args, &[]), output, "{options:?}");
+        refused("ruby", &options, e);
+        let argv = [vec!["ruby".to_owned()], args].concat();
+        assert_eq!(
+            check_declaration(&LaunchDecl {
+                argv: argv.clone(),
+                ..base.clone()
+            }),
+            Err(refusal),
+            "{options:?}"
+        );
+        assert!(
+            matches!(
+                apply_changes(
+                    &base,
+                    &LaunchChanges {
+                        argv: Some(argv),
+                        ..LaunchChanges::default()
+                    }
+                ),
+                Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+            ),
+            "{options:?}"
+        );
+        let path = ruby.to_str().unwrap();
+        // A `#!` line carries one option: the first one's form.
+        assert_eq!(
+            shebang_argv(path, Some(options[0].as_str()), e, &[], path),
+            Err(refusal),
+            "{options:?}"
+        );
+    }
+}
+
+/// Runs `bin` like [`run`], but returns whether it succeeded and what it
+/// printed on standard output and standard error, success or not.
+fn run_any(bin: &Path, home: &Path, args: &[String]) -> (bool, String, String) {
+    run_any_with(bin, home, args, &[])
+}
+
+/// [`run_any`] with `extra` variables.
+fn run_any_with(
+    bin: &Path,
+    home: &Path,
+    args: &[String],
+    extra: &[(&str, &str)],
+) -> (bool, String, String) {
+    let mut cmd = Command::new(bin);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_clear()
+        .env("HOME", home)
+        .env("TMPDIR", home)
+        .current_dir(home)
+        .args(args)
+        .envs(extra.iter().copied());
+    let result = run_capped(cmd, Duration::from_secs(20), 8192).unwrap();
+    assert!(
+        result.in_time && result.complete && !result.over_cap,
+        "{args:?} {result:?}"
+    );
+    (
+        result.output.status.success(),
+        String::from_utf8(result.output.stdout).unwrap(),
+        String::from_utf8_lossy(&result.output.stderr).into_owned(),
+    )
+}
+
+/// A real Node takes the next argument as the value of `--allow-fs-read`
+/// and `--disable-warning`, so the argument checked as the entry file is
+/// not what runs: `node --allow-fs-read <file> --permission -e <code>`
+/// and `node --disable-warning <file> -e <code>` run `<code>`. Each form is
+/// refused for a declaration, an update and a `#!` line. Then every long
+/// option Node 26.7.0 knows, and its `--no-` form, that the policy accepts
+/// bare before an entry file is run before two files: Node must run the
+/// first one, or refuse the option itself (`bad option`, `invalid
+/// negation`); never the second, which would mean the option took the
+/// first as its value, and never anything else, such as evaluating the
+/// first file's name (`node --no-print <file>` does: review of M2-27).
+/// Mutations checked: one prefix list for every family in `boolean_long`
+/// (the r3 rule): the injected forms register and this fails; Node's
+/// `--no-` prefix restored (the r4 rule): `--no-print` registers, its
+/// run evaluates the file's name and the sweep fails.
+#[test]
+#[ignore = "requires Node 26.7.0; run scripts/check-managed-oracles.sh"]
+fn node_long_options_take_values_as_node_does() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let node = runtime("ENVCLOAK_NODE_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert_eq!(run(&node, h, &["--version".into()], &[]), "v26.7.0\n");
+    let first = h.join("first.js");
+    let entry = h.join("entry.js");
+    std::fs::write(&first, "process.stdout.write('first\\n')\n").unwrap();
+    std::fs::write(&entry, "process.stdout.write('entry\\n')\n").unwrap();
+    let (f, e) = (first.to_str().unwrap(), entry.to_str().unwrap());
+    // The benign control: the entry runs, and registers.
+    assert_eq!(run(&node, h, &[e.into()], &[]), "entry\n");
+    let base = LaunchDecl {
+        argv: vec!["node".into(), e.into()],
+        cwd: None,
+        env: vec![],
+        path_env: None,
+    };
+    assert!(check_declaration(&base).is_ok());
+    let code = "process.stdout.write('injected\\n')";
+    for options in [
+        &["--allow-fs-read", f, "--permission", "-e", code][..],
+        &["--disable-warning", f, "-e", code],
+    ] {
+        let args: Vec<String> = options.iter().map(|o| (*o).to_owned()).collect();
+        assert_eq!(run(&node, h, &args, &[]), "injected\n", "{options:?}");
+        let argv = [vec!["node".to_owned()], args].concat();
+        assert_eq!(classify_argv(&argv), Err(DeclError::NoEntry), "{options:?}");
+        assert_eq!(
+            check_declaration(&LaunchDecl {
+                argv: argv.clone(),
+                ..base.clone()
+            }),
+            Err(DeclError::NoEntry),
+            "{options:?}"
+        );
+        assert!(
+            matches!(
+                apply_changes(
+                    &base,
+                    &LaunchChanges {
+                        argv: Some(argv),
+                        ..LaunchChanges::default()
+                    }
+                ),
+                Err(DeclError::NoEntry)
+            ),
+            "{options:?}"
+        );
+        let path = node.to_str().unwrap();
+        assert_eq!(
+            shebang_argv(path, Some(options[0]), f, &[], path),
+            Err(DeclError::NoEntry),
+            "{options:?}"
+        );
+    }
+    // Every option Node knows, by its own table, and each `--no-` form.
+    let names = run(
+        &node,
+        h,
+        &[
+            "--expose-internals".into(),
+            "-e".into(),
+            "const {options, aliases} = require('internal/options').getCLIOptionsInfo(); \
+             for (const n of [...options.keys(), ...aliases.keys()]) console.log(n);"
+                .into(),
+        ],
+        &[],
+    );
+    let mut tried = 0;
+    let mut wrong = Vec::new();
+    for name in names.lines().filter(|n| n.starts_with("--")) {
+        for option in [name.to_owned(), format!("--no-{}", &name[2..])] {
+            let argv = vec!["node".to_owned(), option.clone(), f.into(), e.into()];
+            if classify_argv(&argv) != Ok(ArgvClass::Interpreter { entry: 2 }) {
+                continue;
+            }
+            tried += 1;
+            let (ok, out, err) = run_any(&node, h, &argv[1..]);
+            assert!(!out.contains("entry"), "{option} took the next argument");
+            // Node refuses the option before it runs anything: unknown,
+            // a negation of a valued one, or a permission option without
+            // `--permission`; or, under `--permission`, the reading of
+            // the main file (the first one) is denied.
+            let refused_option = err.contains("bad option")
+                || err.contains("is an invalid negation")
+                || err.contains("ERR_MISSING_OPTION")
+                || (err.contains("ERR_ACCESS_DENIED") && err.contains("resolveMainPath"))
+                || err.contains("OpenSSL error when trying to enable FIPS");
+            if !((ok && out == "first\n") || (!ok && out.is_empty() && refused_option)) {
+                wrong.push(format!("{option}: {out:?} {err:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    // The positive control for the sweep's failure rule: `--no-print`
+    // evaluates the first file's name as code (an `[eval]` error, never an
+    // option one), and is refused.
+    let (ok, out, err) = run_any(&node, h, &["--no-print".into(), f.into(), e.into()]);
+    assert!(!ok && out.is_empty() && err.contains("[eval]"), "{err:?}");
+    assert_eq!(
+        classify_argv(&["node".into(), "--no-print".into(), f.into(), e.into()]),
+        Err(DeclError::NoEntry)
+    );
+    // The measured booleans and negations: 58 of Node 26.7.0's forms.
+    assert!(tried >= 58, "{tried}");
+}

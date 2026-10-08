@@ -1,0 +1,22 @@
+# Files allowed to call libc::kill or libc::killpg, which clippy.toml
+# otherwise forbids (M2 plan D-34: EnvCloak signals a process only through
+# an owned handle, envcloak_sys::owned::OwnedChild, a child it started and
+# has not reaped, or the group that child leads).
+#
+# One repo-relative path per line, followed by `#` and the reason. Every
+# call site still needs `#[allow(clippy::disallowed_methods)]`, and
+# scripts/check-unsafe.sh fails on such an allow in any file not listed here
+# or in security/expose-allowlist.txt. A file listed here alone still may
+# not name expose_secret: the two lists share clippy's lint, not what each
+# allows. Adding a line needs review: each one is a place a signal can reach
+# a process by its number. A test harness that must signal by number (itself,
+# its own group, a child it holds unreaped) calls
+# envcloak_sys::testing::kill_raw, which the `testing` feature alone builds.
+
+crates/envcloak-sys/src/owned.rs           # the one kill call: owned-child checks, the M1 runner's owned signals, and D-35's fixed current-job suspension
+crates/envcloak-exec/src/signals.rs        # the M1 runner: signals its own unreaped child or the group it leads, under the child-state lock (review R-9)
+crates/envcloak-mcp/src/child.rs           # the MCP server child: signals the group of its unreaped leader, under the leader lock
+crates/envcloak-agents/src/probe/run.rs    # the probe: kills what is left of its unreaped host's group before reaping it
+crates/envcloak-agents/src/probe/local.rs  # the probe daemon's stop: SIGTERM to its own unreaped child, only while has_exited says it is one
+crates/envcloak-sys/tests/child.rs         # the tests of signal_process and signal_group themselves
+crates/envcloak-sys/src/child.rs           # signal_process and signal_group themselves, and the test of their bounds

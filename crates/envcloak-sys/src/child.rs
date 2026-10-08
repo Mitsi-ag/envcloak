@@ -42,11 +42,8 @@ pub fn signal_process(pid: i32, sig: i32) -> io::Result<()> {
     if pid < 1 {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    // SAFETY: kill has no memory effects; `pid` names one process.
-    if unsafe { libc::kill(pid, sig) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    // `pid` names one process (D-34: the one kill call is owned.rs's).
+    crate::owned::kill_number(pid, sig)
 }
 
 /// Sends `sig` to every process in process group `pgid`.
@@ -59,11 +56,8 @@ pub fn signal_group(pgid: i32, sig: i32) -> io::Result<()> {
     if pgid < 2 {
         return Err(io::ErrorKind::InvalidInput.into());
     }
-    // SAFETY: kill has no memory effects; `-pgid` names one group.
-    if unsafe { libc::kill(-pgid, sig) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    // `-pgid` names one group (D-34: the one kill call is owned.rs's).
+    crate::owned::kill_number(-pgid, sig)
 }
 
 /// Whether a `waitid` record's `si_code` is an exit: the child exited
@@ -1394,8 +1388,11 @@ mod tests {
         let relay = SignalRelay::install(&[libc::SIGUSR2]).unwrap();
         std::thread::scope(|s| {
             let reader = s.spawn(|| relay.next().unwrap());
-            // SAFETY: kill to this process's own pid.
-            assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGUSR2) }, 0);
+            // To this process's own pid (D-34: the one kill call is owned.rs's).
+            assert_eq!(
+                crate::testing::kill_raw(i32::try_from(std::process::id()).unwrap(), libc::SIGUSR2),
+                0
+            );
             assert_eq!(reader.join().unwrap(), own(libc::SIGUSR2));
         });
     }
@@ -1536,6 +1533,7 @@ mod tests {
     /// Signals outside 1 to 126 are refused: 127 would read as the
     /// wake-up, and 128 on as a mark or a process's signal.
     #[test]
+    #[allow(clippy::disallowed_methods)] // The wrappers' own bounds.
     fn out_of_range_signals_and_pids_are_refused() {
         let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
         for sig in [0, 127, 128, 256, -1] {

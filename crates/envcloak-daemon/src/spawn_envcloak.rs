@@ -1,0 +1,754 @@
+//! The processes a managed server's values go to, which the daemon starts
+//! itself (SPEC §6.6; M2 plan D-36; task M2-27): EnvCloak's runner,
+//! `envcloak run --launch <id>`, for a stdio server, and its relay,
+//! `envcloak mcp-bridge --relay`, for a bridged HTTP server. No value goes
+//! back to the client that asked: it gets `started`, and the values go on
+//! a control channel only these children hold.
+//!
+//! **The anchor** ([`Anchor`]): the `envcloak` beside `envcloakd`, taken
+//! once, when the daemon starts. On Linux the daemon copies it into a
+//! sealed memory file ([`envcloak_sys::launch::SealedImage`]), hashes the
+//! sealed bytes, and starts every runner from that same copy
+//! (`execveat`): an `envcloak` rewritten or replaced since leaves the
+//! daemon starting the image it took, until it restarts. On macOS it
+//! records the file's code directory hash and starts each runner suspended,
+//! resuming it only when the kernel's view of the started process is the
+//! anchor's: its cdhash and signing identifier those of the file the daemon
+//! read at start, its Team ID `envcloakd`'s own (none for an ad hoc build,
+//! which the daemon knows only from its own signature, read: one it cannot
+//! read leaves no anchor); otherwise it kills it through its handle before
+//! it runs. One
+//! window is left there: a daemon killed outright (`SIGKILL`, a crash)
+//! between the suspended start and the resumption leaves the runner
+//! stopped, leading a session of its own, so no orphaned-group `SIGCONT`
+//! reaches it, and no one resumes or signals it; it holds the client's
+//! pipe ends and a control channel whose other end is gone, and no value
+//! (the values go only after the resumption). Its client, whose request
+//! the dead daemon never answered, sees its connection end and exits; the
+//! stopped runner stays until it is killed or the machine restarts. A
+//! timer of its own cannot run while it is suspended. Closing it is left
+//! to M2-25 (the hardening pass), recorded as an M2 residual: a durable
+//! record of suspended runner starts not yet resumed, which a restarted
+//! daemon ends through a fresh handle of its own (never by a number it
+//! read, D-34), tested by killing the daemon at `launch.anchor_resume`. An
+//! anchor that could not be taken, or a runner that could not be started
+//! from it, is `runner_unavailable`: nothing falls back to the file.
+//!
+//! **What a runner gets**: the client's pipe ends as its standard input,
+//! output and error (`/dev/null` for standard error when none was handed
+//! over), the control channel at
+//! [`envcloak_ipc::control::CONTROL_FD`], the lifeline at
+//! [`envcloak_ipc::control::LIFELINE_FD`], and for a launch the program to
+//! run ([`envcloak_ipc::control::IMAGE_FD`], Linux) and the checked working
+//! directory ([`envcloak_ipc::control::CWD_FD`]); every other descriptor is
+//! closed. Its environment is a fixed list read from the daemon's own
+//! (`HOME`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TZ`, `TMPDIR` and the
+//! `XDG_*` directories, so it finds the daemon's socket) and a fixed
+//! `PATH`; a test build adds its test hooks' variables. It leads a session
+//! of its own and is never given `PR_SET_PDEATHSIG`: it outlives a daemon
+//! restart (the systemd unit has `KillMode=process`; launchd's job cleanup
+//! does not reach a process that leads its own session, measured on macOS
+//! 26.4), and the new daemon holds no handle to it.
+
+use std::fs::File;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
+use std::time::Duration;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use envcloak_ipc::control::IMAGE_FD;
+use envcloak_ipc::control::{self, CONTROL_FD, CWD_FD, FromRunner, LIFELINE_FD, ToRunner};
+use envcloak_ipc::proto::{ErrorKind, FdRole};
+use envcloak_ipc::{Frame, RpcError};
+use envcloak_sys::OwnedChild;
+use envcloak_sys::fdpass::{Access, DescriptorKind, descriptor_kind};
+use envcloak_sys::launch::{Program, Session, Spawn, spawn};
+
+use crate::launch_check::{CheckedExec, CheckedLaunch, ExpectedCode};
+
+/// The most descriptors one request may hand over.
+pub(crate) const MAX_REQUEST_FDS: usize = 4;
+
+/// How long the daemon waits for a runner's `ConfirmSpawn` (macOS).
+const CONFIRM_WAIT: Duration = Duration::from_secs(10);
+
+/// The `PATH` a runner gets. It never looks a program up: the server's
+/// `PATH` is the record's.
+const RUNNER_PATH: &[u8] = b"/usr/bin:/bin";
+
+/// Why there is no anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnchorError {
+    /// No `envcloak` beside `envcloakd`, or not a regular file.
+    NotFound,
+    /// Linux: the sealed copy could not be made (an executable memory file
+    /// refused by the system's policy) or checked.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+    Copy,
+    /// macOS: the file has no code directory the kernel would check, or
+    /// none with a signing identifier.
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
+    Unsigned,
+    /// macOS: the daemon's own signature could not be read, or the
+    /// anchor's Team ID is not the daemon's.
+    #[cfg_attr(any(target_os = "linux", target_os = "android"), allow(dead_code))]
+    Identity,
+}
+
+impl AnchorError {
+    fn word(self) -> &'static str {
+        match self {
+            AnchorError::NotFound => "not_found",
+            AnchorError::Copy => "copy_refused",
+            AnchorError::Unsigned => "unsigned",
+            AnchorError::Identity => "identity_unread",
+        }
+    }
+}
+
+/// The image a runner is started from (see the module documentation).
+#[derive(Debug)]
+pub(crate) struct Anchor(Result<Image, AnchorError>);
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Debug)]
+struct Image {
+    sealed: envcloak_sys::launch::SealedImage,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[derive(Debug)]
+struct Image {
+    path: PathBuf,
+    /// What a started runner must show the kernel: the anchor file's
+    /// cdhash and signing identifier, read when the daemon started, and
+    /// `envcloakd`'s own Team ID (`None` only for a daemon whose own
+    /// signature the kernel reported as ad hoc or platform signed).
+    expected: ExpectedCode,
+}
+
+impl Anchor {
+    /// The anchor, taken now (at daemon start). A failure is kept and
+    /// logged: managed requests are then answered `runner_unavailable`.
+    pub(crate) fn at_start() -> Anchor {
+        let a = Anchor(take());
+        match &a.0 {
+            Ok(_) => {}
+            Err(e) => log_line!(
+                "envcloakd: warning: managed servers cannot be started ({}): the envcloak beside \
+                 envcloakd could not be taken as the runner's image",
+                e.word()
+            ),
+        }
+        a
+    }
+
+    /// An anchor that is not there, for tests.
+    #[cfg(test)]
+    pub(crate) fn unavailable() -> Anchor {
+        Anchor(Err(AnchorError::NotFound))
+    }
+}
+
+/// The `envcloak` beside this daemon, canonical.
+fn beside() -> Result<PathBuf, AnchorError> {
+    let me = std::env::current_exe().map_err(|_| AnchorError::NotFound)?;
+    let dir = me.parent().ok_or(AnchorError::NotFound)?;
+    std::fs::canonicalize(dir.join("envcloak")).map_err(|_| AnchorError::NotFound)
+}
+
+fn open_regular(path: &std::path::Path) -> Result<File, AnchorError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|_| AnchorError::NotFound)?;
+    if !f.metadata().is_ok_and(|m| m.is_file()) {
+        return Err(AnchorError::NotFound);
+    }
+    Ok(f)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn take() -> Result<Image, AnchorError> {
+    let file = open_regular(&beside()?)?;
+    envcloak_sys::fail_point("launch.anchor").map_err(|_| AnchorError::Copy)?;
+    let sealed = envcloak_sys::launch::SealedImage::copy_from(
+        file.as_fd(),
+        envcloak_sys::codesign::MAX_EXECUTABLE,
+    )
+    .map_err(|_| AnchorError::Copy)?;
+    // The sealed bytes, hashed once sealed: what every runner runs.
+    let digest = crate::launch_check::sha256_of_image(&sealed).map_err(|_| AnchorError::Copy)?;
+    if envcloak_sys::test_trace() {
+        log_line!(
+            "envcloakd: test: anchor sha256 {}",
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+    }
+    Ok(Image { sealed })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn take() -> Result<Image, AnchorError> {
+    let path = beside()?;
+    let file = open_regular(&path)?;
+    let cd = envcloak_sys::codesign::code_directory(&file)
+        .map_err(|_| AnchorError::Unsigned)?
+        .ok_or(AnchorError::Unsigned)?;
+    let cdhash = crate::launch_check::cdhash_of(&cd).ok_or(AnchorError::Unsigned)?;
+    let identifier = cd.identifier.clone().ok_or(AnchorError::Unsigned)?;
+    // The daemon's own signature, as the kernel validated it: read, or no
+    // anchor. A daemon that cannot say what signed it cannot tell an ad
+    // hoc build (no Team ID) from a Developer ID one, and never treats a
+    // failed read as the former.
+    let me = i32::try_from(std::process::id()).map_err(|_| AnchorError::NotFound)?;
+    envcloak_sys::fail_point("launch.own_signature").map_err(|_| AnchorError::Identity)?;
+    let own = envcloak_sys::proc_info(me)
+        .ok()
+        .and_then(|p| p.exe)
+        .and_then(|e| e.signature)
+        .ok_or(AnchorError::Identity)?;
+    // The anchor file must be signed by the daemon's own team (both ad
+    // hoc, or both the same Developer ID team).
+    if cd.team != own.team_id {
+        return Err(AnchorError::Identity);
+    }
+    Ok(Image {
+        path,
+        expected: ExpectedCode {
+            cdhash,
+            identifier: Some(identifier),
+            team: own.team_id,
+        },
+    })
+}
+
+/// The pipe ends a managed request handed over, checked: each role once,
+/// in the order the request names them ([`FdRole::well_formed`]), standard
+/// input readable, standard output and error writable, each a pipe or a
+/// byte-stream socket. The lifeline is a read-only pipe: closing the
+/// client's write end must deliver EOF to the runner.
+#[derive(Debug)]
+pub(crate) struct ClientEnds {
+    stdin: OwnedFd,
+    stdout: OwnedFd,
+    stderr: Option<OwnedFd>,
+    lifeline: OwnedFd,
+}
+
+impl ClientEnds {
+    /// The ends `fds`, whose roles `roles` names, for a launch (`launch`)
+    /// or a bridge.
+    ///
+    /// # Errors
+    /// `invalid_params` (`invalid_descriptors`) for anything else; the
+    /// descriptors are closed.
+    pub(crate) fn from_request(
+        fds: Vec<OwnedFd>,
+        roles: &[FdRole],
+        launch: bool,
+    ) -> Result<ClientEnds, RpcError> {
+        let bad = || RpcError::new(ErrorKind::InvalidParams);
+        if fds.len() != roles.len() || !FdRole::well_formed(roles, launch) {
+            return Err(bad());
+        }
+        let readable = |a: Access| matches!(a, Access::Read | Access::ReadWrite);
+        let writable = |a: Access| matches!(a, Access::Write | Access::ReadWrite);
+        let mut stdin = None;
+        let mut stdout = None;
+        let mut stderr = None;
+        let mut lifeline = None;
+        for (fd, role) in fds.into_iter().zip(roles) {
+            let (kind, access) = descriptor_kind(fd.as_fd()).map_err(|_| bad())?;
+            if kind == DescriptorKind::Other {
+                return Err(bad());
+            }
+            let fits = match role {
+                FdRole::Stdin => readable(access),
+                FdRole::Lifeline => kind == DescriptorKind::Pipe && access == Access::Read,
+                FdRole::Stdout | FdRole::Stderr => writable(access),
+            };
+            if !fits {
+                return Err(bad());
+            }
+            match role {
+                FdRole::Stdin => stdin = Some(fd),
+                FdRole::Stdout => stdout = Some(fd),
+                FdRole::Stderr => stderr = Some(fd),
+                FdRole::Lifeline => lifeline = Some(fd),
+            }
+        }
+        Ok(ClientEnds {
+            stdin: stdin.ok_or_else(bad)?,
+            stdout: stdout.ok_or_else(bad)?,
+            stderr,
+            lifeline: lifeline.ok_or_else(bad)?,
+        })
+    }
+}
+
+/// What the daemon starts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Role<'a> {
+    /// `envcloak run --launch <id>`, with the checked launch.
+    Runner {
+        launch: &'a str,
+        checked: &'a CheckedLaunch,
+    },
+    /// `envcloak mcp-bridge --relay`.
+    Relay,
+}
+
+/// The runner's environment, each `NAME=value`: see the module
+/// documentation.
+fn runner_env() -> Vec<Vec<u8>> {
+    let keep = |name: &[u8]| {
+        matches!(
+            name,
+            b"HOME" | b"USER" | b"LOGNAME" | b"LANG" | b"TZ" | b"TMPDIR"
+        ) || name.starts_with(b"LC_")
+            || name.starts_with(b"XDG_")
+    };
+    let pair = |k: &[u8], v: &[u8]| [k, b"=", v].concat();
+    let mut env: Vec<Vec<u8>> = std::env::vars_os()
+        .filter(|(k, _)| keep(k.as_bytes()))
+        .map(|(k, v)| pair(k.as_bytes(), v.as_bytes()))
+        .collect();
+    env.push(pair(b"PATH", RUNNER_PATH));
+    env.extend(
+        envcloak_sys::test_hook_vars()
+            .into_iter()
+            .map(|(k, v)| pair(k.as_bytes(), v.as_bytes())),
+    );
+    env
+}
+
+/// A runner or relay the daemon started, holding nothing yet: the values
+/// go on its control channel ([`Started::release`]).
+#[derive(Debug)]
+pub(crate) struct Started {
+    child: OwnedChild,
+    control: UnixStream,
+    /// macOS: the code directory hash the server the runner starts
+    /// suspended must have, before it may run.
+    confirm: Option<ExpectedCode>,
+}
+
+/// Starts the runner or relay `role` from `anchor` on `ends`.
+///
+/// # Errors
+/// `runner_unavailable`: no anchor, or the start failed (or, on macOS, the
+/// started process was not the anchor's image, and was killed before it
+/// ran).
+pub(crate) fn start(
+    anchor: &Anchor,
+    role: Role<'_>,
+    ends: &ClientEnds,
+) -> Result<Started, RpcError> {
+    let unavailable = || RpcError::new(ErrorKind::RunnerUnavailable);
+    let image = anchor.0.as_ref().map_err(|_| unavailable())?;
+    envcloak_sys::fail_point("launch.runner").map_err(|_| unavailable())?;
+    let (ours, theirs) = UnixStream::pair().map_err(|_| unavailable())?;
+    let devnull;
+    let stderr: BorrowedFd<'_> = match &ends.stderr {
+        Some(e) => e.as_fd(),
+        None => {
+            devnull = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/null")
+                .map_err(|_| unavailable())?;
+            devnull.as_fd()
+        }
+    };
+    let mut fds: Vec<(BorrowedFd<'_>, i32)> = vec![
+        (ends.stdin.as_fd(), 0),
+        (ends.stdout.as_fd(), 1),
+        (stderr, 2),
+        (theirs.as_fd(), CONTROL_FD),
+        (ends.lifeline.as_fd(), LIFELINE_FD),
+    ];
+    let mut confirm = None;
+    let argv: Vec<&[u8]> = match role {
+        Role::Runner { launch, checked } => {
+            match &checked.exec {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                CheckedExec::Image(i) => fds.push((i.as_fd(), IMAGE_FD)),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                CheckedExec::Descriptor { file, .. } => fds.push((file.as_fd(), IMAGE_FD)),
+                CheckedExec::Path { confirm: c, .. } => confirm.clone_from(c),
+            }
+            fds.push((checked.cwd.as_fd(), CWD_FD));
+            vec![b"envcloak", b"run", b"--launch", launch.as_bytes()]
+        }
+        Role::Relay => vec![b"envcloak", b"mcp-bridge", b"--relay"],
+    };
+    let env = runner_env();
+    let env: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    let child = spawn_anchor(image, &argv, &env, &fds).map_err(|()| unavailable())?;
+    drop(theirs);
+    Ok(Started {
+        child,
+        control: ours,
+        confirm,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn spawn_anchor(
+    image: &Image,
+    argv: &[&[u8]],
+    env: &[&[u8]],
+    fds: &[(BorrowedFd<'_>, i32)],
+) -> Result<OwnedChild, ()> {
+    spawn(&Spawn {
+        program: Program::Descriptor(image.sealed.as_fd()),
+        argv,
+        env,
+        fds,
+        cwd: None,
+        session: Session::New,
+        suspended: false,
+    })
+    .map_err(|_| ())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn spawn_anchor(
+    image: &Image,
+    argv: &[&[u8]],
+    env: &[&[u8]],
+    fds: &[(BorrowedFd<'_>, i32)],
+) -> Result<OwnedChild, ()> {
+    let child = spawn(&Spawn {
+        program: Program::Path(image.path.as_os_str().as_bytes()),
+        argv,
+        env,
+        fds,
+        cwd: None,
+        session: Session::New,
+        suspended: true,
+    })
+    .map_err(|_| ())?;
+    // The started process must be the anchor's image before any of it
+    // runs: the kernel's cdhash, read while it is suspended. Every way out
+    // but the resumed runner kills it through its handle first: nothing
+    // stays suspended, or unreaped, behind a refusal.
+    let Ok(pid) = i32::try_from(child.id()) else {
+        let _ = child.kill_and_reap();
+        return Err(());
+    };
+    let sig = envcloak_sys::proc_info(pid)
+        .ok()
+        .and_then(|p| p.exe)
+        .and_then(|e| e.signature);
+    let same = sig.as_ref().is_some_and(|s| image.expected.matches(s));
+    if !same {
+        let _ = child.kill_and_reap();
+        return Err(());
+    }
+    // A test makes the resumption fail here.
+    let resumed = envcloak_sys::fail_point("launch.anchor_resume").and_then(|()| child.resume());
+    if resumed.is_err() {
+        let _ = child.kill_and_reap();
+        return Err(());
+    }
+    Ok(child)
+}
+
+impl Started {
+    /// Sends the values (`release`, a framed [`ToRunner::Release`]) and,
+    /// on macOS, answers the runner's `ConfirmSpawn`: `Confirmed` only for
+    /// a child of this runner whose kernel cdhash is the record's. Then
+    /// hands the runner to a thread that reaps it when it exits.
+    ///
+    /// # Errors
+    /// `runner_unavailable` when the values could not be sent;
+    /// `managed_launch_changed` when the started server was not the
+    /// registered image (the runner kills it before it runs).
+    pub(crate) fn release(self, release: &Frame) -> Result<(), RpcError> {
+        let Started {
+            child,
+            control,
+            confirm,
+        } = self;
+        let mut w = &control;
+        // A test makes the write fail, as a runner gone before its values.
+        let lost = envcloak_sys::fail_point("launch.release_write").is_err();
+        if lost || release.write_to(&mut w).is_err() {
+            retire_failed_runner(control, child);
+            return Err(RpcError::new(ErrorKind::RunnerUnavailable));
+        }
+        let outcome = match confirm {
+            None => Ok(()),
+            Some(expected) => confirm_spawn(&control, &child, &expected),
+        };
+        if outcome.is_err() {
+            // Once release starts, the runner may own a suspended server
+            // in another group. Keep its cleanup owner until it exits.
+            // Killing the runner loses the only handle allowed to stop
+            // that server.
+            retire_failed_runner(control, child);
+        } else {
+            drop(control);
+            reap_later(child);
+        }
+        outcome
+    }
+
+    /// Kills the runner, which received nothing.
+    pub(crate) fn abandon(self) {
+        let _ = self.child.kill_and_reap();
+    }
+}
+
+/// Closes a failed release and waits for the runner to clean up its own
+/// server and exit, retaining the handle on a reaper thread if it is
+/// slow. No force-kill is safe after release: the server leads another
+/// group, and only the runner owns its unreaped handle.
+fn retire_failed_runner(control: UnixStream, child: OwnedChild) {
+    if let Some(child) = finish_failed_runner(control, child, Duration::from_secs(1)) {
+        // The private runner can be blocked writing its diagnostic to a
+        // client-held pipe. Keep its handle until it exits; never kill
+        // the process that may still be cleaning up its own child.
+        reap_later(child);
+    }
+}
+
+fn finish_failed_runner<O: envcloak_sys::owned::ProcessOps>(
+    control: UnixStream,
+    child: OwnedChild<O>,
+    grace: Duration,
+) -> Option<OwnedChild<O>> {
+    let _ = control.shutdown(std::net::Shutdown::Both);
+    drop(control);
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if child.has_exited().is_ok_and(|exited| exited) {
+            let _ = child.reap();
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(child);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits for the runner's `ConfirmSpawn` and answers it (macOS).
+fn confirm_spawn(
+    control: &UnixStream,
+    runner: &OwnedChild,
+    expected: &ExpectedCode,
+) -> Result<(), RpcError> {
+    let changed = || RpcError::new(ErrorKind::ManagedLaunchChanged);
+    let _ = control.set_read_timeout(Some(CONFIRM_WAIT));
+    let Ok(FromRunner::ConfirmSpawn(pid)) = control::receive::<FromRunner>(control) else {
+        return Err(RpcError::new(ErrorKind::RunnerUnavailable));
+    };
+    // A test stops here, with the server started and not yet answered: it
+    // must have run nothing.
+    envcloak_sys::pause_point("launch.confirm");
+    // Faults after a real suspended spawn. The timeout waits on the real
+    // channel while the runner waits for its answer; the loss closes it.
+    if envcloak_sys::fail_point("launch.confirm_timeout").is_err() {
+        let _ = control::receive::<FromRunner>(control);
+        return Err(RpcError::new(ErrorKind::RunnerUnavailable));
+    }
+    if envcloak_sys::fail_point("launch.confirm_channel_loss").is_err() {
+        let _ = control.shutdown(std::net::Shutdown::Both);
+    }
+    let ok = i32::try_from(pid)
+        .ok()
+        .and_then(|pid| envcloak_sys::proc_info(pid).ok())
+        .is_some_and(|p| {
+            u32::try_from(p.ppid).is_ok_and(|ppid| ppid == runner.id())
+                && p.exe
+                    .and_then(|e| e.signature)
+                    .is_some_and(|s| expected.matches(&s))
+        });
+    let answer = if ok {
+        ToRunner::Confirmed
+    } else {
+        ToRunner::Refused
+    };
+    if control::send(control, &answer).is_err() {
+        return Err(RpcError::new(ErrorKind::RunnerUnavailable));
+    }
+    if ok { Ok(()) } else { Err(changed()) }
+}
+
+/// Reaps `child` on a thread of its own once it exits. The thread holds the
+/// only handle; nothing signals the runner after this.
+fn reap_later(child: OwnedChild) {
+    let _ = std::thread::Builder::new()
+        .name("runner".into())
+        .spawn(move || {
+            let _ = child.reap();
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mutation: kill the runner before its owned server cleanup completes.
+    #[test]
+    fn failed_release_waits_for_runner_cleanup_without_signalling() {
+        use envcloak_sys::owned::{Recorded, RecordingProcesses};
+        let model = RecordingProcesses::new();
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        model.exit(71);
+        assert!(finish_failed_runner(control, model.child(71), Duration::ZERO).is_none());
+        assert_eq!(
+            model.calls(),
+            vec![Recorded::HasExited(71), Recorded::Reap(71)]
+        );
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+    }
+
+    /// Mutation: reap or kill a runner whose cleanup has not finished.
+    #[test]
+    fn failed_release_keeps_a_slow_cleanup_owner() {
+        use envcloak_sys::owned::{Recorded, RecordingProcesses};
+        let model = RecordingProcesses::new();
+        let (control, mut peer) = UnixStream::pair().unwrap();
+        let retained = finish_failed_runner(control, model.child(72), Duration::ZERO);
+        assert!(retained.is_some(), "the cleanup owner must remain owned");
+        assert_eq!(model.calls(), vec![Recorded::HasExited(72)]);
+        let mut byte = [0];
+        assert_eq!(std::io::Read::read(&mut peer, &mut byte).unwrap(), 0);
+        model.exit(72);
+        retained.unwrap().reap().unwrap();
+        assert_eq!(
+            model.calls(),
+            vec![Recorded::HasExited(72), Recorded::Reap(72)]
+        );
+    }
+
+    fn pipe() -> (OwnedFd, OwnedFd) {
+        envcloak_sys::pipe_cloexec().unwrap()
+    }
+
+    /// The descriptors a request hands over are checked for their roles:
+    /// a write end where a read end belongs, a regular file, a missing
+    /// lifeline, too many or too few, and standard error for a bridge are
+    /// refused; the right ones are taken.
+    #[test]
+    fn handed_over_descriptors_are_checked() {
+        let roles = [FdRole::Stdin, FdRole::Stdout, FdRole::Lifeline];
+        let ok = || {
+            let (sr, _sw) = pipe();
+            let (_or, ow) = pipe();
+            let (lr, _lw) = pipe();
+            vec![sr, ow, lr]
+        };
+        assert!(ClientEnds::from_request(ok(), &roles, true).is_ok());
+        assert!(ClientEnds::from_request(ok(), &roles, false).is_ok());
+        // Standard input given as a write end.
+        let (_sr, sw) = pipe();
+        let (_or, ow) = pipe();
+        let (lr, _lw) = pipe();
+        assert!(ClientEnds::from_request(vec![sw, ow, lr], &roles, true).is_err());
+        // A regular file.
+        let f = OwnedFd::from(tempfile::tempfile().unwrap());
+        let (_or, ow) = pipe();
+        let (lr, _lw) = pipe();
+        assert!(ClientEnds::from_request(vec![f, ow, lr], &roles, true).is_err());
+        // Counts that do not match the roles.
+        let mut v = ok();
+        v.pop();
+        assert!(ClientEnds::from_request(v, &roles, true).is_err());
+        // Standard error for a bridge.
+        let four = [
+            FdRole::Stdin,
+            FdRole::Stdout,
+            FdRole::Stderr,
+            FdRole::Lifeline,
+        ];
+        let mk = || {
+            let (sr, _sw) = pipe();
+            let (_or, ow) = pipe();
+            let (_er, ew) = pipe();
+            let (lr, _lw) = pipe();
+            vec![sr, ow, ew, lr]
+        };
+        assert!(ClientEnds::from_request(mk(), &four, true).is_ok());
+        assert!(ClientEnds::from_request(mk(), &four, false).is_err());
+    }
+
+    /// Datagram peers do not promise EOF on close (notably on Linux).
+    /// Every stream role is checked, and the lifeline must be a read-only
+    /// pipe even when a stream socket would otherwise be supported.
+    #[test]
+    fn managed_descriptors_require_streams_and_a_read_only_pipe_lifeline() {
+        use std::os::unix::net::UnixDatagram;
+
+        for launch in [false, true] {
+            let mut roles = vec![FdRole::Stdin, FdRole::Stdout];
+            if launch {
+                roles.push(FdRole::Stderr);
+            }
+            roles.push(FdRole::Lifeline);
+            let ends = || {
+                roles
+                    .iter()
+                    .map(|role| {
+                        let (r, w) = pipe();
+                        if matches!(role, FdRole::Stdin | FdRole::Lifeline) {
+                            r
+                        } else {
+                            w
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert!(ClientEnds::from_request(ends(), &roles, launch).is_ok());
+            for (i, role) in roles.iter().enumerate() {
+                let (socket, _peer) = UnixDatagram::pair().unwrap();
+                let mut fds = ends();
+                fds[i] = socket.into();
+                assert!(
+                    ClientEnds::from_request(fds, &roles, launch).is_err(),
+                    "datagram {role:?}"
+                );
+
+                let (socket, _peer) = UnixStream::pair().unwrap();
+                let mut fds = ends();
+                fds[i] = socket.into();
+                assert_eq!(
+                    ClientEnds::from_request(fds, &roles, launch).is_ok(),
+                    *role != FdRole::Lifeline,
+                    "stream {role:?}"
+                );
+            }
+            let mut fds = ends();
+            let (_r, w) = pipe();
+            *fds.last_mut().unwrap() = w;
+            assert!(ClientEnds::from_request(fds, &roles, launch).is_err());
+        }
+    }
+
+    /// No anchor, no runner: `runner_unavailable`, and nothing is started.
+    #[test]
+    fn no_anchor_is_runner_unavailable() {
+        let (sr, _sw) = pipe();
+        let (_or, ow) = pipe();
+        let (lr, _lw) = pipe();
+        let ends = ClientEnds::from_request(
+            vec![sr, ow, lr],
+            &[FdRole::Stdin, FdRole::Stdout, FdRole::Lifeline],
+            false,
+        )
+        .unwrap();
+        let e = start(&Anchor::unavailable(), Role::Relay, &ends).unwrap_err();
+        assert_eq!(e.kind, ErrorKind::RunnerUnavailable);
+    }
+}

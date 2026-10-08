@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Proves that clippy.toml's disallowed-methods entry catches secret exposure
-# in workspace crates: runs clippy on security/lint-canary, a workspace
-# member that inherits the workspace lint levels and opens secrets in every
-# way it can, and checks that each call site marked EXPECT-DISALLOWED is
-# reported. A wrong path in clippy.toml, a workspace lint table that turns
+# Proves that clippy.toml's disallowed-methods entries catch secret exposure,
+# and signals sent by number (M2 plan D-34), in workspace crates: runs
+# clippy on security/lint-canary, a workspace member that inherits the
+# workspace lint levels, opens secrets in every way it can and names
+# libc::kill and libc::killpg, and checks that each call site marked
+# EXPECT-DISALLOWED is reported. A wrong path in clippy.toml, a workspace lint table that turns
 # the lint off, or a clippy change in how trait methods are matched makes
 # this fail instead of silently allowing every call.
 set -euo pipefail

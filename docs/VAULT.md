@@ -385,7 +385,7 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 26 | `restore_v2` | M2-05 | landed | a restore lease opened, before the first chunk |
 | 27 | `agents_config` | M2-08 | reserved | an agent config EnvCloak changed, with its backup |
 | 28 | `migrate_mcp` | M2-20 | reserved | a `migrate-mcp` run and what it rewrote |
-| 29 | `managed_register` | M2-27 | reserved | a managed server registered, updated (a new revision) or removed |
+| 29 | `managed_register` | M2-27 | landed | a managed server registered, updated (a new revision) or removed |
 | 30 | `reclassify` | M2-13 | landed | an item's classification set by hand: outcome `reclassified`, or `unchanged` when the item had it already, reason `<from>_to_<to>`, and the grants it ended |
 | 31 | `live_refused` | M2-13 | landed | an approval refused for an unticked live binding, with the items left unticked; with a passphrase or without one (`envcloak approve`'s check) |
 | 32 | `standing_create` | M2-15 | reserved | a standing approval created |
@@ -399,7 +399,7 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 40 | `signin_outcome` | M2b-09 | reserved | after an attempt, with its result class |
 | 41 | `signin_publish` | M2b-05 | reserved | the publication decision for an operation |
 | 42 | `signin_end` | M2b-05 | reserved | an operation cancelled or its session ended |
-| 43 | `managed_launch` | M2-27 | reserved | a managed launch check that refused, with the old and new identity metadata |
+| 43 | `managed_launch` | M2-27 | landed | a managed launch check that refused, with the old and new identity metadata |
 | 44 | `standing_confirm` | M2-15 | reserved | `envcloak standing confirm`, with a proof |
 | 45 | `signin_cleanup` | M2b-09 | reserved | a worker teardown confirmed, left unconfirmed, or cleared by a reboot |
 <!-- /reservations -->

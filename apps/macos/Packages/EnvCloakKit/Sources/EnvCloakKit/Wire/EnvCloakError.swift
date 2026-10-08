@@ -67,6 +67,10 @@ public enum ErrorKind: String, CaseIterable, Sendable {
     case backupFrozen = "backup_frozen"
     case loginReference = "login_reference"
     case liveNotTicked = "live_not_ticked"
+    case managedCommandMismatch = "managed_command_mismatch"
+    case managedLaunchChanged = "managed_launch_changed"
+    case codeSelectingEnv = "code_selecting_env"
+    case runnerUnavailable = "runner_unavailable"
     case `internal` = "internal"
 
     public var code: Int64 {
@@ -116,6 +120,10 @@ public enum ErrorKind: String, CaseIterable, Sendable {
         case .backupFrozen: -32050
         case .loginReference: -32037
         case .liveNotTicked: -32038
+        case .managedCommandMismatch: -32039
+        case .managedLaunchChanged: -32040
+        case .codeSelectingEnv: -32041
+        case .runnerUnavailable: -32042
         case .internal: -32099
         }
     }
@@ -191,4 +199,11 @@ public enum Reason: String, CaseIterable, Sendable {
     case created_by_agent
     case substituted
     case limited
+    case code_selecting_variable
+    case interpreter_option
+    case wrapper_program
+    case disguised_launcher
+    case key_shaped
+    case invalid_header
+    case header_bindings
 }

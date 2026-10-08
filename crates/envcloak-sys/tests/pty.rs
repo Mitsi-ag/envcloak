@@ -181,8 +181,11 @@ fn guarded() {
                 guard.restore()?;
                 // The relay's drop gives SIGTSTP its default action back.
                 drop(relay);
-                // SAFETY: SIGTSTP to this process itself.
-                unsafe { libc::kill(libc::getpid(), libc::SIGTSTP) };
+                // SIGTSTP to this process itself.
+                envcloak_sys::testing::kill_raw(
+                    i32::try_from(std::process::id()).unwrap(),
+                    libc::SIGTSTP,
+                );
                 if scenario == "refresh" {
                     guard.refresh()?;
                 }
@@ -354,9 +357,9 @@ fn restored_after(
     let stty_before = stty_g(slave.as_fd());
     let (child, screen) = start_guarded(scenario, master, &slave);
     leave_unread(&screen, &slave);
-    // SAFETY: kill on this process's own, unreaped child.
+    // kill on this process's own, unreaped child.
     assert_eq!(
-        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), sig) },
+        envcloak_sys::testing::kill_raw(i32::try_from(child.id()).unwrap(), sig),
         0
     );
     assert_restored(child, &slave, &before, &stty_before, how, what);
@@ -408,21 +411,21 @@ fn restored_while_stopped_and_raw_again_after_sigcont() {
     let (child, mut screen) = start_guarded("stop", master, &slave);
     let pid = i32::try_from(child.id()).unwrap();
     leave_unread(&screen, &slave);
-    // SAFETY: kill on this process's own, unreaped child.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTSTP) }, 0);
+    // kill on this process's own, unreaped child.
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGTSTP), 0);
     assert_eq!(
         wait_child(pid, libc::WSTOPPED),
         Some((libc::CLD_STOPPED, libc::SIGTSTP)),
         "the program did not stop"
     );
     assert_as_before(&slave, &before, &stty_before, "stopped");
-    // SAFETY: as above.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    // as above.
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGCONT), 0);
     screen.expect("RAW-AGAIN\n", 1, "continued");
     assert!(TerminalSettings::read(slave.as_fd()).unwrap().is_raw());
     leave_unread(&screen, &slave);
-    // SAFETY: as above.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+    // as above.
+    assert_eq!(envcloak_sys::testing::kill_raw(pid, libc::SIGUSR1), 0);
     assert_restored(
         child,
         &slave,
@@ -533,9 +536,9 @@ fn raw_mode_is_refused_after_the_final_restore() {
     let (master, slave, before) = outer();
     let stty_before = stty_g(slave.as_fd());
     let (child, mut screen) = start_guarded("final", master, &slave);
-    // SAFETY: kill on this process's own, unreaped child.
+    // kill on this process's own, unreaped child.
     assert_eq!(
-        unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGUSR1) },
+        envcloak_sys::testing::kill_raw(i32::try_from(child.id()).unwrap(), libc::SIGUSR1),
         0
     );
     screen.expect("RAW-AFTER=", 1, "the program reports");

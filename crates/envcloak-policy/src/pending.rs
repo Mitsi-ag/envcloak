@@ -428,5 +428,18 @@ fn describe(
         proposals: Vec::new(),
         mode: r.mode,
         argv: r.argv_display.clone(),
+        managed: r
+            .managed
+            .as_ref()
+            .map(|m| crate::statement::ManagedSummary {
+                name: m.name.clone(),
+                written_by_migrate_mcp: m.written_by_migrate_mcp
+                    && m.registered_by == SubjectKind::Terminal,
+                launch: m.launch.map(|l| crate::ids::encode(&l.launch_id, 26)),
+                revision: m.launch.map(|l| l.revision),
+                class: m.class.map(str::to_owned),
+                strength: m.strength.map(str::to_owned),
+                origin: m.origin.clone(),
+            }),
     }
 }

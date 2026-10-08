@@ -53,6 +53,12 @@
 //!   [`hung_up`] (a pipe no process can write to any more), and
 //!   [`Interrupter`] (a thread blocked writing to an output nobody reads,
 //!   broken out of the write once the runner gives up on it).
+//! - Managed launches (M2 task M2-27): [`launch`] (the processes a value
+//!   goes into, each started as an [`OwnedChild`]: on Linux from a sealed
+//!   in-memory copy of the checked executable, on macOS suspended until
+//!   its code directory hash is checked), [`codesign`] (an executable's
+//!   format, a Mach-O file's code directory, an ELF file's `$ORIGIN`) and
+//!   [`fdpass`] (descriptors handed over a Unix socket, `SCM_RIGHTS`).
 //! - PTY mode (`envcloak run --pty`, M2): [`pty`] (the PTY, its monitor
 //!   session, the control channel and signal forwarding),
 //!   [`TerminalGuard`] (the outer terminal in raw mode, restored on every
@@ -79,13 +85,16 @@
 mod alloc;
 mod child;
 mod clock;
+pub mod codesign;
 mod dir;
 mod fd;
+pub mod fdpass;
 mod fs;
 mod fsclock;
 mod harden;
 mod interrupt;
 mod inuse;
+pub mod launch;
 mod lockfile;
 pub mod owned;
 mod panic;
@@ -127,10 +136,10 @@ pub use harden::{
 pub use interrupt::Interrupter;
 pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
-pub use owned::OwnedChild;
+pub use owned::{OwnedChild, ProcessOps, SystemProcesses};
 pub use panic::{
     fail_point, idle_connection_override, install as install_panic_hook, panic_point,
-    panic_with_input, pause_point, test_event, test_trace,
+    panic_with_input, pause_point, test_event, test_hook_vars, test_trace,
 };
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, boot_id, parse_boot_id, parse_stat_start_time,

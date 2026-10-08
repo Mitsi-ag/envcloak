@@ -231,6 +231,9 @@ jobs:
             # The fixture story and gate 12's release run are in
             # envcloak-e2e; they run on main, nightly and on demand.
             cargo test --workspace --locked --no-fail-fast --exclude envcloak-e2e
+            # Gate 39 is end to end: the managed-server tests (M2 task
+            # M2-27) run on pull requests too.
+            cargo test --locked -p envcloak-e2e --no-fail-fast --test managed_launch --test managed_runner
           fi
       # M2-19's job-control gate through the whole of `envcloak run --pty`
       # (crates/envcloak-e2e/tests/pty_job_control.rs) on pull requests
@@ -243,6 +246,33 @@ jobs:
           RUST_LOG: trace
           RUST_BACKTRACE: full
         run: cargo test --locked -p envcloak-e2e --test pty_job_control --no-fail-fast
+
+  managed-oracles:
+    name: managed runtime oracles (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'pull_request' && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "macos-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: managed-oracles
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26.7.0"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/managed-oracles
+          key: managed-oracles-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/provision-managed-oracles.py') }}
+      - name: Build pinned PHP, debug CPython, npm, LuaJIT and Ruby oracles; fetch Deno
+        run: python3 -B scripts/provision-managed-oracles.py "$RUNNER_TEMP/managed-oracles"
+      - name: Require every runtime oracle and its execution controls
+        run: |
+          python3 -B scripts/test-managed-oracles.py
+          scripts/check-managed-oracles.sh
 
   # The shipped binaries as `cargo build --release` makes them: panic =
   # "abort" and no core file (gate 19), no test hook, a truthful `status`,
@@ -277,6 +307,25 @@ jobs:
           sudo sysctl -w kern.coredump=1
           sudo sysctl -w kern.corefile=/cores/core.%P
           echo "ENVCLOAK_TEST_CORE_DIR=/cores" >> "$GITHUB_ENV"
+      # The service manager's restart (crates/envcloak-e2e/tests/
+      # managed_runner.rs) runs on the shipped binaries too: a systemd user
+      # manager on Linux, launchd on macOS. The test fails on Actions
+      # without it.
+      - name: Start a systemd user manager (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          uid="$(id -u)"
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 1 100); do
+            [ -S "/run/user/$uid/bus" ] && break
+            sleep 0.1
+          done
+          XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show-environment >/dev/null
+          echo "ENVCLOAK_TEST_SERVICE_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
+          echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
+      - name: Allow the launchd test (macOS)
+        if: runner.os == 'macOS'
+        run: echo "ENVCLOAK_TEST_SERVICE_MANAGER=1" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

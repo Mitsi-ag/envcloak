@@ -309,6 +309,9 @@ fn parse(args: &[&str]) -> Result<RunArgs, ParseError> {
                     .ok_or("--status-fd needs a descriptor number of 3 or more")?;
                 a.status_fd = Some(n);
             }
+            Some(&"--launch") => {
+                return Err("--launch takes nothing else: envcloak run --launch <id>".into());
+            }
             Some(&"--pty") => {
                 if a.pty {
                     return Err("--pty is given twice".into());
@@ -332,6 +335,10 @@ pub fn run(args: &[&str]) -> ExitCode {
     if args == ["--help"] || args == ["-h"] {
         println!("usage: {USAGE_TEXT}\n\n{PTY_HELP}");
         return ExitCode::SUCCESS;
+    }
+    // The runner the daemon starts for a managed server (M2 task M2-27).
+    if let ["--launch", launch] = args {
+        return run_launch(launch);
     }
     let a = match parse(args) {
         Ok(a) => a,
@@ -517,6 +524,9 @@ fn request(a: RunArgs, terminal: Option<OuterTerminal>) -> Result<Ended, Failure
         env_file: env_file.as_ref().map(|f| EnvFileParams::from(&f.names())),
         argv: a.argv.clone(),
         claims: claims(),
+        launch: None,
+        bridge: None,
+        fds: Vec::new(),
     };
     let answer = match ask {
         Ask::Now(mut client) => {
@@ -550,6 +560,9 @@ fn request(a: RunArgs, terminal: Option<OuterTerminal>) -> Result<Ended, Failure
                 printed: false,
             })
         }
+        // `started` answers a managed server's launch, which this request
+        // does not name: no daemon sends it here.
+        DecisionView::Started {} => Err(protocol()),
         DecisionView::Denied { .. } => {
             let message = decision
                 .deny_reason()
@@ -903,6 +916,216 @@ fn read_env_file(path: &str) -> Result<EnvFileRefs, Failure> {
 
 fn protocol() -> Failure {
     Failure::new("protocol_error", "the daemon's answer was malformed")
+}
+
+/// `envcloak run --launch <id>`: EnvCloak's runner for a managed stdio
+/// server (SPEC §6.6; M2 plan D-33, D-36; task M2-27), which only the
+/// daemon starts, from its own retained image, on the pipe ends a client
+/// handed over.
+///
+/// Before it reads anything it checks that the daemon started it: its
+/// descriptor 3 must be a Unix socket whose peer is its parent, and the
+/// daemon serving the socket must be its parent too. Anything else (a
+/// person, an agent or a test program starting it) exits 125 with
+/// `not_started_by_daemon`, having received nothing; nothing is started.
+/// Then it reads the daemon's `Release` from that channel: the values and
+/// the launch, which must be the one it was started for. It builds the
+/// server's environment from the release and the fixed passthrough list
+/// only (`envcloak_policy::managed::launch_environment`), refuses values
+/// too short to redact, as `run` does, and serves the server
+/// ([`envcloak_exec::launch::serve`]): from the sealed copy the daemon
+/// checked (Linux), the checked descriptor once its stamp is the same, or
+/// the registered path (on macOS started suspended, and resumed only on
+/// the daemon's `Confirmed`), in the checked working directory, its
+/// output redacted onto the client's pipes. It exits with the server's
+/// code, or 125 with `managed_launch_changed` when the file changed after
+/// the daemon's check or the daemon refused the started server.
+fn run_launch(launch: &str) -> ExitCode {
+    use envcloak_ipc::control::{
+        self, CWD_FD, ExecSpec, FromRunner, IMAGE_FD, LIFELINE_FD, Recipient, ToRunner,
+    };
+    // Blocked before any thread starts, so the serving loop takes them.
+    let Ok(signals) = envcloak_sys::TerminationSignals::block() else {
+        return Failure::new("run_failed", "the runner's signals could not be set up")
+            .report(RUN_FAILURE);
+    };
+    if let Err(f) = refuse_if_traced() {
+        return f.report(RUN_FAILURE);
+    }
+    let not_started = || {
+        Failure::new(
+            "not_started_by_daemon",
+            "envcloak run --launch is started only by envcloakd, for a managed server; nothing \
+             was received and nothing was started",
+        )
+        .report(RUN_FAILURE)
+    };
+    let changed = || {
+        Failure::new(
+            "managed_launch_changed",
+            "the managed server's program changed after EnvCloak checked it; nothing was \
+             started. Run envcloak migrate-mcp --update to register it again",
+        )
+        .report(RUN_FAILURE)
+    };
+    let failed = |what: &'static str| Failure::new("run_failed", what).report(RUN_FAILURE);
+    let Some(control) = started_by_daemon() else {
+        return not_started();
+    };
+    let _ = control.set_read_timeout(Some(Duration::from_secs(30)));
+    let release = match control::receive::<ToRunner>(&control) {
+        Ok(ToRunner::Release(r)) => r,
+        _ => return not_started(),
+    };
+    let control::Release { bindings, to } = *release;
+    let Recipient::Runner {
+        launch: given,
+        spec,
+    } = to
+    else {
+        return not_started();
+    };
+    if given != launch {
+        return not_started();
+    }
+    let claim = |n: i32| envcloak_sys::claim_inherited_fd(n).ok();
+    let (Some(lifeline), Some(cwd)) = (claim(LIFELINE_FD), claim(CWD_FD)) else {
+        return failed("the runner's descriptors are not all open; nothing was started");
+    };
+    let image = claim(IMAGE_FD);
+    let (program, suspended) = match (spec.exec, image) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        (ExecSpec::Image, Some(fd)) => {
+            (envcloak_exec::launch::ServerProgram::Descriptor(fd), false)
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        (ExecSpec::Descriptor { stamp }, Some(fd)) => {
+            // Checked at rest: run from the checked descriptor only while
+            // the file is still as the daemon saw it.
+            let same = envcloak_exec::launch::same_stamp(
+                fd.as_fd(),
+                stamp.dev,
+                stamp.ino,
+                stamp.size,
+                stamp.mtime_ns,
+                stamp.ctime_ns,
+            );
+            if !matches!(same, Ok(true)) {
+                return changed();
+            }
+            (envcloak_exec::launch::ServerProgram::Descriptor(fd), false)
+        }
+        (ExecSpec::Path { confirm }, _) => (
+            envcloak_exec::launch::ServerProgram::Path(spec.executable.as_bytes().to_vec()),
+            confirm,
+        ),
+        _ => return failed("the launch the daemon sent cannot be run here; nothing was started"),
+    };
+    // The values: each under its variable, with its slug for the redactor.
+    let mut bound: Vec<(EnvName, Slug, SecretBytes, ShortPolicy)> =
+        Vec::with_capacity(bindings.len());
+    for v in bindings {
+        let (Ok(name), Ok(slug)) = (EnvName::new(&v.env_name), Slug::new(&v.slug)) else {
+            return failed("the daemon's release was not well formed; nothing was started");
+        };
+        bound.push((
+            name,
+            slug,
+            v.value.into_inner(),
+            ShortPolicy::from(v.allow_short),
+        ));
+    }
+    let built = {
+        let labels: Vec<Label<'_>> = bound
+            .iter()
+            .map(|(_, slug, value, short)| Label {
+                slug,
+                value,
+                short: *short,
+            })
+            .collect();
+        envcloak_exec::build_redactor(&labels)
+    };
+    let redactor = match built {
+        Ok((r, report)) => {
+            print_coverage(&report, false);
+            r
+        }
+        Err(ExecError::ValueTooShort(r)) => return too_short(&r).report(RUN_FAILURE),
+        Err(_) => return failed("the redactor could not be built; nothing was started"),
+    };
+    let env = {
+        let inherited: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+            std::env::vars_os().collect();
+        let values: Vec<(EnvName, SecretBytes)> = bound
+            .drain(..)
+            .map(|(name, _, value, _)| (name, value))
+            .collect();
+        envcloak_exec::launch::server_env(&inherited, spec.path_env.as_bytes(), &spec.vars, &values)
+    };
+    drop(bound);
+    let own = |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned().ok();
+    let (Some(input), Some(output), Some(errors)) = (
+        own(std::io::stdin().as_fd()),
+        own(std::io::stdout().as_fd()),
+        own(std::io::stderr().as_fd()),
+    ) else {
+        return failed("the runner's standard streams are not open; nothing was started");
+    };
+    let server = envcloak_exec::launch::ServerLaunch {
+        program,
+        argv: spec.argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        env,
+        cwd,
+        suspended,
+        redactor,
+        idle_flush: envcloak_exec::IDLE_FLUSH,
+    };
+    let io = envcloak_exec::launch::RunnerIo {
+        input,
+        output,
+        errors,
+        lifeline,
+    };
+    // macOS: the daemon checks the suspended server's code directory hash
+    // before it may run.
+    let confirm = |pid: u32| {
+        control::send(&control, &FromRunner::ConfirmSpawn(pid)).is_ok()
+            && matches!(
+                control::receive::<ToRunner>(&control),
+                Ok(ToRunner::Confirmed)
+            )
+    };
+    match envcloak_exec::launch::serve(server, io, signals, confirm) {
+        Ok(exit) => ExitCode::from(exit.shell_code()),
+        Err(envcloak_exec::launch::LaunchError::Refused) => changed(),
+        Err(e) => Failure::new(e.token(), e.describe()).report(RUN_FAILURE),
+    }
+}
+
+/// The runner's control channel, when the daemon started this process:
+/// descriptor 3 a Unix socket whose peer is the parent, and the parent
+/// the process that serves the daemon's socket. `None` otherwise; nothing
+/// was read from descriptor 3.
+fn started_by_daemon() -> Option<std::os::unix::net::UnixStream> {
+    use envcloak_sys::fdpass::{DescriptorKind, descriptor_kind};
+    let parent = i32::try_from(std::os::unix::process::parent_id()).ok()?;
+    if parent <= 1 {
+        return None;
+    }
+    let fd = envcloak_sys::claim_inherited_fd(envcloak_ipc::control::CONTROL_FD).ok()?;
+    let (kind, _) = descriptor_kind(fd.as_fd()).ok()?;
+    if kind != DescriptorKind::Socket {
+        return None;
+    }
+    if envcloak_sys::peer_identity(fd.as_fd()).ok()?.pid != parent {
+        return None;
+    }
+    let daemon = connect().ok()?;
+    if envcloak_sys::peer_identity(daemon.as_fd()).ok()?.pid != parent {
+        return None;
+    }
+    Some(std::os::unix::net::UnixStream::from(fd))
 }
 
 #[cfg(test)]

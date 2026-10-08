@@ -21,6 +21,7 @@
 //! enable it.
 
 pub mod client;
+pub mod control;
 pub mod frame;
 pub mod paths;
 pub mod proto;
@@ -28,7 +29,7 @@ pub mod view;
 pub mod wait;
 mod wire_secret;
 
-pub use client::{Client, ClientError, DaemonIdentity, Unverified};
+pub use client::{Client, ClientError, ClientFds, DaemonIdentity, Unverified};
 pub use frame::{DecodeError, Frame, FrameError, MAX_FRAME};
 pub use paths::{LOCK_NAME, RunPathError, RunPathErrorKind, RunPaths, SOCKET_NAME, SUN_PATH_MAX};
 pub use proto::{ErrorKind, Method, Role, RpcError};

@@ -29,6 +29,11 @@ tempfile.workspace = true
 [dev-dependencies]
 envcloak-scan.workspace = true
 envcloak-agents.workspace = true
+# The managed-launch tests (M2 plan task M2-27) register a server and ask
+# for its launch as `migrate-mcp` and `mcp-bridge` will, through the
+# client's typed helpers.
+envcloak-core.workspace = true
+envcloak-ipc.workspace = true
 # The catalog's tests (M2 plan task M2-10) gather a caller's evidence as
 # the daemon does, against the pinned hosts.
 envcloak-policy.workspace = true

@@ -336,7 +336,9 @@ pub struct RegisteredLaunch {
     pub argv: Vec<Vec<u8>>,
     pub cwd: DirIdentity,
     pub env: LaunchEnv,
-    /// A `script` launch's entry file.
+    /// A `script` launch's entry file, or a `package_runner` launch's
+    /// runner when it is a `#!` file (the interpreter is then the
+    /// executable).
     pub entry: Option<FileIdentity>,
     pub strength: BindingStrength,
     pub declaration: LaunchDecl,
@@ -997,8 +999,14 @@ impl RegisteredLaunch {
             && list_ok(&env.vars, 0, pair_ok)
             && list_ok(&env.binding_names, 0, |n| text_ok(n))
             && self.entry.as_ref().is_none_or(file_ok)
-            // Only a script names an entry file, and it must.
-            && self.entry.is_some() == (self.class == LaunchClass::Script)
+            // A script names an entry file and a native launch none; a
+            // package runner names one when the runner is itself a `#!`
+            // file, run through the interpreter checked.
+            && match self.class {
+                LaunchClass::Script => self.entry.is_some(),
+                LaunchClass::Native => self.entry.is_none(),
+                LaunchClass::PackageRunner => true,
+            }
             && list_ok(&decl.argv, 1, |a| a.len() <= MAX_TEXT)
             && opt_text_ok(decl.cwd.as_ref())
             && list_ok(&decl.env, 0, pair_ok)

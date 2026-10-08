@@ -439,7 +439,7 @@ const CONTROL_FD: libc::c_int = 3;
 /// nothing else to wake it, in seconds.
 const TICK_SECS: libc::time_t = 1;
 
-fn errno() -> libc::c_int {
+pub(crate) fn errno() -> libc::c_int {
     std::io::Error::last_os_error()
         .raw_os_error()
         .unwrap_or(libc::EIO)
@@ -678,9 +678,9 @@ fn drain_output() {
 
 /// Signals reset in the monitor and the command: every one there is.
 #[cfg(target_os = "linux")]
-const LAST_SIGNAL: libc::c_int = 64;
+pub(crate) const LAST_SIGNAL: libc::c_int = 64;
 #[cfg(not(target_os = "linux"))]
-const LAST_SIGNAL: libc::c_int = 31;
+pub(crate) const LAST_SIGNAL: libc::c_int = 31;
 
 extern "C" fn on_child(_sig: libc::c_int) {}
 
@@ -696,7 +696,7 @@ extern "C" fn on_relayed(sig: libc::c_int) {
 /// Sets `sig`'s disposition to `handler` (`SIG_DFL`, `SIG_IGN` or a
 /// function), with no flags: no `SA_RESTART`, so a wait it interrupts
 /// returns.
-fn disposition(sig: libc::c_int, handler: libc::sighandler_t) {
+pub(crate) fn disposition(sig: libc::c_int, handler: libc::sighandler_t) {
     // SAFETY: sigaction is plain data; zeroed is an empty mask and no
     // flags.
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -706,7 +706,7 @@ fn disposition(sig: libc::c_int, handler: libc::sighandler_t) {
     unsafe { libc::sigaction(sig, &act, std::ptr::null_mut()) };
 }
 
-fn set_mask(how: libc::c_int, all: bool, only: &[libc::c_int]) {
+pub(crate) fn set_mask(how: libc::c_int, all: bool, only: &[libc::c_int]) {
     // SAFETY: sigset_t is plain data, initialized by sigfillset or
     // sigemptyset before use.
     let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
@@ -746,7 +746,7 @@ fn primary_closing_passed_over() -> bool {
 /// descriptor opened before the limit was lowered sits above it (Codex's
 /// review of PR #27). `Err(errno)` when no listing could be read: the
 /// monitor then refuses to start the command.
-fn close_from(low: libc::c_int) -> Result<(), libc::c_int> {
+pub(crate) fn close_from(low: libc::c_int) -> Result<(), libc::c_int> {
     #[cfg(target_os = "linux")]
     {
         if !primary_closing_passed_over() {
@@ -2031,7 +2031,7 @@ mod tests {
             None,
             "the stop is reported once"
         );
-        crate::signal_process(pid, libc::SIGCONT).unwrap();
+        assert_eq!(crate::testing::kill_raw(pid, libc::SIGCONT), 0);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut continued = None;
         while continued.is_none() && std::time::Instant::now() < end {

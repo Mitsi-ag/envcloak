@@ -842,6 +842,11 @@ pub fn signal_this_thread(sig: i32) -> io::Result<()> {
     Ok(())
 }
 
+/// Test support only: `kill(target, sig)` as the system call returns it
+/// ([`crate::owned::kill_raw`], kept beside the one `kill` call so this
+/// file names no numeric signal call).
+pub use crate::owned::kill_raw;
+
 /// Does what the installed [`crate::SignalRelay`]'s handler does with a
 /// signal that finds the relay's pipe full (review F-71): keeps `sig`,
 /// sent by a process or not (`by_process`), aside for the reader, and
@@ -1162,6 +1167,15 @@ pub const TRACE: &str = "ENVCLOAK_TEST_TRACE";
 pub(crate) fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os(TRACE).is_some_and(|v| v == "1"))
+}
+
+/// The variables of this process whose names start `ENVCLOAK_TEST_`
+/// ([`crate::test_hook_vars`]).
+pub(crate) fn hook_vars() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::os::unix::ffi::OsStrExt;
+    std::env::vars_os()
+        .filter(|(k, _)| k.as_bytes().starts_with(b"ENVCLOAK_TEST_"))
+        .collect()
 }
 
 /// Names the [`crate::fail_point`] at which a test build fails.

@@ -78,6 +78,9 @@ impl Fixture {
             env_file: None,
             argv: argv.iter().map(|a| (*a).to_owned()).collect(),
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         }
     }
 
@@ -1285,6 +1288,9 @@ fn a_reference_to_a_card_is_rejected_when_bound() {
             env_file: None,
             argv: vec!["./emit".to_owned()],
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         })
     };
     let card_only = project(&home, "card-only", "[env]\nCARD = \"card/acme-web\"\n");
@@ -1397,6 +1403,9 @@ fn b18_a_reference_to_a_login_field_is_refused_when_bound() {
             env_file: None,
             argv: vec!["./emit".to_owned()],
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         })
     };
     let references = [
@@ -1505,6 +1514,9 @@ fn a_tampered_vault_gives_no_decision_and_takes_no_proof() {
             env_file: None,
             argv: vec!["./emit".to_owned()],
             claims: Vec::new(),
+            launch: None,
+            bridge: None,
+            fds: Vec::new(),
         })
         .unwrap_err();
     assert_eq!(rpc_kind(e).0, ErrorKind::VaultTampered);
