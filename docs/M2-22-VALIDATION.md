@@ -37,21 +37,16 @@ and CLI gates test those separately. The older Cycle432 range oracle remains
 in the scanner suite. Its blanket assertion that every decoded token was
 non-rewritable is replaced by paired whole-token/embedded-run controls.
 
-Tests run detached with cleared environments and isolated short temporary
-homes. Build target is `/Volumes/KeenShiftDev/tmp/envcloak-target/E`,
-incremental compilation is off, build jobs and test threads are limited to 3.
-No host credentials or agent stores are read by the tests.
-The local run is dated 2026-10-08 on macOS 26.4.1 (25E253), arm64, with
-rustc 1.98.1 (48a229cea, 2026-09-01).
+Tests run detached with cleared environments and isolated temporary homes.
+Incremental compilation is off; build jobs and test threads are limited to
+three. No host credentials or agent stores are read by the tests. A compiling
+mutation must fail at its property assertion; build failures and timeouts do
+not count as mutation evidence.
 
-## Receipts
+## Gate mutations
 
-Gate tests were added before the corresponding implementation. The initial
-planner failed to compile without `scrub`. The first CLI run stopped at the
-harness's stale-daemon guard and is not property evidence. Each row below was
-then exercised with a compiling product mutation, observed failing, and
-restored. A compiler error or timeout is not counted as mutation evidence.
-Test names below omit the common `gate37_` prefix.
+These original mutations were restored after their failing controls. Test
+names omit the common `gate37_` prefix.
 
 | Tests | Named mutation caught |
 | --- | --- |
@@ -77,22 +72,21 @@ Test names below omit the common `gate37_` prefix.
 | `python_encoded_jsonl_is_scrubbed_and_remains_valid` | Disable encoded-token redaction |
 | `scrub::gate37_scrub_story` | Retain original JSON bytes; the unfiltered exposure sweep fails |
 
-The kill gate covers all six barriers, including committed backup, staged
-output, final stamp check, rename and result recording. It checks every
-temporary sibling for the generated canary. The backup directory is swept
-separately. The real CLI story also has a raw-count exposure positive control
-before scrub and after undo. No detector removes its own hits.
+The crash gate now uses independent Python output for three eligible vault
+canaries: raw, both hex cases, padded and unpadded standard and URL base64,
+both percent-escape cases and JSON Unicode escapes. Every pause receives the
+encoded transcript. The same detector checks all canaries and supported
+encodings in every temporary sibling before and after killing the child.
+Each encoding has a planted-file positive control; backups are swept before
+and after the kill too. Four pauses retain the original and two retain the
+complete scrubbed JSONL, with every item flagged.
 
-The short-value gate uses a generated ten-character value both directly and
-inside a connection URI. It checks the untouched bytes and the sealed audit:
-three `ScanMatch` entries use `scrub`, with zero guessable comparisons. The
-independent Python JSONL gate emits ordinary strings, Unicode escapes and
-base64, then reparses the rewritten documents and checks their markers.
-
-The 256 MiB file uses independently calculated SHA-256 values and daemon
-Argon2id trace events. Its restored baseline passed in 126.81 seconds on this
-Mac; this is a local observation, not a performance guarantee. Cycle548's host
-density measurement does not establish scrub throughput.
+The short-value gate retains the generated ten-character value directly and
+inside a connection URI, and checks three sealed `ScanMatch` entries with
+purpose `scrub` and zero guessable comparisons. The 256 MiB undo gate checks
+one proof, one Argon2id event and an independently computed original digest.
+The Cycle570 adapter covers all 15 groups and 22 files in both enumeration
+orders; the Cycle432 scanner oracle remains a separate provenance check.
 
 | Requirement | Closure |
 | --- | --- |
@@ -101,185 +95,72 @@ density measurement does not establish scrub throughput.
 | R-M2-45 | Recent live writer, separately held file, symlink and hard-link refusals |
 | R-M2-46 | Printed local-only limitations, short-value policy and named database omissions |
 | R-M2-47 | Encrypted v2 backup before write, guarded byte-exact undo, independent seven-day clock |
-| R-M2-79 | Existing startup hardening plus tracer refusal before source discovery; Linux runtime qualification remains CI-only |
+| R-M2-79 | Existing startup hardening plus tracer refusal before source discovery; Linux baseline passed in CI; refusal mutation awaits the driver run |
 | R-M2-84 / gate 37 | Crash barriers, plaintext sweeps, undo digest, retention and rotation gates above |
 
-All 21 macOS gate tests in the table have a failing product control and a
-restored pass. The 27 named negative runs include the old leftover-completion
-regression; none relies on a compile failure or timeout. The hostile-preview
-property test additionally covers arbitrary bytes and invalid ranges.
+## Review repair audit
 
-The Linux-only `gate37_traced_scrub_refuses_before_reading_plaintext` is wired
-into the CLI gate target. Its native execution and the mutation removing the
-initial tracer refusal remain for Linux CI under the plan's section 6 OS
-matrix. This Mac does not qualify that kernel behavior. Gate 41's complete
-pinned-host story belongs to M2-26; M2-22's story drives the real CLI and daemon
-with synthetic transcripts. SQLite rewriting remains out of M2 scope, and a
-match inside a longer encoded run is deliberately reported as unsupported.
+Every path in the M2-22 diff from `36ada484` was searched for these classes.
+The sweep also follows the shared scanner and backup admission dependencies.
 
-Implementation and mutation receipts are split across `ff962584` (planner,
-streaming and atomic writes), `8902dc5c` (CLI, backups and guarded undo),
-`770c347f` (story, open-file/live-writer checks and consistent undo reporting)
-and `45bac804` (the atomic library gate in CI). The final check results below
-refer to the restored tree after these commits.
-
-## Final checks
-
-The commands below ran with `CARGO_TARGET_DIR=/Volumes/KeenShiftDev/tmp/envcloak-target/E`,
-`CARGO_INCREMENTAL=0` and `CARGO_BUILD_JOBS=3`. Test processes were detached
-from the agent tree, with cleared environments and isolated fixture homes.
-No workspace-wide test command was run.
-
-| Check | Result |
+| Bug class | Instances and disposition |
 | --- | --- |
-| `cargo fmt --all --check` | Passed |
-| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Passed |
-| Full `envcloak` CLI suite | 286 passed, zero failures or ignored tests |
-| Full `envcloak-scan` suite | 235 passed, zero failures or ignored tests |
-| Full `envcloakd` suite | 260 passed, zero failures or ignored tests |
-| Full `envcloak-e2e` suite | 137 unique tests passed after the fresh-host target rerun, zero final failures or ignored tests |
-| `scripts/check-unsafe.sh` | Passed |
-| `scripts/check-expose-lint.sh` | Passed, all 6 expected exposure sites detected |
-| `python3 scripts/check-crate-graph.py` | Passed, 50 edges among 21 crates |
-| `scripts/check-sources.sh` | Passed |
-| `cargo deny check` | Passed: advisories, bans, licenses and sources; nonfatal unused-license-allowance warnings |
-| `git diff --check` | Passed |
+| Lost source provenance | CLI path selection and post-scan rewrite format inference; retain named direct-child filters, select the most specific enclosing source, normalize fixed system aliases and pass the actual scanner format to rewriting. Raw stores, misleading extensions, Mixed tool results and JSONL directory selections have CLI controls. Undo's descriptor is only used for leftover discovery and does not choose a rewrite grammar. |
+| Admission drift | Daemon backup roots versus catalog-selected scrub stores: default and relocated Claude/Codex roots, named legacy backups, per-user temporary trees, direct-child cwd files, hook outputs and configured Codex logs now have admission and undo controls. Daemon-owned roots normalize redundant separators and current-directory components, while client path grammar and parent-component refusals remain strict. Existing creator, upload owner, proof, lease and post-change digest checks remain the authorization boundaries. |
+| Unsupported coverage claim | CLI `LIMITS` and DOCTOR's scrub paragraph claimed a short registry exception; both now state the actual short-value exclusion. IPC's comparison eligibility describes the daemon, not scanner discovery, and is unchanged. |
+| Incomplete exposure detector | CLI crash temporary siblings, the post-kill file and the basic rewrite gate used raw-only checks. Use the encoding-aware detector, independent encoded input, unfiltered positive controls and pre/post-kill sweeps. Native preview tests assert exact byte output; the story and Python JSONL gates already use encoding-aware sweeps. |
+| Unqualified platform evidence | Linux tracer baseline is green in the driver-reported CI runs below; its removal mutation still needs Linux execution. |
+| Producer/reader status race | The required unsafe check exposed an early-exit allowlist pipeline. A large valid-list control reproduced it. CI's Xcode version pipeline had the same pattern and a forced producer reproduced a broken pipe. Both readers now consume all input; unlisted-file and wrong-version controls still fail. Other task-file `grep -q` uses read files directly. |
+| Raw metadata in diagnostics | The new `ScanReport.transcript_formats` map bypassed `Source`'s value-free debug output. `ScanReport` now prints counts only, and a generated filename canary qualifies the fix. Scrub `Match`, `Edit`, `FilePlan` and `OpenFile` already have opaque debug implementations; the new daemon scope has none. Existing atomic path errors are converted to fixed CLI reason tokens and sanitized locations. |
+| Public receipt hygiene | Removed local absolute paths, host build details, tool install locations and superseded aggregate test counts from this document. No other task-added documentation or comments contained those receipt details. The local receipt check rejects the old document (`restore_host_receipts`) for all three categories and accepts the repaired task docs. |
 
-The full CLI command was `cargo test -p envcloak --no-fail-fast -- --test-threads 3`.
-The other touched crates ran together using `cargo test -p envcloak-scan -p
-envcloakd -p envcloak-e2e --no-fail-fast -- --test-threads 3`. The existing
-1 GiB doctor target passed all three scans in 2556.92 seconds. All 33 M2 story
-tests passed, including the new scrub story and the pinned Claude Code and
-Codex scanner stories. The four crates total 918 distinct passing macOS tests.
+## Review mutation receipts
 
-The first broad end-to-end run had 134 passes and three failures, all at the
-freshness guard for the pre-existing `envcloak-probe-model` executable.
-Rebuilding with `cargo build -p envcloak-agents --bins` fixed that setup error.
-The complete affected target was rerun with `cargo test -p envcloak-e2e --test
-agent_hosts --no-fail-fast -- --test-threads 3`: all 60 tests passed in 272.81
-seconds, including the Codex, Copilot and Kimi PTY cases. The end-to-end total
-counts each test once, using the fresh run for that target. Future runs should
-build all helper binaries first:
-
-```sh
-cargo build -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
-```
-
-`cargo-deny` was initially absent. The official 0.20.2 macOS arm64 archive
-was installed under target E's `m2-22-tools` directory after verifying its
-published SHA-256, `fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3`.
-The successful check used that directory on `PATH`. The exposure-lint script
-now honors `CARGO_TARGET_DIR` for its isolated canary build.
-
-## PR 46 CI follow-up
-
-The Linux CI failures reported on 2026-10-08 exposed two separate issues.
-`check-reservations.py` could not read the dynamic `reason` forwarded to
-`Failure::new`. Commit `05046fee` makes that conversion a fixed vocabulary,
-keeps an unknown reason a failure with token `incomplete`, and records the
-previously implicit scrub tokens in `docs/IPC.md`. CI now runs the new CLI
-unit gate as well as the existing integration target.
-
-The scanner's closed controls failed because scrub retained its source
-file while `check_modifiable` opened the same inode a second time. Linux's
-`F_SETLEASE` write lease counts this process's other open descriptions too,
-so the second open produces `open_elsewhere` even without an external
-holder. Commit `52ed1b5a` checks the retained source descriptor and drops the
-temporary pathname-check descriptor before asking the kernel. Both checks
-in streamed replacement use it. Full pathname and source-stamp checks,
-including ctime, still precede publication.
-
-This uses the existing inode-specific lease detector, not a walk of
-`/proc/*/fd`: unrelated runner processes and inaccessible descriptor
-directories do not affect its answer. A real holder of the source still
-refuses the change. The existing best-effort behavior on a filesystem
-without leases is unchanged. Linux execution remains for CI; this Mac's
-process-list detector cannot reproduce the Linux duplicate-open failure.
-
-The native holder gate now retains a source before starting the independent
-Python holder. It verifies that `check`, `validate` and `apply` refuse while
-the holder is alive, drops its own source before checking a fresh open
-refusal, and checks the unchanged bytes and closed controls after the holder
-exits. The three filesystem gates share a test mutex because a sibling
-test's fork can briefly inherit descriptors before exec. The holder
-assertions require the exact `open_elsewhere` refusal.
-
-| Gate, with `gate37_` prefix omitted | Repeated named mutation | Observed failure |
+| Gate or check | Mutations observed failing | Repair commits |
 | --- | --- | --- |
-| `failure_tokens_are_fixed_and_unknown_reasons_stay_failures` | `forward_unchecked_scrub_reason` | Unknown text escaped as a token instead of `incomplete`; the original reservation check also failed |
-| `open_elsewhere_refuses_aged_source_with_a_closed_control` | `skip_open_elsewhere` | A separately held source was accepted |
-| `apply_streams_only_scrubbed_temporary_bytes_and_keeps_mode` | `copy_raw_matches_to_output` | The resulting bytes retained the matched text |
-| `recent_linked_and_stale_sources_refused` | `skip_two_minute_rule` | A recent file was accepted |
-| `scrub_exclusive_staging_and_ctime_recheck` | `ignore_ctime` | A same-size edit with restored mtime was lost |
-| `scrub_exclusive_staging_and_ctime_recheck` | `remove_exclusive_stage` | A planted temporary file was overwritten |
+| `catalog_formats_survive_file_and_directory_selection` | `old_format_for` | `aec40697` |
+| `canonical_selections_keep_catalog_jsonl_without_extensions` | `skip_catalog_alias_normalization` | `47fad3a9` |
+| `short_values_untouched_output_swept_and_later_edits_refuse_undo` | `short_registry_exception`, repeated as `short_registry_exception_recheck`; `document_short_registry_exception` | `f3fe82fa`, `48c77fb0` |
+| `kill_at_every_pause_leaves_whole_files_and_no_temporary_exposure` | `retain_github_base64`, `retain_stripe_hex`, `retain_github_json_escape` | `b00f249f` |
+| `cli_rewrites_marks_and_undoes_with_one_proof` | `copy_all_json_matches` | `b00f249f` |
+| `scrub_catalog_backup_scope_and_restore` | `fixed_backup_allowlist` | `813ee50e` |
+| `scrub_refuses_client_only_catalog_roots` | `admit_all_scrub_paths`, repeated after strengthening the input and exact refusal assertions | `813ee50e` |
+| Daemon `catalog_scope_preserves_name_root_and_purpose_boundaries` | `ignore_named_filter`, `allow_nested_named_source`, `widen_scrub_purpose`, `skip_catalog_path_grammar`, `canonicalize_user_symlink_root`, `wrong_default_claude_temp` | `813ee50e`, `93e09cf4` |
+| Daemon `catalog_log_setting_is_bounded_typed_and_recomputed` | `drop_configured_log_root`, `accept_untyped_log_root`, `double_config_read_limit`, `retain_previous_log_root`, `follow_linked_log_setting` | `813ee50e` |
+| Both daemon catalog gates and `scrub_catalog_backup_scope_and_restore` | `reject_equivalent_catalog_roots` | `3389f570` |
+| `format_provenance_debug_never_discloses_paths` | `debug_raw_format_paths` | `16cc8f2b` |
+| `allowlist_membership_does_not_depend_on_pipe_capacity` | `early_exit_allowlist_reader` | `669a9c69` |
+| `ci_version_probe_consumes_the_producers_output` | `early_exit_ci_version_reader` | `669a9c69` |
 
-Each negative test compiled and exited 101 at an assertion, with one failed
-test. No timeout or compiler error counts as evidence. The mutations are
-named in the two fix commits and all were restored before the final checks.
-These extend gate 37's existing R-M2-44, R-M2-45 and R-M2-84 evidence; the
-scope and OS qualifications listed above remain the same.
+Every row reached a runtime assertion under its mutation and passed after
+restoration. The format matrix covers catalog, directory and individual-file
+selections. The backup matrix exercises every writable transcript descriptor
+and host backup, in default and relocated layouts, with byte-exact undo and
+an agent-created legacy backup requiring consent. Default temporary paths are
+also tested by pure admission checks; tests never enumerate real host stores.
 
-The first final pipeline rebuilt only the normal CLI and daemon binaries.
-Its 47 CLI unit tests passed, but the 256 MiB integration test saw zero
-Argon2id trace events and correctly failed; the other ten scrub tests passed.
-The daemon was missing the syscall crate's `testing` instrumentation.
-Before the successful rerun, `cargo test -p envcloakd --no-run` rebuilt it
-with the test features, as the CI gates job already does. The count assertion
-was unchanged. Standalone CLI gate runs need this preparation after a normal
-CLI/daemon build. The complete target then passed all eleven tests in 128.59
-seconds, including the one-proof, one-Argon2id and exact-digest checks.
+The daemon adds normal uses of the already pinned `toml_edit` and `zeroize`
+packages. Cargo's normal/build dependency tree was recorded locally. No new
+package, version, proc macro or workspace crate edge was introduced. The
+catalog parity test avoids a new daemon-to-agents dependency forbidden by
+D-02; every additional path comes from the daemon's own settings.
 
-The final follow-up pipeline passed on the same macOS and Rust versions
-listed above, using target E, incremental compilation off, three build jobs,
-and detached tests with cleared environments and three test threads.
+Original implementation receipts are in `ff962584`, `8902dc5c`, `770c347f`
+and `45bac804`; the first table retains their per-gate mutations.
 
-| Follow-up check | Result |
-| --- | --- |
-| `cargo fmt --all --check` | Passed |
-| `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Passed |
-| Full `envcloak-scan` suite | 235 passed, zero failures or ignored tests, including the independent oracle |
-| CLI `envcloak` binary unit tests | 47 passed, zero failures or ignored tests |
-| CLI `scrub` integration target | 11 passed, zero failures or ignored tests |
-| `python3 scripts/check-reservations.py` | Passed, 276 rows in 17 tables |
-| `python3 scripts/check-spec-decisions.py` | Passed, 54 decisions and 51 sentences |
-| `scripts/check-unsafe.sh` | Passed |
-| `scripts/check-expose-lint.sh` | Passed, all 6 expected sites reported |
-| `scripts/check-sources.sh` | Passed |
-| `python3 scripts/check-crate-graph.py` | Passed, 50 edges among 21 crates |
-| `git diff --check` | Passed |
+## Earlier CI repairs
 
-The test preparation and final test commands were:
+`05046fee` replaced dynamic failure-token forwarding with a fixed vocabulary;
+unknown reasons remain `incomplete`. Mutation `forward_unchecked_scrub_reason`
+fails the CLI unit gate. `52ed1b5a` reuses the held source descriptor for the
+Linux write-lease check: a second open by this process had made a closed file
+look externally held. `aa38155f` qualifies the retained and fresh-open holder
+controls with `skip_open_elsewhere`, `copy_raw_matches_to_output`,
+`skip_two_minute_rule`, `ignore_ctime` and `remove_exclusive_stage`.
 
-```sh
-cargo build -p envcloak -p envcloakd --bins
-cargo test -p envcloakd --no-run
-cargo test -p envcloak-scan --no-fail-fast -- --test-threads 3
-cargo test -p envcloak --bin envcloak --test scrub --no-fail-fast -- --test-threads 3
-```
-
-These are 293 distinct passing tests for this follow-up, not a rerun of the
-historical 918-test receipt above. No workspace-wide test command was run.
-
-## Reservation-fixture follow-up
-
-The five `envcloak-testkit` failures reported from PR 46's Linux test job
-were reproduced on macOS before the fix. Their fixtures assumed that
-`incomplete` was still reserved by M2-14, although scrub now emits it and its
-live row correctly says `landed`. Three tests tried to rename that reserved
-row; the constant and field/method cases expected it to produce a clash.
-
-`reserve_exit_token` now inserts a row owned by the fixture instead of
-renaming a live reservation. The existing M2 table entry locates the table
-without depending on a reservation's status; M3 has a second exit-token
-table. The constant and printed-token cases use `tst_required`. The method
-case uses separate synthetic tokens for its constant and literal arms, so
-it no longer depends on `not_started_by_daemon` remaining reserved either.
-Every negative assertion still requires both the exact token and the source
-file. The constant case keeps its landed-row passing control, and the
-field/method case now also passes only after all three synthetic rows land.
-
-The production checker and the live `docs/IPC.md` reservations are not
-changed by this fix. All detector mutations were temporary and restored.
+`ab26e52f` makes reservation-reader fixtures own their reserved tokens instead
+of depending on live IPC rows remaining reserved. Exact token and source
+assertions and landed-row positive controls remain. Its mutation receipts:
 
 | Test | Named checker mutation observed failing |
 | --- | --- |
@@ -289,22 +170,74 @@ changed by this fix. All detector mutations were temporary and restored.
 | `a_failure_token_in_a_field_or_a_token_method_counts` | `skip_nonfailure_token_methods` loses the method's literal token; `discard_method_constant_values` loses its constant token while the field and literal diagnostics still pass |
 | `a_token_printed_directly_as_envcloak_token_counts` | `disable_printed_token_detection`: disable the printed-token pattern |
 
-The method mutation preserves the reader for `Failure`'s own token field,
-so the failure is the missing method-token diagnostic, not an unrelated
-failure-field validation error. Each qualified mutation ran the Rust test
-and reached an assertion failure (exit 101). All five tests passed again
-after restoring the checker.
+## Platform qualification and remaining scope
 
-Final local checks on macOS, with the same target E and build limits as
-above, and detached tests in isolated homes:
+The driver reports all checks green for `ab26e52f`, including Linux gate 37
+and the scrub story in [run 37716095057](https://github.com/Mitsi-ag/envcloak/actions/runs/37716095057),
+and [manual run 37716104417](https://github.com/Mitsi-ag/envcloak/actions/runs/37716104417).
+These baseline runs do not qualify the tracer-removal mutation. This macOS
+worktree cannot execute that Linux kernel test, and the engineer must not
+push or dispatch workflows. The driver must follow [the concrete mutation handoff](M2-22-LINUX-MUTATION.md) on
+Linux and attach its failing test receipt before R-M2-79's L-01 evidence is
+closed. No local or previous CI pass substitutes for that receipt.
+
+Gate 41's complete pinned-host story belongs to M2-26. M2-22's story drives
+the real CLI and daemon with synthetic transcripts. SQLite rewriting remains
+out of M2 scope; a match inside a longer encoded run remains manual.
+
+## Current local checks
+
+Review repair checks ran on macOS with incremental compilation disabled,
+three build jobs and three test threads. Tests ran detached with cleared
+environments and `--no-fail-fast`. No workspace-wide test command was used.
 
 | Check | Result |
 | --- | --- |
-| `cargo test -p envcloak-testkit --test check_reservations --no-fail-fast -- --test-threads 3` | 91 passed, zero failed or ignored, 1033.43 seconds |
-| Restored run of the five affected tests | 5 passed, zero failed or ignored |
-| `python3 scripts/check-reservations.py` | Passed, 276 rows in 17 tables, including the final restored rerun |
 | `cargo fmt --all --check` | Passed |
 | `RUSTFLAGS="-D warnings" cargo clippy --workspace --all-targets` | Passed |
-| `scripts/check-unsafe.sh` | Passed |
-| `scripts/check-expose-lint.sh` | Passed, all 6 expected sites reported |
-| `git diff --check` | Passed |
+| Full `envcloak-scan` suite | 236 passed, no failures or ignored tests |
+| Full `envcloakd` suite | 262 passed, no failures or ignored tests |
+| Full `envcloak` CLI suite | 291 passed, including the separate large doctor case; no failures or ignored tests |
+| Separate 1 GiB doctor gate | Passed, including both scans from one persistent agent |
+| Full `envcloak-testkit` suite | 286 passed across the full run and the seven-test `ec_model` rerun; no unresolved failures or ignored tests |
+| Full `envcloak-e2e` suite, with required pinned hosts | 137 reported passes: 134 exercised tests and three release-only early returns; no failures |
+| Final CLI `scrub` target | 15 passed, no failures or ignored tests |
+| `bash scripts/check-unsafe.sh` | Passed |
+| `bash scripts/check-expose-lint.sh` | Passed, all 6 expected sites |
+| `python3 scripts/check-reservations.py` | Passed, 276 rows in 17 tables |
+| `python3 scripts/check-spec-decisions.py` | Passed, 54 decisions and 51 sentences |
+| `python3 scripts/check-crate-graph.py` | Passed, 50 edges among 21 crates |
+| `bash scripts/check-sources.sh` | Passed |
+| `cargo deny check` | Advisories, bans, licenses and sources passed; nonfatal unused-license-allowance warnings |
+| Public receipt hygiene and `git diff --check` | Passed |
+
+Final receipts use the source after the catalog-root spelling and counts-only
+debug repairs. The large gate 36 doctor case runs separately from the other
+CLI tests, serially; the combined CLI count includes it once. The test-enabled
+daemon is prepared with `cargo test -p envcloakd --no-run` for the Argon2id
+trace assertions.
+
+The end-to-end run requires the pinned agent hosts. The fixture story's
+optional PHP subcase is unavailable in the detached environment; its other
+available runtime cases run normally. This is separate from M2-22's scrub
+story and the required pinned-host checks. Three release-artifact probes
+return early without `ENVCLOAK_TEST_RELEASE_DIR`; they are not qualified by
+the local pass count. CI's release job supplies that directory, sets
+`ENVCLOAK_TEST_REQUIRE_RELEASE` and requires the PHP emitter too.
+
+Interrupted checks and stale-binary refusals are not passing receipts. After
+the host restart, cached helper, CLI and daemon binaries predated the local
+Cargo settings even though the initial build completed successfully. The
+freshness guard refused them. Helpers were relinked and the affected product
+packages were cleaned and rebuilt before repeating the affected suites. No
+freshness checks or test deadlines were relaxed.
+
+A pre-restart attempt timed out in three daemon `answers` cases. All five
+cases passed unchanged in the final full daemon run. The timed-out attempt
+does not qualify any mutation or passing receipt.
+
+An earlier unsafe-check invocation used `sh` instead of Bash; that exit 2 is
+superseded by the successful Bash run. The corrected invocation exposed the
+reader race repaired in `669a9c69`. The initial root-spelling mutation control
+also stopped at the stale-daemon guard; only its subsequent rebuilt run,
+which reached the expected `invalid_params` assertion, qualifies as evidence.
