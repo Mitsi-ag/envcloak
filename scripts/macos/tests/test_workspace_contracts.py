@@ -9,11 +9,22 @@ import sys
 import tempfile
 import time
 import unittest
+import workspace_fixture
 
 ROOT = Path(__file__).resolve().parents[3]
 
 
 class WorkspaceContracts(unittest.TestCase):
+    def test_ui_stories_run_only_with_their_own_fixture(self):
+        inventory = {'LaunchUITests', 'NavigationTests', 'PasteTests'}
+        for eu1, expected in [(False, {'LaunchUITests', 'NavigationTests'}), (True, {'PasteTests'})]:
+            with self.subTest(eu1=eu1):
+                command = workspace_fixture.xcode_command(Path('/fixture-target'), eu1, False)
+                only = {part.rsplit('/', 1)[-1] for part in command if part.startswith('-only-testing:')}
+                skip = {part.rsplit('/', 1)[-1] for part in command if part.startswith('-skip-testing:')}
+                self.assertEqual((only or inventory) - skip, expected)
+                self.assertEqual(command[command.index('-scheme') + 1], 'EnvCloakUITests')
+
     def test_long_item_last_use_has_a_field_reservation(self):
         blocks = re.findall(r'<!-- reservations:field -->\n(.*?)<!-- /reservations -->',
                             (ROOT / 'docs/IPC.md').read_text(), re.S)
