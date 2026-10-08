@@ -22,6 +22,9 @@ libc.workspace = true
 secrecy.workspace = true
 # The import plan's digest (`import.plan`, `import.commit`).
 sha2.workspace = true
+# Read the daemon's bounded Codex log_dir setting for scrub backup admission.
+toml_edit.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 base64.workspace = true

@@ -534,6 +534,7 @@ jobs:
       - name: Scrub transaction and independent planner gates
         run: |
           cargo test --locked -p envcloakd --no-run
+          cargo test --locked -p envcloakd --bin envcloakd gate37 --no-fail-fast -- --test-threads 3
           cargo test --locked -p envcloak-scan --lib gate37 --no-fail-fast -- --test-threads 3
           cargo test --locked -p envcloak-scan --test scrub --test scrub_oracle --no-fail-fast -- --test-threads 3
           cargo test --locked -p envcloak --bin envcloak gate37 --no-fail-fast -- --test-threads 3
