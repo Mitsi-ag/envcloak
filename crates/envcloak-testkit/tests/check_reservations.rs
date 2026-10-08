@@ -75,12 +75,7 @@ fn fixture() -> TestHome {
         "<!-- reservations:audit_kind -->\n| Number | Token | Task | Status | Use |\n|---|---|---|---|---|\n| 22 |",
         "<!-- reservations:audit_kind -->\n| Number | Token | Task | Status | Use |\n|---|---|---|---|---|\n| 200 | `fixture_audit` | M2-21 | reserved | test fixture |\n| 22 |",
     );
-    edit(
-        &t,
-        IPC,
-        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `not_in_this_build`",
-        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `tst_required` | M2-21 | reserved | test fixture |\n| `not_in_this_build`",
-    );
+    reserve_exit_token(&t, "tst_required");
     t
 }
 
@@ -417,13 +412,16 @@ fn a_code_source_it_cannot_read_fails() {
 
 const PROTO: &str = "crates/envcloak-ipc/src/proto.rs";
 
-/// Points the `incomplete` row of the failure-token table at `token`.
+/// Adds a reservation owned by this fixture, independent of tasks landing.
 fn reserve_exit_token(t: &TestHome, token: &str) {
+    // The M3 section has a second exit-token table. This existing name locates
+    // the M2 table without depending on any reservation's status.
+    let before = "| `not_in_this_build` |";
     edit(
         t,
         IPC,
-        "| `incomplete` | M2-14 | reserved |",
-        &format!("| `{token}` | M2-14 | reserved |"),
+        before,
+        &format!("| `{token}` | M2-21 | reserved | test fixture |\n{before}"),
     );
 }
 
@@ -456,32 +454,31 @@ const CLIENT_STUB: &str = "crates/envcloak-client/src/stub.rs";
 
 #[test]
 fn a_failure_token_written_as_a_constant_in_another_crate_counts() {
-    // `incomplete` is still `reserved` (M2-14), so a constant that holds it
-    // in another crate is a clash until its task marks the row `landed`.
+    // The fixture's token in another crate is a clash until its row is landed.
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
         "/// The token of a job that did not finish.\n\
-         pub const INCOMPLETE: &str = \"incomplete\";\n\
+         pub const TST_REQUIRED: &str = \"tst_required\";\n\
          \n\
          pub fn stopped() -> Failure {\n    \
              Failure::new(\n        \
-                 crate::stub::INCOMPLETE,\n        \
+                 crate::stub::TST_REQUIRED,\n        \
                  \"the job did not finish\",\n    \
              )\n\
          }\n",
     );
     assert_fails(
         &t,
-        &format!("`incomplete` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`tst_required` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
     // The task that lands it marks the row `landed`, and then it passes.
     edit(
         &t,
         IPC,
-        "| `incomplete` | M2-14 | reserved |",
-        "| `incomplete` | M2-14 | landed |",
+        "| `tst_required` | M2-21 | reserved |",
+        "| `tst_required` | M2-21 | landed |",
     );
     assert_passes(&t.home());
 }
@@ -506,19 +503,30 @@ fn the_failure_token_m2_02_landed_is_marked_landed() {
 #[test]
 fn a_failure_token_in_a_field_or_a_token_method_counts() {
     let t = fixture();
+    reserve_exit_token(&t, "tst_method_constant");
+    reserve_exit_token(&t, "tst_method_literal");
     add_file(
         &t,
         CLIENT_STUB,
-        "const APP: &'static str = \"incomplete\";\n\
+        "const METHOD_REQUIRED: &'static str = \"tst_method_constant\";\n\
          pub fn a() -> Failure { Failure { token: \"tst_required\", message: \"\".into() } }\n\
-         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"not_started_by_daemon\" } } }\n",
+         impl E { pub fn token(&self) -> &'static str { match self { E::A => METHOD_REQUIRED, E::B => \"tst_method_literal\" } } }\n",
     );
-    for token in ["tst_required", "not_started_by_daemon", "incomplete"] {
+    for token in ["tst_required", "tst_method_literal", "tst_method_constant"] {
         assert_fails(
             &t,
             &format!("`{token}` is reserved, but the code already has it ({CLIENT_STUB})"),
         );
     }
+    for token in ["tst_required", "tst_method_literal", "tst_method_constant"] {
+        edit(
+            &t,
+            IPC,
+            &format!("| `{token}` | M2-21 | reserved |"),
+            &format!("| `{token}` | M2-21 | landed |"),
+        );
+    }
+    assert_passes(&t.home());
 }
 
 #[test]
@@ -548,12 +556,12 @@ fn a_token_printed_directly_as_envcloak_token_counts() {
         &t,
         CLIENT_STUB,
         "pub fn stopped() -> String {\n    \
-             format!(\"envcloak: incomplete: {} files not read\", 3)\n\
+             format!(\"envcloak: tst_required: {} files not read\", 3)\n\
          }\n",
     );
     assert_fails(
         &t,
-        &format!("`incomplete` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`tst_required` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
 }
 
