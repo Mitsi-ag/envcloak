@@ -15,6 +15,41 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class WorkspaceContracts(unittest.TestCase):
+    def test_binding_menu_query_matches_recorded_macos_titles(self):
+        source = (ROOT / 'apps/macos/EnvCloakUITests/BindingTests.swift').read_text()
+        query = re.findall(r'NSPredicate\(format: ("[^"\n]+"), key \+ " ·"\)', source)
+        self.assertEqual(len(query), 1, 'extract the predicate actually used by bind()')
+        # Independent AX attributes from run 37810914074's failure snapshot:
+        # menu items have titles, an empty label and a shared menuAction: id.
+        probe = '''import Foundation
+let rows: [[String: String]] = [
+    ["title": "Choose a key", "label": "", "identifier": "menuAction:"],
+    ["title": "eu-one · Live · No account", "label": "", "identifier": "menuAction:"],
+    ["title": "fixture · Unknown · No account", "label": "", "identifier": "menuAction:"],
+    ["title": "eu-one-other · Live · No account", "label": "", "identifier": "menuAction:"]
+]
+for key in ["eu-one", "fixture"] {
+    let predicate = NSPredicate(format: QUERY, key + " ·")
+    let matches = rows.filter { predicate.evaluate(with: $0) }
+    guard matches.count == 1, matches[0]["title"]?.hasPrefix(key + " ·") == true else {
+        print("key menu predicate did not select exactly the recorded title for " + key)
+        exit(1)
+    }
+}
+'''.replace('QUERY', query[0])
+        result = subprocess.run(['xcrun', 'swift', '-warnings-as-errors', '-'], input=probe,
+                                text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_binding_row_query_uses_recorded_outline_role(self):
+        source = '\n'.join((ROOT / 'apps/macos/EnvCloakUITests' / name).read_text()
+                           for name in ['BindingTests.swift', 'PasteTests.swift'])
+        # The CI snapshot calls the SwiftUI Table an Outline. Query its
+        # observed role, as well as the identifier, for Change key and Delete.
+        roles = re.findall(r'app\.(\w+)\["project.bindings"\]', source)
+        self.assertTrue(roles)
+        self.assertEqual(set(roles), {'outlines'})
+
     def test_ui_stories_run_only_with_their_own_fixture(self):
         inventory = {'LaunchUITests', 'NavigationTests', 'PasteTests'}
         for eu1, expected in [(False, {'LaunchUITests', 'NavigationTests'}), (True, {'PasteTests'})]:
