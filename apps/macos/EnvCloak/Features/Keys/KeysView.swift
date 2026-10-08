@@ -28,7 +28,7 @@ struct KeysView: View {
             if session.keysUnavailable(query: query, scope: scope) {
                 ContentUnavailableView("Keys could not be refreshed", systemImage: "exclamationmark.triangle", description: Text("Try again. No old listing is shown."))
             } else if rows.isEmpty {
-                ContentUnavailableView(query.isEmpty ? "No keys yet." : "No matching keys", systemImage: "key.horizontal", description: Text(query.isEmpty ? "Add a key in Terminal with envcloak add. Pasting in the app arrives in the next build." : "Try another search."))
+                ContentUnavailableView(query.isEmpty ? "No keys yet." : "No matching keys", systemImage: "key.horizontal", description: Text(query.isEmpty ? "Add a key with Add key or Command-N." : "Try another search."))
             } else {
                 Table(of: KeyRow.self, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
                     TableColumn("Key", value: \.item.slug.escaped) { row in Text(row.item.slug.escaped).font(ECFont.martianMono(size: 12)) }.customizationID("key")
@@ -43,11 +43,11 @@ struct KeysView: View {
                     TableColumn("Fields") { row in Text("\(row.item.fields.count)") }.customizationID("fields").defaultVisibility(.hidden)
                 } rows: {
                     if grouping == .none {
-                        ForEach(rows.sorted(using: sortOrder)) { TableRow($0) }
+                        ForEach(rows.sorted(using: sortOrder)) { row in TableRow(row).draggable(row.item.slug.escaped) }
                     } else {
                         ForEach(sections) { section in
                             Section(section.title) {
-                                ForEach(section.rows.sorted(using: sortOrder)) { TableRow($0) }
+                                ForEach(section.rows.sorted(using: sortOrder)) { row in TableRow(row).draggable(row.item.slug.escaped) }
                             }
                         }
                     }

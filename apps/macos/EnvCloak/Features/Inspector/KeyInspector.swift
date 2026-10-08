@@ -6,6 +6,7 @@ struct KeyInspector: View {
     let session: VaultSession
     let slug: DaemonText?
     @Binding var route: Route?
+    var bind: (BindingSelection) -> Void = { _ in }
     @Environment(\.colorScheme) private var colorScheme
     @State private var action: InspectorAction?
     @State private var selectedField: DaemonText?
@@ -41,6 +42,8 @@ struct KeyInspector: View {
                     if !MetadataRequest.canCopy(item.slug) || selectedField.map({ !MetadataRequest.canCopy($0) }) == true {
                         Text(TerminalCopy.refusalMessage).foregroundStyle(ECToken.warning.color)
                     }
+                    Button("Use in project") { bind(BindingSelection(project: session.projects.scope, key: item)) }
+                        .disabled(session.state != .ready || item.class != .secret)
                     Text("Account").font(.headline)
                     ForEach(DisplayRow.of([item.account?.email, item.account?.label, item.account?.org_id].compactMap { $0 })) { Text($0.value.escaped) }
                     Text("Used by (last adopted run)").font(.headline)

@@ -47,12 +47,6 @@ struct EnvCloakApp: App {
     }
 }
 
-/// The scenes' identifiers.
-enum WindowID {
-    static let main = "main"
-    static let about = "about"
-}
-
 /// The app's log events: fixed words, the only text the app's log holds.
 enum AppEvent: String, LogToken {
     case launched = "launched"

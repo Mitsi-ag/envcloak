@@ -39,7 +39,12 @@ import AppKit
         }
         do {
             let folders = try ProjectFolders(file: URL(fileURLWithPath: directory).appendingPathComponent("test-folders.json"))
-            return VaultSession(client: SocketWorkspaceClient(client: DaemonClient(directory: directory)), folders: folders)
+            let runner: CLIRunner?
+            if let executable = ProcessInfo.processInfo.environment["ENVCLOAK_TEST_CLI"],
+               let home = ProcessInfo.processInfo.environment["ENVCLOAK_TEST_HOME"], home.hasPrefix("/tmp/ec05-") {
+                runner = CLIRunner(executable: executable, home: home, timeout: .seconds(30))
+            } else { runner = nil }
+            return VaultSession(client: SocketWorkspaceClient(client: DaemonClient(directory: directory)), folders: folders, runner: runner)
         } catch {
             let session = VaultSession(client: nil)
             session.state = .unavailable
