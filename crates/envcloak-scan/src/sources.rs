@@ -113,7 +113,9 @@ pub fn absolute_root(path: &Path) -> Result<ScanRoot, ScanErrorKind> {
     crate::root::held_root(path, dir).map_err(|e| crate::root::io_kind(&e))
 }
 
-fn system_path(path: &Path) -> Result<PathBuf, ScanErrorKind> {
+/// Uses the same fixed, root-owned system aliases as source discovery.
+/// Does not resolve any user-controlled path component.
+pub fn system_path(path: &Path) -> Result<PathBuf, ScanErrorKind> {
     #[cfg(target_os = "macos")]
     for alias in ["/tmp", "/var", "/etc"] {
         if let Ok(rest) = path.strip_prefix(alias) {
