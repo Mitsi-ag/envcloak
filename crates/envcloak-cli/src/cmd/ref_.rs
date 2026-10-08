@@ -322,6 +322,35 @@ fn writable(status: RefStatus) -> Result<(), Failure> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn private_undo_descriptors_refuse_ambiguous_invocations() {
+        for fd in ["0", "1", "2", "-1", "2147483648", "not-a-descriptor"] {
+            assert!(parse(&["--restore-fd", fd]).is_err());
+            assert!(parse(&["A=fixture", "--undo-fd", fd]).is_err());
+        }
+        for args in [
+            vec!["--restore-fd", "3", "A=fixture"],
+            vec!["--restore-fd", "3", "--unset", "A"],
+            vec!["--restore-fd", "3", "--profile", "test"],
+            vec!["--restore-fd", "3", "--undo-fd", "4"],
+            vec!["--restore-fd", "3", "--restore-fd", "4"],
+            vec!["A=fixture", "--undo-fd", "3", "--undo-fd", "4"],
+            vec!["--undo-fd", "3"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+        assert_eq!(
+            parse(&["--restore-fd", "3", "--json"]).unwrap().restore_fd,
+            Some(3)
+        );
+        assert_eq!(
+            parse(&["A=fixture", "--undo-fd", "3", "--json"])
+                .unwrap()
+                .undo_fd,
+            Some(3)
+        );
+    }
+
     fn binding(s: &str) -> Binding {
         Binding::parse_arg(s).unwrap()
     }

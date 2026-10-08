@@ -38,4 +38,13 @@ final class PasteDraftTests: XCTestCase {
         XCTAssertTrue(text.isEmpty)
         draft.value.withUnsafeBytes { XCTAssertEqual(Array($0), Array((generated + "=").utf8)) }
     }
+
+    func testEnvValueKeepsTheSameGraphemeCount() throws {
+        var text = "VARIABLE=e\u{301}👨‍👩‍👧‍👦\r\n"
+        var draft = try PasteDraft(taking: &text)
+        XCTAssertEqual(draft.characters, 11)
+        try draft.useEnvLine()
+        XCTAssertEqual(draft.characters, 2)
+        XCTAssertTrue(text.isEmpty)
+    }
 }

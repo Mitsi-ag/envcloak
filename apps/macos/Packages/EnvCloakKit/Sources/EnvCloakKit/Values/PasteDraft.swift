@@ -10,6 +10,7 @@ public struct PasteDraft: ~Copyable {
     public private(set) var envName: String?
     public private(set) var characters: Int
     private var valueOffset: Int?
+    private var envValueCharacters: Int?
 
     public init(taking text: inout String) throws {
         defer { text = "" }
@@ -27,6 +28,7 @@ public struct PasteDraft: ~Copyable {
         try text.withUTF8 { try value.append(contentsOf: UnsafeRawBufferPointer($0)) }
         var envName: String?
         var valueOffset: Int?
+        var envValueCharacters: Int?
         if let equal = text.utf8.firstIndex(of: 61) {
             let nameBytes = text.utf8[..<equal]
             if !nameBytes.isEmpty, nameBytes.count <= 128,
@@ -34,6 +36,7 @@ public struct PasteDraft: ~Copyable {
                let first = nameBytes.first, !(48...57).contains(first), !Self.valueShaped(nameBytes) {
                 envName = String(decoding: nameBytes, as: UTF8.self)
                 valueOffset = nameBytes.count + 1
+                envValueCharacters = text[text.index(after: equal)...].count
             }
         }
         self.value = consume value
@@ -41,6 +44,7 @@ public struct PasteDraft: ~Copyable {
         self.droppedLineEnding = droppedLineEnding
         self.envName = envName
         self.valueOffset = valueOffset
+        self.envValueCharacters = envValueCharacters
     }
 
     // An '=' may be padding on an opaque value. Match the policy's long
@@ -66,11 +70,12 @@ public struct PasteDraft: ~Copyable {
         guard let offset = valueOffset, offset < value.count else { throw PasteError.empty }
         var next = try SecretBuffer(capacity: value.count - offset)
         try value.withUnsafeBytes { try next.append(contentsOf: UnsafeRawBufferPointer(rebasing: $0[offset...])) }
-        // UTF-8 was validated by Swift when the field was read. Count Unicode
-        // scalar starts without producing another secret String.
-        characters = next.withUnsafeBytes { $0.reduce(0) { $0 + ($1 & 0xc0 != 0x80 ? 1 : 0) } }
+        // Counted from the transient field view before it was cleared, so
+        // grapheme clusters stay consistent without another secret String.
+        characters = envValueCharacters ?? 0
         value = consume next
         valueOffset = nil
+        envValueCharacters = nil
     }
 
     public consuming func takeValue() -> SecretBuffer { value }
