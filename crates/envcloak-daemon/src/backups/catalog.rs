@@ -175,6 +175,15 @@ mod tests {
         let root = d.path();
         let scope = Scope::new(&|k| env(root, k), BackupPurpose::Scrub);
         let uid = envcloak_sys::effective_uid();
+        // Pure admission checks only; never enumerate the real host's /tmp stores.
+        let defaults = Scope::new(
+            &|k| (k == "HOME").then(|| root.join("home").into_os_string()),
+            BackupPurpose::Scrub,
+        );
+        assert!(defaults.allows(&format!("/tmp/claude-{uid}/fixture")));
+        assert!(defaults.allows("/tmp/fixture-cwd"));
+        assert!(defaults.allows("/tmp/hook_outputs/fixture"));
+        assert!(!defaults.allows("/tmp/unrelated"));
         for relative in [
             "stores/c/projects/tool.txt".to_owned(),
             "stores/c/.claude.json.backup.fixture".to_owned(),
