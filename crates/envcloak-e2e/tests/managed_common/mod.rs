@@ -465,18 +465,54 @@ pub fn fixture_bin() -> PathBuf {
     envcloak_testkit::testkit_bin("ec-launch-fixture")
 }
 
+/// The `Identifier` and `CDHash` `codesign` reads from the file at `path`
+/// (macOS).
+pub fn code_identity(path: &Path) -> (String, String) {
+    let shown = std::process::Command::new("/usr/bin/codesign")
+        .args(["-d", "-vvv"])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(shown.status.success(), "{}", text(&shown));
+    // codesign writes its display to standard error.
+    let shown = String::from_utf8_lossy(&shown.stderr).into_owned();
+    let field = |name: &str| {
+        shown
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name} in {shown}"))
+            .to_owned()
+    };
+    (field("Identifier="), field("CDHash="))
+}
+
+/// Signs the file at `path` again, ad hoc, with the identifier it has
+/// (macOS): the same identifier and no team, as anyone can make with
+/// `codesign -i`, so only its code directory hash differs from the
+/// original's. A test using it fails when the cdhash value is ignored
+/// (mutation "cdhash value ignored"), not on the identifier or a missing
+/// signature.
+pub fn resign_same_identifier(path: &Path) {
+    let (identifier, cdhash) = code_identity(path);
+    let signed = std::process::Command::new("/usr/bin/codesign")
+        .args(["-f", "-s", "-", "-i", &identifier])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(signed.status.success(), "{}", text(&signed));
+    let (again, changed) = code_identity(path);
+    assert_eq!(again, identifier, "the identifier must stay");
+    assert_ne!(changed, cdhash, "only the cdhash must differ");
+}
+
 /// Another build of the fixture at `to`: the same program, another
-/// identity (on macOS signed again with another identifier, on Linux with
-/// bytes appended after the ELF image, which do not change what runs).
+/// identity (on macOS signed again with the same identifier, so that only
+/// its cdhash differs ([`resign_same_identifier`]); on Linux with bytes
+/// appended after the ELF image, which do not change what runs).
 pub fn other_build(to: &Path) {
     std::fs::copy(fixture_bin(), to).unwrap();
     if cfg!(target_os = "macos") {
-        let signed = std::process::Command::new("/usr/bin/codesign")
-            .args(["-f", "-s", "-", "-i", "ec.launch.fixture.other"])
-            .arg(to)
-            .output()
-            .unwrap();
-        assert!(signed.status.success(), "{}", text(&signed));
+        resign_same_identifier(to);
     } else {
         let mut f = std::fs::OpenOptions::new().append(true).open(to).unwrap();
         f.write_all(b"another build").unwrap();
@@ -750,11 +786,19 @@ impl World {
 
     /// The person approves request `id` for the session.
     pub fn approve(&mut self, id: &str) {
+        self.approve_with(id, &[]);
+    }
+
+    /// As [`World::approve`], with the grant `options` ask for (`--once`,
+    /// `--for 1h`; none is the default session grant).
+    pub fn approve_with(&mut self, id: &str, options: &[&str]) {
         let typed = format!("{}\r", self.h.canary(labels::VAULT_PASSPHRASE).as_str());
         let project = self.project.clone();
+        let mut args = vec!["approve", id];
+        args.extend_from_slice(options);
         let approved = self.h.human(
             &project,
-            &["approve", id],
+            &args,
             &[],
             &[("Vault passphrase to approve this: ", &typed)],
         );

@@ -1717,10 +1717,17 @@ fn held_world(site: &str) -> (World, tempfile::TempDir) {
 /// check: the child is killed before it resumes (its start marker never
 /// appears) and the client is answered `managed_launch_changed`.
 ///
+/// On macOS the other build is the fixture signed again with its own
+/// identifier ([`other_build`]): only its cdhash differs.
+///
 /// Mutations checked: Linux, the source path reopened instead of the
 /// prepared copy (the rename-over's build runs, and this fails); macOS,
-/// the child resumed before the daemon's answer (the start marker
-/// appears, and this fails).
+/// "cdhash value ignored" in `ExpectedCode::matches` (the replaced child
+/// is confirmed and the client answered `started`, and this fails). The
+/// child resumed before the daemon's answer is checked by
+/// `a_suspended_server_runs_nothing_until_the_daemon_confirms`, not here:
+/// the refused child is killed before it writes its marker, so this
+/// test's marker check races it.
 #[test]
 fn the_approved_image_runs_whatever_happens_at_the_barrier() {
     if managed_common::release_run("the_approved_image_runs_whatever_happens_at_the_barrier") {

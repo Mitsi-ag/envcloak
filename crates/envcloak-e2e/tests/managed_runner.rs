@@ -126,11 +126,27 @@ json.dump({"response": resp.decode("utf-8", "replace"), "reply": reply.decode("u
 /// key in every encoding, and the daemon released values to a client
 /// never.
 ///
+/// It runs under each grant this build issues: the default session grant
+/// and a `once` grant. Each is the grant that covers the second request
+/// (it is `started`, with no fresh pending request). A standing record is
+/// not issued by this build (`envcloak standing` is M2-15's, not in this
+/// build): that leg is M2R-89, owned by M2-15.
+///
 /// Mutation checked: the values returned to the requesting client instead
 /// of starting the runner: the answer the foreign client received holds
-/// the key (base64), the sweep finds it, and this fails.
+/// the key (base64), the sweep finds it, and this fails, under each grant.
 #[test]
 fn a_foreign_client_gets_started_and_no_value() {
+    foreign_client_under(&[]);
+}
+
+/// [`a_foreign_client_gets_started_and_no_value`] under a `once` grant.
+#[test]
+fn a_foreign_client_under_a_once_grant_gets_started_and_no_value() {
+    foreign_client_under(&["--once"]);
+}
+
+fn foreign_client_under(grant: &[&str]) {
     let mut w = World::new(&[]);
     let (launch, _) = w.register_fixture();
     let socket = envcloak_testkit::daemon_socket(&w.h.home);
@@ -155,7 +171,8 @@ fn a_foreign_client_gets_started_and_no_value() {
         .as_str()
         .unwrap_or_else(|| panic!("not pending: {first}"))
         .to_owned();
-    w.approve(&id);
+    w.approve_with(&id, grant);
+    let pending = w.pending_count();
     let second = ask(&mut w);
     let response: Value = serde_json::from_str(second["response"].as_str().unwrap()).unwrap();
     assert_eq!(
@@ -164,6 +181,11 @@ fn a_foreign_client_gets_started_and_no_value() {
     );
     let r: Value = serde_json::from_str(second["reply"].as_str().unwrap().trim()).unwrap();
     assert_eq!(r["vars"][KEY], w.key_digest(), "{r}");
+    assert_eq!(
+        w.pending_count(),
+        pending,
+        "the grant covered it: {grant:?}"
+    );
     w.assert_released(0, 1, "values went to the runner once, to the client never");
     w.h.assert_swept("after the foreign client");
 }
@@ -641,6 +663,60 @@ fn a_runner_that_cannot_start_releases_nothing() {
     assert!(!w.marker.exists());
 }
 
+/// A delivery whose values never reach the runner (the write to it
+/// fails, as when it is gone) is `runner_unavailable`, and the sealed log
+/// says so after the delivery's `covered` entry, under the same grant: it
+/// never shows only a delivery the client was told failed. Read from the
+/// log with the vault's key once the daemon stopped; the `covered` entry
+/// is there (the positive control).
+///
+/// Mutation checked: `Ready::send` auditing only `managed_launch_changed`
+/// (the previous rule): the log ends at `covered`, and this fails.
+#[test]
+fn a_release_that_fails_after_delivery_is_audited() {
+    if managed_common::release_run("a_release_that_fails_after_delivery_is_audited") {
+        return;
+    }
+    let mut w = World::new(&[("ENVCLOAK_TEST_FAIL", "launch.release_write")]);
+    let (launch, _) = w.register_fixture();
+    let first = w.request(&launch);
+    w.approve(&pending_id(&first));
+    let answer = w.request(&launch);
+    assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
+    w.assert_released(0, 0, "nothing reached the runner");
+    assert!(!w.marker.exists());
+    let _ = w.h.stop_daemon();
+    let pass = envcloak_core::SecretBytes::copy_from(
+        w.h.value(envcloak_testkit::labels::VAULT_PASSPHRASE),
+    );
+    let vault = envcloak_core::vault::LockedVault::open(&envcloak_core::vault::VaultPaths::under(
+        w.h.data_dir(),
+    ))
+    .unwrap()
+    .unlock_with_passphrase(&pass)
+    .map_err(|(_, e)| e)
+    .unwrap();
+    let (entries, _) = vault.read_audit().unwrap();
+    drop(vault);
+    let runs: Vec<_> = entries
+        .iter()
+        .filter(|e| e.record.kind == envcloak_core::audit::AuditKind::Run)
+        .map(|e| (e.record.decision.outcome.clone(), e.record.grant_id.clone()))
+        .collect();
+    let covered = runs
+        .iter()
+        .position(|(outcome, _)| outcome == "covered")
+        .unwrap_or_else(|| panic!("no delivery entry: {runs:?}"));
+    let grant = runs[covered].1.clone();
+    assert!(grant.is_some(), "{runs:?}");
+    assert!(
+        runs[covered + 1..]
+            .iter()
+            .any(|(outcome, g)| outcome == "runner_unavailable" && *g == grant),
+        "the failed release is not audited after its delivery: {runs:?}"
+    );
+}
+
 /// macOS (D-34, D-36): the anchor's runner, started suspended, whose
 /// resumption fails is killed and reaped through its handle: the request
 /// is `runner_unavailable`, nothing is released, and no process the
@@ -812,9 +888,14 @@ fn replace_with_script(path: &Path, marker: &Path) {
 /// build of `envcloak` put in place, the daemon restarted, the launch
 /// succeeds.
 ///
-/// Mutation checked: the runner started from the installed file instead
+/// On macOS the first replacement is a real `envcloak` signed again with
+/// the anchor's own identifier, so that only its cdhash differs.
+///
+/// Mutations checked: the runner started from the installed file instead
 /// of the image taken at start (Linux): the replacement runs, its marker
-/// appears, and this fails.
+/// appears, and this fails; "cdhash value ignored" in
+/// `ExpectedCode::matches` (macOS): the same-identifier replacement starts
+/// as the runner, the request is `started`, and this fails.
 #[test]
 fn the_anchor_is_the_image_taken_at_start() {
     let tmp = tempfile::Builder::new()
@@ -855,6 +936,22 @@ fn the_anchor_is_the_image_taken_at_start() {
             !appears(&wrong, Duration::from_secs(1)),
             "the anchor rewritten in place ran"
         );
+        std::fs::rename(&kept, &anchor).unwrap();
+    }
+    if cfg!(target_os = "macos") {
+        // A real `envcloak` signed again with the anchor's identifier and
+        // no team: only its cdhash differs, so only the cdhash comparison
+        // can refuse it. Put back after.
+        let anchor = bins.join("envcloak");
+        let kept = w.h.files().join("envcloak.kept");
+        std::fs::copy(&anchor, &kept).unwrap();
+        let same = bins.join("envcloak.same");
+        std::fs::copy(&anchor, &same).unwrap();
+        managed_common::resign_same_identifier(&same);
+        std::fs::rename(&same, &anchor).unwrap();
+        let answer = w.request(&launch);
+        assert_eq!(error_of(&answer), "runner_unavailable", "{answer}");
+        w.assert_released(0, 0, "a same-identifier anchor released nothing");
         std::fs::rename(&kept, &anchor).unwrap();
     }
     replace_with_script(&bins.join("envcloak"), &wrong);

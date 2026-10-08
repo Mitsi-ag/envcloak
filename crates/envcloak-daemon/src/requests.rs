@@ -781,7 +781,15 @@ pub fn run_request(
                 };
                 // Under the lock since the decision: the grant is there.
                 if !s.grants().consume(g) {
-                    return Err(RpcError::new(ErrorKind::Internal));
+                    // The delivery's entry is on disk; the answer is never
+                    // sent, and the log says so after it.
+                    let e = RpcError::new(ErrorKind::Internal);
+                    s.audit(AuditEvent::Request(Box::new(RequestAudit {
+                        decision: e.kind.token(),
+                        grant_id: Some(g.to_string()),
+                        ..entry
+                    })));
+                    return Err(e);
                 }
                 s.touch(Reading::now(&shared.clocks));
                 // Gate 12: a test build panics here on request, holding the
@@ -956,10 +964,20 @@ struct Ready {
 
 impl Ready {
     /// Sends the values to the runner and answers the client `started`.
+    ///
+    /// The delivery's entry is on disk and its grant used before this
+    /// runs. When the values do not reach a server, the outcome the client
+    /// is answered is audited after it, under the same grant, whatever it
+    /// is (`runner_unavailable`, `managed_launch_changed`): the log never
+    /// shows only a delivery the client was told failed.
     fn send(self, shared: &Shared, peer: &PeerIdentity) -> Result<Frame, RpcError> {
         let sent = self.started.release(&self.release);
         drop(self.release);
         if let Err(e) = sent {
+            shared.audit(AuditEvent::Request(Box::new(RequestAudit {
+                decision: e.kind.token(),
+                ..self.entry.clone()
+            })));
             if e.kind == ErrorKind::ManagedLaunchChanged {
                 shared.audit(AuditEvent::ManagedLaunch {
                     pid: peer.pid,
@@ -1127,8 +1145,14 @@ fn prepare_runner(
         }
     };
     if !s.grants().consume(c.grant) {
+        // The delivery's entry is on disk; the values never leave.
         started.abandon();
-        return Prepared::Done(Err(RpcError::new(ErrorKind::Internal)));
+        let e = RpcError::new(ErrorKind::Internal);
+        s.audit(AuditEvent::Request(Box::new(RequestAudit {
+            decision: e.kind.token(),
+            ..entry
+        })));
+        return Prepared::Done(Err(e));
     }
     s.touch(Reading::now(&shared.clocks));
     Prepared::Ready(Box::new(Ready {
