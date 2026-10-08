@@ -51,7 +51,8 @@ fn gate37_cli_rewrites_marks_and_undoes_with_one_proof() {
     assert_eq!(report["files"][0]["state"], "scrubbed");
     let backup = report["files"][0]["backup"].as_str().unwrap();
     let after = std::fs::read(&path).unwrap();
-    assert!(!after.windows(value.len()).any(|w| w == value.as_bytes()));
+    assert!(!envcloak_testkit::find(original.as_bytes(), &values).is_empty());
+    envcloak_testkit::assert_no_canary(&after, &values);
     serde_json::from_slice::<Value>(&after).unwrap();
     let show = run(&home, &["show", "openai/acme-web", "--json"], &[]);
     let shown: Value = serde_json::from_slice(&show.stdout).unwrap();
@@ -341,52 +342,84 @@ fn paused(f: &Fixture, at: usize) -> (Owned, tempfile::TempDir) {
 #[test]
 fn gate37_kill_at_every_pause_leaves_whole_files_and_no_temporary_exposure() {
     let f = Fixture::new();
-    let value = by_label(&f.values, labels::OPENAI_API_KEY).value();
+    let eligible: Vec<_> = [
+        labels::OPENAI_API_KEY,
+        labels::STRIPE_SECRET_KEY,
+        labels::GITHUB_TOKEN,
+    ]
+    .iter()
+    .map(|label| by_label(&f.values, label).clone())
+    .collect();
+    let encoded = encoded_transcript(&f, &eligible);
+    // Every canary and encoding must trigger the same sibling detector used
+    // below. Never discard detector hits, even from an unexpected name.
+    let planted = f.path.with_file_name(".events.jsonl.envcloak-new-22.tmp");
+    for canary in &eligible {
+        for (_, bytes) in envcloak_testkit::encodings(canary) {
+            std::fs::write(&planted, bytes).unwrap();
+            assert!(
+                temporary_exposures(&f) > 0,
+                "temporary detector missed positive control"
+            );
+            std::fs::remove_file(&planted).unwrap();
+        }
+        assert!(envcloak_testkit::find(&encoded, std::slice::from_ref(canary)).len() >= 9);
+    }
     let mut original_count = 0;
     let mut scrubbed_count = 0;
     for at in 0..6 {
-        f.write();
+        std::fs::write(&f.path, &encoded).unwrap();
+        age(&f.path);
         let before = std::fs::read(&f.path).unwrap();
         let (mut child, _pause) = paused(&f, at);
-        // The detector's positive control is the intentionally exposed input.
         if at < 4 {
-            assert!(
-                std::fs::read(&f.path)
-                    .unwrap()
-                    .windows(value.len())
-                    .any(|w| w == value)
-            );
-        }
-        for e in std::fs::read_dir(f.path.parent().unwrap()).unwrap() {
-            let p = e.unwrap().path();
-            if p == f.path {
-                continue;
+            for canary in &eligible {
+                assert!(
+                    !envcloak_testkit::find(
+                        &std::fs::read(&f.path).unwrap(),
+                        std::slice::from_ref(canary)
+                    )
+                    .is_empty()
+                );
             }
-            let bytes = std::fs::read(p).unwrap();
-            assert!(
-                !bytes.windows(value.len()).any(|w| w == value),
-                "plaintext temporary file"
-            );
         }
+        assert_eq!(temporary_exposures(&f), 0, "temporary exposure before kill");
         assert!(
             envcloak_testkit::sweep_dir(&data_dir(&f.home).join("backups"), &f.values).is_empty(),
             "encrypted-backup exposure detected"
         );
         child.0.kill().unwrap();
         child.0.wait().unwrap();
+        assert_eq!(temporary_exposures(&f), 0, "temporary exposure after kill");
+        assert!(
+            envcloak_testkit::sweep_dir(&data_dir(&f.home).join("backups"), &f.values).is_empty()
+        );
         let bytes = std::fs::read(&f.path).unwrap();
         if bytes == before {
             original_count += 1;
         } else {
             scrubbed_count += 1;
-            assert!(!bytes.windows(value.len()).any(|w| w == value));
-            serde_json::from_slice::<Value>(&bytes).unwrap();
-            let shown = run(&f.home, &["show", "openai/acme-web", "--json"], &[]);
-            let item: Value = serde_json::from_slice(&shown.stdout).unwrap();
-            assert!(
-                !item["exposed"].is_null(),
-                "crash left scrubbed item unflagged"
-            );
+            envcloak_testkit::assert_no_canary(&bytes, &f.values);
+            let lines: Vec<_> = bytes
+                .split(|b| *b == b'\n')
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert_eq!(lines.len(), 6);
+            for (rows, slug) in lines.chunks_exact(2).zip(&SLUGS[..3]) {
+                let forms: Value = serde_json::from_slice(rows[0]).unwrap();
+                assert_eq!(forms["forms"].as_array().unwrap().len(), 9);
+                for v in forms["forms"].as_array().unwrap() {
+                    assert_eq!(v, &format!("[envcloak:redacted:{slug}]"));
+                }
+                let escaped: Value = serde_json::from_slice(rows[1]).unwrap();
+                assert_eq!(escaped["escaped"], format!("[envcloak:redacted:{slug}]"));
+                let shown = run(&f.home, &["show", slug, "--json"], &[]);
+                let item: Value = serde_json::from_slice(&shown.stdout).unwrap();
+                assert!(
+                    !item["exposed"].is_null(),
+                    "crash left scrubbed item unflagged"
+                );
+            }
         }
         // Remove only known scrubbed fixture leftovers before the next case.
         for e in std::fs::read_dir(f.path.parent().unwrap()).unwrap() {
@@ -398,6 +431,66 @@ fn gate37_kill_at_every_pause_leaves_whole_files_and_no_temporary_exposure() {
     }
     assert_eq!(original_count, 4);
     assert_eq!(scrubbed_count, 2);
+}
+
+fn temporary_exposures(f: &Fixture) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let mut count = 0;
+    for entry in std::fs::read_dir(f.path.parent().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path() == f.path {
+            continue;
+        }
+        assert!(
+            entry.file_type().unwrap().is_file(),
+            "unexpected temporary type"
+        );
+        count += envcloak_testkit::find(entry.file_name().as_bytes(), &f.values).len();
+        count += envcloak_testkit::find(&std::fs::read(entry.path()).unwrap(), &f.values).len();
+    }
+    count
+}
+
+fn encoded_transcript(f: &Fixture, eligible: &[envcloak_testkit::Canary]) -> Vec<u8> {
+    use std::io::Write;
+    let mut cmd = std::process::Command::new("/usr/bin/python3");
+    f.home
+        .apply(&mut cmd)
+        .args([
+            "-I",
+            "-B",
+            "-c",
+            r#"
+import base64,json,sys
+for v in json.load(sys.stdin):
+    b=v.encode()
+    forms=[v,b.hex(),b.hex().upper()]
+    for encoder in [base64.b64encode,base64.urlsafe_b64encode]:
+        s=encoder(b).decode()
+        forms.extend([s,s.rstrip('=')])
+    forms.extend([''.join('%%%02X'%c for c in b),''.join('%%%02x'%c for c in b)])
+    print(json.dumps({'forms':forms}))
+    print('{"escaped":"'+''.join('\\u%04x'%ord(c) for c in v)+'"}')
+"#,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            &serde_json::to_vec(&eligible.iter().map(|c| c.as_str()).collect::<Vec<_>>()).unwrap(),
+        )
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success() && out.stderr.is_empty(),
+        "independent emitter failed"
+    );
+    out.stdout
 }
 #[test]
 fn gate37_recent_live_writer_symlink_and_failed_backup_never_succeed() {
