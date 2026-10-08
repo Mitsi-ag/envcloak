@@ -17,5 +17,6 @@ crates/envcloak-sys/src/owned.rs           # the one kill call: owned-child chec
 crates/envcloak-exec/src/signals.rs        # the M1 runner: signals its own unreaped child or the group it leads, under the child-state lock (review R-9)
 crates/envcloak-mcp/src/child.rs           # the MCP server child: signals the group of its unreaped leader, under the leader lock
 crates/envcloak-agents/src/probe/run.rs    # the probe: kills what is left of its unreaped host's group before reaping it
+crates/envcloak-agents/src/probe/local.rs  # the probe daemon's stop: SIGTERM to its own unreaped child, only while has_exited says it is one
 crates/envcloak-sys/tests/child.rs         # the tests of signal_process and signal_group themselves
 crates/envcloak-sys/src/child.rs           # signal_process and signal_group themselves, and the test of their bounds

@@ -97,6 +97,9 @@ pub enum AuditKind {
     /// The request id is the backup's; the count says how many items the
     /// restored vault holds.
     Recover = 21,
+    /// A Linux terminal reveal, durably recorded before value release,
+    /// or a failed reveal proof.
+    Reveal = 22,
     // M2 and M2b: each kind joins `ALL`, which `verify` reads, with the task
     // that writes it (docs/VAULT.md "Reserved for M2 and M2b").
     /// Candidate tokens were compared with the vault by keyed hash
@@ -141,7 +144,7 @@ pub enum AuditKind {
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 29] = [
+    pub const ALL: [AuditKind; 30] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -163,6 +166,7 @@ impl AuditKind {
         AuditKind::RecoveryConfirm,
         AuditKind::Backup,
         AuditKind::Recover,
+        AuditKind::Reveal,
         AuditKind::ScanMatch,
         AuditKind::MarkExposed,
         AuditKind::BackupV2,
@@ -197,6 +201,7 @@ impl AuditKind {
             AuditKind::RecoveryConfirm => "recovery_confirm",
             AuditKind::Backup => "backup",
             AuditKind::Recover => "recover",
+            AuditKind::Reveal => "reveal",
             AuditKind::ScanMatch => "scan_match",
             AuditKind::MarkExposed => "mark_exposed",
             AuditKind::BackupV2 => "backup_v2",
@@ -544,9 +549,8 @@ mod tests {
             assert_eq!(AuditKind::from_u8(k as u8), Some(k));
         }
         assert_eq!(AuditKind::from_u8(0), None);
-        // Kind 22 and kinds from 27 on are reserved for later tasks, not
-        // written by this build.
-        for n in [22, 27, 46] {
+        // These kinds remain reserved for later tasks.
+        for n in [27, 46] {
             assert_eq!(AuditKind::from_u8(n), None, "{n}");
         }
         // Numbers in order, each token its own.
@@ -563,6 +567,7 @@ mod tests {
         // The backup v2 kinds are read back: `verify` takes their entries.
         assert_eq!(AuditKind::from_u8(25), Some(AuditKind::BackupV2));
         assert_eq!(AuditKind::from_u8(26), Some(AuditKind::RestoreV2));
+        assert_eq!(AuditKind::from_u8(22), Some(AuditKind::Reveal));
         // And M2-11's.
         assert_eq!(AuditKind::from_u8(23), Some(AuditKind::ScanMatch));
         assert_eq!(AuditKind::from_u8(24), Some(AuditKind::MarkExposed));

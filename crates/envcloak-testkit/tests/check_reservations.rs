@@ -68,13 +68,33 @@ fn fixture() -> TestHome {
             }
         }
     }
+    // Audit and terminal-reveal fixtures must also survive product landing.
+    edit(
+        &t,
+        VAULT,
+        "<!-- reservations:audit_kind -->\n| Number | Token | Task | Status | Use |\n|---|---|---|---|---|\n| 22 |",
+        "<!-- reservations:audit_kind -->\n| Number | Token | Task | Status | Use |\n|---|---|---|---|---|\n| 200 | `fixture_audit` | M2-21 | reserved | test fixture |\n| 22 |",
+    );
+    edit(
+        &t,
+        IPC,
+        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `not_in_this_build`",
+        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `tst_required` | M2-21 | reserved | test fixture |\n| `not_in_this_build`",
+    );
     // Generic token-reader cases own their reservations. Borrowing an
     // unlanded product token makes them depend on other lanes' progress.
     let header = concat!(
         "**The CLI's own failure tokens** (`envcloak: <token>:` lines that are not error kinds, reasons or sign-in tokens):\n\n",
         "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|"
     );
-    reserve_exit_token(&t, "tst_required");
+    edit(
+        &t,
+        IPC,
+        header,
+        &format!(
+            "{header}\n| `zz_reserved_exit` | M2-01 | reserved | fixture |\n| `zz_reserved_method` | M2-01 | reserved | fixture |\n| `zz_reserved_plan` | M2-01 | reserved | fixture |"
+        ),
+    );
     t
 }
 
@@ -240,15 +260,21 @@ fn a_number_outside_the_reserved_range_fails() {
 #[test]
 fn a_reserved_entry_the_code_already_has_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 22, "reveal");
-    assert_fails(&t, "`reveal` is reserved, but the code already has it");
+    add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
+    assert_fails(
+        &t,
+        "`fixture_audit` is reserved, but the code already has it",
+    );
 }
 
 #[test]
 fn a_reserved_number_the_code_gives_another_entry_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Probe", 22, "probe");
-    assert_fails(&t, "`reveal` reserves 22, which the code gives to `probe`");
+    add_audit_kind(&t, "Probe", 200, "probe");
+    assert_fails(
+        &t,
+        "`fixture_audit` reserves 200, which the code gives to `probe`",
+    );
 }
 
 #[test]
@@ -264,12 +290,12 @@ fn a_code_entry_in_the_reserved_range_without_a_landed_row_fails() {
 #[test]
 fn an_entry_landed_as_reserved_passes() {
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 22, "reveal");
+    add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
     assert_passes(&t.home());
 }
@@ -280,23 +306,26 @@ fn a_landed_row_the_code_lacks_fails() {
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
-    assert_fails(&t, "`reveal` is `landed`, but the code has no such entry");
+    assert_fails(
+        &t,
+        "`fixture_audit` is `landed`, but the code has no such entry",
+    );
 }
 
 #[test]
 fn a_landed_row_with_another_number_than_the_code_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 47, "reveal");
+    add_audit_kind(&t, "FixtureAudit", 47, "fixture_audit");
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
-    assert_fails(&t, "`reveal` is 22 here and 47 in the code");
+    assert_fails(&t, "`fixture_audit` is 200 here and 47 in the code");
 }
 
 #[test]
@@ -402,16 +431,13 @@ fn a_code_source_it_cannot_read_fails() {
 
 const PROTO: &str = "crates/envcloak-ipc/src/proto.rs";
 
-/// Adds a reservation owned by this fixture, independent of tasks landing.
+/// Points the fixture-owned spare failure-token row at `token`.
 fn reserve_exit_token(t: &TestHome, token: &str) {
-    // The M3 section has a second exit-token table. This existing name locates
-    // the M2 table without depending on any reservation's status.
-    let before = "| `not_in_this_build` |";
     edit(
         t,
         IPC,
-        before,
-        &format!("| `{token}` | M2-21 | reserved | test fixture |\n{before}"),
+        "| `zz_reserved_plan` | M2-01 | reserved |",
+        &format!("| `{token}` | M2-01 | reserved |"),
     );
 }
 
@@ -444,31 +470,32 @@ const CLIENT_STUB: &str = "crates/envcloak-client/src/stub.rs";
 
 #[test]
 fn a_failure_token_written_as_a_constant_in_another_crate_counts() {
-    // The fixture's token in another crate is a clash until its row is landed.
+    // The fixture owns this reservation; another task landing a real
+    // token cannot change the positive or negative control.
     let t = fixture();
     add_file(
         &t,
         CLIENT_STUB,
         "/// The token of a job that did not finish.\n\
-         pub const TST_REQUIRED: &str = \"tst_required\";\n\
+         pub const INCOMPLETE: &str = \"zz_reserved_plan\";\n\
          \n\
          pub fn stopped() -> Failure {\n    \
              Failure::new(\n        \
-                 crate::stub::TST_REQUIRED,\n        \
+                 crate::stub::INCOMPLETE,\n        \
                  \"the job did not finish\",\n    \
              )\n\
          }\n",
     );
     assert_fails(
         &t,
-        &format!("`tst_required` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`zz_reserved_plan` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
     // The task that lands it marks the row `landed`, and then it passes.
     edit(
         &t,
         IPC,
-        "| `tst_required` | M2-21 | reserved |",
-        "| `tst_required` | M2-21 | landed |",
+        "| `zz_reserved_plan` | M2-01 | reserved |",
+        "| `zz_reserved_plan` | M2-01 | landed |",
     );
     assert_passes(&t.home());
 }
@@ -493,30 +520,19 @@ fn the_failure_token_m2_02_landed_is_marked_landed() {
 #[test]
 fn a_failure_token_in_a_field_or_a_token_method_counts() {
     let t = fixture();
-    reserve_exit_token(&t, "tst_method_constant");
-    reserve_exit_token(&t, "tst_method_literal");
     add_file(
         &t,
         CLIENT_STUB,
-        "const METHOD_REQUIRED: &'static str = \"tst_method_constant\";\n\
-         pub fn a() -> Failure { Failure { token: \"tst_required\", message: \"\".into() } }\n\
-         impl E { pub fn token(&self) -> &'static str { match self { E::A => METHOD_REQUIRED, E::B => \"tst_method_literal\" } } }\n",
+        "const APP: &'static str = \"zz_reserved_plan\";\n\
+         pub fn a() -> Failure { Failure { token: \"zz_reserved_exit\", message: \"\".into() } }\n\
+         impl E { pub fn token(&self) -> &'static str { match self { E::A => APP, E::B => \"zz_reserved_method\" } } }\n",
     );
-    for token in ["tst_required", "tst_method_literal", "tst_method_constant"] {
+    for token in ["zz_reserved_exit", "zz_reserved_method", "zz_reserved_plan"] {
         assert_fails(
             &t,
             &format!("`{token}` is reserved, but the code already has it ({CLIENT_STUB})"),
         );
     }
-    for token in ["tst_required", "tst_method_literal", "tst_method_constant"] {
-        edit(
-            &t,
-            IPC,
-            &format!("| `{token}` | M2-21 | reserved |"),
-            &format!("| `{token}` | M2-21 | landed |"),
-        );
-    }
-    assert_passes(&t.home());
 }
 
 #[test]
@@ -546,12 +562,12 @@ fn a_token_printed_directly_as_envcloak_token_counts() {
         &t,
         CLIENT_STUB,
         "pub fn stopped() -> String {\n    \
-             format!(\"envcloak: tst_required: {} files not read\", 3)\n\
+             format!(\"envcloak: zz_reserved_plan: {} files not read\", 3)\n\
          }\n",
     );
     assert_fails(
         &t,
-        &format!("`tst_required` is reserved, but the code already has it ({CLIENT_STUB})"),
+        &format!("`zz_reserved_plan` is reserved, but the code already has it ({CLIENT_STUB})"),
     );
 }
 
@@ -652,19 +668,19 @@ fn a_name_the_shared_list_names_with_both_tables_passes() {
 
 #[test]
 fn two_audit_kinds_with_one_token_fail() {
-    // Codex's case: 22 and 46 both `reveal`, only 22 registered.
+    // Two numbers share the fixture token; only 200 is registered.
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 22, "reveal");
-    add_audit_kind(&t, "RevealAgain", 46, "reveal");
+    add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
+    add_audit_kind(&t, "FixtureAuditAgain", 46, "fixture_audit");
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
     assert_fails(
         &t,
-        "`fn token` gives `reveal` to more than one `AuditKind` variant (RevealAgain, Reveal)",
+        "`fn token` gives `fixture_audit` to more than one `AuditKind` variant (FixtureAuditAgain, FixtureAudit)",
     );
 }
 
@@ -1043,24 +1059,24 @@ fn an_audit_kind_with_a_hexadecimal_number_is_read() {
         "`AuditKind` gives 4 to more than one variant (Revoke, Login)",
     );
     let t = fixture();
-    add_audit_variant(&t, "Login = 0x16,", Some(("Login", "login")));
+    add_audit_variant(&t, "Login = 0xc9,", Some(("Login", "login")));
     assert_fails(
         &t,
-        "the code has `login` = 22 in the reserved range with no `landed` row",
+        "the code has `login` = 201 in the reserved range with no `landed` row",
     );
-    // Read as the number it is: 22 in any of Rust's forms lands `reveal`.
-    for number in ["0x16", "0o26", "0b1_0110", "2_2", "22u8"] {
+    // Read as the number it is: 200 in any of Rust's forms lands `fixture_audit`.
+    for number in ["0xc8", "0o310", "0b1100_1000", "2_00", "200u8"] {
         let t = fixture();
         add_audit_variant(
             &t,
-            &format!("Reveal = {number},"),
-            Some(("Reveal", "reveal")),
+            &format!("FixtureAudit = {number},"),
+            Some(("FixtureAudit", "fixture_audit")),
         );
         edit(
             &t,
             VAULT,
-            "| 22 | `reveal` | M2-21 | reserved |",
-            "| 22 | `reveal` | M2-21 | landed |",
+            "| 200 | `fixture_audit` | M2-21 | reserved |",
+            "| 200 | `fixture_audit` | M2-21 | landed |",
         );
         assert_passes(&t.home());
     }
@@ -1104,14 +1120,14 @@ fn a_variant_the_reader_cannot_read_fails() {
     let t = fixture();
     add_audit_variant(
         &t,
-        "/// Revealed.\n    #[doc = \"x, y\"]\n    Reveal = 22,",
-        Some(("Reveal", "reveal")),
+        "/// Fixture audit.\n    #[doc = \"x, y\"]\n    FixtureAudit = 200,",
+        Some(("FixtureAudit", "fixture_audit")),
     );
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
     assert_passes(&t.home());
 }
