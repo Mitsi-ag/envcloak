@@ -38,6 +38,21 @@ def whole_runs(block, name):
 
 
 class CIJob(unittest.TestCase):
+    def test_ui_failures_keep_results_and_run_independent_checks(self):
+        with open(CI) as f:
+            block = job(f.read(), "macos-app")
+        steps = re.split(r'^      - ', block, flags=re.M)
+        uploads = [step for step in steps if 'uses: actions/upload-artifact@' in step]
+        self.assertEqual(len(uploads), 1, 'failed UI tests need their xcresult artifact')
+        self.assertRegex(uploads[0], r'if:.*failure\(\)')
+        for path in ['target/m305-ui/Logs/Test/*.xcresult', 'target/m306-ui/Logs/Test/*.xcresult',
+                     '${{ runner.temp }}/dd-*/Logs/Test/*.xcresult']:
+            self.assertIn(path, uploads[0])
+        for name in ['EU-1 paste, bindings, exact undo and canary sweep',
+                     'Compiled Swift sources are the scanned sources']:
+            step = next(step for step in steps if step.startswith('name: ' + name))
+            self.assertIn('!cancelled()', step, name + ' must still run after a UI failure')
+
     def test_every_script_test_runs_whole_in_macos_app(self):
         with open(CI) as f:
             block = job(f.read(), "macos-app")
