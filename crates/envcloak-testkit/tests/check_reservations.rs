@@ -50,7 +50,13 @@ fn copy_dir(from: &Path, to: &Path) {
 fn fixture() -> TestHome {
     let t = TestHome::new();
     let root = t.home();
-    for rel in ["docs/IPC.md", "docs/VAULT.md", BASELINE, "Cargo.toml"] {
+    for rel in [
+        "docs/IPC.md",
+        "docs/VAULT.md",
+        BASELINE,
+        "Cargo.toml",
+        "security/sys-build-script.sha256",
+    ] {
         let dest = root.join(rel);
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::copy(repo_root().join(rel), dest).unwrap();
