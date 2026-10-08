@@ -45,7 +45,7 @@ not count as mutation evidence.
 
 ## Gate mutations
 
-These original mutations were restored after their failing controls. Test
+These gate mutations were restored after their failing controls. Test
 names omit the common `gate37_` prefix.
 
 | Tests | Named mutation caught |
@@ -71,6 +71,7 @@ names omit the common `gate37_` prefix.
 | `leftovers_reported_on_undo_success_and_refusal_without_deleting_foreign_files` | Hide discovered leftovers; restore the old inconsistent completion flag |
 | `python_encoded_jsonl_is_scrubbed_and_remains_valid` | Disable encoded-token redaction |
 | `scrub::gate37_scrub_story` | Retain original JSON bytes; the unfiltered exposure sweep fails |
+| `traced_scrub_refuses_before_reading_plaintext` (Linux) | `skip_initial_scrub_tracer_refusal`; runtime failure and restored passes recorded below |
 
 The crash gate now uses independent Python output for three eligible vault
 canaries: raw, both hex cases, padded and unpadded standard and URL base64,
@@ -95,7 +96,7 @@ orders; the Cycle432 scanner oracle remains a separate provenance check.
 | R-M2-45 | Recent live writer, separately held file, symlink and hard-link refusals |
 | R-M2-46 | Printed local-only limitations, short-value policy and named database omissions |
 | R-M2-47 | Encrypted v2 backup before write, guarded byte-exact undo, independent seven-day clock |
-| R-M2-79 | Existing startup hardening plus tracer refusal before source discovery; Linux baseline passed in CI; refusal mutation awaits the driver run |
+| R-M2-79 | Existing startup hardening plus tracer refusal before source discovery; Linux refusal mutation qualified under L-01 by a runtime assertion failure and two restored passing receipts below |
 | R-M2-84 / gate 37 | Crash barriers, plaintext sweeps, undo digest, retention and rotation gates above |
 
 ## Review repair audit
@@ -109,7 +110,7 @@ The sweep also follows the shared scanner and backup admission dependencies.
 | Admission drift | Daemon backup roots versus catalog-selected scrub stores: default and relocated Claude/Codex roots, named legacy backups, per-user temporary trees, direct-child cwd files, hook outputs and configured Codex logs now have admission and undo controls. Daemon-owned roots normalize redundant separators and current-directory components, while client path grammar and parent-component refusals remain strict. Existing creator, upload owner, proof, lease and post-change digest checks remain the authorization boundaries. |
 | Unsupported coverage claim | CLI `LIMITS` and DOCTOR's scrub paragraph claimed a short registry exception; both now state the actual short-value exclusion. IPC's comparison eligibility describes the daemon, not scanner discovery, and is unchanged. |
 | Incomplete exposure detector | CLI crash temporary siblings, the post-kill file and the basic rewrite gate used raw-only checks. Use the encoding-aware detector, independent encoded input, unfiltered positive controls and pre/post-kill sweeps. Native preview tests assert exact byte output; the story and Python JSONL gates already use encoding-aware sweeps. |
-| Unqualified platform evidence | Linux tracer baseline is green in the driver-reported CI runs below; its removal mutation still needs Linux execution. |
+| Unqualified platform evidence | Closed by the driver-reported Linux tracer-removal mutation failure and two restored passes on `69acef57`, recorded below. |
 | Producer/reader status race | The required unsafe check exposed an early-exit allowlist pipeline. A large valid-list control reproduced it. CI's Xcode version pipeline had the same pattern and a forced producer reproduced a broken pipe. Both readers now consume all input; unlisted-file and wrong-version controls still fail. Other task-file `grep -q` uses read files directly. |
 | Raw metadata in diagnostics | The new `ScanReport.transcript_formats` map bypassed `Source`'s value-free debug output. `ScanReport` now prints counts only, and a generated filename canary qualifies the fix. Scrub `Match`, `Edit`, `FilePlan` and `OpenFile` already have opaque debug implementations; the new daemon scope has none. Existing atomic path errors are converted to fixed CLI reason tokens and sanitized locations. |
 | Public receipt hygiene | Removed local absolute paths, host build details, tool install locations and superseded aggregate test counts from this document. No other task-added documentation or comments contained those receipt details. The local receipt check rejects the old document (`restore_host_receipts`) for all three categories and accepts the repaired task docs. |
@@ -172,14 +173,43 @@ assertions and landed-row positive controls remain. Its mutation receipts:
 
 ## Platform qualification and remaining scope
 
-The driver reports all checks green for `ab26e52f`, including Linux gate 37
-and the scrub story in [run 37716095057](https://github.com/Mitsi-ag/envcloak/actions/runs/37716095057),
-and [manual run 37716104417](https://github.com/Mitsi-ag/envcloak/actions/runs/37716104417).
-These baseline runs do not qualify the tracer-removal mutation. This macOS
-worktree cannot execute that Linux kernel test, and the engineer must not
-push or dispatch workflows. The driver must follow [the concrete mutation handoff](M2-22-LINUX-MUTATION.md) on
-Linux and attach its failing test receipt before R-M2-79's L-01 evidence is
-closed. No local or previous CI pass substitutes for that receipt.
+R-M2-79's Linux tracer mutation is qualified under L-01. The driver supplied
+the following failing mutation and restored-source receipts, completing the
+Linux handoff.
+
+Mutation `skip_initial_scrub_tracer_refusal` was the only change on disposable
+branch `m2/m2-22-mut-tracer`, commit
+`23e73e03072663fb2f6d17d6edb2255288bd7c86`, whose parent is `69acef57`.
+It bypassed the initial `refuse_if_traced()` result in the scrub entry point
+with `if false { refuse_if_traced() } else { Ok(()) }`. The unreachable call
+kept the import used, and the mutation was rustfmt clean.
+
+In [mutation run 37795007127](https://github.com/Mitsi-ag/envcloak/actions/runs/37795007127)
+(`workflow_dispatch`), the `test (ubuntu-latest)` job compiled and ran
+`cargo test --workspace`. Exactly one target failed: `envcloak --test scrub`,
+with 15 tests passed and one failed. The failing test was
+`gate37_traced_scrub_refuses_before_reading_plaintext`, at
+`crates/envcloak-cli/tests/scrub.rs:953:5`, with this assertion:
+
+```text
+assertion failed: stderr(&out).starts_with("envcloak: traced:")
+```
+
+This was a runtime assertion failure, not a compilation error or timeout.
+The mutation run's macOS test job was cancelled before any step ran; the
+tracer gate is Linux-only.
+
+Both restored-source receipts use commit
+`69acef57274b191b33d8bb9ed71edb8edda95825`:
+
+- [PR run 37794925651](https://github.com/Mitsi-ag/envcloak/actions/runs/37794925651)
+  passed, including the gates job's full CLI scrub target on Linux.
+- [Manual run 37795051722](https://github.com/Mitsi-ag/envcloak/actions/runs/37795051722)
+  passed its full `test (ubuntu-latest)` job.
+
+The driver also reports detached local checks passing on `69acef57`: fmt,
+strict Clippy, unsafe and exposure checks, scanner 236, daemon 262, CLI 291,
+testkit `check_unsafe` 29 and the scrub story one, with no failures.
 
 Gate 41's complete pinned-host story belongs to M2-26. M2-22's story drives
 the real CLI and daemon with synthetic transcripts. SQLite rewriting remains
