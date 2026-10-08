@@ -44,7 +44,7 @@ A peer running as another uid is closed at once, answered nothing, and audited. 
 
 **Client, before it sends anything.** `Client::connect` checks the runtime directory as the daemon does (without changing it), checks that the socket is a socket of this uid, connects (the descriptor is close-on-exec), and checks with `getpeereid` (macOS) or `SO_PEERCRED` (Linux) that the process at the other end runs as this uid. A missing directory, socket or listener is `daemon_unavailable`; any failed check is `daemon_unverified`, and nothing is sent. A passphrase is read only after the daemon is verified, and sent on a connection verified again.
 
-Signed macOS builds also check the daemon's code signature from its audit token against the agent requirement and runtime policy before sending any bytes (M3-07). Failure is `daemon_unverified` with reason `code_identity`. The client rechecks the peer instance before each request and after each response. Builds that pin no signing identity cannot: `envcloak status` says "daemon identity unverified", and on them a program running as the same user can impersonate the daemon (SPEC §1.1).
+Signed macOS builds also check the daemon's code signature from its audit token against the agent requirement and runtime policy before sending any bytes (M3-07). The exact verified token must match the recorded peer's uid, pid and pidversion; a final identity read alone cannot detect alternating users of a shared descriptor. Failure is `daemon_unverified` with reason `code_identity`. The client rechecks the peer instance before each request and after each response, including a failed read or write. An identity loss after sending began reports "delivery is uncertain": the request may already have taken effect. That connection remains unverified and refuses subsequent requests even if the original peer returns. Builds that pin no signing identity cannot verify code: `envcloak status` says "daemon identity unverified", and on them a program running as the same user can impersonate the daemon (SPEC §1.1).
 
 ## Framing
 
@@ -291,7 +291,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `code_selecting_variable`, `interpreter_option`, `wrapper_program`, `disguised_launcher` | `code_selecting_env` (from `managed.register`, `managed.update_plan` and `managed.update`; their `invalid_params` carries `not_found`, `not_regular_file`, `too_large`, `invalid_env_name` and `invalid_path` from the rows above, ) |
 | `key_shaped` | `invalid_params` from `managed.register`, `managed.update_plan` and `managed.update`: a launch argument, variable value, working directory or `PATH`, or a bridged server's origin or header name, shaped like a key (gate 13 in the daemon) |
 | `invalid_header`, `header_bindings` | `invalid_params` from `managed.register` for a bridged server: a header whose name cannot name a binding (letters, digits, `-` and `_`, a letter first), or two headers that would share one; a manifest that does not bind exactly its headers' bindings (docs/MIGRATE-MCP.md) |
-| `code_identity` | client-side `daemon_unverified`; the daemon's identity or runtime policy failed before sending |
+| `code_identity` | client-side `daemon_unverified`; the daemon's identity or runtime policy failed; a pre-send failure sends no request, while loss after sending began reports uncertain delivery |
 
 ## Lock
 
@@ -662,7 +662,7 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 <!-- reservations:reason -->
 | Token | Task | Status | Use |
 |---|---|---|---|
-| `code_identity` | M3-07 | landed | `daemon_unverified` on a signed build: the daemon's code signature does not satisfy the daemon's pinned requirement and the runtime conditions of SPEC §4.3; the client sends nothing |
+| `code_identity` | M3-07 | landed | `daemon_unverified` on a signed build: signature, runtime conditions of SPEC §4.3 or peer binding failed; rejection before sending sends no request, while identity loss after sending began reports uncertain delivery |
 | `rolled_back` | M3-16 | reserved | `vault_tampered`: the keychain anchor is newer than the vault file, which opens read-only |
 | `keychain_anchor_missing` | M3-16 | reserved | a vault that had a keychain anchor has none: reported, and the anchor written again with an audit entry |
 <!-- /reservations -->

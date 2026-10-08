@@ -18,7 +18,8 @@ fn main() {
                 }
             );
             // A fake server records this frame and closes without answering.
-            if client.status().is_err() {
+            if let Err(error) = client.status() {
+                println!("{error:?}: {error}");
                 std::process::exit(124);
             }
         }

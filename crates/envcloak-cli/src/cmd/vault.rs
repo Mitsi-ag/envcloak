@@ -216,7 +216,7 @@ fn refused_before_creating(e: ClientError) -> bool {
         ),
         // The connection failed or the answer was unreadable: the daemon
         // may have created the vault first.
-        ClientError::Frame(_) | ClientError::Protocol => false,
+        ClientError::Frame(_) | ClientError::Protocol | ClientError::UnverifiedAfterSend => false,
     }
 }
 
@@ -352,6 +352,7 @@ mod tests {
         }
         for e in [
             ClientError::Frame(FrameError::Closed),
+            ClientError::UnverifiedAfterSend,
             ClientError::Protocol,
             ClientError::Rpc(RpcError::new(ErrorKind::VaultLocked)),
             ClientError::Rpc(RpcError::new(ErrorKind::Internal)),

@@ -15,6 +15,18 @@ impl core::fmt::Debug for AuditToken {
     }
 }
 
+impl AuditToken {
+    /// Bind this exact signature token to the previously recorded socket user.
+    /// Separate identity reads cannot detect an A -> B -> A descriptor race.
+    fn matches_peer(&self, peer: &crate::PeerIdentity) -> bool {
+        peer.source == crate::PeerSource::AuditToken
+            && peer.pid > 0
+            && self.0[1] == peer.uid
+            && self.0[5] == peer.pid as u32
+            && Some(self.0[7] as i32) == peer.pidversion
+    }
+}
+
 /// A requirement produced only by this build's pins.
 #[derive(Debug)]
 pub struct PinnedRequirement(String);
@@ -74,7 +86,12 @@ pub fn runtime_verdict(runtime: bool, debuggable: bool, entitlements: &[&str]) -
 pub fn audit_token(fd: BorrowedFd<'_>) -> Result<AuditToken, PeerCodeError> {
     #[cfg(target_os = "macos")]
     {
-        crate::peer::macos::raw_audit_token(fd).map_err(|_| PeerCodeError::PeerUnknown)
+        #[cfg(feature = "testing")]
+        token_barrier("before-token")?;
+        let token = crate::peer::macos::raw_audit_token(fd).map_err(|_| PeerCodeError::PeerUnknown);
+        #[cfg(feature = "testing")]
+        token_barrier("after-token")?;
+        token
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -83,11 +100,40 @@ pub fn audit_token(fd: BorrowedFd<'_>) -> Result<AuditToken, PeerCodeError> {
     }
 }
 
+// A bounded rendezvous for the native alternating-user test, absent from all
+// non-testing builds. build.rs refuses testing in every release configuration.
+#[cfg(all(target_os = "macos", feature = "testing"))]
+fn token_barrier(stage: &str) -> Result<(), PeerCodeError> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let Some(path) = std::env::var_os("ENVCLOAK_TEST_PEER_BARRIER") else {
+        return Ok(());
+    };
+    let rendezvous = || -> std::io::Result<()> {
+        let mut stream = UnixStream::connect(path)?;
+        let timeout = Some(std::time::Duration::from_secs(30));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+        stream.write_all(stage.as_bytes())?;
+        let mut ack = [0];
+        stream.read_exact(&mut ack)?;
+        if ack != [1] {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(())
+    };
+    rendezvous().map_err(|_| PeerCodeError::PeerUnknown)
+}
+
 /// Checks the running image and then its runtime flags and entitlements.
 pub fn peer_satisfies(
     token: &AuditToken,
+    peer: &crate::PeerIdentity,
     pin: &PinnedRequirement,
 ) -> Result<CodeVerdict, PeerCodeError> {
+    if !token.matches_peer(peer) {
+        return Err(PeerCodeError::PeerUnknown);
+    }
     #[cfg(target_os = "macos")]
     {
         macos::check(token, pin)
@@ -96,6 +142,42 @@ pub fn peer_satisfies(
     {
         let _ = (token, &pin.0);
         Err(PeerCodeError::Unsupported)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signature_token_must_name_the_recorded_peer() {
+        let token = AuditToken([0, 501, 20, 501, 20, 42, 0, 7]);
+        let peer = crate::PeerIdentity {
+            uid: 501,
+            pid: 42,
+            pidversion: Some(7),
+            start_time: crate::StartTime::from_raw(1),
+            source: crate::PeerSource::AuditToken,
+        };
+        assert!(token.matches_peer(&peer));
+        for changed in [
+            crate::PeerIdentity { uid: 502, ..peer },
+            crate::PeerIdentity { pid: 43, ..peer },
+            crate::PeerIdentity {
+                pidversion: Some(8),
+                ..peer
+            },
+            crate::PeerIdentity {
+                pidversion: None,
+                ..peer
+            },
+            crate::PeerIdentity {
+                source: crate::PeerSource::PeerCred,
+                ..peer
+            },
+        ] {
+            assert!(!token.matches_peer(&changed));
+        }
     }
 }
 
