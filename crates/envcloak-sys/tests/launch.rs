@@ -7,7 +7,6 @@
 //! after the copy was made.
 #![allow(clippy::unwrap_used)]
 
-#[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -318,5 +317,119 @@ fn stopping_an_exited_childs_group_is_no_error() {
             "the member outlived the stop"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Every descriptor that is not handed over is closed in the child, also
+/// below the highest number handed over, and a directory descriptor
+/// numbered as a target is still the directory the child starts in. Run
+/// in a copy of this binary ([`launch_isolation_helper`]) started by a
+/// shell that leaves its descriptor 5 open without close-on-exec, so the
+/// numbers are known: the helper hands over only a pipe at 7 (a sparse
+/// mapping, with 5 below it), then a pipe at the number its directory's
+/// descriptor has.
+///
+/// Mutations checked (Linux, in a container): the child closing only from
+/// above its own descriptors up (`close_from(keep_to + 1)`, the previous
+/// rule): the child has 0, 1, 2 and 5 open beside 7, and this fails; the
+/// child changing directory through the directory's unmoved number: the
+/// pipe filled that number first, the start fails, and this fails. On
+/// macOS the directory's descriptor is moved above the targets too, but
+/// macOS 26.4 already changes to the directory the parent named (measured:
+/// with that move removed this still passes); the move stays because the
+/// order of file actions is not documented, and this test holds the
+/// guarantee there.
+#[test]
+fn only_handed_descriptors_reach_the_child_and_the_directory_survives_a_collision() {
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "exec 5</dev/null; exec \"$0\" --exact launch_isolation_helper --nocapture \
+             --test-threads=1",
+            exe.to_str().unwrap(),
+        ])
+        .env("ENVCLOAK_TEST_LAUNCH_HELPER", "1")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The positive control: the helper's own descriptor 5 is open, so a
+    // child that kept it would show it.
+    assert!(text.contains("helper fd5 open\n"), "{text}");
+    assert!(text.contains("child fds: 7\n"), "{text}");
+    assert!(text.contains("child cwd ok\n"), "{text}");
+}
+
+/// Not a test of its own: with `ENVCLOAK_TEST_LAUNCH_HELPER` set, the copy
+/// of this binary
+/// [`only_handed_descriptors_reach_the_child_and_the_directory_survives_a_collision`]
+/// starts.
+#[test]
+fn launch_isolation_helper() {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+
+    if std::env::var_os("ENVCLOAK_TEST_LAUNCH_HELPER").is_none() {
+        return;
+    }
+    if std::path::Path::new("/dev/fd/5").exists() {
+        println!("helper fd5 open");
+    }
+    // A sparse mapping: only 7, with the inherited 5 below it.
+    let (r, w) = std::io::pipe().unwrap();
+    let child = spawn(&Spawn {
+        program: Program::Path(b"/bin/sh"),
+        argv: &[
+            b"sh",
+            b"-c",
+            b"open=''; for n in 0 1 2 3 4 5 6 7 8 9; do \
+              if [ -e /dev/fd/$n ]; then open=\"$open $n\"; fi; done; \
+              echo \"child fds:$open\" >&7",
+        ],
+        env: &[],
+        fds: &[(w.as_fd(), 7)],
+        cwd: None,
+        session: Session::Group,
+        suspended: false,
+    })
+    .unwrap();
+    drop(w);
+    let mut got = String::new();
+    std::fs::File::from(std::os::fd::OwnedFd::from(r))
+        .read_to_string(&mut got)
+        .unwrap();
+    assert!(child.reap().unwrap().success());
+    print!("{got}");
+    // The directory's descriptor numbered as a target.
+    let dir = tempfile::tempdir().unwrap();
+    let canonical = std::fs::canonicalize(dir.path()).unwrap();
+    let d = std::fs::File::open(&canonical).unwrap();
+    let at = d.as_raw_fd();
+    assert!(at <= envcloak_sys::launch::MAX_TARGET_FD, "{at}");
+    let (r, w) = std::io::pipe().unwrap();
+    let line = format!("pwd -P >&{at}");
+    let child = spawn(&Spawn {
+        program: Program::Path(b"/bin/sh"),
+        argv: &[b"sh", b"-c", line.as_bytes()],
+        env: &[],
+        fds: &[(w.as_fd(), at)],
+        cwd: Some(d.as_fd()),
+        session: Session::Group,
+        suspended: false,
+    })
+    .unwrap();
+    drop(w);
+    let mut got = String::new();
+    std::fs::File::from(std::os::fd::OwnedFd::from(r))
+        .read_to_string(&mut got)
+        .unwrap();
+    assert!(child.reap().unwrap().success());
+    if got.trim_end() == canonical.to_str().unwrap() {
+        println!("child cwd ok");
     }
 }
