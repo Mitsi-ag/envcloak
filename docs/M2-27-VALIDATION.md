@@ -633,3 +633,22 @@ remain registered residuals with their owners (evidence below).
 Local receipts are `r3-mut-results.json` and the `r3-*.log` files in the
 lane's target directory. The e2e and daemon runs were detached from any
 agent's process tree, with a cleared environment.
+
+## Review round r4 repairs, 2026-10-09
+
+Six findings from the r3 verifier and Codex review. One is fixed, one is
+a CI gate handled on GitHub, one is left as the optional note it was, and
+the two residuals stay with their registered owners.
+
+| Finding | Class | Instances swept and disposition | Regression and mutation |
+| --- | --- | --- | --- |
+| `node --allow-fs-read <file> --permission -e <code>` registers with `<file>` as its entry and runs `<code>`; registration and stored-record revalidation share the parser (high) | An option's arity taken from a rule shared across interpreters instead of measured on the interpreter that parses it | Every long-option rule in `interpreter_option`. The shared `BOOLEAN_LONG` list and its prefixes (`--no-`, `--allow-`, `--deny-`, `--enable-`, `--disable-`) are now `boolean_long`, one measured list per family: Node 26.7.0's own option table (its non-boolean `--allow-fs-read`, `--allow-fs-write`, `--disable-warning`, `--disable-proto` are refused bare; `--no-` stays because Node refuses it on any option that is not boolean), deno's `--allow-`, `--deny-` and `--no-` (values only after `=`), Bun 1.3.13 (`--smol`, `--no-`), Ruby (`--enable-`, `--disable-`, `--verbose`, `--jit`, `--yjit`), bash and zsh. Any other family has none, so a bare long option leaves the entry unknown. Swept and unchanged: `value_short`, `attached_short`, `shell_named_option` (already per family and measured), long options with `=value` (an attached value never moves the entry), the daemon's `names_a_file` (looks at every argument), and the package runners' option scan (it only labels a launch that is never bound) | `long_options_take_values_as_their_own_interpreter_does` (policy: classification, declaration, update, `#!` line, and the measured booleans as controls); `a_stored_value_taking_long_option_cannot_keep_its_entry` (daemon launch check on a stored record, with a boolean-option control); the real-Node oracle `node_long_options_take_values_as_node_does` runs the injected forms on Node 26.7.0, then every Node option and its `--no-` form that the policy accepts bare, between two files, and requires Node never to run the second. Mutation: one shared prefix list for every family, as before; all three fail. A second mutation lists `--title` as a Node boolean, and the oracle's sweep fails |
+| Merge gate not met; macOS `tty.rs` typeahead test failed once (medium) | CI | The full macOS and Ubuntu runs are repeated on the new head. If the typeahead test fails again, the job is rerun once, and a second failure goes to a separate task rather than being merged over | GitHub runs |
+| Barrier test cannot see a child resumed early (low, optional) | A test claiming a mutation it cannot fail | The claim was already removed in r2. `a_suspended_server_runs_nothing_until_the_daemon_confirms` catches that mutation. No change | n/a |
+| Standing-record legs, M2R-89 (low and medium) | Coverage naming a grant kind it does not exercise | Unchanged: `envcloak standing` is still the `not_in_this_build` stub on main, and M2-15 depends on M2-27. M2R-89 is open in the canonical registry, owned by M2-15 | n/a |
+| Unresumed macOS runner after a daemon crash, M2R-87 (low) | A crash window that leaves a process no owner can end | Unchanged: registered for M2-25 under D-34; M2-25 is not on main | n/a |
+
+The Node oracle joins the managed runtime oracles job:
+`scripts/provision-managed-oracles.py` exports `ENVCLOAK_NODE_ORACLE`, the
+Node 26.7.0 that job selects, and `scripts/check-managed-oracles.py`
+requires it to run.
