@@ -666,6 +666,9 @@ pub struct ItemView {
     pub updated_secs: u64,
     pub rotated_secs: Option<u64>,
     pub expires_secs: Option<u64>,
+    /// Recorded use in long inventories, without the inspector's full detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_secs: Option<u64>,
     /// Who owns or pays for the key: personal, so filled only for
     /// `ls --long` and `show`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -804,6 +807,9 @@ impl ItemView {
             updated_secs: m.updated_at,
             rotated_secs: d.rotated_at,
             expires_secs: d.expires_at,
+            last_used_secs: (detail != ItemDetail::Summary)
+                .then_some(d.last_used_at)
+                .flatten(),
             account,
             detail: full,
             exposed: m.exposure.as_ref().map(|e| ExposedView {
@@ -1993,3 +1999,63 @@ pub struct ManagedUpdatedView {
     pub revision: u64,
     pub receipt: LaunchReceiptView,
 }
+
+/// Position in descending `(last_seen, id)` order, exclusive on continuation.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectCursor {
+    pub last_seen: u64,
+    pub id: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectBindingView {
+    pub env_name: String,
+    pub reference: String,
+}
+
+/// Adopted metadata, not a fresh read of the project's manifest.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectView {
+    pub dir: String,
+    pub manifest_sha256: String,
+    pub bindings: Vec<ProjectBindingView>,
+    pub last_seen_secs: u64,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsView {
+    pub projects: Vec<ProjectView>,
+    pub next: Option<ProjectCursor>,
+}
+
+/// The removed binding, for a caller's undo action. No value crosses.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RefUnsetView {
+    pub profile: Option<String>,
+    pub env_name: String,
+    pub reference: String,
+}
+
+macro_rules! project_debug {
+    ($($t:ty),* $(,)?) => {$(
+        impl core::fmt::Debug for $t {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                f.write_str(stringify!($t))?;
+                f.write_str(" { .. }")
+            }
+        }
+    )*};
+}
+project_debug!(
+    ProjectCursor,
+    ProjectBindingView,
+    ProjectView,
+    ProjectsView,
+    RefUnsetView
+);
+views!(ProjectsView, RefUnsetView);

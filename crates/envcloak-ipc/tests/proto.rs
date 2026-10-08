@@ -199,6 +199,30 @@ fn every_app_method_needs_the_app_role() {
 }
 
 #[test]
+fn managed_and_reveal_methods_are_known_client_methods() {
+    // Pin both method families independently of the registry we are checking.
+    for name in [
+        "items.reveal",
+        "managed.register",
+        "managed.unregister",
+        "managed.update_plan",
+        "managed.update",
+        "projects.list",
+    ] {
+        assert_eq!(
+            CLIENT_METHODS
+                .iter()
+                .filter(|method| **method == name)
+                .count(),
+            1,
+            "{name} must occur once in the client registry"
+        );
+        assert_eq!(required_role(name), Role::Client, "{name}");
+        assert_eq!(loggable_method(name), name);
+    }
+}
+
+#[test]
 fn error_kinds_have_distinct_codes_and_tokens() {
     let mut codes: Vec<i32> = ErrorKind::ALL.iter().map(|k| k.code()).collect();
     codes.sort_unstable();

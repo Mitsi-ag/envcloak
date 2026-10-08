@@ -697,6 +697,40 @@ pub struct TargetParams {
     pub claims: Vec<String>,
 }
 
+/// `items.reveal`: a Linux terminal's fresh passphrase proof. Only secret
+/// items are eligible; the audit entry is durable before the value leaves.
+#[derive(Debug)]
+pub struct ItemsReveal;
+
+impl Method for ItemsReveal {
+    const NAME: &'static str = "items.reveal";
+    type Params = RevealParams;
+    type Output = RevealOutput;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealParams {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    pub passphrase: WireSecret,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for RevealParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RevealParams([REDACTED])")
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealOutput {
+    pub value: WireSecret,
+}
+
 /// `items.rotate`: replaces a field's value, keeping the old one as the
 /// newest of up to three prior values. A proof: the passphrase, from a
 /// terminal subject (SPEC §10b). Grants that bind the item stay.
@@ -1725,7 +1759,7 @@ impl core::fmt::Debug for ManagedUpdateParams {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 43] = [
+pub const CLIENT_METHODS: [&str; 45] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1744,6 +1778,7 @@ pub const CLIENT_METHODS: [&str; 43] = [
     ItemsCheck::NAME,
     ItemsAdd::NAME,
     ItemsTarget::NAME,
+    ItemsReveal::NAME,
     ItemsRotate::NAME,
     ItemsRemove::NAME,
     ItemsMarkExposed::NAME,
@@ -1769,6 +1804,7 @@ pub const CLIENT_METHODS: [&str; 43] = [
     ManagedUnregister::NAME,
     ManagedUpdatePlan::NAME,
     ManagedUpdate::NAME,
+    ProjectsList::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
@@ -2631,5 +2667,28 @@ pub fn parse_response<'a, T: Deserialize<'a>>(
             Err(ResponseError::Rpc(e))
         }
         _ => Err(ResponseError::Protocol),
+    }
+}
+
+/// M3-04: the verified vault's adopted project index, newest first.
+#[derive(Debug)]
+pub struct ProjectsList;
+
+impl Method for ProjectsList {
+    const NAME: &'static str = "projects.list";
+    type Params = ProjectsListParams;
+    type Output = crate::view::ProjectsView;
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectsListParams {
+    #[serde(default)]
+    pub after: Option<crate::view::ProjectCursor>,
+}
+
+impl core::fmt::Debug for ProjectsListParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ProjectsListParams { .. }")
     }
 }

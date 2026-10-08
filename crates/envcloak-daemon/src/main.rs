@@ -42,8 +42,11 @@ mod items;
 mod launch_check;
 mod lock;
 mod managed;
+mod projects;
 mod redact;
 mod requests;
+#[cfg(target_os = "linux")]
+mod reveal;
 mod scan_match;
 mod server;
 mod spawn_envcloak;

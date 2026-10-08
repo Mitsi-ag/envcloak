@@ -68,6 +68,19 @@ fn fixture() -> TestHome {
             }
         }
     }
+    // Audit and terminal-reveal fixtures must also survive product landing.
+    edit(
+        &t,
+        VAULT,
+        "<!-- reservations:audit_kind -->\n| Number | Token | Task | Status | Use |\n|---|---|---|---|---|\n| 22 |",
+        "<!-- reservations:audit_kind -->\n| Number | Token | Task | Status | Use |\n|---|---|---|---|---|\n| 200 | `fixture_audit` | M2-21 | reserved | test fixture |\n| 22 |",
+    );
+    edit(
+        &t,
+        IPC,
+        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `not_in_this_build`",
+        "<!-- reservations:exit_token -->\n| Token | Task | Status | Use |\n|---|---|---|---|\n| `tst_required` | M2-21 | reserved | test fixture |\n| `not_in_this_build`",
+    );
     // Generic token-reader cases own their reservations. Borrowing an
     // unlanded product token makes them depend on other lanes' progress.
     let header = concat!(
@@ -247,15 +260,21 @@ fn a_number_outside_the_reserved_range_fails() {
 #[test]
 fn a_reserved_entry_the_code_already_has_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 22, "reveal");
-    assert_fails(&t, "`reveal` is reserved, but the code already has it");
+    add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
+    assert_fails(
+        &t,
+        "`fixture_audit` is reserved, but the code already has it",
+    );
 }
 
 #[test]
 fn a_reserved_number_the_code_gives_another_entry_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Probe", 22, "probe");
-    assert_fails(&t, "`reveal` reserves 22, which the code gives to `probe`");
+    add_audit_kind(&t, "Probe", 200, "probe");
+    assert_fails(
+        &t,
+        "`fixture_audit` reserves 200, which the code gives to `probe`",
+    );
 }
 
 #[test]
@@ -271,12 +290,12 @@ fn a_code_entry_in_the_reserved_range_without_a_landed_row_fails() {
 #[test]
 fn an_entry_landed_as_reserved_passes() {
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 22, "reveal");
+    add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
     assert_passes(&t.home());
 }
@@ -287,23 +306,26 @@ fn a_landed_row_the_code_lacks_fails() {
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
-    assert_fails(&t, "`reveal` is `landed`, but the code has no such entry");
+    assert_fails(
+        &t,
+        "`fixture_audit` is `landed`, but the code has no such entry",
+    );
 }
 
 #[test]
 fn a_landed_row_with_another_number_than_the_code_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 47, "reveal");
+    add_audit_kind(&t, "FixtureAudit", 47, "fixture_audit");
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
-    assert_fails(&t, "`reveal` is 22 here and 47 in the code");
+    assert_fails(&t, "`fixture_audit` is 200 here and 47 in the code");
 }
 
 #[test]
@@ -646,19 +668,19 @@ fn a_name_the_shared_list_names_with_both_tables_passes() {
 
 #[test]
 fn two_audit_kinds_with_one_token_fail() {
-    // Codex's case: 22 and 46 both `reveal`, only 22 registered.
+    // Two numbers share the fixture token; only 200 is registered.
     let t = fixture();
-    add_audit_kind(&t, "Reveal", 22, "reveal");
-    add_audit_kind(&t, "RevealAgain", 46, "reveal");
+    add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
+    add_audit_kind(&t, "FixtureAuditAgain", 46, "fixture_audit");
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
     assert_fails(
         &t,
-        "`fn token` gives `reveal` to more than one `AuditKind` variant (RevealAgain, Reveal)",
+        "`fn token` gives `fixture_audit` to more than one `AuditKind` variant (FixtureAuditAgain, FixtureAudit)",
     );
 }
 
@@ -1037,24 +1059,24 @@ fn an_audit_kind_with_a_hexadecimal_number_is_read() {
         "`AuditKind` gives 4 to more than one variant (Revoke, Login)",
     );
     let t = fixture();
-    add_audit_variant(&t, "Login = 0x16,", Some(("Login", "login")));
+    add_audit_variant(&t, "Login = 0xc9,", Some(("Login", "login")));
     assert_fails(
         &t,
-        "the code has `login` = 22 in the reserved range with no `landed` row",
+        "the code has `login` = 201 in the reserved range with no `landed` row",
     );
-    // Read as the number it is: 22 in any of Rust's forms lands `reveal`.
-    for number in ["0x16", "0o26", "0b1_0110", "2_2", "22u8"] {
+    // Read as the number it is: 200 in any of Rust's forms lands `fixture_audit`.
+    for number in ["0xc8", "0o310", "0b1100_1000", "2_00", "200u8"] {
         let t = fixture();
         add_audit_variant(
             &t,
-            &format!("Reveal = {number},"),
-            Some(("Reveal", "reveal")),
+            &format!("FixtureAudit = {number},"),
+            Some(("FixtureAudit", "fixture_audit")),
         );
         edit(
             &t,
             VAULT,
-            "| 22 | `reveal` | M2-21 | reserved |",
-            "| 22 | `reveal` | M2-21 | landed |",
+            "| 200 | `fixture_audit` | M2-21 | reserved |",
+            "| 200 | `fixture_audit` | M2-21 | landed |",
         );
         assert_passes(&t.home());
     }
@@ -1098,14 +1120,14 @@ fn a_variant_the_reader_cannot_read_fails() {
     let t = fixture();
     add_audit_variant(
         &t,
-        "/// Revealed.\n    #[doc = \"x, y\"]\n    Reveal = 22,",
-        Some(("Reveal", "reveal")),
+        "/// Fixture audit.\n    #[doc = \"x, y\"]\n    FixtureAudit = 200,",
+        Some(("FixtureAudit", "fixture_audit")),
     );
     edit(
         &t,
         VAULT,
-        "| 22 | `reveal` | M2-21 | reserved |",
-        "| 22 | `reveal` | M2-21 | landed |",
+        "| 200 | `fixture_audit` | M2-21 | reserved |",
+        "| 200 | `fixture_audit` | M2-21 | landed |",
     );
     assert_passes(&t.home());
 }
