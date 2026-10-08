@@ -54,6 +54,40 @@ final class LaunchTests: XCTestCase {
         XCTAssertEqual(titles(menu).filter { $0 == "About EnvCloak" }.count, 1)
     }
 
+    @MainActor
+    func testSystemUndoMenuDispatchesToTheWindowManager() throws {
+        let window = try XCTUnwrap(NSApp.windows.first { $0.title == "Projects" })
+        let manager = try XCTUnwrap(window.undoManager)
+        let target = NSObject()
+        var undone = false
+        manager.beginUndoGrouping()
+        manager.registerUndo(withTarget: target) { _ in undone = true }
+        manager.setActionName("Binding")
+        manager.endUndoGrouping()
+        defer { manager.removeAllActions(withTarget: target) }
+        let menu = try XCTUnwrap(NSApp.mainMenu?.item(withTitle: "Edit")?.submenu)
+        let item = try XCTUnwrap(menu.items.first { $0.action == NSSelectorFromString("undo:") })
+        // Resolve the native command against this scene's window. A local
+        // test host need not own the desktop's key window. AppKit validates
+        // the item; never force isEnabled or install a test UndoManager.
+        // Preserve an explicit native target so a broken one cannot pass.
+        let previousTarget = item.target
+        if previousTarget == nil { item.target = window }
+        defer { item.target = previousTarget; menu.update() }
+        menu.update()
+        // The observed system title varies with host/menu validation.
+        // Both forms must still dispatch the same native undo action.
+        print("Native Undo command: title=\(item.title) enabled=\(item.isEnabled) key=\(item.keyEquivalent) modifiers=\(item.keyEquivalentModifierMask.rawValue)")
+        XCTAssertEqual(manager.undoMenuItemTitle, "Undo Binding")
+        XCTAssertTrue(["Undo", manager.undoMenuItemTitle].contains(item.title), "Unexpected undo title: " + item.title)
+        XCTAssertTrue(item.isEnabled)
+        XCTAssertEqual(item.keyEquivalent, "z")
+        XCTAssertEqual(item.keyEquivalentModifierMask, .command)
+        XCTAssertTrue(window.firstResponder?.undoManager === manager)
+        menu.performActionForItem(at: menu.index(of: item))
+        XCTAssertTrue(undone)
+    }
+
     func testTheBundleHasNoSideDoor() throws {
         let info = try XCTUnwrap(Bundle.main.infoDictionary)
         XCTAssertEqual(Self.sideDoors(in: info), [])

@@ -5,6 +5,7 @@ import SwiftUI
 struct ProjectsOverview: View {
     let session: VaultSession
     @Binding var route: Route?
+    var bind: (BindingSelection) -> Void = { _ in }
     var body: some View {
         if session.projects.failure != nil {
             ContentUnavailableView("Projects could not be refreshed", systemImage: "exclamationmark.triangle", description: Text("Try again. No partial listing is shown."))
@@ -30,6 +31,11 @@ struct ProjectsOverview: View {
                             } else { Text("Not checked") }
                         }.frame(minHeight: 48).contentShape(Rectangle())
                     }.buttonStyle(.plain).accessibilityIdentifier("project.open." + directory.escaped)
+                        .dropDestination(for: String.self) { slugs, _ in
+                            guard session.state == .ready, slugs.count == 1,
+                                  let key = session.items.rows.first(where: { $0.slug.escaped == slugs[0] && $0.class == .secret }) else { return false }
+                            bind(BindingSelection(project: directory, key: key)); return true
+                        }
                 } else {
                     VStack(alignment: .leading) {
                         Text(ProjectInventoryRow.hiddenPathMessage)
@@ -45,7 +51,11 @@ struct ProjectDetail: View {
     let session: VaultSession
     let directory: DaemonText
     @Binding var selectedKey: DaemonText?
+    var bind: (BindingSelection) -> Void = { _ in }
     @State private var profile = ""
+    // The checked table is temporarily absent during reload. Its selection
+    // belongs to this project/profile, not to that transient table instance.
+    @State private var bindingSelection: String?
     private var opened: OpenedProject? {
         guard let project = session.projects.opened, project.directory == directory else { return nil }
         return project
@@ -78,16 +88,22 @@ struct ProjectDetail: View {
                     Text("Default").tag("")
                     ForEach(project.profiles, id: \.self) { Text($0).tag($0) }
                 }.pickerStyle(.segmented)
-                BindingsTable(session: session, project: project, profile: profile.isEmpty ? nil : profile, selectedKey: $selectedKey)
+                Button("Add variable") { bind(BindingSelection(project: directory, profile: profile)) }
+                    .accessibilityIdentifier("binding.add").disabled(session.state != .ready)
+                BindingsTable(session: session, project: project, profile: profile.isEmpty ? nil : profile, selectedKey: $selectedKey, bind: bind, selection: $bindingSelection)
                 Text("Grants in force in this project").font(.headline)
                 if let canonical = project.grantDirectory {
                     GrantRows(session: session, directory: canonical, slug: nil)
                 } else { Text("Project identity unavailable. Grants could not be matched.") }
             } else { Text("Not checked").foregroundStyle(ECToken.secondary.color); Spacer() }
         }.padding(16)
-        .task(id: directory) { profile = ""; await session.openProject(directory) }
+        .task(id: directory) { profile = ""; bindingSelection = nil; selectedKey = nil; await session.openProject(directory) }
+        .onChange(of: profile) { _, _ in bindingSelection = nil; selectedKey = nil }
+        .onChange(of: session.projects.checkFailure) { _, failure in
+            if failure != nil { bindingSelection = nil; selectedKey = nil }
+        }
         .onChange(of: session.projects.opened?.profiles) { _, profiles in
-            if !profile.isEmpty, !(profiles ?? []).contains(profile) { profile = "" }
+            if let profiles, !profile.isEmpty, !profiles.contains(profile) { profile = "" }
         }
     }
 }

@@ -9,6 +9,7 @@ import fcntl
 import json
 import os
 import pathlib
+import plistlib
 import pty
 import selectors
 import signal
@@ -20,7 +21,31 @@ import termios
 import time
 
 
+def xcode_command(cache, eu1, hosted, action='test'):
+    command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloak' if hosted else 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / ('m306-ui' if eu1 else 'm305-ui')), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', action]
+    if eu1:
+        command += ['-only-testing:EnvCloakTests/EU1Tests' if hosted else '-only-testing:EnvCloakUITests/PasteTests']
+    elif not hosted:
+        command += ['-skip-testing:EnvCloakUITests/PasteTests']
+    return command
+
+
+def verify_ui_runner(cache, eu1):
+    # The signed artifact is independent of xcodebuild's resolved settings.
+    # A sandboxed XCTest runner also sandboxes its CLI and sweep children.
+    runner = cache / ('m306-ui' if eu1 else 'm305-ui') / 'Build/Products/Debug/EnvCloakUITests-Runner.app'
+    result = subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', '-', '--xml', str(runner)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=15)
+    entitlements = plistlib.loads(result.stdout)
+    if entitlements.get('com.apple.security.app-sandbox') is not False:
+        raise RuntimeError('UI test runner must disable App Sandbox for its fixture CLI children: ' + str(runner))
+    print('UI test runner signature: App Sandbox disabled for fixture CLI children', flush=True)
+
+
 def main():
+    eu1 = "--eu1" in sys.argv
+    native_package = "--package" in sys.argv
+    hosted = "--hosted" in sys.argv or native_package
     home = pathlib.Path(os.environ['HOME'])
     if not str(home).startswith('/tmp/ec05-') or home.stat().st_mode & 0o077:
         raise RuntimeError('private fixture HOME required')
@@ -31,7 +56,8 @@ def main():
     project.mkdir(mode=0o700)
     (home / 'selected-alias').symlink_to(project, target_is_directory=True)
     manifest = project / 'envcloak.toml'
-    manifest.write_text('[project]\nname = "Workspace fixture"\n[env]\nVARIABLE = "fixture"\n')
+    project_name = 'workspace-fixture' if eu1 else 'Workspace fixture'
+    manifest.write_text('[project]\nname = "' + project_name + '"\n[env]\nVARIABLE = "fixture"\n')
     # This process is not a group leader under the detached check shell.
     os.setsid()
     master, slave = pty.openpty()
@@ -97,14 +123,45 @@ def main():
             del answer
             if len(rpc('projects.list')['projects']) != 1: raise RuntimeError('project not adopted')
             if len(rpc('grants.list')['grants']) != 1: raise RuntimeError('positive grant control absent')
-            (runtime / 'test-folders.json').write_text(json.dumps([str(home / 'selected-alias')]))
-            command = ['xcodebuild', '-project', 'apps/macos/EnvCloak.xcodeproj', '-scheme', 'EnvCloakUITests', '-configuration', 'Debug', '-destination', 'platform=macOS,arch=arm64', '-derivedDataPath', str(cache / 'm305-ui'), '-jobs', '3', '-parallel-testing-enabled', 'NO', 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG ENVCLOAK_SCREEN_TESTS', 'SWIFT_SUPPRESS_WARNINGS=NO', 'SWIFT_TREAT_WARNINGS_AS_ERRORS=YES', 'CODE_SIGN_IDENTITY=-', 'test']
-            test_env = dict(os.environ, TEST_RUNNER_ENVCLOAK_TEST_RUNTIME=str(runtime), TEST_RUNNER_ENVCLOAK_TEST_PROJECT=str(home / "selected-alias"))
-            tested = subprocess.run(command, env=test_env, timeout=300)
+            folders = [str(home / 'selected-alias')]
+            if eu1:
+                billing = home / 'billing-fixture'
+                billing.mkdir(mode=0o700)
+                (billing / 'envcloak.toml').write_bytes(b"[project]\r\nname='billing-fixture'\r\n[env]\r\nBASE='fixture' # keep formatting\r\n")
+                folders = [str(project), str(billing)]
+            (runtime / 'test-folders.json').write_text(json.dumps(folders))
+            command = xcode_command(cache, eu1, hosted)
+            test_env = dict(os.environ, TEST_RUNNER_ENVCLOAK_TEST_HOME=str(home), TEST_RUNNER_CFFIXED_USER_HOME=str(home),
+                            TEST_RUNNER_ENVCLOAK_TEST_STORY='eu1' if eu1 else 'eu0',
+                            TEST_RUNNER_TMPDIR=str(home / "tmp") + "/", TEST_RUNNER_HOME=str(home),
+                            TEST_RUNNER_ENVCLOAK_TEST_CLI=str(cli), TEST_RUNNER_ENVCLOAK_TEST_REPO=str(pathlib.Path.cwd()), TEST_RUNNER_ENVCLOAK_TEST_RUNTIME=str(runtime), TEST_RUNNER_ENVCLOAK_TEST_PROJECT=str(home / "selected-alias"))
+            if native_package:
+                command = ['swift', 'test', '--package-path', 'apps/macos', '--scratch-path', str(cache / 'native-tests'),
+                           '--jobs', '3', '-Xswiftc', '-warnings-as-errors', '--filter', 'EU1Tests']
+                test_env.update(ENVCLOAK_TEST_HOME=str(home), ENVCLOAK_TEST_RUNTIME=str(runtime),
+                                ENVCLOAK_TEST_CLI=str(cli), ENVCLOAK_TEST_REPO=str(pathlib.Path.cwd()),
+                                CFFIXED_USER_HOME=str(home))
+            if not hosted:
+                built = subprocess.run(xcode_command(cache, eu1, hosted, 'build-for-testing'), env=test_env, timeout=600)
+                if built.returncode: return built.returncode
+                verify_ui_runner(cache, eu1)
+                command = xcode_command(cache, eu1, hosted, 'test-without-building')
+            tested = subprocess.run(command, env=test_env, timeout=300 if hosted else 600)
             if tested.returncode: return tested.returncode
+            if eu1:
+                if hosted:
+                    receipt = json.loads((home / 'eu1-sweep.json').read_text())
+                    print('gate12 raw counts: ' + json.dumps(receipt, sort_keys=True), flush=True)
+                    if not (receipt.get('complete') is True and receipt.get('exit') == 0 and receipt.get('file_hits') == 0 and receipt.get('log_hits') == 0 and receipt.get('positive_controls', 0) > 0):
+                        raise RuntimeError('gate12 canary sweep failed')
+                items = rpc('items.list')['items']
+                if not any(i['slug'] == 'eu-one' and i['provider'] == 'openai' for i in items):
+                    raise RuntimeError('saved provider positive control absent')
+                print('EU-1: real items.list detects saved provider; UI checks both manifests and exact undo', flush=True)
+                return 0
             if rpc('grants.list')['grants']: raise RuntimeError('UI revoke did not empty real grants.list')
             print('real daemon controls: adopted project=1, grant before=1, grant after=0', flush=True)
-            subprocess.run(['scripts/check-sources.sh', '--swift', str(cache / 'm305-ui')], check=True, timeout=60)
+            subprocess.run(['scripts/check-sources.sh', '--swift', str(cache / ('m306-ui' if eu1 else 'm305-ui'))], check=True, timeout=60)
             return 0
         finally:
             daemon.terminate()

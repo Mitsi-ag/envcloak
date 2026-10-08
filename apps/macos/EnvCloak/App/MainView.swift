@@ -4,6 +4,9 @@ import SwiftUI
 
 struct MainView: View {
     let session: VaultSession
+    @State private var paste = false
+    @State private var binding: BindingSelection?
+    @State private var pendingBinding: BindingSelection?
     @State private var route: Route? = .projects
     @State private var selectedKey: DaemonText?
     @State private var inspector = false
@@ -73,13 +76,14 @@ struct MainView: View {
         .navigationTitle(windowTitle)
         .navigationSubtitle(windowSubtitle)
         .inspector(isPresented: $inspector) {
-            KeyInspector(session: session, slug: selectedKey, route: $route)
+            KeyInspector(session: session, slug: selectedKey, route: $route, bind: { binding = $0 })
                 .inspectorColumnWidth(min: 260, ideal: 300, max: 380)
         }
         .searchable(text: $query, placement: .toolbar, prompt: "Search keys; provider:, account:, class:, project:")
         .searchFocused($searchFocused)
         .toolbar {
             ToolbarItemGroup {
+                Button { paste = true } label: { Label("Add key", systemImage: "plus") }.accessibilityIdentifier("key.add").disabled(session.state != .ready)
                 Button { addFolder() } label: { Label("Add project folder…", systemImage: "folder.badge.plus") }
                     .help("Add project folder…").disabled(session.state != .ready)
             }
@@ -98,14 +102,24 @@ struct MainView: View {
                 Button { inspector.toggle() } label: { Label("Show inspector", systemImage: "sidebar.right") }.help("Show inspector")
             }
         }
+        .sheet(isPresented: $paste, onDismiss: {
+            if let next = pendingBinding { pendingBinding = nil; binding = next }
+        }) {
+            PasteSheet(session: session) { item in
+                pendingBinding = BindingSelection(project: scope, key: item)
+                paste = false
+            }
+        }
+        .sheet(item: $binding) { BindingSheet(session: session, selection: $0) }
         .frame(minWidth: 900, minHeight: 560)
         .onGeometryChange(for: Bool.self) { $0.size.width < 980 } action: { columns = $0 ? .detailOnly : .all }
         .onChange(of: selectedKey) { _, key in if key != nil { inspector = true } }
         .onChange(of: session.state) { _, state in if !state.canReadMetadata { selectedKey = nil } }
         .focusedSceneValue(\.workspaceNavigation, WorkspaceNavigation(
             navigate: { route = $0 }, search: { searchFocused = true },
-            addFolder: { addFolder() }, lock: { Task { await session.lock() } },
+            addFolder: { addFolder() }, addKey: { paste = true }, lock: { Task { await session.lock() } },
             group: { grouping = $0 }, ready: session.state == .ready, canLock: session.state.canLock))
+        .onDisappear { session.bindings.clear() }
         .task { await session.run() }
     }
 
@@ -140,10 +154,10 @@ struct MainView: View {
                 .accessibilityIdentifier("feature.unavailable")
         } else {
             switch route ?? .projects {
-            case .projects: ProjectsOverview(session: session, route: $route)
-            case .project(let dir): ProjectDetail(session: session, directory: dir, selectedKey: $selectedKey)
+            case .projects: ProjectsOverview(session: session, route: $route, bind: { binding = $0 })
+            case .project(let dir): ProjectDetail(session: session, directory: dir, selectedKey: $selectedKey, bind: { binding = $0 })
             case .keys(let filter): KeysView(session: session, filter: filter, query: query, scope: scope, grouping: $grouping, selectedKey: $selectedKey)
-            case .key(let slug): KeyInspector(session: session, slug: slug, route: $route)
+            case .key(let slug): KeyInspector(session: session, slug: slug, route: $route, bind: { binding = $0 })
             case .settings:
                 VStack(alignment: .leading, spacing: 16) {
                     DevelopmentBanner()
@@ -168,6 +182,7 @@ struct WorkspaceNavigation {
     let navigate: (Route) -> Void
     let search: () -> Void
     let addFolder: () -> Void
+    let addKey: () -> Void
     let lock: () -> Void
     let group: (KeyGrouping) -> Void
     let ready: Bool
@@ -192,6 +207,7 @@ struct WorkspaceCommands: Commands {
             Button("Settings") { navigation?.navigate(.settings) }.keyboardShortcut(",")
         }
         CommandGroup(after: .newItem) {
+            Button("Add key") { navigation?.addKey() }.keyboardShortcut("n").disabled(navigation?.ready != true)
             Button("Add project folder…") { navigation?.addFolder() }.disabled(navigation?.ready != true)
             Button("Lock the vault") { navigation?.lock() }.keyboardShortcut("l", modifiers: [.command, .shift]).disabled(navigation?.canLock != true)
         }

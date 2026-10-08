@@ -25,7 +25,9 @@ use std::process::ExitCode;
 
 use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, USAGE, usage};
-use envcloak_client::manifest_edit::{EditError, edit_manifest_ref, unset_manifest_ref};
+use envcloak_client::manifest_edit::{
+    EditError, UndoRecord, record_ref, record_unset, restore_ref,
+};
 use envcloak_client::render::print;
 use envcloak_ipc::ClientError;
 use envcloak_ipc::view::{RefEditView, RefStatus, RefUnsetView};
@@ -48,6 +50,8 @@ struct RefArgs {
     /// `--manifest`: an absolute path to a file named `envcloak.toml`.
     manifest: Option<PathBuf>,
     json: bool,
+    undo_fd: Option<i32>,
+    restore_fd: Option<i32>,
 }
 
 impl core::fmt::Debug for RefArgs {
@@ -62,6 +66,8 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
     let mut profile = None;
     let mut manifest = None;
     let mut json = false;
+    let mut undo_fd = None;
+    let mut restore_fd = None;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
         match arg {
@@ -72,6 +78,16 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
                 );
             }
             "--json" if !json => json = true,
+            "--undo-fd" if undo_fd.is_none() => {
+                undo_fd = Some(
+                    private_fd(it.next()).ok_or("private undo descriptor must be 3 or greater")?,
+                );
+            }
+            "--restore-fd" if restore_fd.is_none() => {
+                restore_fd = Some(
+                    private_fd(it.next()).ok_or("private undo descriptor must be 3 or greater")?,
+                );
+            }
             "--profile" if profile.is_none() => {
                 let p = *it.next().ok_or("--profile needs a name")?;
                 profile = Some(ProfileName::new(p).map_err(|_| "invalid profile name")?);
@@ -92,7 +108,12 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
             _ => binding = Some(arg),
         }
     }
-    if binding.is_some() == unset.is_some() {
+    if restore_fd.is_some()
+        && (binding.is_some() || unset.is_some() || profile.is_some() || undo_fd.is_some())
+    {
+        return Err("--restore-fd takes no binding, profile or recording option");
+    }
+    if restore_fd.is_none() && binding.is_some() == unset.is_some() {
         return Err("ref needs one binding or --unset NAME");
     }
     Ok(RefArgs {
@@ -104,7 +125,13 @@ fn parse(args: &[&str]) -> Result<RefArgs, &'static str> {
         profile,
         manifest,
         json,
+        undo_fd,
+        restore_fd,
     })
+}
+
+fn private_fd(arg: Option<&&str>) -> Option<i32> {
+    arg.and_then(|s| s.parse::<i32>().ok()).filter(|n| *n >= 3)
 }
 
 pub fn run(args: &[&str]) -> ExitCode {
@@ -156,14 +183,39 @@ fn edit(a: RefArgs) -> Result<ExitCode, Failure> {
             ));
         }
     };
+    let descriptor = |n| {
+        envcloak_sys::claim_inherited_fd(n)
+            .map(std::fs::File::from)
+            .map_err(|_| {
+                Failure::new(
+                    "io",
+                    "private undo channel unavailable; nothing was written",
+                )
+            })
+    };
+    // Validate the channel before the first edit. EOF bounds the private record.
+    let mut recording = a.undo_fd.map(descriptor).transpose()?;
+    if let Some(fd) = a.restore_fd {
+        let record = UndoRecord::read(&mut descriptor(fd)?)?;
+        if let Some(binding) = record.previous_binding()? {
+            writable(check(format!(
+                "{}={}",
+                binding.env_name, binding.reference
+            ))?)?;
+        }
+        restore_ref(&manifest, record)?;
+        println!("{{\"restored\":true}}");
+        return Ok(ExitCode::SUCCESS);
+    }
     if let Some(name) = a.unset {
-        let reference = match unset_manifest_ref(&manifest, &name, a.profile.as_ref()) {
+        let (reference, record) = match record_unset(&manifest, &name, a.profile.as_ref()) {
             Ok(r) => r,
             Err(EditError::BindingAbsent) => {
                 return Ok(Failure::from(EditError::BindingAbsent).report(1));
             }
             Err(e) => return Err(e.into()),
         };
+        deliver_undo(record, &mut recording)?;
         print(
             &RefUnsetView {
                 profile: a.profile.map(|p| p.as_str().to_owned()),
@@ -183,7 +235,8 @@ fn edit(a: RefArgs) -> Result<ExitCode, Failure> {
     let text = format!("{}={}", binding.env_name, binding.reference);
     let status = check(text)?;
     writable(status)?;
-    let e = edit_manifest_ref(&manifest, &binding, a.profile.as_ref())?;
+    let (e, record) = record_ref(&manifest, &binding, a.profile.as_ref())?;
+    deliver_undo(record, &mut recording)?;
     let view = RefEditView {
         manifest: manifest.to_string_lossy().into_owned(),
         profile: a.profile.map(|p| p.as_str().to_owned()),
@@ -195,6 +248,17 @@ fn edit(a: RefArgs) -> Result<ExitCode, Failure> {
     };
     print(&view, a.json);
     Ok(ExitCode::SUCCESS)
+}
+
+fn deliver_undo(
+    record: Option<UndoRecord>,
+    output: &mut Option<std::fs::File>,
+) -> Result<(), Failure> {
+    if let (Some(record), Some(output)) = (record, output) {
+        record.write(output).map_err(|_| Failure::new("io",
+            "the binding was saved, but its undo receipt could not be delivered; do not repeat the edit"))?;
+    }
+    Ok(())
 }
 
 /// The tail of every failure to check: what was not done, and why it was
@@ -263,6 +327,35 @@ fn writable(status: RefStatus) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_undo_descriptors_refuse_ambiguous_invocations() {
+        for fd in ["0", "1", "2", "-1", "2147483648", "not-a-descriptor"] {
+            assert!(parse(&["--restore-fd", fd]).is_err());
+            assert!(parse(&["A=fixture", "--undo-fd", fd]).is_err());
+        }
+        for args in [
+            vec!["--restore-fd", "3", "A=fixture"],
+            vec!["--restore-fd", "3", "--unset", "A"],
+            vec!["--restore-fd", "3", "--profile", "test"],
+            vec!["--restore-fd", "3", "--undo-fd", "4"],
+            vec!["--restore-fd", "3", "--restore-fd", "4"],
+            vec!["A=fixture", "--undo-fd", "3", "--undo-fd", "4"],
+            vec!["--undo-fd", "3"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+        assert_eq!(
+            parse(&["--restore-fd", "3", "--json"]).unwrap().restore_fd,
+            Some(3)
+        );
+        assert_eq!(
+            parse(&["A=fixture", "--undo-fd", "3", "--json"])
+                .unwrap()
+                .undo_fd,
+            Some(3)
+        );
+    }
 
     fn binding(s: &str) -> Binding {
         Binding::parse_arg(s).unwrap()

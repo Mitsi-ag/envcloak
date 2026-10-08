@@ -160,3 +160,30 @@ Errors are value-free. A manifest error is a kind and a place (a manifest line, 
 | 28, identity part: a copy or a move is a new identity; a symlinked path, or a case alias on APFS, keeps it | `tests/project.rs` |
 | 11, parsing part: no fixture in freed memory while parsing env files and manifests | `tests/parse_probe.rs` |
 | Errors carry no value, for malformed env files, manifests and `--ref` arguments holding fixtures | `tests/envfile.rs` |
+
+### Private app undo receipts (M3-06)
+
+The app runs ordinary `ref` with `--undo-fd N` (N at least 3). After a
+changed manifest is durably replaced, that private pipe receives a bounded
+binary receipt holding the writer's actual before and after bytes, project
+device/inode and selected binding. Standard JSON stays metadata-only. No-op
+edits have no receipt. The app keeps receipts in wiping memory for the current
+session; UndoManager holds action ids only. It refuses edits when its 32-entry
+history is full.
+
+`ref --restore-fd N` reads one receipt from a private pipe to EOF. It validates
+both manifests, permits only the selected binding's semantic difference,
+checks a restored reference with `items.check`, and requires the same project
+identity and exact after bytes before restoring the original bytes through
+the ordinary checked writer. The descriptor grants no arbitrary path or
+policy-write authority. Symlinks, hard links and changed stamps are refused.
+The app consumes each receipt once, in reverse edit order. A failed or
+uncertain attempt is refreshed and never offered as a successful undo.
+
+A rename followed by a failed parent sync can leave the edit visible without
+confirmed durability. No receipt is published on that path. Failure to deliver
+a receipt after a successful write reports `io` and says the
+binding was saved, so callers must inspect rather than automatically retry.
+The stamp check and rename are not an atomic compare-and-swap against another
+program writing concurrently. These memory-only receipts provide no crash
+recovery and do not change encrypted vault backup or proof requirements.

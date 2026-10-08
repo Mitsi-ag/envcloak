@@ -8,6 +8,11 @@ struct OpenedProject {
     var grantDirectory: DaemonText? { check.project_dir }
     var title: String { check.project_name?.escaped ?? MetadataRequest.basename(directory) }
     var profiles: [String] { Array(Set(check.bindings.compactMap { $0.profile?.escaped })).sorted() }
+    func removal(of variable: String?, profile: String?) -> BindingEdit? {
+        guard let variable, let binding = bindings(profile: profile).first(where: { $0.env_name?.escaped == variable }),
+              binding.profile?.escaped == profile else { return nil }
+        return BindingEdit(project: directory, profile: profile, envName: variable, reference: nil, previous: binding.reference)
+    }
     func bindings(profile: String?) -> [CheckBindingView] {
         let selected = check.bindings.filter { $0.profile?.escaped == profile }
         guard profile != nil else { return selected }

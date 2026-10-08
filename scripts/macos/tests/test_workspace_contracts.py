@@ -9,11 +9,105 @@ import sys
 import tempfile
 import time
 import unittest
+import workspace_fixture
 
 ROOT = Path(__file__).resolve().parents[3]
 
 
 class WorkspaceContracts(unittest.TestCase):
+    def test_binding_menu_query_matches_recorded_macos_titles(self):
+        source = (ROOT / 'apps/macos/EnvCloakUITests/BindingTests.swift').read_text()
+        query = re.findall(r'NSPredicate\(format: ("[^"\n]+"), key \+ " ·"\)', source)
+        self.assertEqual(len(query), 1, 'extract the predicate actually used by bind()')
+        # Independent AX attributes from run 37810914074's failure snapshot:
+        # menu items have titles, an empty label and a shared menuAction: id.
+        probe = '''import Foundation
+let rows: [[String: String]] = [
+    ["title": "Choose a key", "label": "", "identifier": "menuAction:"],
+    ["title": "eu-one · Live · No account", "label": "", "identifier": "menuAction:"],
+    ["title": "fixture · Unknown · No account", "label": "", "identifier": "menuAction:"],
+    ["title": "eu-one-other · Live · No account", "label": "", "identifier": "menuAction:"]
+]
+for key in ["eu-one", "fixture"] {
+    let predicate = NSPredicate(format: QUERY, key + " ·")
+    let matches = rows.filter { predicate.evaluate(with: $0) }
+    guard matches.count == 1, matches[0]["title"]?.hasPrefix(key + " ·") == true else {
+        print("key menu predicate did not select exactly the recorded title for " + key)
+        exit(1)
+    }
+}
+'''.replace('QUERY', query[0])
+        result = subprocess.run(['xcrun', 'swift', '-warnings-as-errors', '-'], input=probe,
+                                text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_undo_menu_query_matches_recorded_command(self):
+        source = (ROOT / 'apps/macos/EnvCloakUITests/PasteTests.swift').read_text()
+        query = re.findall(r'let undo = .*?matching\((NSPredicate\(format: [^\n]+\))\)\.firstMatch', source)
+        ready = re.findall(r'let available = XCTNSPredicateExpectation\(predicate: (NSPredicate\(format: [^\n]+\)), object: undo\)', source)
+        self.assertEqual(len(query), 1)
+        self.assertEqual(len(ready), 1)
+        confirmation = re.findall(r'let confirmed = XCTNSPredicateExpectation\(predicate: (NSPredicate\(format: [^\n]+\)), object: notice\)', source)
+        self.assertEqual(len(confirmation), 1)
+        # Run 37826362088 exposed Undo; run 37831276033's hosted test
+        # exposed Undo Binding. Both are valid for the same named action.
+        # Other titles, actions and disabled states must still be refused.
+        probe = '''import Foundation
+let query = QUERY
+let ready = READY
+let rows: [[String: Any]] = [
+    ["title": "Undo", "identifier": "undo:", "exists": true, "enabled": true],
+    ["title": "Undo Binding", "identifier": "undo:", "exists": true, "enabled": true],
+    ["title": "Redo", "identifier": "redo:", "exists": true, "enabled": false],
+    ["title": "Undo Other", "identifier": "undo:", "exists": true, "enabled": true],
+    ["title": "Undo", "identifier": "other:", "exists": true, "enabled": true],
+    ["title": "Undo", "identifier": "undo:", "exists": true, "enabled": false],
+    ["title": "Undo Binding", "identifier": "undo:", "exists": true, "enabled": false],
+    ["title": "Undo", "identifier": "undo:", "exists": false, "enabled": true]
+]
+for (index, row) in rows.enumerated() {
+    let accepted = query.evaluate(with: row) && ready.evaluate(with: row)
+    guard accepted == (index < 2) else {
+        print("Undo command predicate accepted wrong state at index " + String(index))
+        exit(1)
+    }
+}
+// The snapshot's session.notice static text carries AXValue, no AXLabel.
+let confirmation = CONFIRMATION
+for (value, expected) in [
+    ("Binding undone. The original envcloak.toml bytes were restored.", true),
+    ("Saved to envcloak.toml. The next run still asks for approval.", false),
+    ("Undo stopped. The file may have changed or the write could not be confirmed. Inspect it before another edit.", false)
+] {
+    guard confirmation.evaluate(with: ["exists": true, "label": "", "value": value]) == expected else {
+        print("Undo confirmation accepted stale or missing state")
+        exit(1)
+    }
+}
+'''.replace('QUERY', query[0]).replace('READY', ready[0]).replace('CONFIRMATION', confirmation[0])
+        result = subprocess.run(['xcrun', 'swift', '-warnings-as-errors', '-'], input=probe,
+                                text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_binding_row_query_uses_recorded_outline_role(self):
+        source = '\n'.join((ROOT / 'apps/macos/EnvCloakUITests' / name).read_text()
+                           for name in ['BindingTests.swift', 'PasteTests.swift'])
+        # The CI snapshot calls the SwiftUI Table an Outline. Query its
+        # observed role, as well as the identifier, for Change key and Delete.
+        roles = re.findall(r'app\.(\w+)\["project.bindings"\]', source)
+        self.assertTrue(roles)
+        self.assertEqual(set(roles), {'outlines'})
+
+    def test_ui_stories_run_only_with_their_own_fixture(self):
+        inventory = {'LaunchUITests', 'NavigationTests', 'PasteTests'}
+        for eu1, expected in [(False, {'LaunchUITests', 'NavigationTests'}), (True, {'PasteTests'})]:
+            with self.subTest(eu1=eu1):
+                command = workspace_fixture.xcode_command(Path('/fixture-target'), eu1, False)
+                only = {part.rsplit('/', 1)[-1] for part in command if part.startswith('-only-testing:')}
+                skip = {part.rsplit('/', 1)[-1] for part in command if part.startswith('-skip-testing:')}
+                self.assertEqual((only or inventory) - skip, expected)
+                self.assertEqual(command[command.index('-scheme') + 1], 'EnvCloakUITests')
+
     def test_long_item_last_use_has_a_field_reservation(self):
         blocks = re.findall(r'<!-- reservations:field -->\n(.*?)<!-- /reservations -->',
                             (ROOT / 'docs/IPC.md').read_text(), re.S)

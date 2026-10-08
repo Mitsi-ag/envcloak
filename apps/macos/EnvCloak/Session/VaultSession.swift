@@ -15,6 +15,7 @@ struct Change: OptionSet {
 }
 
 @Observable @MainActor final class VaultSession {
+    let bindings: BindingHistory
     let items: ItemsStore
     let projects: ProjectsStore
     let grants: GrantsStore
@@ -31,8 +32,9 @@ struct Change: OptionSet {
     private(set) var pendingCount: UInt32 = 0
     private(set) var proofWait: UInt64 = 0
 
-    init(client: (any WorkspaceClient)?, folders: ProjectFolders? = nil) {
+    init(client: (any WorkspaceClient)?, folders: ProjectFolders? = nil, runner: CLIRunner? = try? CLIRunner()) {
         self.client = client
+        bindings = BindingHistory(runner: runner)
         items = ItemsStore(client: client)
         projects = ProjectsStore(client: client, folders: folders)
         grants = GrantsStore(client: client)
@@ -148,6 +150,7 @@ struct Change: OptionSet {
     }
 
     private func clearMetadata() {
+        bindings.clear()
         items.clear(); projects.clear(); grants.clear()
     }
 
@@ -188,6 +191,18 @@ struct Change: OptionSet {
     func openProject(_ directory: DaemonText) async {
         guard state.canReadMetadata else { return }
         await projects.open(directory)
+    }
+
+    func add(_ request: consuming ItemsAdd) async throws -> AddedView {
+        guard state == .ready, !actionInProgress, let client else { throw EnvCloakError.daemonUnavailable }
+        actionInProgress = true
+        defer { actionInProgress = false }
+        let captured = generation
+        let added = try await client.add(consume request)
+        guard captured == generation, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        await items.refetch(.items)
+        guard captured == generation, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        return added
     }
 
     func lock() async {
