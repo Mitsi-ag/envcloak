@@ -14,7 +14,7 @@ spec.loader.exec_module(oracles)
 class ExecutionReceipt(unittest.TestCase):
     def test_every_case_is_required(self):
         lines = [f"test {name} ... ok\n" for name in sorted(oracles.EXPECTED)]
-        summary = "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
+        summary = f"test result: ok. {len(oracles.EXPECTED)} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;\n"
         good = "".join(lines) + summary
         self.assertTrue(oracles.complete(0, good))
         self.assertFalse(oracles.complete(101, good))

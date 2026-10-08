@@ -446,6 +446,42 @@ fn value_short(stem: &str) -> &'static [char] {
     }
 }
 
+/// The short options of interpreter family `stem` known to load no code
+/// and to take no value (`python -u`, `bash -x`, `deno -A`, `perl -w`).
+/// Any other letter before the entry file is refused as one that may load
+/// code: which letters of which interpreter load a module is not a list
+/// EnvCloak can keep complete (review of M2-27: `luajit -jv` and `luajit
+/// -b` load `jit.v` and `jit.bcsave` through the search path, whose first
+/// entry is `./?.lua`, before the entry file runs), so, as for long
+/// options with a value ([`VALUE_LONG`]), the list kept is of the
+/// harmless ones. A family not named here takes no short option.
+fn harmless_short(stem: &str) -> &'static [char] {
+    match stem {
+        "python" | "pypy" => &['u', 'B', 'O', 'q', 'S', 'b', 'v', 'R', 'P'],
+        "ruby" => &['w', 'v', 'U'],
+        "perl" => &['w', 'W', 'X', 'T', 't', 'U'],
+        "php" => &['n', 'q', 'H'],
+        "lua" => &['v', 'W'],
+        "luajit" => &['v'],
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "mksh" | "fish" => &['x', 'v', 'u', 'f', 'a', 'n'],
+        "julia" => &['q'],
+        "deno" => &['A', 'q'],
+        _ => &[],
+    }
+}
+
+/// The short options of interpreter family `stem` whose value, if any, is
+/// the rest of their cluster and never the next argument, and loads no
+/// code: a warning level (`ruby -W2`, `ruby -W:no-deprecated`), an
+/// optimisation setting (`luajit -O3`, `luajit -O+fold`).
+fn attached_short(stem: &str) -> &'static [char] {
+    match stem {
+        "ruby" => &['W'],
+        "luajit" => &['O'],
+        _ => &[],
+    }
+}
+
 /// Whether `arg` is an option that loads other code: a long one of
 /// [`CODE_LOADING_LONG`] (with or without `=value`), or a cluster of short
 /// ones holding any of [`CODE_LOADING_SHORT`].
@@ -463,8 +499,9 @@ pub fn is_code_loading_option(arg: &str) -> bool {
 /// One option of interpreter family `stem` before its entry file: an
 /// error when it loads code ([`is_code_loading_option`], a short one of
 /// [`INTERPRETER_LOADING_SHORT`] or [`stem_loading_short`] in its cluster
-/// before any value, or a long one with `=value` not of [`VALUE_LONG`]), or
-/// when
+/// before any value, a short one not of [`harmless_short`],
+/// [`attached_short`] or [`value_short`], or a long one with `=value` not
+/// of [`VALUE_LONG`]), or when
 /// it may take the next argument as its value (a short one of
 /// [`value_short`] ending its cluster, a long one without `=` that is not
 /// known to take none): which argument is the entry file is then not
@@ -517,6 +554,13 @@ fn interpreter_option(stem: &str, arg: &str) -> Result<(), DeclError> {
                 _ => true,
             };
             return if safe { Ok(()) } else { loads };
+        }
+        if attached_short(stem).contains(&c) {
+            // The rest of the cluster is its value, or there is none.
+            return Ok(());
+        }
+        if !harmless_short(stem).contains(&c) {
+            return loads;
         }
     }
     Ok(())
@@ -1453,6 +1497,84 @@ mod tests {
                 check_declaration(&d),
                 Err(DeclError::CodeSelecting(CodeSelecting::Variable)),
                 "{name}"
+            );
+        }
+    }
+
+    /// A short interpreter option registers only when it is known to load
+    /// nothing; any other letter may load a module before the entry file.
+    /// `luajit -jv` loads `jit.v` and `luajit -b` loads `jit.bcsave`
+    /// through `./?.lua` (measured with a pinned LuaJIT in
+    /// `tests/managed_interpreter_oracle.rs`). The refusal holds for a
+    /// declaration, an update, a `#!` line and a stored record alike, which
+    /// all class the argv here.
+    ///
+    /// Mutation checked: the `harmless_short` check removed (the previous
+    /// rule, refusing only listed letters): `luajit -jv /srv/s.lua`
+    /// registers, and this fails.
+    #[test]
+    fn short_options_register_only_when_known_harmless() {
+        let loads = DeclError::CodeSelecting(CodeSelecting::InterpreterOption);
+        for (name, option) in [
+            ("luajit", "-jv"),
+            ("luajit", "-jdump"),
+            ("luajit", "-jp"),
+            ("luajit", "-j"),
+            ("luajit", "-b"),
+            ("luajit", "-vj"),
+            ("luajit-2.1", "-jv"),
+            ("lua", "-jv"),
+            ("node", "-x"),
+            ("bun", "-j"),
+            ("python3", "-J"),
+            ("ruby", "-y"),
+            ("perl", "-0"),
+            ("tclsh", "-z"),
+            ("pwsh", "-NoProfile"),
+        ] {
+            let d = decl(&[name, option, "/srv/s.lua"]);
+            assert_eq!(classify_argv(&d.argv), Err(loads), "{name} {option}");
+            assert_eq!(check_declaration(&d), Err(loads), "{name} {option}");
+            assert!(
+                matches!(
+                    apply_changes(
+                        &decl(&["/bin/server"]),
+                        &LaunchChanges {
+                            argv: Some(d.argv.clone()),
+                            ..LaunchChanges::default()
+                        }
+                    ),
+                    Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+                ),
+                "{name} {option}"
+            );
+            let path = format!("/usr/bin/{name}");
+            assert_eq!(
+                shebang_argv(&path, Some(option), "/srv/s.lua", &[], &path),
+                Err(loads),
+                "{name} {option}"
+            );
+        }
+        // The positive controls: letters known to load nothing.
+        for (name, option) in [
+            ("luajit", "-v"),
+            ("luajit", "-O3"),
+            ("luajit", "-O+fold"),
+            ("luajit", "-O"),
+            ("lua", "-W"),
+            ("python3", "-uB"),
+            ("ruby", "-W2"),
+            ("ruby", "-w"),
+            ("perl", "-wT"),
+            ("php", "-n"),
+            ("bash", "-xv"),
+            ("deno", "-A"),
+        ] {
+            let argv = decl(&[name, option, "/srv/s"]).argv;
+            assert_eq!(
+                classify_argv(&argv),
+                Ok(ArgvClass::Interpreter { entry: 2 }),
+                "{name} {option}"
             );
         }
     }

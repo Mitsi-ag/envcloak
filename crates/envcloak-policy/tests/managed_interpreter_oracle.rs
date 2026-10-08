@@ -298,3 +298,81 @@ fn bash_login_startup_is_refused_for_declarations_updates_and_shebangs() {
         );
     }
 }
+
+/// A real LuaJIT loads a `jit.*` module through its search path, whose
+/// first entry is `./?.lua`, before the entry file runs: `-jv` loads
+/// `jit.v` and `-b` loads `jit.bcsave` from the working directory. Each
+/// such form is refused for a declaration, an update and a `#!` line; the
+/// benign entry, `-v` and `-O3` beside the same modules run only the entry
+/// and register (the controls). Mutation: drop the `harmless_short` check,
+/// refusing only listed letters (the previous rule): `-jv` registers.
+#[test]
+#[ignore = "requires the pinned LuaJIT 2.1; run scripts/check-managed-oracles.sh"]
+fn luajit_module_options_load_code_before_the_entry() {
+    use envcloak_core::vault::LaunchDecl;
+    use envcloak_policy::managed::{LaunchChanges, apply_changes, check_declaration, shebang_argv};
+    let luajit = runtime("ENVCLOAK_LUAJIT_ORACLE");
+    let home = tempfile::Builder::new()
+        .prefix("eco")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let h = home.path();
+    assert!(run(&luajit, h, &["-v".into()], &[]).starts_with("LuaJIT 2.1."));
+    let modules = h.join("jit");
+    std::fs::create_dir(&modules).unwrap();
+    for module in ["v", "bcsave"] {
+        std::fs::write(
+            modules.join(format!("{module}.lua")),
+            "io.write('prelude\\n')\nreturn { start = function() end }\n",
+        )
+        .unwrap();
+    }
+    let entry = h.join("entry.lua");
+    std::fs::write(&entry, "io.write('entry\\n')\n").unwrap();
+    let e = entry.to_str().unwrap();
+    let base = LaunchDecl {
+        argv: vec!["luajit".into(), e.into()],
+        cwd: Some(h.to_str().unwrap().into()),
+        env: vec![],
+        path_env: None,
+    };
+    // The benign controls: the same working directory and modules.
+    assert_eq!(run(&luajit, h, &[e.into()], &[]), "entry\n");
+    assert!(check_declaration(&base).is_ok());
+    assert!(run(&luajit, h, &["-v".into(), e.into()], &[]).ends_with("\nentry\n"));
+    assert_eq!(run(&luajit, h, &["-O3".into(), e.into()], &[]), "entry\n");
+    for option in ["-v", "-O3"] {
+        assert_eq!(
+            classify_argv(&["luajit".into(), option.into(), e.into()]),
+            Ok(ArgvClass::Interpreter { entry: 2 })
+        );
+    }
+    for (option, output) in [("-jv", "prelude\nentry\n"), ("-b", "prelude\n")] {
+        assert_eq!(run(&luajit, h, &[option.into(), e.into()], &[]), output);
+        refused("luajit", &[option.to_owned()], e);
+        let argv = vec!["luajit".into(), option.into(), e.into()];
+        let refusal = Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption));
+        assert_eq!(
+            check_declaration(&LaunchDecl {
+                argv: argv.clone(),
+                ..base.clone()
+            }),
+            refusal
+        );
+        assert!(matches!(
+            apply_changes(
+                &base,
+                &LaunchChanges {
+                    argv: Some(argv),
+                    ..LaunchChanges::default()
+                }
+            ),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        ));
+        let path = luajit.to_str().unwrap();
+        assert_eq!(
+            shebang_argv(path, Some(option), e, &[], path),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption))
+        );
+    }
+}
