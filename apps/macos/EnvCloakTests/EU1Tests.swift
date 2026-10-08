@@ -23,6 +23,7 @@ import XCTest
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 540, height: 650), styleMask: [.titled], backing: .buffered, defer: false)
         let host = NSHostingView(rootView: PasteSheet(session: session, useInProject: { _ in }, model: model))
         window.contentView = host; window.makeKeyAndOrderFront(nil)
+        NSApp.setValue(true, forKey: "accessibilityEnhancedUserInterface")
         defer { window.orderOut(nil); window.contentView = nil }
         host.layoutSubtreeIfNeeded()
         let field = try await waitField(host)
@@ -43,6 +44,7 @@ import XCTest
         XCTAssertEqual(saved.item.provider?.escaped, "openai")
         XCTAssertEqual(saved.item.slug.escaped, "eu-one")
         XCTAssertTrue(session.items.rows.contains { $0.slug.escaped == "eu-one" })
+        try await assertPasteValue("Saved as eu-one. openai, live.", identifier: "paste.saved", in: window)
         let manager = UndoManager(); manager.groupsByEvent = false
         let first = DaemonText(home + "/workspace-fixture")
         let second = DaemonText(home + "/billing-fixture")
@@ -70,8 +72,49 @@ import XCTest
         }
         XCTAssertTrue(SHA256.hash(data: try Data(contentsOf: manifest)) == SHA256.hash(data: original))
         try check(cli: cli, home: home, project: second.escaped, slug: "fixture")
+        // A duplicate slug is refused by the real daemon. Neither the model
+        // nor the mounted sheet may retain the previous success.
+        var duplicate = canary
+        model.receive(&duplicate)
+        await model.save(session)
+        XCTAssertNil(model.saved)
+        XCTAssertEqual(model.count, 0)
+        try await assertPasteValue("The save outcome could not be confirmed. Check Keys before pasting again. Names shaped like a key are refused.",
+                                   identifier: "paste.error", in: window)
+        XCTAssertTrue(pasteElements("paste.saved", in: window).isEmpty)
         model.reset(); window.orderOut(nil)
         try sweep(repo: repo, home: home, canary: canary)
+    }
+
+    private func attribute(_ object: NSObject, _ name: String) -> Any? {
+        let selector = NSSelectorFromString(name)
+        return object.responds(to: selector) ? object.perform(selector)?.takeUnretainedValue() : nil
+    }
+
+    private func pasteElements(_ identifier: String, in window: NSWindow) -> [NSObject] {
+        var seen = Set<ObjectIdentifier>()
+        func walk(_ object: NSObject, depth: Int) -> [NSObject] {
+            guard depth < 40, seen.insert(ObjectIdentifier(object)).inserted else { return [] }
+            let children = ["accessibilityChildren", "accessibilityRows", "accessibilityContents"]
+                .flatMap { attribute(object, $0) as? [NSObject] ?? [] }
+            let own = attribute(object, "accessibilityIdentifier") as? String == identifier ? [object] : []
+            return own + children.flatMap { walk($0, depth: depth + 1) }
+        }
+        // Match XCUITest's public tree. Only the identified element's own
+        // value counts, never a native subview or descendant's text.
+        return walk(window, depth: 0)
+    }
+
+    private func assertPasteValue(_ expected: String, identifier: String, in window: NSWindow) async throws {
+        for _ in 0..<100 {
+            let elements = pasteElements(identifier, in: window)
+            if elements.count == 1, attribute(elements[0], "accessibilityValue") as? String == expected { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let observed = pasteElements(identifier, in: window).map {
+            "label=\(String(describing: attribute($0, "accessibilityLabel"))), value=\(String(describing: attribute($0, "accessibilityValue")))"
+        }
+        XCTFail("Missing exact value for \(identifier): \(expected); observed \(observed)")
     }
 
     private func waitField(_ root: NSView) async throws -> SecurePasteField {

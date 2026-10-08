@@ -11,11 +11,15 @@ final class PasteTests: XCTestCase {
             throw XCTSkip("Run scripts/macos/test-eu1.sh with its isolated real daemon")
         }
         XCTAssertTrue(home.hasPrefix("/tmp/ec05-"))
+        XCTAssertEqual(env["ENVCLOAK_TEST_STORY"], "eu1", "EU-1 requires its two-project fixture")
         let app = XCUIApplication()
         app.launchEnvironment = ["HOME": home, "CFFIXED_USER_HOME": home, "TMPDIR": home + "/tmp/",
             "ENVCLOAK_TEST_RUNTIME": runtime, "ENVCLOAK_TEST_CLI": cli, "ENVCLOAK_TEST_HOME": home]
         app.launch()
-        addTeardownBlock { @MainActor in app.terminate() }
+        addTeardownBlock { @MainActor in
+            if self.testRun?.hasSucceeded == false { self.recordPasteState(app) }
+            app.terminate()
+        }
         XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 20))
         let canary = ["sk", "proj", UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")].joined(separator: "-")
         let board = NSPasteboard.general
@@ -30,9 +34,12 @@ final class PasteTests: XCTestCase {
         name.click(); name.typeText("eu-one")
         let variable = app.textFields["paste.variable"]
         variable.click(); variable.typeText("OPENAI_API_KEY")
+        XCTAssertEqual(name.value as? String, "eu-one", "Name input did not reach the sheet")
+        XCTAssertEqual(variable.value as? String, "OPENAI_API_KEY", "Variable input did not reach the sheet")
         app.buttons["paste.save"].click()
-        XCTAssertTrue(app.staticTexts["paste.saved"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.staticTexts["paste.saved"].label.contains("openai"))
+        XCTAssertTrue(app.staticTexts["paste.saved"].waitForExistence(timeout: 15), "Save did not produce a confirmed result")
+        // macOS static text exposes its content as AXValue, not AXLabel.
+        XCTAssertEqual(app.staticTexts["paste.saved"].value as? String, "Saved as eu-one. openai, live.")
         app.buttons["paste.bind"].click()
         try bind(app, project: "workspace-fixture", variable: "OPENAI_API_KEY", key: nil)
         try check(cli: cli, home: home, project: "workspace-fixture", variable: "OPENAI_API_KEY", slug: "eu-one")
@@ -70,5 +77,25 @@ final class PasteTests: XCTestCase {
         app.typeKey("q", modifierFlags: .command)
         XCTAssertTrue(app.wait(for: .notRunning, timeout: 15))
         try sweep(repo: repo, home: home, pid: pid, canary: canary)
+    }
+
+    @MainActor private func recordPasteState(_ app: XCUIApplication) {
+        let sheet = app.sheets.firstMatch
+        let saved = app.staticTexts["paste.saved"]
+        let error = app.staticTexts["paste.error"]
+        let state = """
+        EU-1 failure: visible paste state
+        saved exists: \(saved.exists); label: \(saved.exists ? saved.label : "<absent>"); value: \(saved.exists ? String(describing: saved.value) : "<absent>")
+        error exists: \(error.exists); text: \(error.exists ? String(describing: error.value) : "<absent>")
+        sheet accessibility tree:
+        \(sheet.exists ? sheet.debugDescription : "<no sheet>\n" + app.windows.debugDescription)
+        """
+        // Only this isolated generated-value fixture prints a tree. Capture
+        // before termination, including when an assertion aborts the test.
+        print(state)
+        let attachment = XCTAttachment(string: state)
+        attachment.name = "EU-1 visible sheet state"
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 }

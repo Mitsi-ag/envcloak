@@ -51,7 +51,10 @@ struct PasteSheet: View {
                 TextField("Account (optional email)", text: $model.account).accessibilityIdentifier("paste.account")
                 TextField("Variable (optional)", text: $model.variable).accessibilityIdentifier("paste.variable")
                 Text("Provider detection appears after saving.").foregroundStyle(ECToken.secondary.color)
-                if let notice = model.notice { Text(notice).foregroundStyle(ECToken.warning.color) }
+                if let notice = model.notice {
+                    Text(notice).foregroundStyle(ECToken.warning.color)
+                        .accessibilityIdentifier("paste.error")
+                }
                 HStack {
                     Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
                     Spacer()
