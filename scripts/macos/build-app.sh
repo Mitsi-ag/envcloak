@@ -85,8 +85,8 @@ done
 # preflight runs before keychain selection, output creation or installation.
 case "$sign" in
   development|ci)
-    (cd "$root" && "${CARGO:-cargo}" run --release --locked --quiet -p envcloak-sys --example production_pin) ||
-      die "signed packaging blocked: configure the production requirement (Q3-01) first"
+    (cd "$root" && "${CARGO:-cargo}" run --release --locked --quiet -p envcloak-sys --bin production_pin) ||
+      die "signed packaging blocked: production pin preflight failed (Q3-01)"
     ;;
 esac
 keychain=()

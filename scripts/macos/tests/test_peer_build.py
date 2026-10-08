@@ -29,7 +29,7 @@ class TargetDirectory(unittest.TestCase):
                 self.assertIn("Q3-01", result.stderr)
                 self.assertFalse((home / "out").exists())
             self.assertEqual((home / "calls").read_text().splitlines(),
-                             ["run --release --locked --quiet -p envcloak-sys --example production_pin"] * 2)
+                             ["run --release --locked --quiet -p envcloak-sys --bin production_pin"] * 2)
 
     def harness(self, missing=None):
         with tempfile.TemporaryDirectory(prefix="ect", dir="/tmp") as directory:

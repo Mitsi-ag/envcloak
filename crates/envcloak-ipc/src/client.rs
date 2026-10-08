@@ -10,10 +10,10 @@
 //!
 //! A missing directory, socket or listener means no daemon is running:
 //! [`ClientError::Unavailable`]. The client never starts one, and never
-//! looks for `envcloakd` on `PATH`; the CLI says how to start it. Anything
-//! else that fails a check is [`ClientError::Unverified`], and nothing is
-//! sent. The socket is opened close-on-exec, so a child the CLI starts
-//! does not inherit the connection.
+//! looks for `envcloakd` on `PATH`; the CLI says how to start it. Other
+//! failures in these connection checks are [`ClientError::Unverified`];
+//! no request has been sent. The socket is opened close-on-exec, so a child
+//! the CLI starts does not inherit the connection.
 //!
 //! Every connection is bounded in time from before it connects
 //! ([`envcloak_sys::connect_unix`]). An ordinary call waits at most 300
@@ -31,6 +31,11 @@
 //! signing identity cannot, and say so:
 //! [`DaemonIdentity::Unverified`]. On them a program running as the same
 //! user can impersonate the daemon (SPEC §1.1).
+//!
+//! Calls recheck a verified peer before sending and after I/O. Identity loss
+//! after sending begins returns [`ClientError::UnverifiedAfterSend`]: delivery
+//! is uncertain. Once a verified connection loses its identity, it remains
+//! unverified and refuses later calls.
 
 use std::cell::Cell;
 use std::io::{self, Read, Write};
@@ -449,6 +454,7 @@ impl Client {
     /// wiped as soon as it is sent.
     ///
     /// # Errors
+    /// [`ClientError::Unverified`] when the recorded peer changed before sending,
     /// [`ClientError::Rpc`] for an error response, [`ClientError::Frame`]
     /// when the connection fails, [`ClientError::Protocol`] for a
     /// malformed response, [`ClientError::UnverifiedAfterSend`] when identity

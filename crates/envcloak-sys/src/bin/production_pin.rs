@@ -15,8 +15,8 @@ fn main() -> ExitCode {
 
 #[test]
 fn unconfigured_production_build_refuses_packaging() {
-    // Once Q3-01 is configured this becomes the signed-build positive control.
-    let expected = if pins::TEAM_ID.is_none() {
+    // Once Q3-01 is configured macOS becomes the signed-build positive control.
+    let expected = if !cfg!(target_os = "macos") || pins::TEAM_ID.is_none() {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
