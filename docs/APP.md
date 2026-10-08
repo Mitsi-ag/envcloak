@@ -41,6 +41,11 @@ As built by M3-02:
 
 ## Metadata workspace (M3-05, EU-0)
 
+Lock suspends new polls and invalidates earlier refreshes at both entry and
+completion. A successful status with `vault.busy` retries with backoff for up
+to two seconds, preserving the current screen; continued Busy shows the
+designated notice, and recovery clears it.
+
 The main window has Projects, Keys, the native sidebar and inspector commands,
 scope, token search, Lock, and keyboard navigation with Command-1 through
 Command-5 and Command-F. Projects combine the daemon's paged adopted index
@@ -54,8 +59,10 @@ bindings in today's manifest or proof that an application used a value.
 Keys can be grouped by project, provider or account and filtered by live/test
 classification, project scope and search prefixes. The inspector shows
 full `items.show` metadata, links and grants, with a solid held-value block.
-The long inventory supplies recorded last-used dates without per-row RPCs. No workspace store
-holds values. Replace and Remove offer quoted commands for a human Terminal
+The long inventory supplies recorded last-used dates without per-row RPCs. Its
+new `last_used_secs` field and the matching top-level `items.show` field are
+registered in IPC.md; the table explains why their reservation status cannot
+yet be marked landed. No workspace store holds values. Replace and Remove offer quoted commands for a human Terminal
 session; Replace requires a field and qualifies the target as `slug#field`.
 Folder paths and command targets containing control or directional characters
 cannot be copied to Terminal. The controls explain the refusal; safe text is
@@ -94,7 +101,10 @@ story is `scripts/macos/tests/run_workspace.py`; run it detached from an
 agent process tree. It creates its own HOME, XDG directories, terminal proof,
 vault and generated values, then verifies the UI's Revoke independently with
 `grants.list`. Local runs can use `scripts/macos/tests/detach_m305.py` with a
-command file in the lane cache. See [M3-05 evidence](M3-05.md) for gates,
+command file in the lane cache. Start every native test or Codex subprocess
+with a cleared, allowlisted environment, including usage probes: diagnostic
+output can include inherited environment values. Do not run `xctest -help`
+with the caller's environment. See [M3-05 evidence](M3-05.md) for gates,
 mutations, limits and the installed EU-0 artifact.
 
 ## The Swift client (M3-03)
