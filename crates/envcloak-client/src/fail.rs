@@ -77,9 +77,7 @@ impl From<ClientError> for Failure {
             ClientError::Unavailable => {
                 format!("the EnvCloak daemon is not running; {START_DAEMON}").into()
             }
-            ClientError::Unverified(u) => {
-                format!("{}; this request was not sent", u.message()).into()
-            }
+            ClientError::Unverified(u) => format!("{}; nothing was sent to it", u.message()).into(),
             ClientError::Rpc(r) => match r.reason {
                 Some(reason) => {
                     format!("{} ({})", r.kind.message(), reason_text_for(r.kind, reason)).into()
@@ -352,13 +350,39 @@ mod tests {
 
     #[test]
     fn identity_failure_words_distinguish_delivery_uncertainty() {
-        let before = Failure::from(ClientError::Unverified(
-            envcloak_ipc::Unverified::CodeIdentity,
-        ));
+        use envcloak_ipc::{RunPathErrorKind, Unverified};
+        use std::io::ErrorKind;
+
+        // K-01 and ACCEPTANCE pin the pre-send refusal, even on hosts where
+        // the sandboxed story reaches the daemon and takes its positive path.
+        for (reason, message) in [
+            (
+                Unverified::Directory(RunPathErrorKind::Io(ErrorKind::PermissionDenied)),
+                "the daemon's runtime directory cannot be accessed; nothing was sent to it",
+            ),
+            (
+                Unverified::Socket(RunPathErrorKind::Io(ErrorKind::ConnectionRefused)),
+                "the daemon's runtime directory cannot be accessed; nothing was sent to it",
+            ),
+            (
+                Unverified::PeerUnknown,
+                "the kernel did not report who is listening on the socket; nothing was sent to it",
+            ),
+            (
+                Unverified::ForeignServer,
+                "the process listening on the daemon socket runs as another user; nothing was sent to it",
+            ),
+            (
+                Unverified::CodeIdentity,
+                "code_identity: the daemon's code identity could not be verified; nothing was sent to it",
+            ),
+        ] {
+            let before = Failure::from(ClientError::Unverified(reason));
+            assert_eq!(before.token(), "daemon_unverified");
+            assert_eq!(before.message(), message);
+        }
         let after = Failure::from(ClientError::UnverifiedAfterSend);
-        assert_eq!(before.token(), "daemon_unverified");
         assert_eq!(after.token(), "daemon_unverified");
-        assert!(before.message().contains("this request was not sent"));
         assert!(after.message().contains("delivery is uncertain"));
         assert!(!after.message().contains("not sent"));
         assert!(!after.message().contains("nothing was sent"));
