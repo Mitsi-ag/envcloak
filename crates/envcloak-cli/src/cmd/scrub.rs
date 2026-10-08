@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "envcloak scrub [--path <path>]... [--yes] [--json] | --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]";
-const LIMITS: &str = "Rotate exposed values first. Scrub rewrites local files only. Short values are neither found nor scrubbed, except registry-recognized values. SQLite stores are not scrubbed. Scrub cannot remove copies sent to model providers, cloud-synced transcripts, Time Machine backups or APFS snapshots, other machines, terminal scrollback, Spotlight's index, crash reports, or a running agent's context. Quit the agent first for recent, open or linked files.";
+const LIMITS: &str = "Rotate exposed values first. Scrub rewrites local files only. Short values are neither found nor scrubbed (under 16 characters). SQLite stores are not scrubbed. Scrub cannot remove copies sent to model providers, cloud-synced transcripts, Time Machine backups or APFS snapshots, other machines, terminal scrollback, Spotlight's index, crash reports, or a running agent's context. Quit the agent first for recent, open or linked files.";
 #[derive(Default)]
 struct Options {
     paths: Vec<PathBuf>,
