@@ -54,7 +54,13 @@ fn copy_dir(from: &Path, to: &Path) {
 fn fixture() -> TestHome {
     let t = TestHome::new();
     let root = t.home();
-    for rel in [IPC, VAULT, BASELINE, "Cargo.toml"] {
+    for rel in [
+        IPC,
+        VAULT,
+        BASELINE,
+        "Cargo.toml",
+        "security/sys-build-script.sha256",
+    ] {
         let dest = root.join(rel);
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::copy(repo_root().join(rel), dest).unwrap();
@@ -112,6 +118,33 @@ fn assert_fails(t: &TestHome, expect_in_message: &str) {
         stderr.contains(expect_in_message),
         "expected {expect_in_message:?} in: {stderr}"
     );
+}
+
+#[test]
+fn reviewed_test_pin_is_bounded_configuration_never_a_token() {
+    let t = fixture();
+    assert_passes(&t.home());
+    let script = t.home().join("crates/envcloak-sys/build.rs");
+    let original = std::fs::read_to_string(&script).unwrap();
+    std::fs::write(&script, original.clone() + "\n// unreviewed\n").unwrap();
+    assert_fails(&t, "unreviewed build-time test certificate input");
+    std::fs::write(&script, original).unwrap();
+    let pins = t.home().join("crates/envcloak-sys/src/peer_code/pins.rs");
+    let original = std::fs::read_to_string(&pins).unwrap();
+    std::fs::write(
+        &pins,
+        original.clone() + "\npub fn token() -> &'static str { CI_CERT_SHA1 }\n",
+    )
+    .unwrap();
+    assert_fails(&t, "cannot read");
+    std::fs::write(&pins, original).unwrap();
+    let other = t.home().join("crates/envcloak-client/src/test_pin.rs");
+    std::fs::write(
+        other,
+        "const OTHER: &str = env!(\"ENVCLOAK_COMPILED_TEST_CERT\");\n",
+    )
+    .unwrap();
+    assert_fails(&t, "variable other than Cargo");
 }
 
 /// Appends a method `name` to the copy of proto.rs.

@@ -24,7 +24,7 @@ pub const NO_PEER_PID: &str =
 /// seccomp filter, inside a user namespace: the command never runs.
 pub const SECCOMP_HELPER: &str = "apply-seccomp: write /proc/self/uid_map: Operation not permitted";
 
-/// What the CLI adds to a `daemon_unverified` message.
+/// What the CLI adds to a pre-send `daemon_unverified` message.
 pub const NOTHING_SENT: &str = "; nothing was sent to it";
 
 /// The coverage reason a refused setting is reported with (docs/IPC.md,
@@ -159,11 +159,25 @@ pub fn user_namespace() -> bool {
 /// a refused or never-run setting gives is in its host behaviour table,
 /// and its "K-01 on Linux" section names both pinned hosts `unsupported`
 /// and the reason token. The matching receipt S0 and `agent_hosts` rest
-/// on, so a table that disagrees with the docs fails.
+/// on, so a table that disagrees with the docs fails. The full CLI refusal
+/// must also match the published S0 contract in docs/ACCEPTANCE.md.
 ///
 /// # Panics
 /// When the docs say otherwise.
 pub fn check_documented() {
+    let acceptance = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/ACCEPTANCE.md"),
+    )
+    .expect("read docs/ACCEPTANCE.md");
+    let message = RUNTIME_DIR
+        .strip_prefix("daemon_unverified: ")
+        .expect("K-01 runtime directory refusal token");
+    assert!(
+        acceptance.contains(&format!(
+            "`envcloak: daemon_unverified: {message}{NOTHING_SENT}`"
+        )),
+        "K-01's full pre-send refusal differs from docs/ACCEPTANCE.md"
+    );
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/AGENTS.md");
     let docs =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -196,6 +210,11 @@ pub fn check_documented() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_send_refusal_agrees_with_acceptance_contract() {
+        check_documented();
+    }
 
     /// Only the CLI's own refusal is K-01's `unsupported` receipt: a
     /// sandbox that ran no command never tried the socket, and its line

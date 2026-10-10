@@ -90,6 +90,7 @@ mod lockfile;
 pub mod owned;
 mod panic;
 mod peer;
+pub mod peer_code;
 mod perm;
 mod proc;
 pub mod pty;

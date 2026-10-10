@@ -4,7 +4,7 @@
 //!
 //! It says truthfully what this build cannot guarantee:
 //! - "daemon identity unverified" on every build that pins no code
-//!   signature (every M1 build): only the daemon's uid was checked, so a
+//!   signature: only the daemon's uid was checked, so a
 //!   program running as you could impersonate it;
 //! - "unhardened" for the daemon and for this CLI when they run without
 //!   the hardened runtime (macOS) or could not be made non-dumpable
@@ -280,6 +280,9 @@ mod tests {
         assert_eq!(back["daemon"]["version"], version);
         assert_eq!(back["daemon"]["state"], "running");
         assert_eq!(back["daemon"]["identity"], "unverified");
+        let verified = status_json(&s, DaemonIdentity::Verified, &hardening());
+        let verified: serde_json::Value = serde_json::from_str(&verified).unwrap();
+        assert_eq!(verified["daemon"]["identity"], "verified");
 
         let text = not_running_json("not running", &hardening());
         assert!(text.ends_with('\n'), "{text:?}");

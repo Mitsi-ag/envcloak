@@ -476,19 +476,14 @@ mod linux {
 }
 
 #[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use std::io;
     use std::os::fd::{AsRawFd, BorrowedFd};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{PeerIdentity, PeerSource, StartTime, peer_gone};
 
-    /// `audit_token_t` from `<bsm/audit.h>`: eight 32-bit words.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct AuditToken {
-        val: [u32; 8],
-    }
+    use crate::peer_code::AuditToken;
 
     #[link(name = "bsm")]
     unsafe extern "C" {
@@ -535,8 +530,8 @@ mod macos {
 
     /// The uid, pid and pid version in the socket's audit token: the last
     /// process to use the client's end (see the module documentation).
-    pub(super) fn audit_token(fd: BorrowedFd<'_>) -> io::Result<(u32, i32, i32)> {
-        let mut token = AuditToken { val: [0; 8] };
+    pub(crate) fn raw_audit_token(fd: BorrowedFd<'_>) -> io::Result<AuditToken> {
+        let mut token = AuditToken([0; 8]);
         let mut len = size_of::<AuditToken>() as libc::socklen_t;
         // SAFETY: `token` is writable for `len` bytes; the socket stays
         // open for the call.
@@ -564,6 +559,11 @@ mod macos {
                 "the kernel reported no audit token",
             ));
         }
+        Ok(token)
+    }
+
+    pub(super) fn audit_token(fd: BorrowedFd<'_>) -> io::Result<(u32, i32, i32)> {
+        let token = raw_audit_token(fd)?;
         // SAFETY: the token is a plain value the kernel filled in; these
         // functions only read its words.
         let (uid, pid, pidversion) = unsafe {

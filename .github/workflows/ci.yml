@@ -822,6 +822,10 @@ jobs:
           sw_vers
           python3 --version
           automationmodetool || true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-app
       # Every scripts/macos/tests/test_*.py runs here whole (every class;
       # those that need a built app or build report their skips, and run
       # again below with it): test_ci_job.py checks this job for each.
@@ -841,6 +845,12 @@ jobs:
         run: python3 scripts/macos/tests/test_sign_check.py
       - name: sign-check's policy on modeled codesign and lipo answers
         run: python3 scripts/macos/tests/test_sign_check_policy.py
+      - name: Release gate with stock runner tools and compiler failures
+        run: |
+          python3 scripts/macos/tests/test_peer_release.py
+          python3 scripts/macos/tests/test_peer_build.py
+      - name: Native DYLD gate host qualification and failure paths
+        run: python3 scripts/macos/tests/test_dyld_gate.py
       - name: build-app.sh keeps the previous app and leaves nothing behind, however it stops
         run: python3 scripts/macos/tests/test_build_swap.py
       - name: check-sources.sh --swift's fixtures
@@ -854,10 +864,8 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/dd-EnvCloakKit" SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test)
           (cd apps/macos/Packages/EnvCloakDesign && xcodebuild -scheme EnvCloakDesign -destination 'platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/dd-EnvCloakDesign" SWIFT_TREAT_WARNINGS_AS_ERRORS=YES test)
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: macos-app
+      - name: Native app and daemon identity gates (M3-07)
+        run: scripts/macos/check-peer-code.sh
       - name: Swift client wire, peer, oracle and real-daemon tests
         run: |
           kit_root="$(mktemp -d /tmp/eck.XXXXXXXX)"

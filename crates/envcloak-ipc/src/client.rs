@@ -10,10 +10,10 @@
 //!
 //! A missing directory, socket or listener means no daemon is running:
 //! [`ClientError::Unavailable`]. The client never starts one, and never
-//! looks for `envcloakd` on `PATH`; the CLI says how to start it. Anything
-//! else that fails a check is [`ClientError::Unverified`], and nothing is
-//! sent. The socket is opened close-on-exec, so a child the CLI starts
-//! does not inherit the connection.
+//! looks for `envcloakd` on `PATH`; the CLI says how to start it. Other
+//! failures in these connection checks are [`ClientError::Unverified`];
+//! no request has been sent. The socket is opened close-on-exec, so a child
+//! the CLI starts does not inherit the connection.
 //!
 //! Every connection is bounded in time from before it connects
 //! ([`envcloak_sys::connect_unix`]). An ordinary call waits at most 300
@@ -26,12 +26,18 @@
 //! stalls, sends its answer a byte at a time, or reads the request slowly
 //! cannot hold `envcloak run --wait` past that instant.
 //!
-//! On signed macOS builds the client will also check the daemon's code
-//! signature from its audit token (M3). Builds that pin no signing
-//! identity, which is every M1 build, cannot, and say so:
+//! On signed macOS builds the client also checks the daemon's code
+//! signature and runtime policy from its audit token. Builds that pin no
+//! signing identity cannot, and say so:
 //! [`DaemonIdentity::Unverified`]. On them a program running as the same
 //! user can impersonate the daemon (SPEC §1.1).
+//!
+//! Calls recheck a verified peer before sending and after I/O. Identity loss
+//! after sending begins returns [`ClientError::UnverifiedAfterSend`]: delivery
+//! is uncertain. Once a verified connection loses its identity, it remains
+//! unverified and refuses later calls.
 
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::net::UnixStream;
@@ -84,17 +90,67 @@ use crate::wire_secret::WireSecret;
 /// Argon2id twice, at up to 4 GiB each.
 const CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
+#[cfg(all(test, target_os = "macos"))]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn an_observed_identity_loss_permanently_invalidates_the_connection() {
+        let (stream, _peer_stream) = UnixStream::pair().expect("socket pair");
+        let peer = envcloak_sys::peer_identity(stream.as_fd()).expect("kernel identity");
+        let mut client = Client {
+            stream,
+            verified_peer: Some(peer),
+            identity_lost: Cell::new(false),
+            next_id: 1,
+            by: None,
+        };
+        assert_eq!(client.identity(), DaemonIdentity::Verified);
+        client.verified_peer.as_mut().expect("peer").pidversion = None;
+        assert_eq!(client.identity(), DaemonIdentity::Unverified);
+        client.verified_peer = Some(peer);
+        assert_eq!(client.identity(), DaemonIdentity::Unverified);
+        assert_eq!(
+            client.check_peer(true),
+            Err(ClientError::UnverifiedAfterSend)
+        );
+        assert_eq!(
+            client.check_peer(false),
+            Err(ClientError::Unverified(Unverified::CodeIdentity))
+        );
+    }
+}
+
+fn verify_code_identity(
+    stream: &UnixStream,
+) -> Result<Option<envcloak_sys::PeerIdentity>, ClientError> {
+    use envcloak_sys::peer_code::{self, CodeVerdict, pins};
+    let denied = || ClientError::Unverified(Unverified::CodeIdentity);
+    let Some(pin) = pins::agent().map_err(|_| denied())? else {
+        return Ok(None);
+    };
+    let peer = envcloak_sys::peer_identity(stream.as_fd()).map_err(|_| denied())?;
+    let token = peer_code::audit_token(stream.as_fd()).map_err(|_| denied())?;
+    if peer_code::peer_satisfies(&token, &peer, &pin).map_err(|_| denied())?
+        != CodeVerdict::Satisfies
+        || !envcloak_sys::peer_unchanged(stream.as_fd(), &peer).unwrap_or(false)
+    {
+        return Err(denied());
+    }
+    Ok(Some(peer))
+}
+
 /// Whether the client verified the daemon's code identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DaemonIdentity {
     /// The daemon's code signature matched the pinned identity.
     Verified,
-    /// This build pins no signing identity, so only the daemon's uid was
-    /// checked: `daemon identity unverified` in `envcloak status`.
+    /// This build pins no signing identity, or this connection observed an
+    /// identity loss: `daemon identity unverified` in `envcloak status`.
     Unverified,
 }
 
-/// Why the socket could not be trusted. Nothing was sent.
+/// Why the socket could not be trusted before sending this request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Unverified {
     /// The runtime directory failed a check.
@@ -105,6 +161,8 @@ pub enum Unverified {
     ForeignServer,
     /// The kernel did not report who is at the other end.
     PeerUnknown,
+    /// The daemon failed the embedded code requirement or runtime policy.
+    CodeIdentity,
 }
 
 impl Unverified {
@@ -116,6 +174,9 @@ impl Unverified {
                 "the process listening on the daemon socket runs as another user"
             }
             Unverified::PeerUnknown => "the kernel did not report who is listening on the socket",
+            Unverified::CodeIdentity => {
+                "code_identity: the daemon's code identity could not be verified"
+            }
         }
     }
 }
@@ -127,8 +188,10 @@ pub enum ClientError {
     /// listening.
     Unavailable,
     /// The socket or the process behind it could not be verified; nothing
-    /// was sent.
+    /// was sent for this request.
     Unverified(Unverified),
+    /// Identity changed after writing began. Delivery and the result are unknown.
+    UnverifiedAfterSend,
     /// The runtime location cannot be used at all.
     Paths(RunPathErrorKind),
     /// The connection failed during a call.
@@ -146,7 +209,7 @@ impl ClientError {
             ClientError::Unavailable | ClientError::Paths(_) | ClientError::Frame(_) => {
                 "daemon_unavailable"
             }
-            ClientError::Unverified(_) => "daemon_unverified",
+            ClientError::Unverified(_) | ClientError::UnverifiedAfterSend => "daemon_unverified",
             ClientError::Rpc(e) => e.kind.token(),
             ClientError::Protocol => "protocol_error",
         }
@@ -158,6 +221,9 @@ impl core::fmt::Display for ClientError {
         match self {
             ClientError::Unavailable => f.write_str("the EnvCloak daemon is not running"),
             ClientError::Unverified(u) => f.write_str(u.message()),
+            ClientError::UnverifiedAfterSend => f.write_str(
+                "code_identity: the daemon's identity changed after sending began; delivery is uncertain",
+            ),
             ClientError::Paths(k) => f.write_str(k.message()),
             ClientError::Frame(e) => e.fmt(f),
             ClientError::Rpc(e) => e.fmt(f),
@@ -184,6 +250,8 @@ impl From<RunPathError> for ClientError {
 #[derive(Debug)]
 pub struct Client {
     stream: UnixStream,
+    verified_peer: Option<envcloak_sys::PeerIdentity>,
+    identity_lost: Cell<bool>,
     next_id: u64,
     /// For a waiter's connection ([`Client::connect_by`]): the instant by
     /// which every call on it must be answered.
@@ -346,6 +414,7 @@ impl Client {
         if server != uid {
             return Err(ClientError::Unverified(Unverified::ForeignServer));
         }
+        let verified_peer = verify_code_identity(&stream)?;
         // A waiter's calls never block on the socket: each read and write
         // waits for it only for the time left (`Bounded`).
         if by.is_some() {
@@ -355,48 +424,82 @@ impl Client {
         }
         Ok(Client {
             stream,
+            verified_peer,
+            identity_lost: Cell::new(false),
             next_id: 1,
             by,
         })
     }
 
-    /// Whether the daemon's code identity was verified. Always
-    /// [`DaemonIdentity::Unverified`] in M1 builds, which pin none.
+    /// Whether this connection verified the daemon and still names that peer.
     pub fn identity(&self) -> DaemonIdentity {
-        DaemonIdentity::Unverified
+        if self.identity_lost.get() {
+            return DaemonIdentity::Unverified;
+        }
+        match &self.verified_peer {
+            Some(peer)
+                if envcloak_sys::peer_unchanged(self.stream.as_fd(), peer).unwrap_or(false) =>
+            {
+                DaemonIdentity::Verified
+            }
+            Some(_) => {
+                self.identity_lost.set(true);
+                DaemonIdentity::Unverified
+            }
+            None => DaemonIdentity::Unverified,
+        }
     }
 
     /// Calls method `M`. The request frame, which may hold a value, is
     /// wiped as soon as it is sent.
     ///
     /// # Errors
+    /// [`ClientError::Unverified`] when the recorded peer changed before sending,
     /// [`ClientError::Rpc`] for an error response, [`ClientError::Frame`]
     /// when the connection fails, [`ClientError::Protocol`] for a
-    /// malformed response.
+    /// malformed response, [`ClientError::UnverifiedAfterSend`] when identity
+    /// is lost after sending began. Such a call may already have taken effect.
     pub fn call<M: Method>(&mut self, params: &M::Params) -> Result<M::Output, ClientError> {
+        self.check_peer(false)?;
         let id = self.next_id;
         self.next_id += 1;
         let request = proto::request_frame::<M>(id, params)?;
-        let response = match self.by {
-            None => {
-                request.write_to(&mut self.stream)?;
-                drop(request);
-                Frame::read_from(&mut self.stream)?
+        let response = (|| -> Result<Frame, FrameError> {
+            match self.by {
+                None => {
+                    request.write_to(&mut self.stream)?;
+                    drop(request);
+                    Frame::read_from(&mut self.stream)
+                }
+                Some(by) => {
+                    let mut s = Bounded {
+                        stream: &self.stream,
+                        by,
+                    };
+                    request.write_to(&mut s)?;
+                    drop(request);
+                    Frame::read_from(&mut s)
+                }
             }
-            Some(by) => {
-                let mut s = Bounded {
-                    stream: &self.stream,
-                    by,
-                };
-                request.write_to(&mut s)?;
-                drop(request);
-                Frame::read_from(&mut s)?
-            }
-        };
-        proto::parse_response::<M::Output>(&response, id).map_err(|e| match e {
+        })();
+        // Check even after a partial write or failed read. Neither proves that
+        // the request was undelivered; a changed peer permanently poisons it.
+        self.check_peer(true)?;
+        proto::parse_response::<M::Output>(&response?, id).map_err(|e| match e {
             ResponseError::Rpc(e) => ClientError::Rpc(e),
             ResponseError::Protocol => ClientError::Protocol,
         })
+    }
+
+    fn check_peer(&self, sent: bool) -> Result<(), ClientError> {
+        if self.verified_peer.is_some() && self.identity() != DaemonIdentity::Verified {
+            return Err(if sent {
+                ClientError::UnverifiedAfterSend
+            } else {
+                ClientError::Unverified(Unverified::CodeIdentity)
+            });
+        }
+        Ok(())
     }
 
     /// `status`, with the daemon's strings checked
@@ -414,7 +517,8 @@ impl Client {
     ///
     /// # Errors
     /// As [`Client::call`]. An error does not always mean that no vault was
-    /// created: after a [`ClientError::Frame`] or [`ClientError::Protocol`]
+    /// created: after a [`ClientError::Frame`], [`ClientError::Protocol`] or
+    /// [`ClientError::UnverifiedAfterSend`]
     /// the daemon may have created it before the answer was lost.
     pub fn vault_create(
         &mut self,

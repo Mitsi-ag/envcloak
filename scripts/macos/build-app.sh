@@ -81,6 +81,14 @@ while [ $# -gt 0 ]; do
 done
 
 [ "$(uname -s)" = Darwin ] || die "the app builds on macOS only"
+# Signing an unpinned source build would still leave its IPC unverified. This
+# preflight runs before keychain selection, output creation or installation.
+case "$sign" in
+  development|ci)
+    (cd "$root" && "${CARGO:-cargo}" run --release --locked --quiet -p envcloak-sys --bin production_pin) ||
+      die "signed packaging blocked: production pin preflight failed (Q3-01)"
+    ;;
+esac
 keychain=()
 case "$sign" in
   adhoc)

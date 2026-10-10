@@ -96,6 +96,10 @@ impl From<ClientError> for Failure {
 /// Words for each error reason token of `REASONS` that an error carries
 /// (the reasons a `run` is denied for have theirs in `DenyReason`).
 const REASON_TEXTS: &[(&str, &str)] = &[
+    (
+        "code_identity",
+        "the daemon's code identity could not be verified",
+    ),
     ("not_text", "the passphrase must be UTF-8 text"),
     (
         "control_character",
@@ -343,6 +347,46 @@ mod tests {
     use super::*;
     use envcloak_ipc::proto::REASONS;
     use envcloak_policy::DenyReason;
+
+    #[test]
+    fn identity_failure_words_distinguish_delivery_uncertainty() {
+        use envcloak_ipc::{RunPathErrorKind, Unverified};
+        use std::io::ErrorKind;
+
+        // K-01 and ACCEPTANCE pin the pre-send refusal, even on hosts where
+        // the sandboxed story reaches the daemon and takes its positive path.
+        for (reason, message) in [
+            (
+                Unverified::Directory(RunPathErrorKind::Io(ErrorKind::PermissionDenied)),
+                "the daemon's runtime directory cannot be accessed; nothing was sent to it",
+            ),
+            (
+                Unverified::Socket(RunPathErrorKind::Io(ErrorKind::ConnectionRefused)),
+                "the daemon's runtime directory cannot be accessed; nothing was sent to it",
+            ),
+            (
+                Unverified::PeerUnknown,
+                "the kernel did not report who is listening on the socket; nothing was sent to it",
+            ),
+            (
+                Unverified::ForeignServer,
+                "the process listening on the daemon socket runs as another user; nothing was sent to it",
+            ),
+            (
+                Unverified::CodeIdentity,
+                "code_identity: the daemon's code identity could not be verified; nothing was sent to it",
+            ),
+        ] {
+            let before = Failure::from(ClientError::Unverified(reason));
+            assert_eq!(before.token(), "daemon_unverified");
+            assert_eq!(before.message(), message);
+        }
+        let after = Failure::from(ClientError::UnverifiedAfterSend);
+        assert_eq!(after.token(), "daemon_unverified");
+        assert!(after.message().contains("delivery is uncertain"));
+        assert!(!after.message().contains("not sent"));
+        assert!(!after.message().contains("nothing was sent"));
+    }
 
     /// A backup v2 over its caps says which caps; `too_large` elsewhere
     /// keeps the manifest's words.
