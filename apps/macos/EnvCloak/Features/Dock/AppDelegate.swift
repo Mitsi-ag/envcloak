@@ -33,9 +33,14 @@ import AppKit
         return menu
     }
 
-    @objc private func reviewRequests(_ sender: Any?) {
-        session?.openApprovalWindow()
-        session?.onOpenApprovalWindow?()
+    @objc func reviewRequests(_ sender: Any?) {
+        guard let session else { return }
+        if !session.grants.pending.isEmpty {
+            session.openApprovalWindow()
+        } else {
+            session.onFocusApprovals?()
+            session.onOpenMainWindow?()
+        }
         NSApplication.shared.activate()
     }
 

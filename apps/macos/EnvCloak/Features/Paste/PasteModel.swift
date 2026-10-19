@@ -21,7 +21,7 @@ import Observation
 
     init(ask: AskSummary? = nil) {
         self.ask = ask
-        if let askAccount = ask?.account?.escaped {
+        if let askAccount = ask?.account.map(MetadataRequest.raw) {
             self.account = askAccount
         }
     }
@@ -49,10 +49,9 @@ import Observation
     }
 
     func inspect(_ session: VaultSession) async {
-        guard envName == nil, stagedId == nil, draft != nil else { return }
+        guard envName == nil, stagedId == nil, let incoming = draft.take() else { return }
         do {
             let stage = try await session.beginPasteStage()
-            guard let incoming = draft.take() else { return }
             let info = try await session.inspectPasteStage(
                 stage: stage.stage,
                 secret: incoming.value,
@@ -60,8 +59,9 @@ import Observation
             )
             stagedId = stage.stage
             inspection = info
+            draft = consume incoming
         } catch {
-            // Leave `draft` intact when `beginPasteStage` is unavailable so `save` can proceed.
+            draft = consume incoming
         }
     }
 
@@ -85,19 +85,47 @@ import Observation
         }
         guard !busy, envName == nil, (stagedId != nil || draft != nil) else { return }
         busy = true; notice = nil
-        defer { busy = false; count = 0 }
+        defer {
+            draft = nil
+            busy = false
+            count = 0
+        }
         do {
+            let initialProvider = inspection?.provider.map(MetadataRequest.raw)
+                ?? ask?.provider.map(MetadataRequest.raw)
             if let stage = stagedId {
                 stagedId = nil
-                _ = draft.take()
-                saved = try await session.commitPasteStage(
-                    stage: stage,
-                    slug: name.isEmpty ? nil : name,
-                    provider: inspection?.provider?.escaped ?? ask?.provider?.escaped,
-                    account: account.isEmpty ? nil : account,
-                    envHint: variable.isEmpty ? nil : variable,
-                    ask: ask?.ask
-                )
+                do {
+                    saved = try await session.commitPasteStage(
+                        stage: stage,
+                        slug: name.isEmpty ? nil : name,
+                        provider: initialProvider,
+                        account: account.isEmpty ? nil : account,
+                        envHint: variable.isEmpty ? nil : variable,
+                        ask: ask?.ask
+                    )
+                } catch EnvCloakError.rpc(.noSuchRequest, _) {
+                    guard let incoming = draft.take() else {
+                        throw EnvCloakError.rpc(.noSuchRequest, nil)
+                    }
+                    let restaged = try await session.beginPasteStage()
+                    let info = try await session.inspectPasteStage(
+                        stage: restaged.stage,
+                        secret: incoming.value,
+                        daemonEphPubHex: MetadataRequest.raw(restaged.daemon_eph_pub)
+                    )
+                    inspection = info
+                    let providerParam = info.provider.map(MetadataRequest.raw)
+                        ?? ask?.provider.map(MetadataRequest.raw)
+                    saved = try await session.commitPasteStage(
+                        stage: restaged.stage,
+                        slug: name.isEmpty ? nil : name,
+                        provider: providerParam,
+                        account: account.isEmpty ? nil : account,
+                        envHint: variable.isEmpty ? nil : variable,
+                        ask: ask?.ask
+                    )
+                }
             } else if let incoming = draft.take() {
                 do {
                     let stage = try await session.beginPasteStage()
@@ -107,18 +135,23 @@ import Observation
                         daemonEphPubHex: MetadataRequest.raw(stage.daemon_eph_pub)
                     )
                     inspection = info
+                    let providerParam = info.provider.map(MetadataRequest.raw)
+                        ?? ask?.provider.map(MetadataRequest.raw)
                     saved = try await session.commitPasteStage(
                         stage: stage.stage,
                         slug: name.isEmpty ? nil : name,
-                        provider: info.provider?.escaped ?? ask?.provider?.escaped,
+                        provider: providerParam,
                         account: account.isEmpty ? nil : account,
                         envHint: variable.isEmpty ? nil : variable,
                         ask: ask?.ask
                     )
                 } catch EnvCloakError.rpc(let kind, _) where kind == .methodNotFound || kind == .roleDenied {
+                    let providerParam = inspection?.provider.map(MetadataRequest.raw)
+                        ?? ask?.provider.map(MetadataRequest.raw)
                     saved = try await session.add(ItemsAdd(
                         value: incoming.takeValue(),
                         slug: name.isEmpty ? nil : name,
+                        provider: providerParam,
                         account: account.isEmpty ? nil : account,
                         envHint: variable.isEmpty ? nil : variable
                     ))
@@ -144,7 +177,7 @@ import Observation
         inspectTask?.cancel()
         inspectTask = nil
         draft = nil; stagedId = nil; inspection = nil
-        name = ""; account = ask?.account?.escaped ?? ""; variable = ""; count = 0
+        name = ""; account = ask?.account.map(MetadataRequest.raw) ?? ""; variable = ""; count = 0
         envName = nil; saved = nil; notice = nil; clipboardNotice = nil; droppedLineEnding = false
     }
 }

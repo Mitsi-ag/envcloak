@@ -12,12 +12,21 @@ struct KeyInspector: View {
     @State private var selectedField: DaemonText?
     var body: some View {
         content.task(id: slug) { await session.selectKey(slug) }
-            .onChange(of: slug) { _, _ in action = nil; selectedField = nil }
+            .onChange(of: slug) { _, _ in
+                action = nil
+                selectedField = nil
+                session.selectedField = nil
+            }
+            .onChange(of: selectedField) { _, field in
+                session.selectedField = field
+            }
             .onChange(of: session.state) { _, state in if state != .ready { action = nil } }
     }
     @ViewBuilder private var content: some View {
         if let summary = session.items.rows.first(where: { $0.slug == slug }) {
             let item = session.items.selectedItem?.slug == slug ? session.items.selectedItem! : summary
+            let canReplaceInApp = session.canSignInApp && !item.fields.isEmpty
+            let canRemoveInApp = session.canSignInApp
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let exposed = item.exposed ?? summary.exposed {
@@ -52,9 +61,9 @@ struct KeyInspector: View {
                     HStack {
                         Button("Reveal…") { action = .reveal }
                         Button("Replace…") { action = .replace }
-                            .disabled(session.state != .ready || InspectorAction.replace.command(item: item, field: selectedField) == nil)
+                            .disabled(session.state != .ready || (!canReplaceInApp && InspectorAction.replace.command(item: item, field: selectedField) == nil))
                     }
-                    if !MetadataRequest.canCopy(item.slug) || selectedField.map({ !MetadataRequest.canCopy($0) }) == true {
+                    if !session.canSignInApp, !MetadataRequest.canCopy(item.slug) || selectedField.map({ !MetadataRequest.canCopy($0) }) == true {
                         Text(TerminalCopy.refusalMessage).foregroundStyle(ECToken.warning.color)
                     }
                     Button("Use in project") { bind(BindingSelection(project: session.projects.scope, key: item)) }
@@ -90,17 +99,22 @@ struct KeyInspector: View {
                     LabeledContent("Expires") { DateLabel(seconds: item.expires_secs) }
                     Text("Balance and spend arrive in a later release (M4).").foregroundStyle(ECToken.secondary.color)
                     Button("Remove key…") { action = .remove }
-                        .foregroundStyle(ECToken.danger.color).disabled(session.state != .ready || InspectorAction.remove.command(item: item, field: nil) == nil)
+                        .foregroundStyle(ECToken.danger.color)
+                        .disabled(session.state != .ready || (!canRemoveInApp && InspectorAction.remove.command(item: item, field: nil) == nil))
                 }.padding(16)
             }.onChange(of: item.fields.map(\.name), initial: true) { _, fields in
-                if !fields.contains(selectedField ?? DaemonText("")) { selectedField = fields.count == 1 ? fields.first : nil }
+                if !fields.contains(selectedField ?? DaemonText("")) {
+                    selectedField = fields.count == 1 ? fields.first : nil
+                    session.selectedField = selectedField
+                }
             }.sheet(item: $action) { action in
-                if session.enrolledTouchID {
+                let resolvedField = selectedField ?? item.fields.first?.name
+                if session.canSignInApp {
                     switch action {
                     case .reveal:
-                        RevealSheet(session: session, item: item, field: selectedField)
+                        RevealSheet(session: session, item: item, field: resolvedField)
                     case .replace:
-                        ReplaceSheet(session: session, item: item, field: selectedField)
+                        ReplaceSheet(session: session, item: item, field: resolvedField)
                     case .remove:
                         RemoveSheet(session: session, item: item)
                     }

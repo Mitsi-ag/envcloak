@@ -126,6 +126,28 @@ actor ScriptedClient: WorkspaceClient {
     }
     var asksCount = 0
     func setAsksCount(_ count: Int) { asksCount = count }
+    var hostileAskAccount = false
+    func setHostileAskAccount(_ enabled: Bool) { hostileAskAccount = enabled }
+    var incrementTargetId = false
+    var targetCounter = 0
+    func setIncrementTargetId(_ enabled: Bool) { incrementTargetId = enabled }
+    var lastUnlockBeginUnlockerID: String?
+    func unlockBeginUnlockerID() -> String? { lastUnlockBeginUnlockerID }
+    var removedUnlockers: [String] = []
+    func removedUnlockerIDs() -> [String] { removedUnlockers }
+    var rotateErrors: [EnvCloakError] = []
+    func queueRotateErrors(_ errors: [EnvCloakError]) { rotateErrors = errors }
+    var removeErrors: [EnvCloakError] = []
+    func queueRemoveErrors(_ errors: [EnvCloakError]) { removeErrors = errors }
+    var pasteBeginErrors: [EnvCloakError] = []
+    func queuePasteBeginErrors(_ errors: [EnvCloakError]) { pasteBeginErrors = errors }
+    var pasteInspectErrors: [EnvCloakError] = []
+    func queuePasteInspectErrors(_ errors: [EnvCloakError]) { pasteInspectErrors = errors }
+    var pasteCommitErrors: [EnvCloakError] = []
+    func queuePasteCommitErrors(_ errors: [EnvCloakError]) { pasteCommitErrors = errors }
+    var lastPastedProvider: String?
+    var lastPastedAccount: String?
+    func pasteReceipt() -> (provider: String?, account: String?) { (lastPastedProvider, lastPastedAccount) }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
         var row: [String: Any] = ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
@@ -306,6 +328,7 @@ actor ScriptedClient: WorkspaceClient {
             if pending > 0 { pending -= 1 }
             result = ["root_auto_denied": false]
         case "app.unlock.begin":
+            lastUnlockBeginUnlockerID = (method as? AppUnlockBegin)?.unlocker_id
             guard let unlockBeginData else { throw EnvCloakError.rpc(.noUnlocker, nil) }
             result = unlockBeginData
         case "app.unlock":
@@ -320,10 +343,15 @@ actor ScriptedClient: WorkspaceClient {
             ]
         case "app.items.target":
             let slug = (method as? AppItemsTarget)?.slug ?? "fixture-0"
+            if slug.hasPrefix("unlocker"), slug != "unlocker:add", slug != "unlocker:remove" {
+                throw EnvCloakError.rpc(.noSuchItem, nil)
+            }
             let field = (method as? AppItemsTarget)?.field ?? "value"
             let ephHex = daemonEphKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+            targetCounter += 1
+            let targetID = incrementTargetId ? "target-\(targetCounter)" : "target-1"
             result = [
-                "target": "target-1",
+                "target": targetID,
                 "nonce": pendingNonce,
                 "daemon_eph_pub": ephHex,
                 "vault_id": "vault-0",
@@ -338,6 +366,9 @@ actor ScriptedClient: WorkspaceClient {
                 "expires_in_secs": 60,
             ]
         case "app.items.rotate":
+            if !rotateErrors.isEmpty {
+                throw rotateErrors.removeFirst()
+            }
             if let req = method as? AppItemsRotate {
                 lastWriteDigest = req.digest
                 lastWriteSignature = req.signature
@@ -354,6 +385,9 @@ actor ScriptedClient: WorkspaceClient {
                 "grants_ended": 0,
             ]
         case "app.items.remove":
+            if !removeErrors.isEmpty {
+                throw removeErrors.removeFirst()
+            }
             if let req = method as? AppItemsRemove {
                 lastWriteDigest = req.digest
                 lastWriteSignature = req.signature
@@ -370,14 +404,15 @@ actor ScriptedClient: WorkspaceClient {
                 lastWriteSignature = req.signature
             }
             head += 1
-            result = ["unlocker_id": "unlocker-touchid-only-1"]
+            result = ["unlocker_id": "ffeeddccbbaa99887766554433221100"]
         case "app.unlocker.remove":
             if let req = method as? AppUnlockerRemove {
                 lastWriteDigest = req.digest
                 lastWriteSignature = req.signature
+                removedUnlockers.append(req.unlocker)
             }
             head += 1
-            result = ["removed": "passphrase"]
+            result = ["removed": (method as? AppUnlockerRemove)?.unlocker ?? "passphrase"]
         case "app.reveal.begin":
             let slug = (method as? AppRevealBegin)?.slug ?? "fixture-0"
             let field = (method as? AppRevealBegin)?.field ?? "value"
@@ -412,6 +447,9 @@ actor ScriptedClient: WorkspaceClient {
             )
             result = ["sealed_value": sealedHex]
         case "app.paste.begin":
+            if !pasteBeginErrors.isEmpty {
+                throw pasteBeginErrors.removeFirst()
+            }
             let ephHex = daemonEphKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
             result = [
                 "stage": "STAGE123",
@@ -419,8 +457,11 @@ actor ScriptedClient: WorkspaceClient {
                 "expires_in_secs": 120,
             ]
         case "app.paste.inspect":
+            if !pasteInspectErrors.isEmpty {
+                throw pasteInspectErrors.removeFirst()
+            }
             result = [
-                "provider": "openai",
+                "provider": "openai" + hostileSuffix,
                 "detected": "openai",
                 "ambiguous": false,
                 "classification": "live",
@@ -429,7 +470,12 @@ actor ScriptedClient: WorkspaceClient {
                 "env_hint": "OPENAI_API_KEY",
             ]
         case "app.paste":
+            if !pasteCommitErrors.isEmpty {
+                throw pasteCommitErrors.removeFirst()
+            }
             let req = method as? AppPaste
+            lastPastedProvider = req?.provider
+            lastPastedAccount = req?.account
             var addedItem = item(0)
             addedItem["slug"] = req?.slug ?? "openai-work"
             addedItem["provider"] = req?.provider ?? "openai"
@@ -444,6 +490,7 @@ actor ScriptedClient: WorkspaceClient {
                 "length": "ok",
             ]
         case "app.asks.list":
+            let accountVal = hostileAskAccount ? "dev\\acct@example.com" : "dev@example.com"
             result = [
                 "asks": (0..<asksCount).map { idx in
                     [
@@ -460,9 +507,9 @@ actor ScriptedClient: WorkspaceClient {
                                 "exe": "/usr/local/bin/cursor",
                             ],
                         ],
-                        "provider": "openai",
+                        "provider": "openai" + hostileSuffix,
                         "project_dir": "/tmp/project",
-                        "account": "dev@example.com",
+                        "account": accountVal,
                         "env_hint": "OPENAI_API_KEY",
                         "note": NSNull(),
                     ] as [String: Any]
@@ -1830,6 +1877,185 @@ final class SessionTests: XCTestCase {
         XCTAssertTrue(declined)
         let declineCalls = await client.calls("app.asks.decline")
         XCTAssertEqual(declineCalls, 1)
+    }
+
+    @MainActor func testReviewRemediationF01ThroughF05() async throws {
+        // F-01: Target sentinel colons ("unlocker:add" / "unlocker:remove"), signing identity,
+        // and Touch ID-only transition removing the earlier SE unlocker and updating unlocker_id.
+        XCTAssertEqual(MetadataRequest.itemsTargetUnlockerAdd().slug, "unlocker:add")
+        XCTAssertEqual(MetadataRequest.itemsTargetUnlockerRemove().slug, "unlocker:remove")
+
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        do {
+            _ = try await client.call(AppItemsTarget(slug: "unlocker_add"))
+            XCTFail("Expected ScriptedClient to reject underscore sentinel unlocker_add")
+        } catch let error as EnvCloakError {
+            XCTAssertEqual(error, .rpc(.noSuchItem, nil))
+        }
+
+        let unlockPub = P256.KeyAgreement.PrivateKey().publicKey
+        let approveKey = P256.Signing.PrivateKey()
+        let enrolledKeys = EnrolledPublicKeys(
+            unlockPublicKeyHex: HexCoding.encode(unlockPub.x963Representation),
+            approvePublicKeyHex: HexCoding.encode(approveKey.publicKey.x963Representation)
+        )
+        let signer = SoftwareApprovalSigner(privateKey: approveKey)
+        let unlockKey = SoftwareUnlockKey()
+        let session = VaultSession(
+            client: client,
+            unlockKey: unlockKey,
+            approvalSigner: signer,
+            enrolledPublicKeysOverride: enrolledKeys,
+            enrolledTouchID: true
+        )
+        let ownIdentity = VaultSession.readOwnSigningIdentity()
+        XCTAssertFalse(ownIdentity.teamID.isEmpty)
+        XCTAssertFalse(ownIdentity.signingID.isEmpty)
+        session.enrolledTeamID = "TEAM998877"
+        session.enrolledSigningID = "ai.envcloak.custom"
+        await session.poll()
+
+        // Enrol initial SE unlocker and poll to record enrolledUnlockerID ("unlocker-1")
+        let began = await session.beginEnrolment()
+        XCTAssertTrue(began)
+        let enrollState = await session.pollEnrolment()
+        XCTAssertEqual(enrollState, .enrolled)
+        XCTAssertEqual(session.enrolledUnlockerID?.raw, "unlocker-1")
+
+        // Transition to Touch ID-only unlocker: adds new unlocker AND removes prior SE unlocker ("unlocker-1")
+        let upgraded = await session.enrollTouchIDOnlyUnlocker(label: "Mac Studio Touch ID Only")
+        XCTAssertTrue(upgraded)
+        XCTAssertTrue(session.touchIDOnlyEnabled)
+        let upgradedUnlockerHex = "ffeeddccbbaa99887766554433221100"
+        XCTAssertEqual(session.enrolledUnlockerID?.raw, upgradedUnlockerHex)
+        let removedUnlockers = await client.removedUnlockerIDs()
+        XCTAssertEqual(removedUnlockers, ["unlocker-1"])
+
+        // Subsequent Touch ID unlock passes the active enrolledUnlockerID to app.unlock.begin
+        let vmk = Data((0..<32).map { UInt8($0 + 1) })
+        let vaultIDHex = "00112233445566778899aabbccddeeff"
+        let daemonEph = Curve25519.KeyAgreement.PrivateKey()
+        let env = try SoftwareUnlockKey.sealEnvelope(
+            vmk: vmk,
+            recipientPublicKey: unlockKey.privateKey.publicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: upgradedUnlockerHex,
+            epoch: 1
+        )
+        await client.configure(vault: "locked")
+        await client.setUnlockBegin([
+            "request_id": "REQUNLOCK2",
+            "unlocker_id": upgradedUnlockerHex,
+            "vault_id": vaultIDHex,
+            "epoch": 1,
+            "challenge": String(repeating: "11", count: 32),
+            "envelope": ["enc": env.enc.raw, "ciphertext": env.ciphertext.raw],
+            "daemon_eph_pub": HexCoding.encode(daemonEph.publicKey.rawRepresentation),
+        ])
+        await session.poll()
+        let unlocked = await session.unlockWithTouchID()
+        XCTAssertTrue(unlocked)
+        let beginUnlockerID = await client.unlockBeginUnlockerID()
+        XCTAssertEqual(beginUnlockerID, upgradedUnlockerHex)
+
+        // F-02: PasteModel preserves draft across inspect failure and stage expiry, and sends raw provider/account.
+        await client.hostileMetadata()
+        await client.setHostileAskAccount(true)
+        await client.setAsksCount(1)
+        await session.poll()
+        let ask = try XCTUnwrap(session.grants.asks.first)
+        let pasteModel = PasteModel(ask: ask)
+        XCTAssertEqual(pasteModel.account, "dev\\acct@example.com")
+
+        // Fail first beginPasteStage during inspect, then fail first commitPasteStage with .noSuchRequest
+        await client.queuePasteBeginErrors([.rpc(.busy, nil)])
+        var rawSecret = "sk_test_f02_preserve_draft_123456"
+        pasteModel.receive(&rawSecret)
+        await pasteModel.inspect(session)
+        XCTAssertNil(pasteModel.stagedId, "inspect failed so stagedId is nil, but draft must remain intact")
+        await pasteModel.save(session)
+        XCTAssertNotNil(pasteModel.saved, "save must succeed using preserved draft after inspect failure")
+        let receipt = await client.pasteReceipt()
+        XCTAssertEqual(receipt.account, "dev\\acct@example.com")
+        XCTAssertEqual(receipt.provider, "openai\u{202e}\u{1b}[31m")
+
+        // Stage expiry (.noSuchRequest) re-stages from preserved draft
+        let expiryModel = PasteModel(ask: nil)
+        var secondSecret = "sk_test_f02_expiry_restage_654321"
+        expiryModel.receive(&secondSecret)
+        await expiryModel.inspect(session)
+        XCTAssertNotNil(expiryModel.stagedId)
+        await client.queuePasteCommitErrors([.rpc(.noSuchRequest, nil)])
+        await expiryModel.save(session)
+        XCTAssertNotNil(expiryModel.saved, "save must re-stage and succeed when initial stage expired")
+
+        // F-03: KeyWriteModel preserves draft on Touch ID cancellation, ignores stale session.notice,
+        // and reloads a fresh target after RPC failure.
+        await client.plainSlugs()
+        await client.setIncrementTargetId(true)
+        session.notice = "Stale unrelated workspace notice"
+        let rotModel = KeyWriteModel(slug: DaemonText("fixture-0"), field: DaemonText("value"))
+        await rotModel.loadTarget(session)
+        XCTAssertEqual(rotModel.target?.target.raw, "target-3")
+
+        var rotSecret = "sk_test_f03_rotate_draft_777"
+        rotModel.receive(&rotSecret)
+        signer.simulatedFailure = SignerError.userCancelled
+        await rotModel.submitRotation(session)
+        XCTAssertFalse(rotModel.completed)
+        XCTAssertEqual(rotModel.count, "sk_test_f03_rotate_draft_777".count)
+        XCTAssertEqual(rotModel.notice, "Touch ID was cancelled. The key value was not replaced.")
+        XCTAssertNil(session.notice, "Stale session.notice must be cleared on entry to rotateItemWithTouchID")
+
+        // Now let signer succeed, but fail first rotate RPC with .noSuchRequest -> target reloads to target-4
+        signer.simulatedFailure = nil
+        await client.queueRotateErrors([.rpc(.noSuchRequest, nil)])
+        await rotModel.submitRotation(session)
+        XCTAssertFalse(rotModel.completed)
+        XCTAssertEqual(rotModel.count, "sk_test_f03_rotate_draft_777".count)
+        XCTAssertEqual(rotModel.target?.target.raw, "target-4")
+        XCTAssertEqual(rotModel.notice, "The key value could not be replaced.")
+
+        // Retry with refreshed target-4 succeeds without re-pasting
+        await rotModel.submitRotation(session)
+        XCTAssertTrue(rotModel.completed)
+        XCTAssertEqual(rotModel.count, 0)
+
+        // F-04: Dock badge includes asksCount and AppDelegate.reviewRequests does not double-invoke or open empty window
+        await client.configure(pending: 0)
+        await client.setAsksCount(2)
+        await session.poll()
+        XCTAssertEqual(session.notifications.lastBadge, "2")
+
+        var approvalOpenCount = 0
+        var mainOpenCount = 0
+        var focusedApprovals = 0
+        session.onOpenApprovalWindow = { approvalOpenCount += 1 }
+        session.onOpenMainWindow = { mainOpenCount += 1 }
+        session.onFocusApprovals = { focusedApprovals += 1 }
+
+        let delegate = EnvCloakAppDelegate()
+        delegate.session = session
+        delegate.reviewRequests(nil)
+        XCTAssertEqual(approvalOpenCount, 0, "Should not open empty approval window when only asks are waiting")
+        XCTAssertEqual(focusedApprovals, 1)
+        XCTAssertEqual(mainOpenCount, 1)
+
+        await client.configure(pending: 1)
+        await session.poll()
+        XCTAssertEqual(session.notifications.lastBadge, "3")
+        delegate.reviewRequests(nil)
+        XCTAssertEqual(approvalOpenCount, 1, "Must invoke onOpenApprovalWindow exactly once")
+
+        // F-05: session.canSignInApp and selectedField reset on key change
+        XCTAssertTrue(session.canSignInApp)
+        session.sshSession = true
+        XCTAssertFalse(session.canSignInApp)
+        session.sshSession = false
+        session.selectedField = DaemonText("secondary")
+        await session.selectKey(DaemonText("fixture-0"))
+        XCTAssertNil(session.selectedField)
     }
 }
 

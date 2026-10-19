@@ -2,6 +2,7 @@ import CryptoKit
 import EnvCloakKit
 import Foundation
 import Observation
+import Security
 
 struct Change: OptionSet {
     let rawValue: Int
@@ -28,8 +29,10 @@ struct Change: OptionSet {
     var unlockKey: (any UnlockKeyAgreement)?
     var approvalSigner: (any ApprovalSigner)?
     var enrolledPublicKeysOverride: EnrolledPublicKeys?
-    var enrolledTeamID = "CI00000000"
-    var enrolledSigningID = "ai.envcloak.app"
+    var enrolledTeamID: String
+    var enrolledSigningID: String
+    var enrolledUnlockerID: DaemonText?
+    var enrolledUnlockerLabel = "This Mac"
     var enrolledTouchID = false
     var passphraseUnlockerRemoved = false
     var touchIDOnlyEnabled = false
@@ -40,9 +43,11 @@ struct Change: OptionSet {
     var activeApprovalRequestId: DaemonText?
     var activeAsk: AskSummary?
     var activeRevealRequest: DaemonText?
+    var selectedField: DaemonText?
     var onOpenApprovalWindow: (@MainActor () -> Void)?
     var onOpenPasteWindow: (@MainActor () -> Void)?
     var onOpenMainWindow: (@MainActor () -> Void)?
+    var onFocusApprovals: (@MainActor () -> Void)?
     var isFrontmostOverride: Bool?
     var sshSession = false
     var clamshellClosed = false
@@ -68,6 +73,32 @@ struct Change: OptionSet {
         #endif
     }
 
+    static func readOwnSigningIdentity() -> (teamID: String, signingID: String) {
+        var code: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code else {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode else {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef) == errSecSuccess,
+              let info = infoRef as? [String: Any] else {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        let teamID = (info[kSecCodeInfoTeamIdentifier as String] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "CI00000000"
+        let signingID = (info[kSecCodeInfoIdentifier as String] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "ai.envcloak.app"
+        if signingID.lowercased().contains("xctest") {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        return (teamID, signingID)
+    }
+
+    var canSignInApp: Bool {
+        enrolledTouchID && !sshSession
+    }
+
     init(
         client: (any WorkspaceClient)?,
         folders: ProjectFolders? = nil,
@@ -87,6 +118,9 @@ struct Change: OptionSet {
         self.unlockKey = unlockKey
         self.approvalSigner = approvalSigner
         self.enrolledPublicKeysOverride = enrolledPublicKeysOverride
+        let ownIdentity = VaultSession.readOwnSigningIdentity()
+        self.enrolledTeamID = ownIdentity.teamID
+        self.enrolledSigningID = ownIdentity.signingID
         self.showMenuBarExtra = folders?.showMenuBarExtra ?? false
         let resolvedNotifications = notifications ?? NotificationManager()
         self.notifications = resolvedNotifications
@@ -235,6 +269,7 @@ struct Change: OptionSet {
             if change.contains(.pending) {
                 await notifications.reconcile(
                     pending: grants.pending,
+                    asksCount: grants.asks.count,
                     isFrontmost: isFrontmostOverride
                 )
             }
@@ -276,6 +311,7 @@ struct Change: OptionSet {
     private func clearMetadata() {
         bindings.clear()
         items.clear(); projects.clear(); grants.clear()
+        selectedField = nil
         notifications.clear()
     }
 
@@ -311,6 +347,9 @@ struct Change: OptionSet {
 
     func selectKey(_ slug: DaemonText?) async {
         guard state.canReadMetadata else { return }
+        if items.selectedSlug != slug {
+            selectedField = nil
+        }
         await items.select(slug)
     }
 
@@ -447,9 +486,10 @@ struct Change: OptionSet {
         actionInProgress = true
         defer { actionInProgress = false }
         do {
-            let begin = try await client.call(MetadataRequest.unlockBegin())
+            let begin = try await client.call(MetadataRequest.unlockBegin(unlockerID: enrolledUnlockerID))
             let sealed = try await key.openAndReseal(begin, reason: ContextFactory.unlockReason)
             _ = try await client.call(MetadataRequest.unlockFinish(requestID: begin.request_id, sealed: sealed))
+            enrolledUnlockerID = begin.unlocker_id
             notice = nil
             await poll()
             return state == .ready || state == .upgradeReadOnly
@@ -514,6 +554,9 @@ struct Change: OptionSet {
             switch output.state {
             case .enrolled:
                 enrolledTouchID = true
+                if let id = output.unlocker_id {
+                    enrolledUnlockerID = id
+                }
                 enrolmentCompleted = true
                 enrolmentPendingId = nil
                 notice = "Touch ID added."
@@ -565,6 +608,7 @@ struct Change: OptionSet {
         await grants.refetch([.grants, .pending])
         await notifications.reconcile(
             pending: grants.pending,
+            asksCount: grants.asks.count,
             isFrontmost: isFrontmostOverride
         )
         return output
@@ -580,6 +624,7 @@ struct Change: OptionSet {
             await grants.refetch(.pending)
             await notifications.reconcile(
                 pending: grants.pending,
+                asksCount: grants.asks.count,
                 isFrontmost: isFrontmostOverride
             )
             return true
@@ -641,6 +686,11 @@ struct Change: OptionSet {
         await items.refetch(.items)
         if ask != nil {
             await grants.refetch(.pending)
+            await notifications.reconcile(
+                pending: grants.pending,
+                asksCount: grants.asks.count,
+                isFrontmost: isFrontmostOverride
+            )
         }
         return added
     }
@@ -656,6 +706,11 @@ struct Change: OptionSet {
                 activeAsk = nil
             }
             await grants.refetch(.pending)
+            await notifications.reconcile(
+                pending: grants.pending,
+                asksCount: grants.asks.count,
+                isFrontmost: isFrontmostOverride
+            )
             return true
         } catch {
             await grants.refetch(.pending)
@@ -680,6 +735,7 @@ struct Change: OptionSet {
             throw SignerError.notInteractiveSession
         }
         actionInProgress = true
+        notice = nil
         defer { actionInProgress = false }
 
         let aad = try SEHPKE.resealAAD(
@@ -735,6 +791,7 @@ struct Change: OptionSet {
             throw SignerError.notInteractiveSession
         }
         actionInProgress = true
+        notice = nil
         defer { actionInProgress = false }
 
         let stmt = WriteStatement(
@@ -785,6 +842,7 @@ struct Change: OptionSet {
             throw SignerError.notInteractiveSession
         }
         actionInProgress = true
+        notice = nil
         defer { actionInProgress = false }
 
         let appEphKey = Curve25519.KeyAgreement.PrivateKey()
@@ -872,6 +930,8 @@ struct Change: OptionSet {
         actionInProgress = true
         defer { actionInProgress = false }
         do {
+            let priorKeys: EnrolledPublicKeys? = enrolledPublicKeysOverride
+                ?? (keyStore.hasEnrolledKeys() ? (try? keyStore.loadOrCreatePublicKeys(touchIDOnly: false)) : nil)
             let target = try await client.call(MetadataRequest.itemsTargetUnlockerAdd())
             let unlockHex: String
             let approveHex: String
@@ -905,7 +965,7 @@ struct Change: OptionSet {
                 stmtBytes,
                 reason: ContextFactory.unlockerAddReason(label: label)
             )
-            _ = try await client.call(
+            let added = try await client.call(
                 MetadataRequest.unlockerAdd(
                     unlockPublicKeyHex: unlockHex,
                     approvePublicKeyHex: approveHex,
@@ -916,9 +976,44 @@ struct Change: OptionSet {
                     signatureHex: signature.hex
                 )
             )
+            if let priorID = enrolledUnlockerID, let priorKeys {
+                let priorUnlockFP = try SEHPKE.p256FingerprintHex(priorKeys.unlockPublicKeyHex)
+                let priorApproveFP = try SEHPKE.p256FingerprintHex(priorKeys.approvePublicKeyHex)
+                let removeTarget = try await client.call(MetadataRequest.itemsTargetUnlockerRemove())
+                let removeStmt = WriteStatement(
+                    target: "unlocker_remove",
+                    nonce: MetadataRequest.raw(removeTarget.nonce),
+                    vault_id: MetadataRequest.raw(removeTarget.vault_id),
+                    action: .unlockerRemove(
+                        unlocker: .secureEnclave(
+                            unlocker_id: MetadataRequest.raw(priorID),
+                            label: enrolledUnlockerLabel,
+                            unlock_pub_sha256: priorUnlockFP,
+                            approve_pub_sha256: priorApproveFP
+                        )
+                    )
+                )
+                let removeBytes = CanonicalStatement.encodeWrite(removeStmt)
+                let removeDigestHex = CanonicalStatement.writeDigestHex(removeStmt)
+                let removeSig = try await resolvedSigner.sign(
+                    removeBytes,
+                    reason: ContextFactory.unlockerRemoveReason(target: enrolledUnlockerLabel)
+                )
+                _ = try await client.call(
+                    MetadataRequest.unlockerRemove(
+                        unlocker: MetadataRequest.raw(priorID),
+                        createdSecs: removeTarget.created_secs,
+                        nonceHex: MetadataRequest.raw(removeTarget.nonce),
+                        digestHex: removeDigestHex,
+                        signatureHex: removeSig.hex
+                    )
+                )
+            }
             if let stagedPair {
                 try keyStore.commitStagedKeys(stagedPair)
             }
+            enrolledUnlockerID = added.unlocker_id
+            enrolledUnlockerLabel = label
             touchIDOnlyEnabled = true
             enrolledTouchID = true
             notice = "Touch ID is now required. Your login password will no longer approve."

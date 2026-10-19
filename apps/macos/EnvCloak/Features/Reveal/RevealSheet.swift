@@ -74,6 +74,8 @@ import SwiftUI
             descriptor = desc
             let opened = try await session.completeRevealWithTouchID(descriptor: desc)
             receiveSecret(opened)
+        } catch SignerError.userCancelled, KeyStoreError.userCancelled {
+            notice = "Touch ID was cancelled. The key value was not shown."
         } catch {
             notice = session.notice ?? "The key value could not be shown."
         }

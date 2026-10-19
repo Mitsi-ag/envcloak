@@ -65,12 +65,19 @@ import SwiftUI
     func submitRotation(_ session: VaultSession) async {
         guard !busy, envName == nil, let target, let incoming = draft.take() else { return }
         busy = true; notice = nil
-        defer { busy = false; count = 0 }
+        defer { busy = false }
         do {
             _ = try await session.rotateItemWithTouchID(target: target, newValue: incoming.value)
+            count = 0
             completed = true
+        } catch SignerError.userCancelled, KeyStoreError.userCancelled {
+            draft = consume incoming
+            notice = "Touch ID was cancelled. The key value was not replaced."
         } catch {
-            notice = session.notice ?? "The key value could not be replaced."
+            draft = consume incoming
+            let failureNotice = session.notice ?? "The key value could not be replaced."
+            await loadTarget(session)
+            notice = failureNotice
         }
     }
 
@@ -81,8 +88,12 @@ import SwiftUI
         do {
             _ = try await session.removeItemWithTouchID(target: target)
             completed = true
+        } catch SignerError.userCancelled, KeyStoreError.userCancelled {
+            notice = "Touch ID was cancelled. The key was not removed."
         } catch {
-            notice = session.notice ?? "The key could not be removed."
+            let failureNotice = session.notice ?? "The key could not be removed."
+            await loadTarget(session)
+            notice = failureNotice
         }
     }
 

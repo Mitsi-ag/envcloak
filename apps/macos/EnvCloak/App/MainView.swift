@@ -147,17 +147,18 @@ struct MainView: View {
         .sheet(item: $binding) { BindingSheet(session: session, selection: $0) }
         .sheet(item: $paletteSheetAction) { action in
             if let item = currentSelectedKeyItem {
-                if session.enrolledTouchID {
+                let resolvedField = session.selectedField ?? item.fields.first?.name
+                if session.canSignInApp {
                     switch action {
                     case .reveal:
-                        RevealSheet(session: session, item: item, field: item.fields.first?.name)
+                        RevealSheet(session: session, item: item, field: resolvedField)
                     case .replace:
-                        ReplaceSheet(session: session, item: item, field: item.fields.first?.name)
+                        ReplaceSheet(session: session, item: item, field: resolvedField)
                     case .remove:
                         RemoveSheet(session: session, item: item)
                     }
                 } else {
-                    InspectorActionSheet(action: action, item: item, field: item.fields.first?.name)
+                    InspectorActionSheet(action: action, item: item, field: resolvedField)
                 }
             }
         }
@@ -179,6 +180,9 @@ struct MainView: View {
             }
             session.onOpenMainWindow = { [openWindow] in
                 openWindow(id: WindowID.main)
+            }
+            session.onFocusApprovals = {
+                route = .approvals
             }
         }
         .onDisappear { session.bindings.clear() }
@@ -215,8 +219,12 @@ struct MainView: View {
             case .deleteKey:
                 paletteSheetAction = .remove
             case .reviewRequests:
-                session.openApprovalWindow()
-                openWindow(id: WindowID.approval)
+                if !session.grants.pending.isEmpty {
+                    session.openApprovalWindow()
+                } else {
+                    route = .approvals
+                    openWindow(id: WindowID.main)
+                }
             case .welcome:
                 openWindow(id: WindowID.welcome)
             }
