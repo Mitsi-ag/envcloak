@@ -201,6 +201,10 @@ fn host_slice(f: &File, len: u64) -> Result<(u64, u64), FormatError> {
                 if be32(e, 0)? != HOST_CPU {
                     continue;
                 }
+                #[cfg(target_arch = "aarch64")]
+                if (be32(e, 4)? & 0x00ff_ffff) > 2 {
+                    continue;
+                }
                 let (off, size) = if wide {
                     (be64(e, 8)?, be64(e, 16)?)
                 } else {

@@ -952,10 +952,60 @@ const RUNNER_LOADING_LONG: [&str; 6] = [
     "--globalconfig",
 ];
 
-/// The options npx takes without a value (npm 11.19.0's `npx-cli.js`: its
-/// `switches`, npm's boolean configuration, and `-y`, which it expands to
-/// `--yes`). Each one is measured: an option here that npx gave a value
-/// would let that value pass for the package.
+/// The shorthands of npm 11.19.0's `@npmcli/config` (`lib/definitions`):
+/// `npx-cli.js` and `nopt` strip every leading `-` before looking up
+/// `shorthands[key]`, so `--<key>` and `-<key>` expand alike (`--c` and
+/// `-c` both expand to `--call`).
+const NPM_SHORTHANDS: [(&str, &str); 40] = [
+    ("enjoy-by", "--before"),
+    ("d", "--loglevel"),
+    ("dd", "--loglevel"),
+    ("ddd", "--loglevel"),
+    ("quiet", "--loglevel"),
+    ("q", "--loglevel"),
+    ("s", "--loglevel"),
+    ("silent", "--loglevel"),
+    ("verbose", "--loglevel"),
+    ("desc", "--description"),
+    ("help", "--usage"),
+    ("local", "--no-global"),
+    ("n", "--no-yes"),
+    ("no", "--no-yes"),
+    ("porcelain", "--parseable"),
+    ("readonly", "--read-only"),
+    ("reg", "--registry"),
+    ("iwr", "--include-workspace-root"),
+    ("ws", "--workspaces"),
+    ("a", "--all"),
+    ("c", "--call"),
+    ("f", "--force"),
+    ("g", "--global"),
+    ("L", "--location"),
+    ("l", "--long"),
+    ("m", "--message"),
+    ("p", "--parseable"),
+    ("C", "--prefix"),
+    ("S", "--save"),
+    ("B", "--save-bundle"),
+    ("D", "--save-dev"),
+    ("E", "--save-exact"),
+    ("O", "--save-optional"),
+    ("P", "--save-prod"),
+    ("?", "--usage"),
+    ("H", "--usage"),
+    ("h", "--usage"),
+    ("v", "--version"),
+    ("w", "--workspace"),
+    ("y", "--yes"),
+];
+
+/// A subset of the options npx takes without a value (npm 11.19.0's
+/// `npx-cli.js`: its `switches`, `@npmcli/config`'s `Boolean` definitions,
+/// and `-y`, which `shorthands` expands to `--yes`). Each listed switch is
+/// measured in the npx oracle: an option listed here that npx gave a value
+/// would let that value pass for the package, whereas switches omitted here
+/// err toward refusal (their following word is taken as an option value and
+/// the runner option scan continues).
 const NPX_SWITCHES: [&str; 8] = [
     "yes",
     "y",
@@ -1020,12 +1070,40 @@ fn runner_options_end(name: &str, argv: &[String]) -> usize {
 }
 
 /// Whether the runner's option `a` runs other code or chooses it
-/// ([`is_code_loading_option`], [`RUNNER_LOADING_LONG`]).
+/// ([`is_code_loading_option`], [`RUNNER_LOADING_LONG`], or an
+/// [`NPM_SHORTHANDS`] expansion in `-<key>` or `--<key>` form).
 fn runner_option_loads(a: &str) -> bool {
-    is_code_loading_option(a)
-        || RUNNER_LOADING_LONG
-            .iter()
-            .any(|o| a == *o || a.strip_prefix(o).is_some_and(|r| r.starts_with('=')))
+    if is_code_loading_option(a) {
+        return true;
+    }
+    let Some(rest) = a.strip_prefix('-') else {
+        return false;
+    };
+    let key = rest.trim_start_matches('-').split('=').next().unwrap_or("");
+    if let Some(long) = NPM_SHORTHANDS
+        .iter()
+        .find_map(|&(k, target)| (k == key).then_some(target))
+    {
+        return RUNNER_LOADING_LONG.contains(&long);
+    }
+    if key.len() > 1
+        && key.chars().all(|ch| {
+            NPM_SHORTHANDS
+                .iter()
+                .any(|&(k, _)| k.len() == 1 && k.starts_with(ch))
+        })
+        && key.chars().any(|ch| {
+            NPM_SHORTHANDS
+                .iter()
+                .find_map(|&(k, target)| (k.len() == 1 && k.starts_with(ch)).then_some(target))
+                .is_some_and(|target| RUNNER_LOADING_LONG.contains(&target))
+        })
+    {
+        return true;
+    }
+    RUNNER_LOADING_LONG
+        .iter()
+        .any(|o| o.strip_prefix("--") == Some(key))
 }
 
 /// The label of a package runner `name` with `argv` (see
@@ -2469,6 +2547,10 @@ mod tests {
         assert!(check_declaration(&base).is_ok());
         for argv in [
             &["npx", "--package", "foo", "--call", "echo CONTROL"][..],
+            &["npx", "--c=echo CONTROL"],
+            &["npx", "--c", "echo CONTROL"],
+            &["npx", "--yes", "--c=echo CONTROL"],
+            &["npm", "exec", "--c=echo CONTROL"],
             &[
                 "npx",
                 "--cache",

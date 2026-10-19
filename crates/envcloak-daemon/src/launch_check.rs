@@ -1158,20 +1158,33 @@ mod tests {
         // The record keeps the `#!` line's interpreter before the
         // declaration: its own arguments are the last two.
         let head = package.argv.len() - 2;
-        let stored = |args: &[&str]| {
+        let stored = |argv: &[&str]| {
             let mut old = package.clone();
-            old.declaration.argv.truncate(1);
-            old.declaration
-                .argv
-                .extend(args.iter().map(|a| (*a).to_owned()));
+            old.declaration.argv = argv.iter().map(|a| (*a).to_owned()).collect();
             old.argv.truncate(head);
-            old.argv.extend(args.iter().map(|a| a.as_bytes().to_vec()));
+            old.argv
+                .extend(argv.iter().skip(1).map(|a| a.as_bytes().to_vec()));
             old
         };
-        assert!(check(&stored(&["--package", "foo", "fixture", "--call", "x"])).is_ok());
-        for args in [
-            &["--package", "foo", "--call", "echo CONTROL"][..],
+        assert!(
+            check(&stored(&[
+                "npx",
+                "--package",
+                "foo",
+                "fixture",
+                "--call",
+                "x"
+            ]))
+            .is_ok()
+        );
+        for argv in [
+            &["npx", "--package", "foo", "--call", "echo CONTROL"][..],
+            &["npx", "--c=echo CONTROL"],
+            &["npx", "--c", "echo CONTROL"],
+            &["npx", "--yes", "--c=echo CONTROL"],
+            &["npm", "exec", "--c=echo CONTROL"],
             &[
+                "npx",
                 "--cache",
                 "/tmp/cache",
                 "--node-options=--require=/tmp/p.js",
@@ -1179,8 +1192,8 @@ mod tests {
             ],
         ] {
             assert!(
-                matches!(check(&stored(args)), Err(CheckError::Changed { .. })),
-                "{args:?}"
+                matches!(check(&stored(argv)), Err(CheckError::Changed { .. })),
+                "{argv:?}"
             );
         }
     }

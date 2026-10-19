@@ -239,7 +239,9 @@ fn npx_reads_its_options_after_an_option_value() {
         Ok(ArgvClass::PackageRunner { .. })
     ));
     for args in [
-        &["--package", p, "--call", "echo CONTROL"][..],
+        &["--call=echo CONTROL"][..],
+        &["--call", "echo CONTROL"],
+        &["--package", p, "--call", "echo CONTROL"],
         &["--cache", c, "--call", "echo CONTROL"],
         &[
             "--cache",
@@ -257,6 +259,67 @@ fn npx_reads_its_options_after_an_option_value() {
             "{args:?}"
         );
     }
+    let defs = npx
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("node_modules/@npmcli/config/lib/definitions");
+    let shorthands = run(
+        Path::new("/usr/bin/env"),
+        h,
+        &[
+            "node".into(),
+            "-e".into(),
+            "const { shorthands } = require(process.argv[1]); \
+             for (const k of Object.keys(shorthands)) console.log(k);"
+                .into(),
+            defs.to_str().unwrap().into(),
+        ],
+        &env,
+    );
+    let keys: Vec<&str> = shorthands.lines().filter(|k| !k.is_empty()).collect();
+    assert!(keys.len() >= 35, "{keys:?}");
+    let mut run_env = env.to_vec();
+    let h_str = h.to_str().unwrap();
+    run_env.extend([
+        ("XDG_CONFIG_HOME", h_str),
+        ("XDG_DATA_HOME", h_str),
+        ("XDG_CACHE_HOME", h_str),
+    ]);
+    let mut printed = Vec::new();
+    for key in keys {
+        for prefix in ["-", "--"] {
+            let flag = format!("{prefix}{key}");
+            for args in [
+                vec![format!("{flag}=echo CONTROL")],
+                vec![flag, "echo CONTROL".into()],
+            ] {
+                let (_, out, _) = run_any_with(&npx, h, &args, &run_env);
+                if out.contains("CONTROL") {
+                    assert_eq!(out, "CONTROL\n", "{args:?}");
+                    let full: Vec<String> = std::iter::once("npx".to_owned())
+                        .chain(args.clone())
+                        .collect();
+                    assert_eq!(
+                        classify_argv(&full),
+                        Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+                        "{full:?}"
+                    );
+                    printed.push(args);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        printed,
+        vec![
+            vec!["-c=echo CONTROL".to_owned()],
+            vec!["-c".to_owned(), "echo CONTROL".to_owned()],
+            vec!["--c=echo CONTROL".to_owned()],
+            vec!["--c".to_owned(), "echo CONTROL".to_owned()],
+        ]
+    );
 }
 
 /// Deno 2.9.7 takes no value for any `--allow-`, `--deny-` or `--no-`
