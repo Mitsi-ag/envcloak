@@ -1065,6 +1065,12 @@ fn respond<'s>(
         proto::AppAsksDecline::NAME => answer::<proto::AppAsksDecline>(id, &req, |p| {
             crate::app::asks::decline(shared, peer, p)
         }),
+        proto::AppAuditList::NAME => {
+            answer::<proto::AppAuditList>(id, &req, |p| crate::app::audit::list(shared, p))
+        }
+        proto::AppLock::NAME => {
+            answer::<proto::AppLock>(id, &req, |p| crate::app::lock::lock(shared, p))
+        }
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }
@@ -1174,7 +1180,7 @@ fn unlock(shared: &Shared, peer: &PeerIdentity, p: UnlockParams) -> Result<Unloc
     let now = Reading::now(&shared.clocks);
     let at = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
-    let r = s.finish_unlock(generation, now, result);
+    let r = s.finish_unlock_for_peer(peer.pid, generation, now, result);
     match &r {
         Ok(_) => {
             s.limiter().succeeded();

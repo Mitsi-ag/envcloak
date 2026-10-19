@@ -218,4 +218,6 @@ public enum Reason: String, CaseIterable, Sendable {
     case invalid_header
     case header_bindings
     case code_identity
+    case rolled_back
+    case keychain_anchor_missing
 }

@@ -31,6 +31,7 @@ macro_rules! log_line {
     }};
 }
 
+mod anchor;
 mod app;
 mod audit;
 mod backup;

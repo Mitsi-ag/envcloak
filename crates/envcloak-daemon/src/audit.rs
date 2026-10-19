@@ -446,6 +446,14 @@ pub enum AuditEvent {
         outcome: &'static str,
         item: Option<(ItemId, Slug)>,
     },
+    /// The keychain rollback anchor contradicted the vault file at unlock
+    /// (`tampered`, `rolled_back`) or was missing on a vault that had one and
+    /// was re-created (`recreated`, `keychain_anchor_missing`; M3-16).
+    KeychainAnchorMismatch {
+        pid: i32,
+        outcome: &'static str,
+        reason: &'static str,
+    },
 }
 
 /// A managed launch's counts, as its audit entries record them.
@@ -781,6 +789,13 @@ impl AuditEvent {
             AuditEvent::Ask {
                 pid, ask, outcome, ..
             } => format!("envcloakd: audit: ask outcome={outcome} ask={ask} pid={pid}"),
+            AuditEvent::KeychainAnchorMismatch {
+                pid,
+                outcome,
+                reason,
+            } => format!(
+                "envcloakd: audit: keychain anchor mismatch outcome={outcome} reason={reason} pid={pid}"
+            ),
         })
     }
 
@@ -1361,6 +1376,15 @@ impl AuditEvent {
                 items: item.iter().cloned().collect(),
                 decision: decision(outcome, None, Some("items.ask"), None),
                 ..AuditRecord::new(AuditKind::Ask, outcome)
+            },
+            AuditEvent::KeychainAnchorMismatch {
+                pid,
+                outcome,
+                reason,
+            } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision(outcome, Some(reason), Some("unlock"), None),
+                ..AuditRecord::new(AuditKind::KeychainAnchorMismatch, outcome)
             },
         }
     }

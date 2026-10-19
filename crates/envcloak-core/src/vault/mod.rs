@@ -50,7 +50,9 @@ use crate::crypto::{
 use crate::secret::SecretBytes;
 
 pub use error::{VaultError, VaultErrorKind};
-pub use integrity::{AuditHead, HeaderState, Integrity, TamperKind};
+pub use integrity::{
+    ANCHOR_LEN, Anchor, AnchorComparison, AuditHead, HeaderState, Integrity, TamperKind,
+};
 pub use items::{
     Account, COVER_BITS, COVER_HASHES, Classification, Exposure, ExposureCover, ExposureSource,
     FieldId, FieldKind, FieldMeta, FieldName, ItemDetails, ItemId, ItemMeta, Links, LoginMeta,
@@ -847,6 +849,32 @@ impl Vault {
     pub fn header(&self) -> Result<HeaderState, VaultError> {
         self.trusted()?;
         Ok(self.state.header)
+    }
+
+    /// The 68-byte keychain rollback anchor for this vault's committed state
+    /// (`docs/VAULT.md` "Keychain rollback anchor", D3-12). Fails with
+    /// [`VaultErrorKind::Tampered`] unless the vault verified.
+    pub fn anchor(&self) -> Result<Anchor, VaultError> {
+        let h = self.header()?;
+        Ok(Anchor {
+            vault_id: self.ctx.vault_id,
+            epoch: self.ctx.epoch,
+            write_counter: h.write_counter,
+            state_digest: h.state_digest,
+            audit_seq: h.audit_head.map_or(0, |a| a.seq),
+        })
+    }
+
+    /// Marks the vault tampered (`Integrity::Tampered(kind)`) and switches its
+    /// SQLite connection to `query_only = ON` so no writes, grants, policies or
+    /// project records can be served, while readable items and values remain
+    /// available for recovery (SPEC §5 "Integrity", D3-12).
+    pub fn mark_tampered(&mut self, kind: TamperKind) -> Result<(), VaultError> {
+        if self.integrity.get() == Integrity::Ok {
+            self.integrity.set(Integrity::Tampered(kind));
+        }
+        self.file.conn.pragma_update(None, "query_only", "ON")?;
+        Ok(())
     }
 
     /// Fails with [`VaultErrorKind::Tampered`] unless [`Vault::integrity`]

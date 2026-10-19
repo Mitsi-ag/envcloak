@@ -453,7 +453,7 @@ Status: M3 plan decision D3-02 and lane C's rule 9, written by task M3-01. The v
 | 47 | `unlocker_remove` | M3-14 | landed | an unlocker removed under a signed write statement (`app.unlocker.remove`): the passphrase unlocker, or a Secure Enclave unlocker with its label and both public keys' fingerprints |
 | 48 | `reveal_app` | M3-14 | landed | a reveal in the app, written durably before the sealed value is released |
 | 49 | `ask` | M3-14 | landed | an ask filed by `envcloak add --ask`, and its outcome (added, declined or expired), with the requester's evidence |
-| 50 | `keychain_anchor_mismatch` | M3-16 | reserved | the keychain anchor is newer than the vault file (rolled back), or a vault that had an anchor has none; the anchor written again (named apart from `audit.verify`'s `anchor_mismatch`, the audit log's saved head) |
+| 50 | `keychain_anchor_mismatch` | M3-16 | landed | the keychain anchor is newer than the vault file (rolled back), or a vault that had an anchor has none; the anchor written again (named apart from `audit.verify`'s `anchor_mismatch`, the audit log's saved head) |
 <!-- /reservations -->
 
 **Unlocker kinds** (`unlockers.kind`, and the envelope's kind):

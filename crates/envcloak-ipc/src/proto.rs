@@ -27,10 +27,12 @@ use envcloak_policy::{
 
 pub use crate::app::{
     AppApprove, AppApproveParams, AppAskDeclinedView, AppAsksDecline, AppAsksDeclineParams,
-    AppAsksList, AppAsksListParams, AppAsksListView, AppItemsRemove, AppItemsRemoveParams,
-    AppItemsRotate, AppItemsRotateParams, AppItemsTarget, AppItemsTargetOutput,
-    AppItemsTargetParams, AppPaste, AppPasteBegin, AppPasteBeginOutput, AppPasteBeginParams,
-    AppPasteInspect, AppPasteInspectOutput, AppPasteInspectParams, AppPasteParams, AppPendingGet,
+    AppAsksList, AppAsksListParams, AppAsksListView, AppAuditEntryView, AppAuditList,
+    AppAuditListParams, AppAuditListView, AppAuditSubjectView, AppItemsRemove,
+    AppItemsRemoveParams, AppItemsRotate, AppItemsRotateParams, AppItemsTarget,
+    AppItemsTargetOutput, AppItemsTargetParams, AppLock, AppLockParams, AppLockReason, AppPaste,
+    AppPasteBegin, AppPasteBeginOutput, AppPasteBeginParams, AppPasteInspect,
+    AppPasteInspectOutput, AppPasteInspectParams, AppPasteParams, AppPendingGet,
     AppPendingGetParams, AppPendingList, AppPendingListParams, AppPendingListView, AppPendingView,
     AppReveal, AppRevealBegin, AppRevealBeginParams, AppRevealOutput, AppRevealParams, AppUnlock,
     AppUnlockBegin, AppUnlockBeginOutput, AppUnlockBeginParams, AppUnlockParams, AppUnlockerAdd,
@@ -1838,7 +1840,7 @@ pub const CLIENT_METHODS: [&str; 48] = [
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
 /// approval, policy, reveal, the paste sheet, devices and registry
 /// overrides. Any other `app.` name is an app method too.
-pub const APP_METHODS: [&str; 23] = [
+pub const APP_METHODS: [&str; 25] = [
     "app.unlock.begin",
     "app.unlock",
     "app.unlocker.enroll.begin",
@@ -1858,6 +1860,8 @@ pub const APP_METHODS: [&str; 23] = [
     "app.paste",
     "app.asks.list",
     "app.asks.decline",
+    "app.audit.list",
+    "app.lock",
     "app.policy.set",
     "app.device.add",
     "app.device.remove",
@@ -2501,6 +2505,11 @@ pub const REASONS: &[&str] = &[
     "invalid_header",
     "header_bindings",
     "code_identity",
+    // Keychain rollback anchor (M3-16): the keychain anchor is ahead of the
+    // vault file (`vault_tampered`, `keychain_anchor_mismatch`), or an
+    // anchored vault had no anchor in the keychain (`keychain_anchor_mismatch`).
+    "rolled_back",
+    "keychain_anchor_missing",
 ];
 
 /// An error response. Built from fixed tokens only.

@@ -54,6 +54,20 @@ public enum LockReason: String, Sendable, WireDecodable {
     case `sleep` = "sleep"
     case `signal` = "signal"
     case `restore` = "restore"
+    case `screenLock` = "screen_lock"
+    case `sessionResign` = "session_resign"
+    init(wire: WireReader) throws {
+        guard let value = Self(rawValue: try wire.string()) else { throw EnvCloakError.protocolError }
+        self = value
+    }
+}
+
+public enum KeychainAnchorState: String, Sendable, WireDecodable {
+    case `matched` = "matched"
+    case `ahead` = "ahead"
+    case `missing` = "missing"
+    case `none` = "none"
+    case `unavailable` = "unavailable"
     init(wire: WireReader) throws {
         guard let value = Self(rawValue: try wire.string()) else { throw EnvCloakError.protocolError }
         self = value
@@ -213,10 +227,11 @@ public struct VaultView: Sendable, WireDecodable, CustomStringConvertible, Custo
     public let `unavailable`: String?
     public let `busy`: Bool
     public let `failed_unlocks`: UInt32
+    public let `keychain_anchor`: KeychainAnchorState
     public var description: String { "[VaultView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
-        let o = try wire.object(["state", "integrity", "read_only", "unavailable", "busy", "failed_unlocks"])
+        let o = try wire.object(["state", "integrity", "read_only", "unavailable", "busy", "failed_unlocks", "keychain_anchor"])
         self.`state` = try o.decode("state")
         self.`integrity` = try o.optional("integrity")
         self.`read_only` = try o.decode("read_only")
@@ -228,6 +243,7 @@ public struct VaultView: Sendable, WireDecodable, CustomStringConvertible, Custo
         }
         self.`busy` = try o.decode("busy")
         self.`failed_unlocks` = try o.decode("failed_unlocks")
+        self.`keychain_anchor` = try o.optional("keychain_anchor") ?? .unavailable
     }
 }
 

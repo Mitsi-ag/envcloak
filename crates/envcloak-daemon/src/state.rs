@@ -39,21 +39,26 @@
 //! quickly; Argon2id runs between a `begin_*` and its `finish_*`, outside
 //! the mutex.
 
+use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use envcloak_core::crypto::CryptoErrorKind;
 use envcloak_core::vault::{
-    AuditHead, FieldId, Integrity, LockedVault, Vault, VaultError, VaultErrorKind, VaultPaths,
+    Anchor, AnchorComparison, AuditHead, FieldId, Integrity, LockedVault, TamperKind, Vault,
+    VaultError, VaultErrorKind, VaultPaths,
 };
 use envcloak_core::{PassphraseRejected, RestoreReport, SecretBytes};
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::ErrorKind;
 use envcloak_ipc::view::{
     ApprovalsView, AuditStatusView, AuditVerifyView, CreatedView, DaemonView,
-    Integrity as IntegrityView, LockReason, LockView, RecoveredView, StatusView, UnlockedView,
-    VaultState, VaultView,
+    Integrity as IntegrityView, KeychainAnchorState, LockReason, LockView, RecoveredView,
+    StatusView, UnlockedView, VaultState, VaultView,
 };
 use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now, ProcessInstance};
+
+use crate::anchor::{AnchorError, AnchorStore, KeychainAnchorStore};
 
 use crate::audit::{AuditEvent, AuditLog, RequestAudit};
 use crate::clock::{Clocks, now_of};
@@ -207,11 +212,25 @@ pub struct State {
     /// Single-use nonces consumed by `app.unlocker.add` and
     /// `app.unlocker.remove`.
     used_write_nonces: Vec<[u8; 32]>,
+    /// Keychain rollback anchor store (M3-16).
+    anchor_store: Arc<dyn AnchorStore>,
+    /// Current keychain rollback anchor status reported in `status.vault`.
+    keychain_anchor: KeychainAnchorState,
+    /// Vaults that have had a keychain rollback anchor in this daemon process.
+    anchored_vaults: BTreeSet<[u8; 16]>,
+    /// Last rollback anchor synced for the currently unlocked vault.
+    last_synced_anchor: Option<Anchor>,
 }
 
 impl State {
     /// Opens the vault at `paths` if there is one, locked.
     pub fn open(paths: VaultPaths, idle_limit: Duration, now: Reading) -> Self {
+        let anchor_store: Arc<dyn AnchorStore> = Arc::new(KeychainAnchorStore);
+        let keychain_anchor = if anchor_store.is_available() {
+            KeychainAnchorState::None
+        } else {
+            KeychainAnchorState::Unavailable
+        };
         State {
             slot: probe(&paths),
             paths,
@@ -232,7 +251,30 @@ impl State {
             write_targets: Vec::new(),
             paste_stages: Vec::new(),
             used_write_nonces: Vec::new(),
+            anchor_store,
+            keychain_anchor,
+            anchored_vaults: BTreeSet::new(),
+            last_synced_anchor: None,
         }
+    }
+
+    /// Replaces the rollback anchor store (for tests).
+    #[allow(dead_code)]
+    pub fn with_anchor_store(mut self, store: Arc<dyn AnchorStore>) -> Self {
+        self.set_anchor_store(store);
+        self
+    }
+
+    /// Replaces the rollback anchor store (for tests).
+    #[allow(dead_code)]
+    pub fn set_anchor_store(&mut self, store: Arc<dyn AnchorStore>) {
+        self.keychain_anchor = if store.is_available() {
+            KeychainAnchorState::None
+        } else {
+            KeychainAnchorState::Unavailable
+        };
+        self.anchor_store = store;
+        self.last_synced_anchor = None;
     }
 
     #[cfg(test)]
@@ -271,7 +313,20 @@ impl State {
     pub fn unlocked(&self) -> Result<&Vault, RpcError> {
         match &self.slot {
             Slot::Unlocked(v) if v.integrity() == Integrity::Ok => Ok(v),
-            Slot::Unlocked(_) => Err(RpcError::new(ErrorKind::VaultTampered)),
+            Slot::Unlocked(v) => Err(tampered_error(v)),
+            Slot::Locked(_) => Err(RpcError::new(ErrorKind::VaultLocked)),
+            Slot::Absent => Err(RpcError::new(ErrorKind::NoVault)),
+            Slot::Busy => Err(RpcError::new(ErrorKind::Busy)),
+            Slot::Unavailable(r) => Err(RpcError::with_reason(ErrorKind::VaultUnavailable, r)),
+        }
+    }
+
+    /// The unlocked vault even when it opened read-only after failing an
+    /// integrity or rollback check (`app.audit.list` reads the audit log on a
+    /// rolled-back or tampered vault).
+    pub fn unlocked_any_integrity(&self) -> Result<&Vault, RpcError> {
+        match &self.slot {
+            Slot::Unlocked(v) => Ok(v),
             Slot::Locked(_) => Err(RpcError::new(ErrorKind::VaultLocked)),
             Slot::Absent => Err(RpcError::new(ErrorKind::NoVault)),
             Slot::Busy => Err(RpcError::new(ErrorKind::Busy)),
@@ -287,9 +342,7 @@ impl State {
     /// [`ErrorKind::VaultTampered`].
     pub fn refuse_if_tampered(&self) -> Result<(), RpcError> {
         match &self.slot {
-            Slot::Unlocked(v) if v.integrity() != Integrity::Ok => {
-                Err(RpcError::new(ErrorKind::VaultTampered))
-            }
+            Slot::Unlocked(v) if v.integrity() != Integrity::Ok => Err(tampered_error(v)),
             _ => Ok(()),
         }
     }
@@ -345,6 +398,7 @@ impl State {
             if let Some(head) = self.unsaved_head.take() {
                 save_at_lock(self.save_head, &mut vault, head);
             }
+            self.sync_anchor_vault(&vault);
             self.slot = Slot::Locked((*vault).lock());
             Err(RpcError::new(ErrorKind::VaultLocked))
         }
@@ -389,6 +443,7 @@ impl State {
                 if let Some(head) = self.audit.close() {
                     save_at_lock(self.save_head, &mut v, head);
                 }
+                self.sync_anchor_vault(&v);
                 // Dropping the Vault wipes the VMK, the subkeys and the
                 // decrypted metadata; the file stays open and locked.
                 self.slot = Slot::Locked((*v).lock());
@@ -439,19 +494,35 @@ impl State {
     }
 
     /// Finishes an unlock begun under `generation` with Argon2id's result.
+    #[cfg(test)]
     pub fn finish_unlock(
         &mut self,
         generation: u64,
         now: Reading,
         result: Result<Vault, (LockedVault, VaultError)>,
     ) -> Result<UnlockedView, RpcError> {
+        self.finish_unlock_for_peer(std::process::id().cast_signed(), generation, now, result)
+    }
+
+    /// Finishes an unlock begun under `generation` for `pid`.
+    pub fn finish_unlock_for_peer(
+        &mut self,
+        pid: i32,
+        generation: u64,
+        now: Reading,
+        result: Result<Vault, (LockedVault, VaultError)>,
+    ) -> Result<UnlockedView, RpcError> {
         match result {
-            Ok(v) if generation == self.generation => {
+            Ok(mut v) if generation == self.generation => {
+                let mismatch = self.check_anchor_at_unlock(pid, &mut v);
                 let view = unlocked_view(&v, false);
                 self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
                 self.timer.touch(now);
                 self.audit_open();
+                if let Some(m) = mismatch {
+                    self.audit(m);
+                }
                 Ok(view)
             }
             Ok(v) => {
@@ -763,7 +834,8 @@ impl State {
             return Err(RpcError::new(ErrorKind::Internal));
         };
         match locked.unlock_se(vmk) {
-            Ok(v) => {
+            Ok(mut v) => {
+                let mismatch = self.check_anchor_at_unlock(pid, &mut v);
                 let view = unlocked_view(&v, false);
                 self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
@@ -773,6 +845,9 @@ impl State {
                     pid,
                     created: false,
                 });
+                if let Some(m) = mismatch {
+                    self.audit(m);
+                }
                 Ok(view)
             }
             Err((locked, e)) => {
@@ -799,6 +874,7 @@ impl State {
         record: envcloak_core::crypto::SeUnlockerRecord,
         e: AuditEvent,
     ) -> Result<envcloak_core::crypto::SeUnlockerEnvelope, RpcError> {
+        self.unlocked()?;
         self.audit_open();
         let Slot::Unlocked(vault) = &mut self.slot else {
             return Err(RpcError::new(ErrorKind::VaultLocked));
@@ -839,6 +915,7 @@ impl State {
             });
         }
         self.anchor_if_due(None);
+        self.sync_anchor();
         Ok(env)
     }
 
@@ -879,6 +956,7 @@ impl State {
             });
         }
         self.anchor_if_due(None);
+        self.sync_anchor();
         Ok(())
     }
 
@@ -917,6 +995,7 @@ impl State {
     ) -> Result<CreatedView, RpcError> {
         match result {
             Ok(v) if generation == self.generation => {
+                self.sync_anchor_vault(&v);
                 let view = created_view(&v, false);
                 self.start_grants(&v);
                 self.slot = Slot::Unlocked(Box::new(v));
@@ -925,6 +1004,7 @@ impl State {
                 Ok(view)
             }
             Ok(v) => {
+                self.sync_anchor_vault(&v);
                 let view = created_view(&v, true);
                 self.slot = Slot::Locked(v.lock());
                 Ok(view)
@@ -970,6 +1050,7 @@ impl State {
     ) -> Result<RecoveredView, RpcError> {
         match result {
             Ok((v, report)) => {
+                self.sync_anchor_vault(&v);
                 let locked = generation != self.generation;
                 let view = RecoveredView {
                     items: u64::try_from(report.items).unwrap_or(u64::MAX),
@@ -1024,6 +1105,7 @@ impl State {
                 unavailable,
                 busy: matches!(self.slot, Slot::Busy),
                 failed_unlocks: self.failed_unlocks,
+                keychain_anchor: self.keychain_anchor,
             },
             lock: LockView {
                 last_reason: self.last_reason,
@@ -1049,6 +1131,7 @@ impl State {
         self.audit_open();
         self.audit.record(e.record());
         self.anchor_if_due(None);
+        self.sync_anchor();
     }
 
     /// Writes a delivery's entry durably, before anything is released
@@ -1059,6 +1142,7 @@ impl State {
         let written = Self::write_delivery(&mut self.audit, e);
         if written {
             self.anchor_if_due(None);
+            self.sync_anchor();
         }
         written
     }
@@ -1142,7 +1226,7 @@ impl State {
                 })
             })?;
         if vault.integrity() != Integrity::Ok {
-            return Err(Delivery::Refused(RpcError::new(ErrorKind::VaultTampered)));
+            return Err(Delivery::Refused(tampered_error(vault)));
         }
         let answer = answer(values).map_err(Delivery::Unsendable)?;
         let now = now_of(clocks);
@@ -1215,6 +1299,7 @@ impl State {
                 ))
             })?;
             self.anchor_if_due(None);
+            self.sync_anchor();
         } else if !self.audit_delivery(e.clone()) {
             return Err(Delivery::AuditFailed);
         }
@@ -1323,7 +1408,8 @@ impl State {
             return;
         };
         let saved = (self.save_head)(v, head);
-        if self.audit.anchor_saved(saved.is_ok(), awake) {
+        let ok = saved.is_ok();
+        if self.audit.anchor_saved(ok, awake) {
             match saved {
                 Err(e) => log_line!(
                     "envcloakd: warning: the audit log's head could not be saved in the vault \
@@ -1331,6 +1417,157 @@ impl State {
                     vault_reason(e.kind())
                 ),
                 Ok(()) => log_line!("envcloakd: the audit log's head was saved in the vault again"),
+            }
+        }
+        if ok {
+            self.sync_anchor();
+        }
+    }
+
+    /// Compares `v` at unlock against the stored keychain rollback anchor
+    /// (SPEC §5 "Keychain rollback anchor", D3-12).
+    fn check_anchor_at_unlock(&mut self, pid: i32, v: &mut Vault) -> Option<AuditEvent> {
+        if !self.anchor_store.is_available() {
+            self.keychain_anchor = KeychainAnchorState::Unavailable;
+            return None;
+        }
+        let vault_id = v.vault_id();
+        match self.anchor_store.read(vault_id) {
+            Ok(Some(stored)) => {
+                let Ok(current) = v.anchor() else {
+                    return None;
+                };
+                match stored.compare_vault(&current) {
+                    AnchorComparison::RolledBack => {
+                        let _ = v.mark_tampered(TamperKind::RolledBack);
+                        self.anchored_vaults.insert(vault_id.0);
+                        self.last_synced_anchor = Some(stored);
+                        self.keychain_anchor = KeychainAnchorState::Ahead;
+                        Some(AuditEvent::KeychainAnchorMismatch {
+                            pid,
+                            outcome: "tampered",
+                            reason: "rolled_back",
+                        })
+                    }
+                    AnchorComparison::Consistent => {
+                        self.anchored_vaults.insert(vault_id.0);
+                        self.last_synced_anchor = Some(stored);
+                        self.keychain_anchor = KeychainAnchorState::Matched;
+                        self.sync_anchor_vault(v);
+                        None
+                    }
+                }
+            }
+            Ok(None) => {
+                let had_anchor = self.anchored_vaults.contains(&vault_id.0)
+                    || v.header().is_ok_and(|h| h.audit_head.is_some())
+                    || v.se_unlockers().next().is_some();
+                if v.integrity() == Integrity::Ok
+                    && let Ok(anchor) = v.anchor()
+                {
+                    match self.anchor_store.write(&anchor) {
+                        Ok(()) => {
+                            self.anchored_vaults.insert(vault_id.0);
+                            self.last_synced_anchor = Some(anchor);
+                        }
+                        Err(AnchorError::Unavailable) => {
+                            self.keychain_anchor = KeychainAnchorState::Unavailable;
+                            return None;
+                        }
+                        Err(e) => {
+                            log_line!(
+                                "envcloakd: warning: keychain rollback anchor could not be written ({e})"
+                            );
+                        }
+                    }
+                }
+                if had_anchor {
+                    self.keychain_anchor = KeychainAnchorState::Missing;
+                    Some(AuditEvent::KeychainAnchorMismatch {
+                        pid,
+                        outcome: "recreated",
+                        reason: "keychain_anchor_missing",
+                    })
+                } else {
+                    self.keychain_anchor = KeychainAnchorState::Matched;
+                    None
+                }
+            }
+            Err(AnchorError::Unavailable) => {
+                self.keychain_anchor = KeychainAnchorState::Unavailable;
+                None
+            }
+            Err(e) => {
+                log_line!("envcloakd: warning: keychain rollback anchor could not be read ({e})");
+                None
+            }
+        }
+    }
+
+    /// Writes `v`'s current rollback anchor to [`Self::anchor_store`] when the
+    /// vault passed its integrity check and the anchor store is available.
+    fn sync_anchor_vault(&mut self, v: &Vault) {
+        if v.integrity() != Integrity::Ok {
+            return;
+        }
+        if !self.anchor_store.is_available() {
+            self.keychain_anchor = KeychainAnchorState::Unavailable;
+            return;
+        }
+        let Ok(anchor) = v.anchor() else {
+            return;
+        };
+        if self.last_synced_anchor == Some(anchor) {
+            return;
+        }
+        match self.anchor_store.write(&anchor) {
+            Ok(()) => {
+                self.anchored_vaults.insert(v.vault_id().0);
+                self.last_synced_anchor = Some(anchor);
+                self.keychain_anchor = KeychainAnchorState::Matched;
+            }
+            Err(AnchorError::Unavailable) => {
+                self.keychain_anchor = KeychainAnchorState::Unavailable;
+            }
+            Err(e) => {
+                log_line!(
+                    "envcloakd: warning: keychain rollback anchor could not be written ({e})"
+                );
+            }
+        }
+    }
+
+    /// Writes the unlocked vault's rollback anchor when it changed since the
+    /// last sync.
+    pub fn sync_anchor(&mut self) {
+        let Some((vault_id, anchor)) = (match &self.slot {
+            Slot::Unlocked(v) if v.integrity() == Integrity::Ok => {
+                v.anchor().ok().map(|a| (v.vault_id(), a))
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        if !self.anchor_store.is_available() {
+            self.keychain_anchor = KeychainAnchorState::Unavailable;
+            return;
+        }
+        if self.last_synced_anchor == Some(anchor) {
+            return;
+        }
+        match self.anchor_store.write(&anchor) {
+            Ok(()) => {
+                self.anchored_vaults.insert(vault_id.0);
+                self.last_synced_anchor = Some(anchor);
+                self.keychain_anchor = KeychainAnchorState::Matched;
+            }
+            Err(AnchorError::Unavailable) => {
+                self.keychain_anchor = KeychainAnchorState::Unavailable;
+            }
+            Err(e) => {
+                log_line!(
+                    "envcloakd: warning: keychain rollback anchor could not be written ({e})"
+                );
             }
         }
     }
@@ -1361,6 +1598,14 @@ impl State {
             proof_failures: self.limiter.failures(),
             proof_wait_secs: self.limiter.wait_remaining(at).as_secs(),
         }
+    }
+}
+
+fn tampered_error(v: &Vault) -> RpcError {
+    if v.integrity() == Integrity::Tampered(TamperKind::RolledBack) {
+        RpcError::with_reason(ErrorKind::VaultTampered, "rolled_back")
+    } else {
+        RpcError::new(ErrorKind::VaultTampered)
     }
 }
 
@@ -1761,7 +2006,11 @@ mod tests {
                     assert_eq!(s.observe(now(&f.clocks)), Some(LockReason::Sleep));
                 }
                 // A restore locks through `begin_recover`, tested below.
-                LockReason::Signal | LockReason::Request | LockReason::Restore => {
+                LockReason::Signal
+                | LockReason::Request
+                | LockReason::Restore
+                | LockReason::ScreenLock
+                | LockReason::SessionResign => {
                     assert!(s.lock(reason));
                 }
             }
@@ -3157,5 +3406,83 @@ mod tests {
                 assert_eq!(entries(&s).len(), before + 1);
             }
         }
+    }
+
+    #[test]
+    fn keychain_anchor_roundtrip_rollback_and_missing_recreation() {
+        use crate::anchor::{AnchorStore, MemoryAnchorStore};
+        use std::sync::Arc;
+        let f = fixture();
+        let store = Arc::new(MemoryAnchorStore::new());
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks))
+            .with_anchor_store(store.clone());
+        assert_eq!(
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .vault
+                .keychain_anchor,
+            KeychainAnchorState::None
+        );
+        create(&f, &mut s);
+        assert_eq!(
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .vault
+                .keychain_anchor,
+            KeychainAnchorState::Matched
+        );
+
+        let _ = stored_value(&mut s, "a/b", VALUE);
+        s.sync_anchor();
+        assert!(s.lock(LockReason::ScreenLock));
+        assert_eq!(
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .lock
+                .last_reason,
+            Some(LockReason::ScreenLock)
+        );
+        let vid = match s.slot() {
+            Slot::Locked(lv) => lv.vault_id(),
+            other => panic!("expected locked vault, got {other:?}"),
+        };
+
+        // Missing anchor on an already-anchored vault is re-created and reported as Missing.
+        assert!(store.remove(vid).is_some());
+        let view = unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(view.integrity, IntegrityView::Ok);
+        assert!(!view.read_only);
+        assert_eq!(
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .vault
+                .keychain_anchor,
+            KeychainAnchorState::Missing
+        );
+        assert!(s.lock(LockReason::SessionResign));
+        assert_eq!(
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .lock
+                .last_reason,
+            Some(LockReason::SessionResign)
+        );
+
+        // Stored anchor ahead of vault marks vault tampered (rolled_back) and opens read-only.
+        let current = store.read(vid).unwrap().unwrap();
+        store
+            .write(&Anchor {
+                write_counter: current.write_counter + 1,
+                ..current
+            })
+            .unwrap();
+        let view = unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(view.integrity, IntegrityView::Tampered);
+        assert!(view.read_only);
+        assert_eq!(
+            s.status(now(&f.clocks), &at(&f.clocks), daemon_view())
+                .vault
+                .keychain_anchor,
+            KeychainAnchorState::Ahead
+        );
+        let err = s.unlocked().unwrap_err();
+        assert_eq!(err.kind, ErrorKind::VaultTampered);
+        assert_eq!(err.reason, Some("rolled_back"));
+        assert!(s.unlocked_any_integrity().is_ok());
     }
 }

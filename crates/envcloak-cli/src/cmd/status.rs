@@ -244,6 +244,7 @@ mod tests {
                 unavailable: Some("damaged\u{9b}2J".to_owned()),
                 busy: false,
                 failed_unlocks: 0,
+                keychain_anchor: envcloak_ipc::view::KeychainAnchorState::Unavailable,
             },
             lock: LockView {
                 last_reason: None,

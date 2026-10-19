@@ -94,6 +94,7 @@ mod fsclock;
 mod harden;
 mod interrupt;
 mod inuse;
+pub mod keychain;
 pub mod launch;
 mod lockfile;
 pub mod owned;
@@ -136,6 +137,10 @@ pub use harden::{
 };
 pub use interrupt::Interrupter;
 pub use inuse::{InUse, open_elsewhere};
+pub use keychain::{
+    KEYCHAIN_ANCHOR_LEN, KEYCHAIN_ANCHOR_SERVICE, KeychainAnchorError,
+    is_keychain_anchor_available, read_keychain_anchor, write_keychain_anchor,
+};
 pub use lockfile::try_lock_exclusive;
 pub use owned::{OwnedChild, ProcessOps, SystemProcesses};
 pub use panic::{
