@@ -1524,74 +1524,101 @@ impl Client {
             .checked_add(crate::wait::CALL_GRACE)
             .unwrap_or(deadline);
         let mut backoff = crate::wait::Backoff::new();
-        let id = loop {
-            if Instant::now() >= deadline {
-                return Ok(AskWaitOutcome::Expired);
-            }
-            match Self::connect_by(paths, limit)?.items_ask(p) {
-                Ok(opened) => {
-                    break PendingId::parse(&opened.ask).ok_or(ClientError::Protocol)?;
-                }
-                Err(ClientError::Rpc(RpcError {
-                    kind: crate::ErrorKind::TooManyPending | crate::ErrorKind::Busy,
-                    ..
-                })) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(AskWaitOutcome::Expired);
-                    }
-                    backoff.after_busy();
-                    std::thread::sleep(
-                        backoff
-                            .interval()
-                            .min(deadline.saturating_duration_since(now)),
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        let id_str = id.to_string();
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(AskWaitOutcome::Expired);
-            }
-            let sleep_for = backoff
-                .interval()
-                .min(deadline.saturating_duration_since(now));
-            if !sleep_for.is_zero() {
-                std::thread::sleep(sleep_for);
-            }
-            match Self::connect_by(paths, limit)?.items_ask_state(&id_str) {
-                Ok(envcloak_policy::AskStateOutcome::Added { slug }) => {
-                    envcloak_core::vault::Slug::new(&slug).map_err(|_| ClientError::Protocol)?;
-                    return Ok(AskWaitOutcome::Added { slug });
-                }
-                Ok(envcloak_policy::AskStateOutcome::Declined) => {
-                    return Ok(AskWaitOutcome::Declined);
-                }
-                Ok(
-                    envcloak_policy::AskStateOutcome::Expired
-                    | envcloak_policy::AskStateOutcome::Unknown,
-                ) => {
+        let mut answered = false;
+        'ask: loop {
+            let id = loop {
+                if Instant::now() >= deadline {
                     return Ok(AskWaitOutcome::Expired);
                 }
-                Ok(envcloak_policy::AskStateOutcome::Pending) => {
-                    if Instant::now() >= deadline {
+                match Self::connect_by(paths, limit).and_then(|mut c| c.items_ask(p)) {
+                    Ok(opened) => {
+                        answered = true;
+                        break PendingId::parse(&opened.ask).ok_or(ClientError::Protocol)?;
+                    }
+                    Err(ClientError::Rpc(RpcError {
+                        kind: crate::ErrorKind::TooManyPending | crate::ErrorKind::Busy,
+                        ..
+                    })) => {
+                        answered = true;
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(AskWaitOutcome::Expired);
+                        }
+                        backoff.after_busy();
+                        std::thread::sleep(
+                            backoff
+                                .interval()
+                                .min(deadline.saturating_duration_since(now)),
+                        );
+                    }
+                    Err(e) if crate::wait::not_taken(&e, answered) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(e);
+                        }
+                        backoff.after_busy();
+                        std::thread::sleep(
+                            backoff
+                                .interval()
+                                .min(deadline.saturating_duration_since(now)),
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            let id_str = id.to_string();
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(AskWaitOutcome::Expired);
+                }
+                let sleep_for = backoff
+                    .interval()
+                    .min(deadline.saturating_duration_since(now));
+                if !sleep_for.is_zero() {
+                    std::thread::sleep(sleep_for);
+                }
+                match Self::connect_by(paths, limit).and_then(|mut c| c.items_ask_state(&id_str)) {
+                    Ok(envcloak_policy::AskStateOutcome::Added { slug }) => {
+                        envcloak_core::vault::Slug::new(&slug)
+                            .map_err(|_| ClientError::Protocol)?;
+                        return Ok(AskWaitOutcome::Added { slug });
+                    }
+                    Ok(envcloak_policy::AskStateOutcome::Declined) => {
+                        return Ok(AskWaitOutcome::Declined);
+                    }
+                    Ok(envcloak_policy::AskStateOutcome::Expired) => {
                         return Ok(AskWaitOutcome::Expired);
                     }
-                    backoff.after_pending();
-                }
-                Err(ClientError::Rpc(RpcError {
-                    kind: crate::ErrorKind::Busy,
-                    ..
-                })) => {
-                    if Instant::now() >= deadline {
-                        return Ok(AskWaitOutcome::Expired);
+                    Ok(envcloak_policy::AskStateOutcome::Unknown) => {
+                        if Instant::now() >= deadline {
+                            return Ok(AskWaitOutcome::Expired);
+                        }
+                        continue 'ask;
                     }
-                    backoff.after_busy();
+                    Ok(envcloak_policy::AskStateOutcome::Pending) => {
+                        if Instant::now() >= deadline {
+                            return Ok(AskWaitOutcome::Expired);
+                        }
+                        backoff.after_pending();
+                    }
+                    Err(ClientError::Rpc(RpcError {
+                        kind: crate::ErrorKind::Busy,
+                        ..
+                    })) => {
+                        if Instant::now() >= deadline {
+                            return Ok(AskWaitOutcome::Expired);
+                        }
+                        backoff.after_busy();
+                    }
+                    Err(e) if crate::wait::not_taken(&e, answered) => {
+                        if Instant::now() >= deadline {
+                            return Err(e);
+                        }
+                        backoff.after_busy();
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
         }
     }
@@ -1631,65 +1658,94 @@ impl Client {
             .checked_add(crate::wait::CALL_GRACE)
             .unwrap_or(deadline);
         let mut backoff = crate::wait::Backoff::new();
-        let id = loop {
-            if Instant::now() >= deadline {
-                return Ok(RevealWaitOutcome::Expired);
-            }
-            match Self::connect_by(paths, limit)?.reveal_request(slug, field, claims) {
-                Ok(opened) => {
-                    break PendingId::parse(&opened.request).ok_or(ClientError::Protocol)?;
-                }
-                Err(ClientError::Rpc(RpcError {
-                    kind: crate::ErrorKind::TooManyPending | crate::ErrorKind::Busy,
-                    ..
-                })) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(RevealWaitOutcome::Expired);
-                    }
-                    backoff.after_busy();
-                    std::thread::sleep(
-                        backoff
-                            .interval()
-                            .min(deadline.saturating_duration_since(now)),
-                    );
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        loop {
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(RevealWaitOutcome::Expired);
-            }
-            let sleep_for = backoff
-                .interval()
-                .min(deadline.saturating_duration_since(now));
-            if !sleep_for.is_zero() {
-                std::thread::sleep(sleep_for);
-            }
-            match Self::connect_by(paths, limit)?.pending_state(&id) {
-                Ok(PendingState::Approved) => return Ok(RevealWaitOutcome::Shown),
-                Ok(PendingState::Denied) => return Ok(RevealWaitOutcome::Declined),
-                Ok(PendingState::Expired | PendingState::Unknown) => {
+        let mut answered = false;
+        'reveal: loop {
+            let id = loop {
+                if Instant::now() >= deadline {
                     return Ok(RevealWaitOutcome::Expired);
                 }
-                Ok(PendingState::Pending) => {
-                    if Instant::now() >= deadline {
-                        return Ok(RevealWaitOutcome::Expired);
+                match Self::connect_by(paths, limit)
+                    .and_then(|mut c| c.reveal_request(slug, field, claims))
+                {
+                    Ok(opened) => {
+                        answered = true;
+                        break PendingId::parse(&opened.request).ok_or(ClientError::Protocol)?;
                     }
-                    backoff.after_pending();
-                }
-                Err(ClientError::Rpc(RpcError {
-                    kind: crate::ErrorKind::Busy,
-                    ..
-                })) => {
-                    if Instant::now() >= deadline {
-                        return Ok(RevealWaitOutcome::Expired);
+                    Err(ClientError::Rpc(RpcError {
+                        kind: crate::ErrorKind::TooManyPending | crate::ErrorKind::Busy,
+                        ..
+                    })) => {
+                        answered = true;
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Ok(RevealWaitOutcome::Expired);
+                        }
+                        backoff.after_busy();
+                        std::thread::sleep(
+                            backoff
+                                .interval()
+                                .min(deadline.saturating_duration_since(now)),
+                        );
                     }
-                    backoff.after_busy();
+                    Err(e) if crate::wait::not_taken(&e, answered) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            return Err(e);
+                        }
+                        backoff.after_busy();
+                        std::thread::sleep(
+                            backoff
+                                .interval()
+                                .min(deadline.saturating_duration_since(now)),
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
+            };
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(RevealWaitOutcome::Expired);
+                }
+                let sleep_for = backoff
+                    .interval()
+                    .min(deadline.saturating_duration_since(now));
+                if !sleep_for.is_zero() {
+                    std::thread::sleep(sleep_for);
+                }
+                match Self::connect_by(paths, limit).and_then(|mut c| c.pending_state(&id)) {
+                    Ok(PendingState::Approved) => return Ok(RevealWaitOutcome::Shown),
+                    Ok(PendingState::Denied) => return Ok(RevealWaitOutcome::Declined),
+                    Ok(PendingState::Expired) => return Ok(RevealWaitOutcome::Expired),
+                    Ok(PendingState::Unknown) => {
+                        if Instant::now() >= deadline {
+                            return Ok(RevealWaitOutcome::Expired);
+                        }
+                        continue 'reveal;
+                    }
+                    Ok(PendingState::Pending) => {
+                        if Instant::now() >= deadline {
+                            return Ok(RevealWaitOutcome::Expired);
+                        }
+                        backoff.after_pending();
+                    }
+                    Err(ClientError::Rpc(RpcError {
+                        kind: crate::ErrorKind::Busy,
+                        ..
+                    })) => {
+                        if Instant::now() >= deadline {
+                            return Ok(RevealWaitOutcome::Expired);
+                        }
+                        backoff.after_busy();
+                    }
+                    Err(e) if crate::wait::not_taken(&e, answered) => {
+                        if Instant::now() >= deadline {
+                            return Err(e);
+                        }
+                        backoff.after_busy();
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
     }

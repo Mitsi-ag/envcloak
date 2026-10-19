@@ -18,19 +18,17 @@
 //! The output is the item's metadata and how to reference it; the account
 //! is shown, since the person running the command just typed it.
 
-use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use envcloak_client::claims::claims;
-use envcloak_client::connect::{connect, run_paths};
+use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, RUN_FAILURE, USAGE, refuse_if_traced, usage};
-use envcloak_client::render::{print, registry, shown};
+use envcloak_client::render::{print, registry};
 use envcloak_client::tty::{InputError, MAX_VALUE, Terminal, read_stdin_value, read_value_from};
-use envcloak_ipc::proto::{AddParams, AskParams};
+use envcloak_ipc::WireSecret;
+use envcloak_ipc::proto::AddParams;
 use envcloak_ipc::wait::MAX_WAIT;
-use envcloak_ipc::{AskWaitOutcome, Client, WireSecret};
-use envcloak_policy::find_manifest;
 use envcloak_sys::{PasteboardError, read_and_clear_pasteboard};
 
 use super::{refuse_value_like, require_unlocked};
@@ -92,6 +90,7 @@ fn parse_wait(s: &str) -> Option<Duration> {
 
 fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
     let mut a = AddArgs::default();
+    let mut wait_raw: Option<String> = None;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
         let slot = match arg {
@@ -100,6 +99,7 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
             "--account" => &mut a.account,
             "--env" => &mut a.env,
             "--note" => &mut a.note,
+            "--wait" => &mut wait_raw,
             "--allow-short" if !a.allow_short => {
                 a.allow_short = true;
                 continue;
@@ -114,17 +114,6 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
             }
             "--ask" if !a.ask => {
                 a.ask = true;
-                continue;
-            }
-            "--wait" => {
-                if a.wait.is_some() {
-                    return Err("an option is given twice");
-                }
-                let d = it
-                    .next()
-                    .and_then(|v| parse_wait(v))
-                    .ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?;
-                a.wait = Some(d);
                 continue;
             }
             "--json" if !a.json => {
@@ -147,6 +136,11 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
             return Err("an option is given twice");
         }
         *slot = Some((*it.next().ok_or("an option needs a name after it")?).to_owned());
+    }
+    if let Some(v) = wait_raw {
+        a.wait = Some(
+            parse_wait(&v).ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?,
+        );
     }
     if usize::from(a.stdin) + usize::from(a.from_clipboard) + usize::from(a.ask) > 1 {
         return Err("--stdin, --from-clipboard and --ask cannot be combined");
@@ -198,7 +192,11 @@ fn validate_provider(provider: Option<&str>) -> Result<(), Failure> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn current_project_dir() -> Option<String> {
+    use envcloak_policy::find_manifest;
+    use std::path::Path;
+
     let manifest = find_manifest(Path::new(".")).ok().flatten()?;
     let dir = std::fs::canonicalize(manifest.parent()?).ok()?;
     let s = dir.into_os_string().into_string().ok()?;
@@ -212,43 +210,62 @@ fn add_ask(a: AddArgs) -> ExitCode {
     if let Err(f) = refuse_if_traced() {
         return f.report(RUN_FAILURE);
     }
-    if envcloak_sys::termination_ends_process().is_err() {
-        return Failure::new(
-            "run_failed",
-            "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = a;
+        Failure::new(
+            "app_required",
+            "add --ask opens the EnvCloak app on macOS; on Linux, run `envcloak add` in a \
+             separate terminal",
         )
-        .report(RUN_FAILURE);
+        .report(RUN_FAILURE)
     }
-    let paths = match run_paths() {
-        Ok(p) => p,
-        Err(f) => return f.report(FAILURE),
-    };
-    let params = AskParams {
-        provider: a.provider,
-        project_dir: current_project_dir(),
-        account: a.account,
-        env_hint: a.env,
-        note: a.note,
-        claims: claims(),
-    };
-    match Client::wait_for_ask(&paths, &params, a.wait.unwrap_or(MAX_WAIT)) {
-        Ok(AskWaitOutcome::Added { slug }) => {
-            if a.json {
-                println!("{}", serde_json::json!({ "slug": slug }));
-            } else {
-                println!("{}", shown(&slug));
+    #[cfg(target_os = "macos")]
+    {
+        use envcloak_client::connect::run_paths;
+        use envcloak_client::render::shown;
+        use envcloak_ipc::proto::AskParams;
+        use envcloak_ipc::{AskWaitOutcome, Client};
+
+        if envcloak_sys::termination_ends_process().is_err() {
+            return Failure::new(
+                "run_failed",
+                "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
+            )
+            .report(RUN_FAILURE);
+        }
+        let paths = match run_paths() {
+            Ok(p) => p,
+            Err(f) => return f.report(FAILURE),
+        };
+        let params = AskParams {
+            provider: a.provider,
+            project_dir: current_project_dir(),
+            account: a.account,
+            env_hint: a.env,
+            note: a.note,
+            claims: claims(),
+        };
+        match Client::wait_for_ask(&paths, &params, a.wait.unwrap_or(MAX_WAIT)) {
+            Ok(AskWaitOutcome::Added { slug }) => {
+                if a.json {
+                    println!("{}", serde_json::json!({ "slug": slug }));
+                } else {
+                    println!("{}", shown(&slug));
+                }
+                ExitCode::SUCCESS
             }
-            ExitCode::SUCCESS
+            Ok(AskWaitOutcome::Declined) => {
+                Failure::new("declined", "the request to add a key was declined")
+                    .report(RUN_FAILURE)
+            }
+            Ok(AskWaitOutcome::Expired) => Failure::new(
+                "expired",
+                "the request to add a key expired before it was answered",
+            )
+            .report(RUN_FAILURE),
+            Err(e) => Failure::from(e).report(FAILURE),
         }
-        Ok(AskWaitOutcome::Declined) => {
-            Failure::new("declined", "the request to add a key was declined").report(RUN_FAILURE)
-        }
-        Ok(AskWaitOutcome::Expired) => Failure::new(
-            "expired",
-            "the request to add a key expired before it was answered",
-        )
-        .report(RUN_FAILURE),
-        Err(e) => Failure::from(e).report(FAILURE),
     }
 }
 
@@ -270,12 +287,12 @@ fn read_clipboard_value() -> Result<envcloak_core::SecretBytes, Failure> {
     drop(pb);
     if cleared {
         eprintln!(
-            "envcloak: warning: cleared from the clipboard; clipboard history tools may already \
+            "warning: cleared from the clipboard; clipboard history tools may already \
              hold the value"
         );
     } else {
         eprintln!(
-            "envcloak: warning: the clipboard changed before it could be cleared; clipboard \
+            "warning: the clipboard changed before it could be cleared; clipboard \
              history tools may already hold the value"
         );
     }
@@ -284,9 +301,17 @@ fn read_clipboard_value() -> Result<envcloak_core::SecretBytes, Failure> {
 
 fn add(a: AddArgs) -> Result<ExitCode, Failure> {
     validate_provider(a.provider.as_deref())?;
+    refuse_if_traced()?;
+    #[cfg(not(target_os = "macos"))]
+    if a.from_clipboard {
+        return Err(Failure::new(
+            "app_required",
+            "--from-clipboard is only available on macOS; pipe the value in with --stdin or type \
+             it at the prompt",
+        ));
+    }
     // The vault is unlocked before the value is asked for.
     require_unlocked(&mut connect()?)?;
-    refuse_if_traced()?;
     let value = if a.from_clipboard {
         read_clipboard_value()?
     } else if a.stdin {

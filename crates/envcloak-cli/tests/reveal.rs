@@ -776,6 +776,32 @@ mod macos {
             common::stderr(&out_expired)
         );
 
+        // 4. Vault locked while polling -> re-issues `items.ask` and reports
+        //    `vault_locked` instead of `expired`.
+        let lock_cmd = agent_command(&home, &["add", "openai", "--ask", "--wait", "30s"]);
+        let out_locked = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    let listed = connect_client(&home).app_asks_list(&[]).unwrap();
+                    if !listed.asks.is_empty() {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "timed out waiting for ask");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                connect_client(&home).lock().unwrap();
+            });
+            common::finish_within(lock_cmd, Duration::from_secs(30))
+        });
+        assert_eq!(out_locked.status.code(), Some(1));
+        assert!(out_locked.stdout.is_empty());
+        assert!(
+            common::stderr(&out_locked).starts_with("envcloak: vault_locked:"),
+            "stderr: {}",
+            common::stderr(&out_locked)
+        );
+
         d.signal("-TERM");
         assert!(d.wait_exit(Duration::from_secs(30)).is_some());
         assert_no_canary(&d.log_bytes(), &cs);
@@ -833,7 +859,7 @@ mod macos {
         let err1 = common::stderr(&out1);
         assert!(
             err1.contains(
-                "envcloak: warning: cleared from the clipboard; clipboard history tools may already hold the value"
+                "warning: cleared from the clipboard; clipboard history tools may already hold the value"
             ),
             "stderr missing clipboard warning: {err1}"
         );
@@ -876,7 +902,7 @@ mod macos {
         let err2 = common::stderr(&out2);
         assert!(
             err2.contains(
-                "envcloak: warning: the clipboard changed before it could be cleared; clipboard history tools may already hold the value"
+                "warning: the clipboard changed before it could be cleared; clipboard history tools may already hold the value"
             ),
             "stderr missing concurrent change warning: {err2}"
         );
@@ -1115,6 +1141,34 @@ mod macos {
             common::stderr(&out_exp).starts_with("envcloak: expired:"),
             "stderr: {}",
             common::stderr(&out_exp)
+        );
+
+        // 5. Vault locked while polling -> re-issues `reveal.request` and exits
+        //    125 with `vault_locked` instead of `expired`.
+        let human_lock_cmd = common::on_terminal_command(&home, &["reveal", common::SLUGS[0]], &[]);
+        let out_lock = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let deadline = Instant::now() + Duration::from_secs(15);
+                loop {
+                    if connect_client(&home).status().unwrap().app_requests > 0 {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for reveal.request"
+                    );
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                connect_client(&home).lock().unwrap();
+            });
+            common::finish_within(human_lock_cmd, Duration::from_secs(30))
+        });
+        assert_eq!(out_lock.status.code(), Some(125));
+        assert!(out_lock.stdout.is_empty());
+        assert!(
+            common::stderr(&out_lock).starts_with("envcloak: vault_locked:"),
+            "stderr: {}",
+            common::stderr(&out_lock)
         );
 
         d.signal("-TERM");

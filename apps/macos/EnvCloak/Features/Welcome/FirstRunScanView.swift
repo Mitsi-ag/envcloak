@@ -213,7 +213,7 @@ struct FirstRunScanView: View {
                                         Button("Replace…") { model.copyRotate(item.slug) }
                                             .disabled(MetadataRequest.rotateSlugCommand(item.slug) == nil)
                                     }
-                                    if !MetadataRequest.canCopy(item.slug) {
+                                    if MetadataRequest.rotateSlugCommand(item.slug) == nil {
                                         Text(TerminalCopy.refusalMessage)
                                             .font(.caption)
                                             .foregroundStyle(ECToken.warning.color)
@@ -234,12 +234,19 @@ struct FirstRunScanView: View {
                         } else {
                             ForEach(DisplayRow.of(report.plaintext_projects)) { row in
                                 let project = row.value
-                                HStack(spacing: 12) {
-                                    Text(project.summaryLabel)
-                                        .foregroundStyle(ECToken.text.color)
-                                    Spacer()
-                                    Button("Remove plaintext") { model.copyDeletePlaintext(project.dir) }
-                                        .disabled(MetadataRequest.deletePlaintextCommand(project.dir) == nil)
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack(spacing: 12) {
+                                        Text(project.summaryLabel)
+                                            .foregroundStyle(ECToken.text.color)
+                                        Spacer()
+                                        Button("Remove plaintext") { model.copyDeletePlaintext(project.dir) }
+                                            .disabled(MetadataRequest.deletePlaintextCommand(project.dir) == nil)
+                                    }
+                                    if MetadataRequest.deletePlaintextCommand(project.dir) == nil {
+                                        Text(TerminalCopy.refusalMessage)
+                                            .font(.caption)
+                                            .foregroundStyle(ECToken.warning.color)
+                                    }
                                 }
                                 .padding(10)
                                 .background(ECToken.raised.color)

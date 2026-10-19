@@ -231,18 +231,20 @@ public enum FirstRunReportReader {
             throw EnvCloakError.protocolError
         }
         let uid = geteuid()
-        var dirStat = stat()
-        if lstat(dir, &dirStat) != 0 {
+        let dirFd = Darwin.open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        if dirFd < 0 {
             if errno == ENOENT { return nil }
             throw EnvCloakError.protocolError
         }
-        guard dirStat.st_mode & S_IFMT == S_IFDIR,
+        defer { Darwin.close(dirFd) }
+        var dirStat = stat()
+        guard fstat(dirFd, &dirStat) == 0,
+              dirStat.st_mode & S_IFMT == S_IFDIR,
               dirStat.st_uid == uid,
               dirStat.st_mode & 0o077 == 0 else {
             throw EnvCloakError.protocolError
         }
-        let path = dir + "/first-run.json"
-        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        let fd = Darwin.openat(dirFd, "first-run.json", O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
         if fd < 0 {
             if errno == ENOENT { return nil }
             throw EnvCloakError.protocolError
@@ -253,6 +255,7 @@ public enum FirstRunReportReader {
               fileStat.st_mode & S_IFMT == S_IFREG,
               fileStat.st_uid == uid,
               fileStat.st_mode & 0o777 == 0o600,
+              fileStat.st_nlink == 1,
               fileStat.st_size > 0,
               fileStat.st_size <= Int64(Frame.limit) else {
             throw EnvCloakError.protocolError

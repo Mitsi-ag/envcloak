@@ -45,6 +45,12 @@ fn reveal(slug: &str, field: Option<&str>) -> Result<ExitCode, Failure> {
             "revealing a value on macOS uses the EnvCloak app; it is never printed to the terminal",
         )
     })?;
+    if envcloak_sys::termination_ends_process().is_err() {
+        return Err(Failure::new(
+            "run_failed",
+            "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
+        ));
+    }
     match Client::wait_for_reveal(&run_paths()?, slug, field, &claims_now, MAX_WAIT) {
         Ok(RevealWaitOutcome::Shown) => {
             println!("Shown in EnvCloak");
