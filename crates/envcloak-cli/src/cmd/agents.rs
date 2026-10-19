@@ -65,12 +65,15 @@
 //!   `probe_unavailable` when a host's probe could not be set up (the
 //!   programs it needs are not beside this `envcloak`, or its probe home,
 //!   daemon, vault or install could not be made), after the report.
-//! - `migrate-mcp` (M2-20) is not in this build: it exits 125 with
-//!   `not_in_this_build`, reading no argument.
+//! - `migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout]
+//!   [--passphrase-fd N] [--json]`, `migrate-mcp --update <agent>/<server>
+//!   [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH]
+//!   [--passphrase-fd N] [--json] [-- <argv>...]`, and `migrate-mcp --undo <id>
+//!   [--passphrase-fd N] [--json]` (SPEC §6.6; M2 plan M2-20).
 //!
 //! Exit 0 when every change was made (or was there already); otherwise 1
-//! with `agents_incomplete`, after the report says which file was refused
-//! and why. No argument is echoed.
+//! with `agents_incomplete` or `incomplete`, after the report says which file
+//! was refused or left manual and why. No argument is echoed.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -86,21 +89,29 @@ use envcloak_agents::install::{
     self, Context, HostReport, Note, Options, Plan, Report, Step, StepKind, StepResult, host_name,
 };
 use envcloak_agents::locations::Locations;
+use envcloak_agents::migrate::{
+    self, MigrateConsent, MigrateError, MigratePlan, MigrateProof, MigrateReport,
+};
 use envcloak_agents::probe;
 use envcloak_agents::writer::{DaemonBackups, Journal, Outcome, StateFile, Writer};
-use envcloak_client::claims::claims;
+use envcloak_client::claims::{claims, refuse_if_claimed};
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use envcloak_client::render::print_json;
+use envcloak_client::tty::{Terminal, read_secret_fd};
+use envcloak_ipc::view::{LaunchDeclarationView, LaunchReceiptView, UpdateStatementView};
+use envcloak_policy::managed::LaunchChanges;
 use envcloak_policy::{escape_for_display, find_manifest};
 use serde_json::{Value, json};
 
-use super::require_unlocked;
+use super::{fd_number, require_unlocked};
 
 const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
        envcloak agents status [--json]
        envcloak agents status --probe [--agent claude-code|codex]... [--json]
-       envcloak agents migrate-mcp (not in this build)";
+       envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
+       envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
+       envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]";
 
 #[derive(Debug, Default)]
 struct Args {
@@ -138,7 +149,7 @@ fn parse(args: &[&str], install: bool) -> Option<Args> {
 pub fn run(args: &[&str]) -> ExitCode {
     match args {
         ["status", rest @ ..] => run_status(rest),
-        ["migrate-mcp", ..] => super::not_in_this_build("`envcloak agents migrate-mcp`"),
+        ["migrate-mcp", rest @ ..] => run_migrate_mcp(rest),
         [cmd @ ("install" | "uninstall"), rest @ ..] => {
             if rest == ["--help"] || rest == ["-h"] {
                 println!("usage: {USAGE_TEXT}");
@@ -1409,5 +1420,767 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
         Ok(ExitCode::SUCCESS)
     } else {
         Err(incomplete())
+    }
+}
+
+#[derive(Debug)]
+enum MigrateCmd {
+    Migrate {
+        agent: Option<String>,
+        dry_run: bool,
+        yes: bool,
+        consent_startup_timeout: bool,
+        passphrase_fd: Option<i32>,
+        json: bool,
+    },
+    Update {
+        server: String,
+        changes: LaunchChanges,
+        passphrase_fd: Option<i32>,
+        json: bool,
+    },
+    Undo {
+        backup_id: String,
+        created_by_agent: bool,
+        unrecorded: bool,
+        passphrase_fd: Option<i32>,
+        json: bool,
+    },
+}
+
+fn normalize_migrate_agent(raw: &str) -> Option<String> {
+    match raw {
+        "claude" | "claude-code" => Some("claude-code".to_owned()),
+        "codex" | "cursor" | "gemini" | "copilot" | "kimi" | "opencode" | "goose" | "qwen"
+        | "vscode" => Some(raw.to_owned()),
+        _ => None,
+    }
+}
+
+fn parse_migrate_mcp(args: &[&str]) -> Option<MigrateCmd> {
+    let (before_dash, after_dash) = match args.iter().position(|&a| a == "--") {
+        Some(idx) => (&args[..idx], Some(&args[idx + 1..])),
+        None => (args, None),
+    };
+
+    let mut agent = None;
+    let mut dry_run = false;
+    let mut yes = false;
+    let mut consent_startup_timeout = false;
+    let mut passphrase_fd = None;
+    let mut json = false;
+    let mut update_server = None;
+    let mut undo_id = None;
+    let mut created_by_agent = false;
+    let mut unrecorded = false;
+    let mut changes = LaunchChanges::default();
+    let mut cmd_argv: Vec<String> = Vec::new();
+
+    let mut it = before_dash.iter();
+    while let Some(&flag) = it.next() {
+        match flag {
+            "--agent" if agent.is_none() => {
+                agent = Some(normalize_migrate_agent(it.next()?)?);
+            }
+            "--dry-run" if !dry_run => dry_run = true,
+            "--yes" if !yes => yes = true,
+            "--consent-startup-timeout" if !consent_startup_timeout => {
+                consent_startup_timeout = true;
+            }
+            "--passphrase-fd" if passphrase_fd.is_none() => {
+                passphrase_fd = Some(fd_number(it.next()?)?);
+            }
+            "--json" if !json => json = true,
+            "--update" if update_server.is_none() => {
+                let s = (*it.next()?).to_owned();
+                if s.is_empty() {
+                    return None;
+                }
+                update_server = Some(s);
+            }
+            "--undo" if undo_id.is_none() => {
+                let id = (*it.next()?).to_owned();
+                if id.is_empty() {
+                    return None;
+                }
+                undo_id = Some(id);
+            }
+            "--created-by-agent" if !created_by_agent => created_by_agent = true,
+            "--unrecorded" if !unrecorded => unrecorded = true,
+            "--cwd" if changes.cwd.is_none() => {
+                changes.cwd = Some((*it.next()?).to_owned());
+            }
+            "--path-env" if changes.path_env.is_none() => {
+                changes.path_env = Some((*it.next()?).to_owned());
+            }
+            "--env" => {
+                let kv = *it.next()?;
+                let (k, v) = kv.split_once('=')?;
+                if k.is_empty() {
+                    return None;
+                }
+                changes.set_env.push((k.to_owned(), v.to_owned()));
+            }
+            "--unset-env" => {
+                let k = *it.next()?;
+                if k.is_empty() {
+                    return None;
+                }
+                changes.unset_env.push(k.to_owned());
+            }
+            "--cmd" if cmd_argv.is_empty() => {
+                let c = *it.next()?;
+                if c.is_empty() {
+                    return None;
+                }
+                cmd_argv.push(c.to_owned());
+            }
+            "--arg" => {
+                cmd_argv.push((*it.next()?).to_owned());
+            }
+            _ => return None,
+        }
+    }
+
+    if let Some(tail) = after_dash {
+        if !cmd_argv.is_empty() || tail.is_empty() {
+            return None;
+        }
+        changes.argv = Some(tail.iter().map(|s| (*s).to_owned()).collect());
+    } else if !cmd_argv.is_empty() {
+        changes.argv = Some(cmd_argv);
+    }
+
+    let has_update_flags = changes.argv.is_some()
+        || changes.cwd.is_some()
+        || changes.path_env.is_some()
+        || !changes.set_env.is_empty()
+        || !changes.unset_env.is_empty();
+
+    match (update_server, undo_id) {
+        (Some(server), None) => {
+            if agent.is_some()
+                || dry_run
+                || consent_startup_timeout
+                || created_by_agent
+                || unrecorded
+            {
+                return None;
+            }
+            Some(MigrateCmd::Update {
+                server,
+                changes,
+                passphrase_fd,
+                json,
+            })
+        }
+        (None, Some(backup_id)) => {
+            if agent.is_some() || dry_run || yes || consent_startup_timeout || has_update_flags {
+                return None;
+            }
+            Some(MigrateCmd::Undo {
+                backup_id,
+                created_by_agent,
+                unrecorded,
+                passphrase_fd,
+                json,
+            })
+        }
+        (None, None) => {
+            if has_update_flags || created_by_agent || unrecorded {
+                return None;
+            }
+            Some(MigrateCmd::Migrate {
+                agent,
+                dry_run,
+                yes,
+                consent_startup_timeout,
+                passphrase_fd,
+                json,
+            })
+        }
+        (Some(_), Some(_)) => None,
+    }
+}
+
+fn run_migrate_mcp(args: &[&str]) -> ExitCode {
+    if args == ["--help"] || args == ["-h"] {
+        println!("usage: {USAGE_TEXT}");
+        return ExitCode::SUCCESS;
+    }
+    let Some(cmd) = parse_migrate_mcp(args) else {
+        return usage(USAGE_TEXT);
+    };
+    let res = match cmd {
+        MigrateCmd::Migrate {
+            agent,
+            dry_run,
+            yes,
+            consent_startup_timeout,
+            passphrase_fd,
+            json,
+        } => exec_migrate_mcp(
+            agent,
+            dry_run,
+            yes,
+            consent_startup_timeout,
+            passphrase_fd,
+            json,
+        ),
+        MigrateCmd::Update {
+            server,
+            changes,
+            passphrase_fd,
+            json,
+        } => exec_migrate_update(&server, changes, passphrase_fd, json),
+        MigrateCmd::Undo {
+            backup_id,
+            created_by_agent,
+            unrecorded,
+            passphrase_fd,
+            json,
+        } => exec_migrate_undo(
+            &backup_id,
+            created_by_agent,
+            unrecorded,
+            passphrase_fd,
+            json,
+        ),
+    };
+    res.unwrap_or_else(|f| {
+        if f.token() == "value_on_argv" {
+            f.report(envcloak_client::fail::USAGE)
+        } else {
+            f.report(FAILURE)
+        }
+    })
+}
+
+fn migrate_paths() -> Result<(Locations, PathBuf, PathBuf, PathBuf), Failure> {
+    let locations = Locations::from_env().map_err(|_| {
+        Failure::new(
+            "no_home",
+            "HOME is not set to an absolute path, so the agents' files cannot be found",
+        )
+    })?;
+    let data_dir = envcloak_core::vault::VaultPaths::for_user()
+        .map_err(|_| {
+            Failure::new(
+                "no_home",
+                "HOME is not set to an absolute path, so EnvCloak's data directory cannot be found",
+            )
+        })?
+        .data_dir;
+    let exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| Failure::new("io", "the path of this envcloak could not be read"))?;
+    let envcloak = install::stable_exe(&exe, &env("PATH").unwrap_or_default());
+    let proj = project_dir().unwrap_or_else(|_| locations.home().to_path_buf());
+    Ok((locations, data_dir, envcloak, proj))
+}
+
+fn incomplete_migration() -> Failure {
+    Failure::new(
+        "incomplete",
+        "one or more MCP servers or credential stores require manual migration: see the report \
+         above",
+    )
+}
+
+fn exec_migrate_mcp(
+    agent: Option<String>,
+    dry_run: bool,
+    yes: bool,
+    consent_startup_timeout: bool,
+    passphrase_fd: Option<i32>,
+    json: bool,
+) -> Result<ExitCode, Failure> {
+    refuse_if_traced()?;
+    let (locations, data_dir, envcloak, proj) = migrate_paths()?;
+    let home = locations.home().to_path_buf();
+    let mut plan = migrate::plan_with_project(&locations, Some(&proj));
+    if let Some(a) = &agent {
+        plan.filter_agent(a);
+    }
+
+    if dry_run {
+        print_migrate_plan(&home, &plan, json);
+        if !plan.manual_items.is_empty() {
+            return Err(incomplete_migration());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let consent = MigrateConsent {
+        startup_timeout: consent_startup_timeout || yes,
+    };
+
+    let connect_fn = || envcloak_client::connect::connect();
+
+    if plan.rewrites.is_empty() {
+        let proof = MigrateProof {
+            loc: &locations,
+            data_dir,
+            project_dir: proj,
+            path_env: env("PATH").unwrap_or_default(),
+            envcloak_bin: envcloak,
+            connect: &connect_fn,
+            passphrase: None,
+            claims: claims(),
+            expected_statement_digest: None,
+            created_by_agent: false,
+            unrecorded: false,
+            enforce_min_age: true,
+        };
+        let report = migrate::apply(&plan, &consent, &proof).map_err(|e| e.to_failure())?;
+        print_migrate_report(&home, &report, json);
+        if !report.complete() {
+            return Err(incomplete_migration());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let claims_list = refuse_if_claimed()?;
+    let mut client = envcloak_client::connect::connect()?;
+    require_unlocked(&mut client)?;
+    drop(client);
+
+    let passphrase = match passphrase_fd {
+        Some(fd) => read_secret_fd(fd)?,
+        None => {
+            let mut t = Terminal::open()?;
+            t.read_secret("Vault passphrase to migrate MCP servers: ")?
+        }
+    };
+
+    let proof = MigrateProof {
+        loc: &locations,
+        data_dir,
+        project_dir: proj,
+        path_env: env("PATH").unwrap_or_default(),
+        envcloak_bin: envcloak,
+        connect: &connect_fn,
+        passphrase: Some(passphrase),
+        claims: claims_list,
+        expected_statement_digest: None,
+        created_by_agent: false,
+        unrecorded: false,
+        enforce_min_age: true,
+    };
+
+    let report = migrate::apply(&plan, &consent, &proof).map_err(|e| e.to_failure())?;
+    print_migrate_report(&home, &report, json);
+    if !report.complete() {
+        return Err(incomplete_migration());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn exec_migrate_update(
+    server: &str,
+    changes: LaunchChanges,
+    passphrase_fd: Option<i32>,
+    json: bool,
+) -> Result<ExitCode, Failure> {
+    refuse_if_traced()?;
+    // Gate 13: check key-shaped arguments and env values before any socket contact.
+    envcloak_client::managed::refuse_key_shaped_changes(&changes).map_err(|f| {
+        f.with_tail("add it with `envcloak add` and bind it in the managed manifest")
+    })?;
+    let claims_list = refuse_if_claimed()?;
+    let (locations, data_dir, envcloak, proj) = migrate_paths()?;
+    let home = locations.home().to_path_buf();
+    let connect_fn = || envcloak_client::connect::connect();
+
+    let mut proof = MigrateProof {
+        loc: &locations,
+        data_dir,
+        project_dir: proj,
+        path_env: env("PATH").unwrap_or_default(),
+        envcloak_bin: envcloak,
+        connect: &connect_fn,
+        passphrase: None,
+        claims: claims_list,
+        expected_statement_digest: None,
+        created_by_agent: false,
+        unrecorded: false,
+        enforce_min_age: true,
+    };
+
+    let (_launch_id, stmt) =
+        migrate::plan_update(server, &changes, &proof).map_err(|e| e.to_failure())?;
+    let statement_text = format_update_statement(&home, server, &stmt);
+
+    let passphrase = match passphrase_fd {
+        Some(fd) => {
+            if !json {
+                print!("{statement_text}");
+            }
+            read_secret_fd(fd)?
+        }
+        None => {
+            let mut t = Terminal::open()?;
+            t.say(&statement_text)?;
+            t.read_secret("Vault passphrase to approve this update: ")?
+        }
+    };
+
+    proof.passphrase = Some(passphrase);
+    proof.expected_statement_digest = Some(stmt.digest.clone());
+    let report = migrate::update(server, changes, &proof).map_err(|e| e.to_failure())?;
+
+    if json {
+        print_json(&serde_json::to_value(&report).unwrap_or(Value::Null));
+    } else {
+        println!(
+            "Updated managed server {} (launch {}, revision {}).",
+            escape_for_display(&report.server),
+            escape_for_display(&report.launch_id),
+            report.revision
+        );
+        print_launch_receipt(&home, &report.receipt);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn exec_migrate_undo(
+    backup_id: &str,
+    created_by_agent: bool,
+    unrecorded: bool,
+    passphrase_fd: Option<i32>,
+    json: bool,
+) -> Result<ExitCode, Failure> {
+    refuse_if_traced()?;
+    let claims_list = refuse_if_claimed()?;
+    let (locations, data_dir, envcloak, proj) = migrate_paths()?;
+    let home = locations.home().to_path_buf();
+    let mut client = envcloak_client::connect::connect()?;
+    require_unlocked(&mut client)?;
+    drop(client);
+
+    let passphrase = match passphrase_fd {
+        Some(fd) => read_secret_fd(fd)?,
+        None => {
+            let mut t = Terminal::open()?;
+            t.read_secret("Vault passphrase to undo migration: ")?
+        }
+    };
+
+    let connect_fn = || envcloak_client::connect::connect();
+    let proof = MigrateProof {
+        loc: &locations,
+        data_dir,
+        project_dir: proj,
+        path_env: env("PATH").unwrap_or_default(),
+        envcloak_bin: envcloak,
+        connect: &connect_fn,
+        passphrase: Some(passphrase),
+        claims: claims_list,
+        expected_statement_digest: None,
+        created_by_agent,
+        unrecorded,
+        enforce_min_age: true,
+    };
+
+    let report = migrate::undo(backup_id, &proof).map_err(|e: MigrateError| e.to_failure())?;
+    if json {
+        print_json(&json!({
+            "backup_id": report.backup_id,
+            "restored_files": report
+                .restored_files
+                .iter()
+                .map(|p| shown(&home, p))
+                .collect::<Vec<_>>(),
+            "unregistered_servers": report.unregistered_servers,
+        }));
+    } else {
+        println!(
+            "Restored {} file(s) from backup {}.",
+            report.restored_files.len(),
+            escape_for_display(&report.backup_id)
+        );
+        for f in &report.restored_files {
+            println!("  {}: restored", shown(&home, f));
+        }
+        for s in &report.unregistered_servers {
+            println!("  {}: unregistered", escape_for_display(s));
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn format_declaration_lines(label: &str, d: &LaunchDeclarationView) -> Vec<String> {
+    let mut out = Vec::new();
+    let argv: Vec<String> = d.argv.iter().map(|a| escape_for_display(a)).collect();
+    out.push(format!("  {label} argv: {}", argv.join(" ")));
+    if let Some(cwd) = &d.cwd {
+        out.push(format!("  {label} cwd: {}", escape_for_display(cwd)));
+    }
+    if !d.env.is_empty() {
+        let pairs: Vec<String> = d
+            .env
+            .iter()
+            .map(|(k, v)| format!("{}={}", escape_for_display(k), escape_for_display(v)))
+            .collect();
+        out.push(format!("  {label} env: {}", pairs.join(", ")));
+    }
+    if let Some(p) = &d.path_env {
+        out.push(format!("  {label} PATH: {}", escape_for_display(p)));
+    }
+    out
+}
+
+fn format_receipt_lines(home: &Path, label: &str, r: &LaunchReceiptView) -> Vec<String> {
+    let mut out = Vec::new();
+    let class = r.class.as_deref().unwrap_or("bridge");
+    let strength = r.strength.as_deref().unwrap_or("none");
+    out.push(format!(
+        "  {label} class: {} ({})",
+        escape_for_display(class),
+        escape_for_display(strength)
+    ));
+    if let Some(exe) = &r.executable {
+        let shown_exe = shown(home, Path::new(exe));
+        let id = r.identity.as_deref().unwrap_or("unknown");
+        out.push(format!(
+            "  {label} executable: {} ({})",
+            shown_exe,
+            escape_for_display(id)
+        ));
+    }
+    if let Some(entry) = &r.entry {
+        let shown_entry = shown(home, Path::new(entry));
+        let id = r.entry_identity.as_deref().unwrap_or("unknown");
+        out.push(format!(
+            "  {label} entry: {} ({})",
+            shown_entry,
+            escape_for_display(id)
+        ));
+    }
+    if let Some(cwd) = &r.cwd {
+        out.push(format!("  {label} cwd: {}", shown(home, Path::new(cwd))));
+    }
+    if !r.env_names.is_empty() {
+        let names: Vec<String> = r.env_names.iter().map(|n| escape_for_display(n)).collect();
+        out.push(format!("  {label} env names: {}", names.join(", ")));
+    }
+    if !r.bindings.is_empty() {
+        let names: Vec<String> = r.bindings.iter().map(|n| escape_for_display(n)).collect();
+        out.push(format!("  {label} bindings: {}", names.join(", ")));
+    }
+    for s in &r.sentences {
+        out.push(format!("  {label} note: {}", escape_for_display(s)));
+    }
+    out
+}
+
+fn format_update_statement(home: &Path, server: &str, stmt: &UpdateStatementView) -> String {
+    let mut lines = vec![format!(
+        "Update managed MCP server {} (launch {}, revision {} -> {}):",
+        escape_for_display(server),
+        escape_for_display(&stmt.launch),
+        stmt.revision,
+        stmt.revision + 1
+    )];
+    lines.extend(format_declaration_lines("old", &stmt.old_declaration));
+    lines.extend(format_receipt_lines(home, "old", &stmt.old));
+    lines.extend(format_declaration_lines("new", &stmt.new_declaration));
+    lines.extend(format_receipt_lines(home, "new", &stmt.new));
+    let mut text = lines.join("\n");
+    text.push('\n');
+    text
+}
+
+fn print_launch_receipt(home: &Path, r: &LaunchReceiptView) {
+    println!(
+        "  receipt {}: transport={}",
+        escape_for_display(&r.server),
+        escape_for_display(&r.transport)
+    );
+    if let (Some(class), Some(strength)) = (&r.class, &r.strength) {
+        println!(
+            "    class: {} ({})",
+            escape_for_display(class),
+            escape_for_display(strength)
+        );
+    }
+    if let Some(exe) = &r.executable {
+        println!(
+            "    executable: {} ({})",
+            shown(home, Path::new(exe)),
+            escape_for_display(r.identity.as_deref().unwrap_or("unknown"))
+        );
+    }
+    if let Some(entry) = &r.entry {
+        println!(
+            "    entry: {} ({})",
+            shown(home, Path::new(entry)),
+            escape_for_display(r.entry_identity.as_deref().unwrap_or("unknown"))
+        );
+    }
+    if let Some(cwd) = &r.cwd {
+        println!("    cwd: {}", shown(home, Path::new(cwd)));
+    }
+    if let Some(origin) = &r.origin {
+        println!("    origin: {}", escape_for_display(origin));
+    }
+    if !r.header_names.is_empty() {
+        let hdrs: Vec<String> = r
+            .header_names
+            .iter()
+            .map(|h| escape_for_display(h))
+            .collect();
+        println!("    headers: {}", hdrs.join(", "));
+    }
+    if !r.env_names.is_empty() {
+        let envs: Vec<String> = r.env_names.iter().map(|n| escape_for_display(n)).collect();
+        println!("    env: {}", envs.join(", "));
+    }
+    if !r.bindings.is_empty() {
+        let binds: Vec<String> = r.bindings.iter().map(|b| escape_for_display(b)).collect();
+        println!("    bindings: {}", binds.join(", "));
+    }
+    for s in &r.sentences {
+        println!("    {}", escape_for_display(s));
+    }
+    if matches!(r.class.as_deref(), Some("script" | "package_runner"))
+        || r.strength.as_deref() == Some("checked_at_rest")
+    {
+        println!(
+            "    approvals: only once and session approvals apply (standing approvals are for \
+             `bound` launches only)"
+        );
+    }
+}
+
+fn print_migrate_plan(home: &Path, plan: &MigratePlan, json: bool) {
+    if json {
+        let rewrites: Vec<Value> = plan
+            .rewrites
+            .iter()
+            .map(|r| {
+                json!({
+                    "agent": r.agent,
+                    "server": r.server,
+                    "config_path": shown(home, &r.config_path),
+                    "transport": r.transport_name(),
+                    "secret_names": r.secret_names(),
+                    "codex_needs_startup_timeout": r.codex_needs_startup_timeout,
+                })
+            })
+            .collect();
+        print_json(&json!({
+            "committed": false,
+            "rewrites": rewrites,
+            "manual_items": plan.manual_items,
+            "unavailable_opt_ins": plan.unavailable_opt_ins,
+            "claude_backups_dir": plan.claude_backups_dir.as_ref().map(|d| shown(home, d)),
+            "shared_mcp_json_touched": plan.shared_mcp_json_touched,
+            "complete": plan.manual_items.is_empty(),
+        }));
+        return;
+    }
+    if plan.rewrites.is_empty()
+        && plan.manual_items.is_empty()
+        && plan.unavailable_opt_ins.is_empty()
+    {
+        println!("No MCP server with literal secrets found.");
+    }
+    for r in &plan.rewrites {
+        println!(
+            "  {}/{} ({}, {}): migrate {}",
+            escape_for_display(&r.agent),
+            escape_for_display(&r.server),
+            shown(home, &r.config_path),
+            r.transport_name(),
+            r.secret_names()
+                .iter()
+                .map(|n| escape_for_display(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    for m in &plan.manual_items {
+        println!(
+            "  manual ({}, {}): {}",
+            escape_for_display(&m.agent),
+            escape_for_display(&m.reason),
+            escape_for_display(&m.detail)
+        );
+    }
+    for u in &plan.unavailable_opt_ins {
+        println!("  unavailable: {}", escape_for_display(&u.detail));
+    }
+    if let Some(d) = &plan.claude_backups_dir {
+        println!(
+            "  note (claude_backups): Claude Code keeps copies in {}; run `envcloak scrub` to \
+             inspect and remove plaintext copies there.",
+            shown(home, d)
+        );
+    }
+    println!("Dry run: nothing was changed.");
+}
+
+fn print_migrate_report(home: &Path, report: &MigrateReport, json: bool) {
+    if json {
+        let mut val = serde_json::to_value(report).unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut val {
+            map.insert("complete".to_owned(), Value::Bool(report.complete()));
+        }
+        print_json(&val);
+        return;
+    }
+    if let Some(id) = &report.backup_id {
+        println!(
+            "Backed up configuration files as backup {} (undo with `envcloak agents migrate-mcp \
+             --undo {}`).",
+            escape_for_display(id),
+            escape_for_display(id)
+        );
+    }
+    for s in &report.servers {
+        println!(
+            "Migrated {}/{} in {} -> {} ({})",
+            escape_for_display(&s.agent),
+            escape_for_display(&s.server),
+            shown(home, &s.config_path),
+            shown(home, &s.manifest_path),
+            escape_for_display(&s.transport)
+        );
+        if s.codex_startup_timeout_set {
+            println!("  codex startup_timeout_sec set to 60");
+        }
+        print_launch_receipt(home, &s.receipt);
+    }
+    for m in &report.manual_items {
+        println!(
+            "  manual ({}, {}): {}",
+            escape_for_display(&m.agent),
+            escape_for_display(&m.reason),
+            escape_for_display(&m.detail)
+        );
+    }
+    for u in &report.unavailable_opt_ins {
+        println!("  unavailable: {}", escape_for_display(&u.detail));
+    }
+    if !report.reprobe_agents.is_empty() {
+        println!(
+            "  re-probe needed ({}): shared `.mcp.json` was rewritten; run `envcloak agents \
+             status --probe`.",
+            report.reprobe_agents.join(", ")
+        );
+    }
+    for step in &report.next_steps {
+        println!("  {}", escape_for_display(step));
+    }
+    if !report.committed
+        && report.servers.is_empty()
+        && report.manual_items.is_empty()
+        && report.unavailable_opt_ins.is_empty()
+    {
+        if let Some(note) = &report.claude_backups_note {
+            println!("  {}", escape_for_display(note));
+        }
+        println!("No MCP server with literal secrets needed migration.");
     }
 }

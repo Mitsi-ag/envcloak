@@ -683,6 +683,47 @@ impl Doc {
         Ok(true)
     }
 
+    /// Replaces the value of member `key` in the object at `path` in place,
+    /// keeping every byte outside `key`'s value span untouched. Returns
+    /// `Ok(false)` when the member is not present or already equals `value`.
+    ///
+    /// # Errors
+    /// [`JsonError::Shape`] when the value at `path` is not an object.
+    pub fn replace_member(
+        &mut self,
+        path: &[&str],
+        key: &str,
+        value: &Value,
+    ) -> Result<bool, JsonError> {
+        let Some(node) = self.get(path) else {
+            return Ok(false);
+        };
+        let Kind::Object(ms) = &node.kind else {
+            return Err(JsonError::Shape);
+        };
+        let Some(m) = ms.iter().find(|m| m.key == key) else {
+            return Ok(false);
+        };
+        let existing: Value = serde_json::from_str(&self.text[m.value.start..m.value.end])
+            .map_err(|_| JsonError::Syntax)?;
+        if &existing == value {
+            return Ok(false);
+        }
+        let (vstart, vend) = (m.value.start, m.value.end);
+        let multi = self.text[vstart..vend].contains('\n')
+            || self.text[node.start..node.end].contains('\n');
+        let rendered = if multi {
+            let ind = self.indent_at(m.key_start);
+            let unit = self.unit();
+            reindent(&render_value(value), &ind, &unit)
+        } else {
+            serde_json::to_string(value).unwrap_or_default()
+        };
+        let text = format!("{}{rendered}{}", &self.text[..vstart], &self.text[vend..]);
+        self.reparse(text)?;
+        Ok(true)
+    }
+
     /// Removes the last `created` keys of `path`, innermost first, while
     /// what each holds is empty.
     fn remove_empty(&mut self, path: &[&str], created: usize) -> Result<(), JsonError> {
