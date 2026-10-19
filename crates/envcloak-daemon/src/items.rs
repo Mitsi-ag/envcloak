@@ -122,7 +122,7 @@ pub(crate) fn looks_like_value(shared: &Shared, s: &str) -> bool {
 }
 
 /// A vault error from a write, as the protocol reports it.
-fn write_error(e: &VaultError) -> RpcError {
+pub(crate) fn write_error(e: &VaultError) -> RpcError {
     match e.kind() {
         VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
             RpcError::new(ErrorKind::VaultTampered)
@@ -138,7 +138,7 @@ fn write_error(e: &VaultError) -> RpcError {
 
 /// Checks a new value: not empty, no NUL byte (no environment can carry
 /// one), and within the vault's 64 KiB field cap.
-fn check_value(v: &SecretBytes) -> Result<(), RpcError> {
+pub(crate) fn check_value(v: &SecretBytes) -> Result<(), RpcError> {
     if v.is_empty() {
         return Err(invalid("empty_value"));
     }
@@ -279,7 +279,7 @@ pub fn check(shared: &Shared, p: CheckParams) -> Result<CheckView, RpcError> {
 /// Text a person gave as an account: 1 to [`MAX_ACCOUNT`] bytes, with no
 /// blanks, control characters, or invisible characters that could spoof
 /// what a terminal shows.
-fn valid_account(s: &str) -> bool {
+pub(crate) fn valid_account(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= MAX_ACCOUNT
         && !s.chars().any(|c| {
@@ -289,23 +289,26 @@ fn valid_account(s: &str) -> bool {
         })
 }
 
-/// A checked [`AddParams`], without the value.
-struct NewNames {
-    slug: Option<Slug>,
-    provider: Option<String>,
-    field: FieldName,
-    account: Option<String>,
-    env_hint: Option<EnvName>,
+/// Raw item name parameters before validation.
+pub(crate) struct RawNames<'a> {
+    pub(crate) slug: Option<&'a str>,
+    pub(crate) provider: Option<&'a str>,
+    pub(crate) field: Option<&'a str>,
+    pub(crate) account: Option<&'a str>,
+    pub(crate) env_hint: Option<&'a str>,
 }
 
-fn check_names(shared: &Shared, p: &AddParams) -> Result<NewNames, RpcError> {
-    let named = [
-        p.slug.as_deref(),
-        p.provider.as_deref(),
-        p.field.as_deref(),
-        p.account.as_deref(),
-        p.env_hint.as_deref(),
-    ];
+/// Checked item names, without the value.
+pub(crate) struct NewNames {
+    pub(crate) slug: Option<Slug>,
+    pub(crate) provider: Option<String>,
+    pub(crate) field: FieldName,
+    pub(crate) account: Option<String>,
+    pub(crate) env_hint: Option<EnvName>,
+}
+
+pub(crate) fn check_raw_names(shared: &Shared, p: RawNames<'_>) -> Result<NewNames, RpcError> {
+    let named = [p.slug, p.provider, p.field, p.account, p.env_hint];
     if named
         .into_iter()
         .flatten()
@@ -315,11 +318,10 @@ fn check_names(shared: &Shared, p: &AddParams) -> Result<NewNames, RpcError> {
     }
     let slug = p
         .slug
-        .as_deref()
         .map(Slug::new)
         .transpose()
         .map_err(|_| invalid("invalid_slug"))?;
-    let provider = match p.provider.as_deref() {
+    let provider = match p.provider {
         None => None,
         Some(id) => {
             let known = shared.registry.as_ref().and_then(|r| r.get(id));
@@ -331,15 +333,14 @@ fn check_names(shared: &Shared, p: &AddParams) -> Result<NewNames, RpcError> {
             )
         }
     };
-    let field = FieldName::new(p.field.as_deref().unwrap_or(DEFAULT_FIELD))
-        .map_err(|_| invalid("invalid_field"))?;
-    let account = match p.account.as_deref() {
+    let field =
+        FieldName::new(p.field.unwrap_or(DEFAULT_FIELD)).map_err(|_| invalid("invalid_field"))?;
+    let account = match p.account {
         Some(a) if !valid_account(a) => return Err(invalid("invalid_account")),
         a => a.map(str::to_owned),
     };
     let env_hint = p
         .env_hint
-        .as_deref()
         .map(EnvName::new)
         .transpose()
         .map_err(|_| invalid("invalid_env_name"))?;
@@ -352,8 +353,21 @@ fn check_names(shared: &Shared, p: &AddParams) -> Result<NewNames, RpcError> {
     })
 }
 
+fn check_names(shared: &Shared, p: &AddParams) -> Result<NewNames, RpcError> {
+    check_raw_names(
+        shared,
+        RawNames {
+            slug: p.slug.as_deref(),
+            provider: p.provider.as_deref(),
+            field: p.field.as_deref(),
+            account: p.account.as_deref(),
+            env_hint: p.env_hint.as_deref(),
+        },
+    )
+}
+
 /// The first of `base`, `base-2`, ... `base-99` that no item has.
-fn free_slug(v: &Vault, base: &str) -> Result<Slug, RpcError> {
+pub(crate) fn free_slug(v: &Vault, base: &str) -> Result<Slug, RpcError> {
     (1..=SLUG_TRIES)
         .map(|n| {
             if n == 1 {
@@ -367,28 +381,26 @@ fn free_slug(v: &Vault, base: &str) -> Result<Slug, RpcError> {
         .ok_or_else(|| invalid("no_free_slug"))
 }
 
-/// `items.add`. See the module documentation.
-pub fn add(shared: &Shared, peer: &PeerIdentity, p: AddParams) -> Result<AddedView, RpcError> {
-    let names = check_names(shared, &p)?;
-    let value = p.value.into_inner();
-    refuse_if_traced()?;
-    check_value(&value)?;
-    let caller = evidence(shared, peer, &p.claims)?;
-
+pub(crate) fn prepare_new_item(
+    shared: &Shared,
+    names: &NewNames,
+    allow_short: bool,
+    value: &SecretBytes,
+) -> (ItemDetails, Option<String>, bool, LengthClass) {
     let mut details = ItemDetails {
         provider: names.provider.clone(),
         account: Account {
-            email: names.account,
+            email: names.account.clone(),
             ..Account::default()
         },
         env_hint: names.env_hint.as_ref().map(|e| e.as_str().to_owned()),
-        allow_short: p.allow_short,
+        allow_short,
         ..ItemDetails::default()
     };
     let hint = names.env_hint.as_ref().map(EnvName::as_str);
     let (detected, ambiguous) = match shared.registry.as_ref() {
         Some(r) => {
-            let d = r.detect(&value, hint);
+            let d = r.detect(value, hint);
             r.prefill(&d, &mut details);
             let found = d.provider.as_ref().map(|id| id.as_str().to_owned());
             // Worth saying only when the item does not carry it.
@@ -401,22 +413,35 @@ pub fn add(shared: &Shared, peer: &PeerIdentity, p: AddParams) -> Result<AddedVi
         None => (None, false),
     };
     let length = LengthClass::of(value.len());
+    (details, detected, ambiguous, length)
+}
 
-    let mut s = locked(&shared.state);
-    let v = s.unlocked_mut()?;
-    let slug = match names.slug {
+pub(crate) fn resolve_new_slug(
+    v: &Vault,
+    requested: Option<Slug>,
+    default_provider: Option<&str>,
+) -> Result<Slug, RpcError> {
+    match requested {
         Some(slug) => {
             if v.find(&slug).is_some() {
                 return Err(RpcError::new(ErrorKind::ItemExists));
             }
-            slug
+            Ok(slug)
         }
-        None => free_slug(v, details.provider.as_deref().unwrap_or(DEFAULT_SLUG))?,
-    };
+        None => free_slug(v, default_provider.unwrap_or(DEFAULT_SLUG)),
+    }
+}
+
+pub(crate) fn commit_new_item(
+    v: &mut Vault,
+    slug: Slug,
+    field: FieldName,
+    mut details: ItemDetails,
+    value: SecretBytes,
+) -> Result<(ItemId, Slug, FieldName, ItemView), RpcError> {
     if details.title.is_empty() {
         details.title = slug.as_str().to_owned();
     }
-    let field = names.field;
     let new = NewItem {
         class: ItemClass::Secret,
         slug: slug.clone(),
@@ -433,6 +458,24 @@ pub fn add(shared: &Shared, peer: &PeerIdentity, p: AddParams) -> Result<AddedVi
         .item(id)
         .map(|m| ItemView::from_meta(m, ItemDetail::Long))
         .ok_or(RpcError::new(ErrorKind::Internal))?;
+    Ok((id, slug, field, item))
+}
+
+/// `items.add`. See the module documentation.
+pub fn add(shared: &Shared, peer: &PeerIdentity, p: AddParams) -> Result<AddedView, RpcError> {
+    let names = check_names(shared, &p)?;
+    let value = p.value.into_inner();
+    refuse_if_traced()?;
+    check_value(&value)?;
+    let caller = evidence(shared, peer, &p.claims)?;
+
+    let (details, detected, ambiguous, length) =
+        prepare_new_item(shared, &names, p.allow_short, &value);
+
+    let mut s = locked(&shared.state);
+    let v = s.unlocked_mut()?;
+    let slug = resolve_new_slug(v, names.slug, details.provider.as_deref())?;
+    let (id, slug, field, item) = commit_new_item(v, slug, names.field, details, value)?;
     s.audit(AuditEvent::Added {
         pid: peer.pid,
         subject: subject_summary(peer, &caller),
@@ -1050,7 +1093,7 @@ fn mark(
 /// no registry, when nothing can be detected. In M1 every classification
 /// comes from a detection (no command sets one by hand), so the item's
 /// classification follows its value.
-fn detected_class(
+pub(crate) fn detected_class(
     shared: &Shared,
     details: &ItemDetails,
     value: &SecretBytes,

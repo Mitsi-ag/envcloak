@@ -76,9 +76,9 @@ pub use flood::{
 };
 pub use grants::{
     AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BoundRef, DEFAULT_TTL, Decision,
-    DenyOutcome, DenyReason, Grant, GrantBinding, GrantId, GrantStore, MAX_AGENT_TTL, MAX_GRANTS,
-    MAX_TERMINAL_TTL, ManagedRequest, NoSuchRequest, Now, OptionsError, PendingCap, ProofKind,
-    RevokeSelector, Uses,
+    DenyOutcome, DenyReason, Grant, GrantBinding, GrantId, GrantStore, MAX_AGENT_TTL,
+    MAX_APP_REVEAL_STAGES, MAX_GRANTS, MAX_TERMINAL_TTL, ManagedRequest, NoSuchRequest, Now,
+    OptionsError, PendingCap, ProofKind, RevokeSelector, Uses,
 };
 pub use limiter::{AttemptLimiter, FIRST_WAIT, FREE_ATTEMPTS, MAX_WAIT};
 pub use manifest::{
@@ -87,8 +87,10 @@ pub use manifest::{
 };
 pub use names::{Binding, EnvName, ProfileName, Reference, VALUE_RUN, value_shaped};
 pub use pending::{
-    Busy, MAX_OUTCOMES, MAX_POLL_ROOTS, OUTCOME_TTL, PENDING_TTL, POLLS_PER_REQUEST, Pending,
-    PendingId, PendingState, PendingUnlockerAdd, UnlockerAddRequest, UnlockerEnrollOutcome,
+    APP_REVEAL_TTL, AskClosed, AskRequest, AskStateOutcome, AskSummary, Busy, MAX_OUTCOMES,
+    MAX_POLL_ROOTS, OUTCOME_TTL, PENDING_TTL, POLLS_PER_REQUEST, Pending, PendingAsk, PendingId,
+    PendingReveal, PendingState, PendingUnlockerAdd, RevealRequestSpec, UnlockerAddRequest,
+    UnlockerEnrollOutcome,
 };
 pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
@@ -101,9 +103,12 @@ pub use standing::{
 };
 pub use statement::{
     BindingSummary, HIDDEN, ManagedSummary, PendingDescriptor, ProcessSummary, ProjectSummary,
-    Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, StandingSummary, SubjectSummary,
-    UNLOCKER_STATEMENT_DOMAIN, UnlockerAddDescriptor, UnlockerRequestKind, canonical_statement,
-    canonical_unlocker_statement, display_escaped, escape_for_display, live_guarded, proposals,
-    proposed_for, render_statement, render_statement_with, render_unlocker_statement, shell_word,
-    shown_name, statement_digest, unlocker_statement_digest, unticked_live,
+    Proposal, RENDER_LIMIT, REVEAL_STATEMENT_DOMAIN, RevealDescriptor, STATEMENT_DOMAIN,
+    StandingSummary, SubjectSummary, UNLOCKER_STATEMENT_DOMAIN, UnlockerAddDescriptor,
+    UnlockerRequestKind, UnlockerTarget, WRITE_STATEMENT_DOMAIN, WriteAction, WriteStatement,
+    canonical_reveal_statement, canonical_statement, canonical_unlocker_statement,
+    canonical_write_statement, display_escaped, escape_for_display, live_guarded, proposals,
+    proposed_for, render_reveal_statement, render_statement, render_statement_with,
+    render_unlocker_statement, render_write_statement, reveal_statement_digest, shell_word,
+    shown_name, statement_digest, unlocker_statement_digest, unticked_live, write_statement_digest,
 };

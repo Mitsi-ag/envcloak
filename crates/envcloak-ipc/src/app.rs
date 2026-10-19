@@ -1,11 +1,17 @@
-//! App-role wire types and methods for Secure Enclave unlock, enrolment and
-//! signed approvals (SPEC §4.3, §5, §10b; M3 plan M3-08, M3-09).
+//! App-role wire types and methods for Secure Enclave unlock, enrolment,
+//! signed approvals, signed writes, reveal, sealed paste and asks
+//! (SPEC §4.3, §5, §6.3, §6.7, §10b; M3 plan M3-08, M3-09, M3-14).
 
-use envcloak_policy::{ApprovalOptions, PendingDescriptor, PendingId, SubjectKind};
+use envcloak_policy::{
+    ApprovalOptions, AskSummary, PendingDescriptor, PendingId, RevealDescriptor, SubjectKind,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::Method;
-use crate::view::{ApprovedView, MAX_LISTED_BINDINGS, UnlockedView, View};
+use crate::view::{
+    AddedView, ApprovedView, ClassificationView, LengthClass, MAX_LISTED_BINDINGS, RemovedView,
+    RotatedView, UnlockedView, View,
+};
 
 /// `app.unlock.begin`: starts a Secure Enclave unlock (SPEC §5 step 2).
 /// Returns the unlocker's envelope, a 32-byte random challenge and a fresh
@@ -308,3 +314,449 @@ pub struct AppApproveParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
 }
+
+/// `app.unlocker.add`: enrols another Secure Enclave unlocker under a signed
+/// `envcloak-write-statement/1` by an already-enrolled `approve` key (SPEC §5,
+/// §12; M3 plan M3-14).
+#[derive(Debug)]
+pub struct AppUnlockerAdd;
+
+impl Method for AppUnlockerAdd {
+    const NAME: &'static str = "app.unlocker.add";
+    type Params = AppUnlockerAddParams;
+    type Output = AppUnlockerAddedView;
+}
+
+/// Parameters of [`AppUnlockerAdd`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUnlockerAddParams {
+    /// Device label (`1..=128` UTF-8 bytes, no control or format characters).
+    pub label: String,
+    /// 65-byte uncompressed SEC1 P-256 `unlock` public key (130 hex or 88 base64 chars).
+    pub unlock_pub: String,
+    /// 65-byte uncompressed SEC1 P-256 `approve` public key (130 hex or 88 base64 chars).
+    pub approve_pub: String,
+    /// 32-byte single-use nonce, 64 lowercase hex characters.
+    pub nonce: String,
+    /// SHA-256 of the canonical `envcloak-write-statement/1`, 64 lowercase hex characters.
+    pub digest: String,
+    /// 64-byte raw P-256 ECDSA signature (`r || s`), 128 hex or 88 base64 chars.
+    pub signature: String,
+    #[serde(default)]
+    pub created_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppUnlockerAdd`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUnlockerAddedView {
+    /// 32 lowercase hex characters (`UnlockerId`).
+    pub unlocker_id: String,
+}
+
+impl View for AppUnlockerAddedView {}
+
+/// `app.unlocker.remove`: removes the passphrase unlocker or a Secure Enclave
+/// unlocker under a signed `envcloak-write-statement/1` (SPEC §4.3, §5; M3-14).
+/// Never removes the Recovery Kit unlocker (`no_unlocker`) or the last daily
+/// unlocker (`last_unlocker`).
+#[derive(Debug)]
+pub struct AppUnlockerRemove;
+
+impl Method for AppUnlockerRemove {
+    const NAME: &'static str = "app.unlocker.remove";
+    type Params = AppUnlockerRemoveParams;
+    type Output = AppUnlockerRemovedView;
+}
+
+/// Parameters of [`AppUnlockerRemove`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUnlockerRemoveParams {
+    /// `"passphrase"` or 32 lowercase hex characters (`UnlockerId`) for a
+    /// Secure Enclave unlocker.
+    pub unlocker: String,
+    /// 32-byte single-use nonce, 64 lowercase hex characters.
+    pub nonce: String,
+    /// SHA-256 of the canonical `envcloak-write-statement/1`, 64 lowercase hex characters.
+    pub digest: String,
+    /// 64-byte raw P-256 ECDSA signature (`r || s`), 128 hex or 88 base64 chars.
+    pub signature: String,
+    #[serde(default)]
+    pub created_secs: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppUnlockerRemove`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppUnlockerRemovedView {
+    pub removed: String,
+}
+
+impl View for AppUnlockerRemovedView {}
+
+/// `app.items.target`: opens a 60-second signed-write target for `slug`
+/// (and `field`), returning a single-use nonce and a daemon X25519 ephemeral
+/// public key (M3-14).
+#[derive(Debug)]
+pub struct AppItemsTarget;
+
+impl Method for AppItemsTarget {
+    const NAME: &'static str = "app.items.target";
+    type Params = AppItemsTargetParams;
+    type Output = AppItemsTargetOutput;
+}
+
+/// Parameters of [`AppItemsTarget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppItemsTargetParams {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppItemsTarget`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppItemsTargetOutput {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub target: String,
+    /// 32-byte single-use nonce, 64 lowercase hex characters.
+    pub nonce: String,
+    /// 32-byte single-use X25519 daemon public key, 64 lowercase hex characters.
+    pub daemon_eph_pub: String,
+    /// 32 lowercase hex characters (`VaultId`).
+    pub vault_id: String,
+    /// 26 Crockford base32 characters (`ItemId`).
+    pub item: String,
+    pub slug: String,
+    /// 26 Crockford base32 characters (`FieldId`), when a single field is resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field_name: Option<String>,
+    pub classification: ClassificationView,
+    pub prior_count: u8,
+    pub grants: u64,
+    pub created_secs: u64,
+    pub expires_in_secs: u64,
+}
+
+impl View for AppItemsTargetOutput {}
+
+/// `app.items.rotate`: replaces an item field's value under a signed
+/// `envcloak-write-statement/1`, with the new value HPKE-sealed to the
+/// target's `daemon_eph_pub` (M3-14).
+#[derive(Debug)]
+pub struct AppItemsRotate;
+
+impl Method for AppItemsRotate {
+    const NAME: &'static str = "app.items.rotate";
+    type Params = AppItemsRotateParams;
+    type Output = RotatedView;
+}
+
+/// Parameters of [`AppItemsRotate`]. `Debug` is redacted so the sealed value
+/// frame is never printed in diagnostics.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppItemsRotateParams {
+    /// 8 Crockford base32 characters (`PendingId`) from [`AppItemsTarget`].
+    pub target: String,
+    /// HPKE-sealed secret value to `daemon_eph_pub` with AAD `target || nonce`
+    /// (lowercase hex or standard base64).
+    pub sealed_value: String,
+    /// SHA-256 of the canonical `envcloak-write-statement/1`, 64 lowercase hex characters.
+    pub digest: String,
+    /// 64-byte raw P-256 ECDSA signature (`r || s`), 128 hex or 88 base64 chars.
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for AppItemsRotateParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("AppItemsRotateParams([REDACTED])")
+    }
+}
+
+/// `app.items.remove`: removes an item under a signed
+/// `envcloak-write-statement/1` after writing an encrypted backup of the vault
+/// (M3-14).
+#[derive(Debug)]
+pub struct AppItemsRemove;
+
+impl Method for AppItemsRemove {
+    const NAME: &'static str = "app.items.remove";
+    type Params = AppItemsRemoveParams;
+    type Output = RemovedView;
+}
+
+/// Parameters of [`AppItemsRemove`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppItemsRemoveParams {
+    /// 8 Crockford base32 characters (`PendingId`) from [`AppItemsTarget`].
+    pub target: String,
+    /// SHA-256 of the canonical `envcloak-write-statement/1`, 64 lowercase hex characters.
+    pub digest: String,
+    /// 64-byte raw P-256 ECDSA signature (`r || s`), 128 hex or 88 base64 chars.
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `app.reveal.begin`: starts a reveal in the app, either for an existing
+/// `reveal.request` (`request`) or directly for `slug` (and `field`), returning
+/// the [`RevealDescriptor`] and its single-use nonce (SPEC §6.7; M3-14).
+#[derive(Debug)]
+pub struct AppRevealBegin;
+
+impl Method for AppRevealBegin {
+    const NAME: &'static str = "app.reveal.begin";
+    type Params = AppRevealBeginParams;
+    type Output = RevealDescriptor;
+}
+
+impl View for RevealDescriptor {}
+
+/// Parameters of [`AppRevealBegin`]. Either `request` or `slug` must be given.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppRevealBeginParams {
+    /// Existing pending `reveal.request` id (8 Crockford base32 characters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+    /// Item slug when opening a reveal directly from the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `app.reveal`: releases a secret value HPKE-sealed to `app_eph_pub` after
+/// verifying a signed `envcloak-reveal-statement/1` and durably flushing the
+/// `reveal_app` audit entry (SPEC §6.7; M3-14).
+#[derive(Debug)]
+pub struct AppReveal;
+
+impl Method for AppReveal {
+    const NAME: &'static str = "app.reveal";
+    type Params = AppRevealParams;
+    type Output = AppRevealOutput;
+}
+
+/// Parameters of [`AppReveal`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppRevealParams {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub request: String,
+    /// SHA-256 of the canonical `envcloak-reveal-statement/1`, 64 lowercase hex characters.
+    pub digest: String,
+    /// 64-byte raw P-256 ECDSA signature (`r || s`), 128 hex or 88 base64 chars.
+    pub signature: String,
+    /// 32-byte single-use X25519 public key generated by the app (64 hex or 44 base64 chars).
+    pub app_eph_pub: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppReveal`]. `Debug` is redacted so the sealed secret value
+/// is never printed in diagnostics.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppRevealOutput {
+    /// Secret value HPKE-sealed to `app_eph_pub` with AAD `request || nonce`,
+    /// lowercase hex.
+    pub sealed_value: String,
+}
+
+impl core::fmt::Debug for AppRevealOutput {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("AppRevealOutput([REDACTED])")
+    }
+}
+
+/// `app.paste.begin`: opens a 2-minute paste stage with a fresh daemon X25519
+/// ephemeral public key (M3-14).
+#[derive(Debug)]
+pub struct AppPasteBegin;
+
+impl Method for AppPasteBegin {
+    const NAME: &'static str = "app.paste.begin";
+    type Params = AppPasteBeginParams;
+    type Output = AppPasteBeginOutput;
+}
+
+/// Parameters of [`AppPasteBegin`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPasteBeginParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppPasteBegin`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPasteBeginOutput {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub stage: String,
+    /// 32-byte single-use X25519 daemon public key, 64 lowercase hex characters.
+    pub daemon_eph_pub: String,
+    pub expires_in_secs: u64,
+}
+
+impl View for AppPasteBeginOutput {}
+
+/// `app.paste.inspect`: opens the HPKE-sealed pasted value into daemon memory
+/// (`SecretBytes`, wiped after 2 minutes or on lock) and returns provider,
+/// classification and length metadata without storing or logging the secret
+/// (M3-14).
+#[derive(Debug)]
+pub struct AppPasteInspect;
+
+impl Method for AppPasteInspect {
+    const NAME: &'static str = "app.paste.inspect";
+    type Params = AppPasteInspectParams;
+    type Output = AppPasteInspectOutput;
+}
+
+/// Parameters of [`AppPasteInspect`]. `Debug` is redacted so the sealed value
+/// frame is never printed in diagnostics.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPasteInspectParams {
+    /// 8 Crockford base32 characters (`PendingId`) from [`AppPasteBegin`].
+    pub stage: String,
+    /// HPKE-sealed secret value to `daemon_eph_pub` with AAD `stage.as_bytes()`
+    /// (lowercase hex or standard base64).
+    pub sealed: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for AppPasteInspectParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("AppPasteInspectParams([REDACTED])")
+    }
+}
+
+/// Answer to [`AppPasteInspect`]. Metadata only; never the secret value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPasteInspectOutput {
+    pub provider: Option<String>,
+    pub detected: Option<String>,
+    pub ambiguous: bool,
+    pub classification: ClassificationView,
+    pub length: LengthClass,
+    pub suggested_slug: Option<String>,
+    pub env_hint: Option<String>,
+}
+
+impl View for AppPasteInspectOutput {}
+
+/// `app.paste`: saves the staged value from [`AppPasteInspect`] as a new item,
+/// optionally resolving an open ask (`ask`) as `added` without creating any
+/// grant (M3-14).
+#[derive(Debug)]
+pub struct AppPaste;
+
+impl Method for AppPaste {
+    const NAME: &'static str = "app.paste";
+    type Params = AppPasteParams;
+    type Output = AddedView;
+}
+
+/// Parameters of [`AppPaste`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPasteParams {
+    /// 8 Crockford base32 characters (`PendingId`) from [`AppPasteInspect`].
+    pub stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hint: Option<String>,
+    #[serde(default)]
+    pub allow_short: bool,
+    /// Optional ask id (`PendingId`) answered by this paste.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `app.asks.list`: lists open asks filed by `items.ask`, oldest first (M3-14).
+#[derive(Debug)]
+pub struct AppAsksList;
+
+impl Method for AppAsksList {
+    const NAME: &'static str = "app.asks.list";
+    type Params = AppAsksListParams;
+    type Output = AppAsksListView;
+}
+
+/// Parameters of [`AppAsksList`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAsksListParams {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppAsksList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAsksListView {
+    pub asks: Vec<AskSummary>,
+}
+
+impl View for AppAsksListView {}
+
+/// `app.asks.decline`: declines an open ask (`ask_closed` if not open; M3-14).
+#[derive(Debug)]
+pub struct AppAsksDecline;
+
+impl Method for AppAsksDecline {
+    const NAME: &'static str = "app.asks.decline";
+    type Params = AppAsksDeclineParams;
+    type Output = AppAskDeclinedView;
+}
+
+/// Parameters of [`AppAsksDecline`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAsksDeclineParams {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub ask: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppAsksDecline`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAskDeclinedView {
+    pub declined: String,
+}
+
+impl View for AppAskDeclinedView {}

@@ -154,11 +154,21 @@ pub enum AuditKind {
     /// later signed in the app), with its label and both public keys'
     /// fingerprints.
     UnlockerAdd = 46,
+    /// An unlocker removed under a signed write statement
+    /// (`app.unlocker.remove`): the passphrase unlocker, or a Secure Enclave
+    /// unlocker with its label and both public keys' fingerprints.
+    UnlockerRemove = 47,
+    /// A reveal in the app, written durably before the sealed value is
+    /// released (`app.reveal`).
+    RevealApp = 48,
+    /// An ask filed by `envcloak add --ask`, and its outcome (`added`,
+    /// `declined` or `expired`), with the requester's evidence.
+    Ask = 49,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 35] = [
+    pub const ALL: [AuditKind; 38] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -194,6 +204,9 @@ impl AuditKind {
         AuditKind::ManagedLaunch,
         AuditKind::StandingConfirm,
         AuditKind::UnlockerAdd,
+        AuditKind::UnlockerRemove,
+        AuditKind::RevealApp,
+        AuditKind::Ask,
     ];
 
     /// The kind's stable token.
@@ -234,6 +247,9 @@ impl AuditKind {
             AuditKind::ManagedLaunch => "managed_launch",
             AuditKind::StandingConfirm => "standing_confirm",
             AuditKind::UnlockerAdd => "unlocker_add",
+            AuditKind::UnlockerRemove => "unlocker_remove",
+            AuditKind::RevealApp => "reveal_app",
+            AuditKind::Ask => "ask",
         }
     }
 
@@ -574,7 +590,7 @@ mod tests {
         }
         assert_eq!(AuditKind::from_u8(0), None);
         // These kinds remain reserved for later tasks.
-        for n in [27, 47] {
+        for n in [27, 50] {
             assert_eq!(AuditKind::from_u8(n), None, "{n}");
         }
         // Numbers in order, each token its own.
@@ -592,10 +608,13 @@ mod tests {
         assert_eq!(AuditKind::from_u8(25), Some(AuditKind::BackupV2));
         assert_eq!(AuditKind::from_u8(26), Some(AuditKind::RestoreV2));
         assert_eq!(AuditKind::from_u8(22), Some(AuditKind::Reveal));
-        // And M2-11's and M3-08's.
+        // And M2-11's, M3-08's and M3-14's.
         assert_eq!(AuditKind::from_u8(23), Some(AuditKind::ScanMatch));
         assert_eq!(AuditKind::from_u8(24), Some(AuditKind::MarkExposed));
         assert_eq!(AuditKind::from_u8(46), Some(AuditKind::UnlockerAdd));
+        assert_eq!(AuditKind::from_u8(47), Some(AuditKind::UnlockerRemove));
+        assert_eq!(AuditKind::from_u8(48), Some(AuditKind::RevealApp));
+        assert_eq!(AuditKind::from_u8(49), Some(AuditKind::Ask));
     }
 
     /// A record's named counts (M2-11: `scan.match`'s counts by kind) come

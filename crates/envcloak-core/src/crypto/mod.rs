@@ -46,11 +46,12 @@ pub(crate) use keys::{keyed_hash_parts, keyed_hash_prefixes, open_subkey, seal_s
 pub use se_unlocker::{
     MAX_SE_LABEL_LEN, MAX_SE_SIGNING_ID_LEN, MAX_SE_TEAM_ID_LEN, P256_PUBLIC_KEY_LEN,
     P256_SIGNATURE_LEN, SE_CHALLENGE_LEN, SE_HPKE_CIPHERTEXT_LEN, SE_HPKE_ENC_LEN,
-    SE_HPKE_INFO_PREFIX, SE_RESEAL_LEN, SeEnrolledUnder, SeEphemeralKey, SeHpkeEnvelope,
-    SeUnlockerEnvelope, SeUnlockerRecord, X25519_PUBLIC_KEY_LEN, check_p256_public_key,
-    check_se_label, derive_p256_keypair, generate_se_challenge, open_se_envelope, p256_fingerprint,
-    recreate_se_unlocker, se_hpke_info, se_reseal_aad, seal_se_unlocker, seal_vmk_to_daemon,
-    seal_vmk_to_se, sign_p256_prehash, verify_p256_prehash,
+    SE_HPKE_INFO_PREFIX, SE_RESEAL_LEN, SE_SEALED_SECRET_OVERHEAD, SeEnrolledUnder, SeEphemeralKey,
+    SeHpkeEnvelope, SeUnlockerEnvelope, SeUnlockerRecord, X25519_PUBLIC_KEY_LEN,
+    check_p256_public_key, check_se_label, derive_p256_keypair, generate_se_challenge,
+    open_se_envelope, open_secret_from_x25519, p256_fingerprint, recreate_se_unlocker,
+    se_hpke_info, se_reseal_aad, se_reveal_aad, seal_se_unlocker, seal_secret_to_x25519,
+    seal_vmk_to_daemon, seal_vmk_to_se, secret_sha256, sign_p256_prehash, verify_p256_prehash,
 };
 
 /// A crypto failure. Carries its kind only: no values, sizes of secrets or

@@ -1465,4 +1465,159 @@ impl Client {
             claims: claims.to_vec(),
         })
     }
+
+    /// `items.ask`: files an ask for the app's paste sheet.
+    pub fn items_ask(
+        &mut self,
+        p: &crate::proto::AskParams,
+    ) -> Result<crate::view::AskOpenedView, ClientError> {
+        self.call::<crate::proto::ItemsAsk>(p)
+    }
+
+    /// `items.ask_state`: polls the state of ask `ask`.
+    pub fn items_ask_state(
+        &mut self,
+        ask: &str,
+    ) -> Result<envcloak_policy::AskStateOutcome, ClientError> {
+        self.call::<crate::proto::ItemsAskState>(&crate::proto::AskStateParams {
+            ask: ask.to_owned(),
+        })
+    }
+
+    /// `reveal.request`: files a reveal request for the app from a terminal
+    /// subject.
+    pub fn reveal_request(
+        &mut self,
+        slug: &str,
+        field: Option<&str>,
+        claims: &[String],
+    ) -> Result<crate::view::RevealRequestedView, ClientError> {
+        self.call::<crate::proto::RevealRequest>(&crate::proto::RevealRequestParams {
+            slug: slug.to_owned(),
+            field: field.map(str::to_owned),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.unlocker.add`: enrols another Secure Enclave unlocker under a
+    /// signed `envcloak-write-statement/1`.
+    pub fn app_unlocker_add(
+        &mut self,
+        p: &crate::app::AppUnlockerAddParams,
+    ) -> Result<crate::app::AppUnlockerAddedView, ClientError> {
+        self.call::<crate::app::AppUnlockerAdd>(p)
+    }
+
+    /// `app.unlocker.remove`: removes the passphrase unlocker or a Secure
+    /// Enclave unlocker under a signed `envcloak-write-statement/1`.
+    pub fn app_unlocker_remove(
+        &mut self,
+        p: &crate::app::AppUnlockerRemoveParams,
+    ) -> Result<crate::app::AppUnlockerRemovedView, ClientError> {
+        self.call::<crate::app::AppUnlockerRemove>(p)
+    }
+
+    /// `app.items.target`: opens a 60-second signed-write target for `slug`
+    /// (and `field`).
+    pub fn app_items_target(
+        &mut self,
+        slug: &str,
+        field: Option<&str>,
+        claims: &[String],
+    ) -> Result<crate::app::AppItemsTargetOutput, ClientError> {
+        self.call::<crate::app::AppItemsTarget>(&crate::app::AppItemsTargetParams {
+            slug: slug.to_owned(),
+            field: field.map(str::to_owned),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.items.rotate`: replaces an item field's value under a signed
+    /// `envcloak-write-statement/1`.
+    pub fn app_items_rotate(
+        &mut self,
+        p: &crate::app::AppItemsRotateParams,
+    ) -> Result<RotatedView, ClientError> {
+        self.call::<crate::app::AppItemsRotate>(p)
+    }
+
+    /// `app.items.remove`: removes an item under a signed
+    /// `envcloak-write-statement/1` after writing an encrypted vault backup.
+    pub fn app_items_remove(
+        &mut self,
+        p: &crate::app::AppItemsRemoveParams,
+    ) -> Result<RemovedView, ClientError> {
+        self.call::<crate::app::AppItemsRemove>(p)
+    }
+
+    /// `app.reveal.begin`: starts a reveal in the app.
+    pub fn app_reveal_begin(
+        &mut self,
+        p: &crate::app::AppRevealBeginParams,
+    ) -> Result<envcloak_policy::RevealDescriptor, ClientError> {
+        self.call::<crate::app::AppRevealBegin>(p)
+    }
+
+    /// `app.reveal`: releases a secret value HPKE-sealed to `app_eph_pub`
+    /// after verifying a signed `envcloak-reveal-statement/1`.
+    pub fn app_reveal(
+        &mut self,
+        p: &crate::app::AppRevealParams,
+    ) -> Result<crate::app::AppRevealOutput, ClientError> {
+        self.call::<crate::app::AppReveal>(p)
+    }
+
+    /// `app.paste.begin`: opens a 2-minute paste stage with a daemon X25519
+    /// ephemeral public key.
+    pub fn app_paste_begin(
+        &mut self,
+        claims: &[String],
+    ) -> Result<crate::app::AppPasteBeginOutput, ClientError> {
+        self.call::<crate::app::AppPasteBegin>(&crate::app::AppPasteBeginParams {
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.paste.inspect`: opens the HPKE-sealed pasted value into daemon
+    /// memory and returns provider, classification and length metadata.
+    pub fn app_paste_inspect(
+        &mut self,
+        stage: &str,
+        sealed: &str,
+        claims: &[String],
+    ) -> Result<crate::app::AppPasteInspectOutput, ClientError> {
+        self.call::<crate::app::AppPasteInspect>(&crate::app::AppPasteInspectParams {
+            stage: stage.to_owned(),
+            sealed: sealed.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.paste`: saves the staged value from `app.paste.inspect` as a new
+    /// item (and optionally resolves an open ask).
+    pub fn app_paste(&mut self, p: &crate::app::AppPasteParams) -> Result<AddedView, ClientError> {
+        self.call::<crate::app::AppPaste>(p)
+    }
+
+    /// `app.asks.list`: lists open asks filed by `items.ask`.
+    pub fn app_asks_list(
+        &mut self,
+        claims: &[String],
+    ) -> Result<crate::app::AppAsksListView, ClientError> {
+        self.call::<crate::app::AppAsksList>(&crate::app::AppAsksListParams {
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.asks.decline`: declines an open ask.
+    pub fn app_asks_decline(
+        &mut self,
+        ask: &str,
+        claims: &[String],
+    ) -> Result<crate::app::AppAskDeclinedView, ClientError> {
+        self.call::<crate::app::AppAsksDecline>(&crate::app::AppAsksDeclineParams {
+            ask: ask.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
 }

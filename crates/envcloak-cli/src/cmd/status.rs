@@ -276,6 +276,7 @@ mod tests {
                 queued: 0,
                 dropped: 0,
             },
+            app_requests: 0,
         };
         let text = status_json(&s, DaemonIdentity::Unverified, &hardening());
         assert!(text.ends_with('\n'), "{text:?}");

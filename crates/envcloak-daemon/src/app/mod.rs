@@ -1,11 +1,16 @@
-//! App-role admission and handlers (`app.unlock.*`, `app.unlocker.enroll.*`,
-//! `app.pending.*`, `app.approve`).
+//! App-role admission and handlers (`app.unlock.*`, `app.unlocker.*`,
+//! `app.pending.*`, `app.approve`, `app.items.*`, `app.reveal*`,
+//! `app.paste*`, `app.asks.*`).
 //! A code-identity verdict belongs only to the accepted connection.
 
 pub(crate) mod approve;
+pub(crate) mod asks;
 pub(crate) mod enroll;
+pub(crate) mod paste;
 pub(crate) mod pending;
+pub(crate) mod reveal;
 pub(crate) mod unlock;
+pub(crate) mod writes;
 
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
@@ -75,9 +80,30 @@ pub(crate) fn decode_fixed_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
     decode_base64::<N>(s)
 }
 
+/// Decodes up to `max_len` bytes from even-length hex or standard padded base64.
+pub(crate) fn decode_bytes(s: &str, max_len: usize) -> Option<Vec<u8>> {
+    if !s.is_empty() && s.len() & 1 == 0 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let len = s.len() / 2;
+        if len > max_len {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        for i in 0..len {
+            out.push(u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?);
+        }
+        return Some(out);
+    }
+    let out = decode_base64_vec(s)?;
+    (out.len() <= max_len).then_some(out)
+}
+
 fn decode_base64<const N: usize>(s: &str) -> Option<[u8; N]> {
+    decode_base64_vec(s)?.as_slice().try_into().ok()
+}
+
+fn decode_base64_vec(s: &str) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || bytes.len() & 3 != 0 {
         return None;
     }
     let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
@@ -109,7 +135,7 @@ fn decode_base64<const N: usize>(s: &str) -> Option<[u8; N]> {
             return None;
         }
     }
-    out.as_slice().try_into().ok()
+    Some(out)
 }
 
 fn b64_val(b: u8) -> Option<u8> {
