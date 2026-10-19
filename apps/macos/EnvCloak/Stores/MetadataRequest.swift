@@ -73,6 +73,24 @@ enum MetadataRequest {
         AppApprove(request: request.unescaped, options: options, digest: digestHex, signature: signatureHex)
     }
     static func standingRevoke(_ id: DaemonText) -> StandingRevoke { StandingRevoke(id: id.unescaped, all: false) }
+    static func proposalEdit(project: DaemonText, proposal: Proposal) -> BindingEdit {
+        let profile: String? = switch proposal.source {
+        case .profile(let name): name.unescaped
+        case .env, .envFile, .ref: nil
+        }
+        let reference: String = if let field = proposal.test_field, !field.unescaped.isEmpty {
+            proposal.test_slug.unescaped + "#" + field.unescaped
+        } else {
+            proposal.test_slug.unescaped
+        }
+        return BindingEdit(
+            project: project,
+            profile: profile,
+            envName: proposal.env_name.unescaped,
+            reference: reference,
+            previous: nil
+        )
+    }
     static func enrollApprovalCommand(request: DaemonText) -> TerminalCopy? {
         guard canCopy(request), let text = terminalCommand(["approve", request.unescaped]) else { return nil }
         return TerminalCopy(text)

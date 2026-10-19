@@ -27,7 +27,6 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
     case hours24 = "24 h"
     case standingDays7 = "Standing: 7 days"
     case standingDays30 = "Standing: 30 days"
-    case standingDays90 = "Standing: 90 days"
 
     var id: String { rawValue }
 
@@ -41,13 +40,12 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
         case .hours24: 86400
         case .standingDays7: 604_800
         case .standingDays30: 2_592_000
-        case .standingDays90: 7_776_000
         }
     }
 
     var isStanding: Bool {
         switch self {
-        case .standingDays7, .standingDays30, .standingDays90: true
+        case .standingDays7, .standingDays30: true
         default: false
         }
     }
@@ -62,7 +60,6 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
         case .hours24: "24 hours"
         case .standingDays7: "7 days (standing)"
         case .standingDays30: "30 days (standing)"
-        case .standingDays90: "90 days (standing)"
         }
     }
 }
@@ -104,18 +101,29 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
         return descriptor.subject.kind == .agent && descriptor.subject.label != nil
     }
 
+    var isStandingCapable: Bool {
+        guard let descriptor, isKnownAgentRoot, descriptor.standing != nil else { return false }
+        return descriptor.bindings.allSatisfy { $0.classificationView == .test }
+    }
+
+    var isLiveGuarded: Bool {
+        guard let descriptor else { return false }
+        return CanonicalStatement.liveGuarded(descriptor.subject.kind)
+    }
+
     var availableDurationChoices: [ApprovalDurationChoice] {
         if isKnownAgentRoot {
-            return [
+            var choices: [ApprovalDurationChoice] = [
                 .once,
                 .minutes15,
                 .hour1,
                 .hours8,
                 .hours24,
-                .standingDays7,
-                .standingDays30,
-                .standingDays90,
             ]
+            if isStandingCapable {
+                choices.append(contentsOf: [.standingDays7, .standingDays30])
+            }
+            return choices
         } else {
             return [.once, .minutes15, .hour1, .hours8, .hours12]
         }
@@ -130,10 +138,10 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
     }
 
     var liveBindings: [BindingSummary] {
-        guard let descriptor, CanonicalStatement.liveGuarded(descriptor.subject.kind) else {
+        guard let descriptor, isLiveGuarded else {
             return []
         }
-        return requestedBindings.filter { $0.classificationView == .live }
+        return descriptor.bindings.filter { $0.classificationView == .live }
     }
 
     var allLiveKeysTicked: Bool {
@@ -212,9 +220,11 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
         guard let descriptor else {
             return ApprovalOptions(uses: .once, ttl_secs: 300)
         }
-        let confirmed = descriptor.bindings
-            .filter { !$0.granted && $0.classificationView == .live && tickedLiveVariables.contains($0.env_name.escaped) }
-            .map { MetadataRequest.raw($0.env_name) }
+        let confirmed: [String] = isLiveGuarded
+            ? descriptor.bindings
+                .filter { $0.classificationView == .live && tickedLiveVariables.contains($0.env_name.escaped) }
+                .map { MetadataRequest.raw($0.env_name) }
+            : []
         if durationChoice == .once {
             return ApprovalOptions(
                 uses: .once,
@@ -367,16 +377,22 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
 
     func useTestKeyInstead(_ proposal: Proposal) async {
         guard let descriptor else { return }
-        let edit = BindingEdit(
-            project: descriptor.project.dir,
-            profile: nil,
-            envName: MetadataRequest.raw(proposal.env_name),
-            reference: MetadataRequest.raw(proposal.test_slug),
-            previous: nil
-        )
-        _ = await session.bindings.apply(edit, session: session, manager: nil)
+        guard proposal.canApplyAutomatically else {
+            outcome = .failed(proposal.advice(manifest: descriptor.project.manifest))
+            return
+        }
+        let edit = MetadataRequest.proposalEdit(project: descriptor.project.dir, proposal: proposal)
+        let applied = await session.bindings.apply(edit, session: session, manager: nil)
+        guard applied else {
+            outcome = .failed(session.notice ?? "The binding could not be updated in envcloak.toml.")
+            return
+        }
         _ = WorkspaceActions.copyBindingCommand(edit)
-        _ = await session.denyPending(descriptor.request)
+        let denied = await session.denyPending(descriptor.request)
+        guard denied else {
+            outcome = .failed("Updated envcloak.toml, but the pending request could not be denied.")
+            return
+        }
         outcome = .proposalApplied(
             envName: proposal.env_name.escaped,
             slug: proposal.testReferenceDisplay

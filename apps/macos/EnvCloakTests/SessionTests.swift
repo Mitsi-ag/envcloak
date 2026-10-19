@@ -5,6 +5,37 @@ import EnvCloakKitTestSupport
 @testable import EnvCloak
 @testable import EnvCloakKit
 
+extension SoftwareUnlockKey: @retroactive UnlockKeyAgreement {
+    public func openAndReseal(_ begin: AppUnlockBeginView, reason: String) async throws -> String {
+        try recordOpen(reason: reason)
+        return try SEHPKE.openAndResealWithKey(begin, privateKey: privateKey)
+    }
+
+    public static func sealEnvelope(
+        vmk: Data,
+        recipientPublicKey: P256.KeyAgreement.PublicKey,
+        vaultIDHex: String,
+        unlockerIDHex: String,
+        epoch: UInt32
+    ) throws -> SeEnvelopeView {
+        let hex = try sealEnvelopeHex(
+            vmk: vmk,
+            recipientPublicKey: recipientPublicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: unlockerIDHex,
+            epoch: epoch
+        )
+        return SeEnvelopeView(enc: DaemonText(hex.encHex), ciphertext: DaemonText(hex.ciphertextHex))
+    }
+}
+
+extension SoftwareApprovalSigner: @retroactive ApprovalSigner {
+    public func sign(_ statementBytes: Data, reason: String) async throws -> P256RawSignature {
+        let raw = try await signRaw(statementBytes, reason: reason)
+        return try P256RawSignature(rawRepresentation: raw)
+    }
+}
+
 /// Scripted metadata passes through FakeDaemon and the real socket client. No fixture reads the account's runtime path.
 actor ScriptedClient: WorkspaceClient {
     var counts: [String: Int] = [:]
@@ -1079,6 +1110,11 @@ final class SessionTests: XCTestCase {
         )
 
         // Proposal swap ("Use test key instead") denies the live request and records the swapped outcome.
+        var appliedEdit: BindingEdit?
+        session.bindings.applyOverride = { edit in
+            appliedEdit = edit
+            return true
+        }
         await model.load(requestId: DaemonText("REQ0ABCD"))
         let proposal = try XCTUnwrap(model.descriptor?.proposals.first)
         await model.useTestKeyInstead(proposal)
@@ -1086,6 +1122,9 @@ final class SessionTests: XCTestCase {
             model.outcome,
             .proposalApplied(envName: "STRIPE_SECRET_KEY", slug: "stripe/acme-test")
         )
+        XCTAssertEqual(appliedEdit?.envName, "STRIPE_SECRET_KEY")
+        XCTAssertEqual(appliedEdit?.reference, "stripe/acme-test")
+        XCTAssertNil(appliedEdit?.profile)
         let denyCalls = await client.calls("deny")
         XCTAssertEqual(denyCalls, 1)
 
@@ -1110,6 +1149,198 @@ final class SessionTests: XCTestCase {
         model.triggerExpiry()
         XCTAssertEqual(model.outcome, .expired)
         XCTAssertEqual(signer.invalidatedCount, invalidatedBefore + 1)
+    }
+
+    @MainActor func testStandingCapCoveredLiveGuardAndProposalEditSemantics() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        // F-1: Standing choices are capped at 30 days and only offered when descriptor.standing != nil and all bindings are test.
+        XCTAssertEqual(
+            ApprovalDurationChoice.allCases.filter(\.isStanding).map(\.durationSecs),
+            [604_800, 2_592_000]
+        )
+
+        let model = ApprovalWindowModel(session: session)
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        XCTAssertFalse(model.isStandingCapable)
+        XCTAssertFalse(model.availableDurationChoices.contains(where: \.isStanding))
+
+        func decodeDescriptor(_ bodyJSON: String) throws -> PendingDescriptor {
+            let envelope = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\(bodyJSON)}"
+            return try Frame(text: envelope).response(id: 1)
+        }
+
+        let standingEligibleJSON = """
+        {
+          "request": "REQSTAND",
+          "nonce": "\(String(repeating: "ab", count: 32))",
+          "created_secs": 1000,
+          "expires_in_secs": 540,
+          "subject": {
+            "kind": "agent",
+            "label": "claude_code",
+            "caller_pid": 100,
+            "root": { "pid": 90, "start_time": 123456, "exe": "/usr/local/bin/claude" }
+          },
+          "project": {
+            "dir": "/tmp/project",
+            "manifest": "/tmp/project/envcloak.toml",
+            "manifest_sha256": "\(String(repeating: "c", count: 64))",
+            "new_project": false
+          },
+          "bindings": [
+            {
+              "env_name": "OPENAI_API_KEY",
+              "slug": "openai/acme-test",
+              "item": "item-test-1",
+              "field": "field-test-1",
+              "field_name": "value",
+              "classification": "test",
+              "first_use": false,
+              "granted": false
+            }
+          ],
+          "proposals": [],
+          "standing": {
+            "exe": "/usr/local/bin/claude"
+          },
+          "mode": "inject",
+          "argv": ["npm", "test"]
+        }
+        """
+        let standingDescriptor = try decodeDescriptor(standingEligibleJSON)
+        model.applyDescriptor(standingDescriptor)
+        XCTAssertTrue(model.isStandingCapable)
+        XCTAssertTrue(model.availableDurationChoices.contains(.standingDays7))
+        XCTAssertTrue(model.availableDurationChoices.contains(.standingDays30))
+
+        // F-2: Covered live binding must still be ticked for agent/unknown subjects; terminal subjects have no live guard.
+        let coveredLiveJSON = """
+        {
+          "request": "REQCOVLIVE",
+          "nonce": "\(String(repeating: "ab", count: 32))",
+          "created_secs": 1000,
+          "expires_in_secs": 540,
+          "subject": {
+            "kind": "agent",
+            "label": "claude_code",
+            "caller_pid": 100,
+            "root": { "pid": 90, "start_time": 123456, "exe": "/usr/local/bin/claude" }
+          },
+          "project": {
+            "dir": "/tmp/project",
+            "manifest": "/tmp/project/envcloak.toml",
+            "manifest_sha256": "\(String(repeating: "c", count: 64))",
+            "new_project": false
+          },
+          "bindings": [
+            {
+              "env_name": "OPENAI_API_KEY",
+              "slug": "openai/acme-test",
+              "item": "item-test-1",
+              "field": "field-test-1",
+              "field_name": "value",
+              "classification": "test",
+              "first_use": false,
+              "granted": false
+            },
+            {
+              "env_name": "COVERED_LIVE_KEY",
+              "slug": "stripe/acme-live",
+              "item": "item-live-1",
+              "field": "field-live-1",
+              "field_name": "value",
+              "classification": "live",
+              "first_use": false,
+              "granted": true
+            }
+          ],
+          "proposals": [
+            {
+              "env_name": "STRIPE_SECRET_KEY",
+              "live_slug": "stripe/acme-live",
+              "test_slug": "stripe/acme-test",
+              "test_field": "secret",
+              "source": { "layer": "profile", "profile": "dev" }
+            },
+            {
+              "env_name": "LOCAL_LIVE_KEY",
+              "live_slug": "stripe/acme-live",
+              "test_slug": "stripe/acme-test",
+              "source": { "layer": "ref" }
+            }
+          ],
+          "mode": "inject",
+          "argv": ["npm", "test"]
+        }
+        """
+        let coveredLiveDescriptor = try decodeDescriptor(coveredLiveJSON)
+        model.applyDescriptor(coveredLiveDescriptor)
+        XCTAssertTrue(model.isLiveGuarded)
+        XCTAssertEqual(model.liveBindings.map(\.env_name.escaped), ["COVERED_LIVE_KEY"])
+        XCTAssertFalse(model.allLiveKeysTicked)
+        model.toggleLiveKey("COVERED_LIVE_KEY")
+        XCTAssertTrue(model.allLiveKeysTicked)
+        XCTAssertEqual(model.currentApproveOptions().live, ["COVERED_LIVE_KEY"])
+
+        let terminalLiveJSON = coveredLiveJSON.replacingOccurrences(of: "\"kind\": \"agent\"", with: "\"kind\": \"terminal\"")
+        let terminalDescriptor = try decodeDescriptor(terminalLiveJSON)
+        model.applyDescriptor(terminalDescriptor)
+        XCTAssertFalse(model.isLiveGuarded)
+        XCTAssertTrue(model.liveBindings.isEmpty)
+        XCTAssertTrue(model.allLiveKeysTicked)
+        XCTAssertTrue(model.currentApproveOptions().live.isEmpty)
+
+        // F-3: Profile and test_field preservation, non-automatic refusal, and apply failure checks.
+        let profileProposal = try XCTUnwrap(coveredLiveDescriptor.proposals.first)
+        let localProposal = try XCTUnwrap(coveredLiveDescriptor.proposals.last)
+
+        var recordedEdits: [BindingEdit] = []
+        session.bindings.applyOverride = { edit in
+            recordedEdits.append(edit)
+            return false
+        }
+        let denyCallsBefore = await client.calls("deny")
+
+        // Local override proposal cannot be applied automatically.
+        await model.useTestKeyInstead(localProposal)
+        if case .failed = model.outcome {} else {
+            XCTFail("Expected .failed for non-automatic proposal, got \(model.outcome)")
+        }
+        XCTAssertTrue(recordedEdits.isEmpty)
+        let denyAfterLocal = await client.calls("deny")
+        XCTAssertEqual(denyAfterLocal, denyCallsBefore)
+
+        // When apply fails, outcome is .failed and pending request is not denied.
+        await model.useTestKeyInstead(profileProposal)
+        if case .failed = model.outcome {} else {
+            XCTFail("Expected .failed when apply returns false, got \(model.outcome)")
+        }
+        XCTAssertEqual(recordedEdits.count, 1)
+        XCTAssertEqual(recordedEdits.first?.profile, "dev")
+        XCTAssertEqual(recordedEdits.first?.reference, "stripe/acme-test#secret")
+        XCTAssertEqual(
+            recordedEdits.first?.cliArguments,
+            ["ref", "STRIPE_SECRET_KEY=stripe/acme-test#secret", "--profile", "dev", "--json"]
+        )
+        let denyAfterFailedApply = await client.calls("deny")
+        XCTAssertEqual(denyAfterFailedApply, denyCallsBefore)
+
+        // When apply succeeds, request is denied and outcome is .proposalApplied with slug#field.
+        session.bindings.applyOverride = { edit in
+            recordedEdits.append(edit)
+            return true
+        }
+        await model.useTestKeyInstead(profileProposal)
+        XCTAssertEqual(
+            model.outcome,
+            .proposalApplied(envName: "STRIPE_SECRET_KEY", slug: "stripe/acme-test#secret")
+        )
+        let denyAfterSuccess = await client.calls("deny")
+        XCTAssertEqual(denyAfterSuccess, denyCallsBefore + 1)
     }
 
     @MainActor func testNotificationManagerNeverIncludesArgvAndHandlesActions() async throws {

@@ -190,7 +190,7 @@ struct ApprovalWindowView: View {
                 .font(.headline)
                 .foregroundStyle(ECToken.text.color)
             ForEach(Array(requested.enumerated()), id: \.offset) { _, binding in
-                bindingRow(binding, proposals: descriptor.proposals)
+                bindingRow(binding, proposals: descriptor.proposals, manifest: descriptor.project.manifest)
             }
             if !covered.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -199,8 +199,22 @@ struct ApprovalWindowView: View {
                         .foregroundStyle(ECToken.secondary.color)
                         .accessibilityIdentifier("approval.covered.heading")
                     ForEach(Array(covered.enumerated()), id: \.offset) { _, item in
+                        let envEscaped = item.env_name.escaped
+                        let isLive = item.classificationView == .live
+                        let isTicked = model.tickedLiveVariables.contains(envEscaped)
                         HStack(spacing: 8) {
-                            Text(item.env_name.escaped)
+                            if model.isLiveGuarded && isLive {
+                                Toggle(
+                                    "Allow live key",
+                                    isOn: Binding(
+                                        get: { isTicked },
+                                        set: { model.toggleLiveKey(envEscaped, isTicked: $0) }
+                                    )
+                                )
+                                .accessibilityLabel("Allow live key \(envEscaped), \(item.slug.escaped)")
+                                .accessibilityIdentifier("approval.live." + envEscaped)
+                            }
+                            Text(envEscaped)
                                 .font(ECFont.martianMono(size: 12))
                                 .foregroundStyle(ECToken.text.color)
                             Text("→")
@@ -214,7 +228,7 @@ struct ApprovalWindowView: View {
                                 .foregroundStyle(ECToken.secondary.color)
                         }
                         .accessibilityElement(children: .contain)
-                        .accessibilityIdentifier("approval.covered." + item.env_name.escaped)
+                        .accessibilityIdentifier("approval.covered." + envEscaped)
                     }
                 }
                 .padding(.top, 4)
@@ -222,7 +236,7 @@ struct ApprovalWindowView: View {
         }
     }
 
-    private func bindingRow(_ binding: BindingSummary, proposals: [Proposal]) -> some View {
+    private func bindingRow(_ binding: BindingSummary, proposals: [Proposal], manifest: DaemonText) -> some View {
         let envEscaped = binding.env_name.escaped
         let isLive = binding.classificationView == .live
         let isTicked = model.tickedLiveVariables.contains(envEscaped)
@@ -230,7 +244,7 @@ struct ApprovalWindowView: View {
 
         return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                if isLive {
+                if model.isLiveGuarded && isLive {
                     Toggle(
                         "Allow live key",
                         isOn: Binding(
@@ -263,16 +277,30 @@ struct ApprovalWindowView: View {
                 }
             }
             if let proposal = matchingProposal {
-                HStack(spacing: 12) {
-                    Text("Test key available: \(proposal.testReferenceDisplay).")
+                if proposal.canApplyAutomatically {
+                    HStack(spacing: 12) {
+                        Text("Test key available: \(proposal.testReferenceDisplay).")
+                            .font(.caption)
+                            .foregroundStyle(ECToken.info.color)
+                            .accessibilityIdentifier("approval.proposal.label." + envEscaped)
+                        Button("Use test key instead") {
+                            Task { await model.useTestKeyInstead(proposal) }
+                        }
                         .font(.caption)
-                        .foregroundStyle(ECToken.info.color)
-                        .accessibilityIdentifier("approval.proposal.label." + envEscaped)
-                    Button("Use test key instead") {
-                        Task { await model.useTestKeyInstead(proposal) }
+                        .accessibilityIdentifier("approval.proposal.use." + envEscaped)
                     }
-                    .font(.caption)
-                    .accessibilityIdentifier("approval.proposal.use." + envEscaped)
+                } else {
+                    HStack(spacing: 12) {
+                        Text(proposal.advice(manifest: manifest))
+                            .font(.caption)
+                            .foregroundStyle(ECToken.info.color)
+                            .accessibilityIdentifier("approval.proposal.label." + envEscaped)
+                        Button("Copy advice") {
+                            _ = WorkspaceActions.copy(proposal.advice(manifest: manifest))
+                        }
+                        .font(.caption)
+                        .accessibilityIdentifier("approval.proposal.copy." + envEscaped)
+                    }
                 }
             }
         }

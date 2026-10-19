@@ -5,6 +5,37 @@ import LocalAuthentication
 import XCTest
 @testable import EnvCloakKit
 
+extension SoftwareUnlockKey: UnlockKeyAgreement {
+    public func openAndReseal(_ begin: AppUnlockBeginView, reason: String) async throws -> String {
+        try recordOpen(reason: reason)
+        return try SEHPKE.openAndResealWithKey(begin, privateKey: privateKey)
+    }
+
+    public static func sealEnvelope(
+        vmk: Data,
+        recipientPublicKey: P256.KeyAgreement.PublicKey,
+        vaultIDHex: String,
+        unlockerIDHex: String,
+        epoch: UInt32
+    ) throws -> SeEnvelopeView {
+        let hex = try sealEnvelopeHex(
+            vmk: vmk,
+            recipientPublicKey: recipientPublicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: unlockerIDHex,
+            epoch: epoch
+        )
+        return SeEnvelopeView(enc: DaemonText(hex.encHex), ciphertext: DaemonText(hex.ciphertextHex))
+    }
+}
+
+extension SoftwareApprovalSigner: ApprovalSigner {
+    public func sign(_ statementBytes: Data, reason: String) async throws -> P256RawSignature {
+        let raw = try await signRaw(statementBytes, reason: reason)
+        return try P256RawSignature(rawRepresentation: raw)
+    }
+}
+
 final class StatementVectorTests: XCTestCase {
     private func repoRoot() -> URL {
         var url = URL(fileURLWithPath: #filePath)
