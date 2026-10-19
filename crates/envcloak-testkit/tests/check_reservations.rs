@@ -286,10 +286,10 @@ fn a_reserved_number_the_code_gives_another_entry_fails() {
 #[test]
 fn a_code_entry_in_the_reserved_range_without_a_landed_row_fails() {
     let t = fixture();
-    add_audit_kind(&t, "Probe", 46, "probe");
+    add_audit_kind(&t, "Probe", 198, "probe");
     assert_fails(
         &t,
-        "the code has `probe` = 46 in the reserved range with no `landed` row",
+        "the code has `probe` = 198 in the reserved range with no `landed` row",
     );
 }
 
@@ -324,14 +324,14 @@ fn a_landed_row_the_code_lacks_fails() {
 #[test]
 fn a_landed_row_with_another_number_than_the_code_fails() {
     let t = fixture();
-    add_audit_kind(&t, "FixtureAudit", 47, "fixture_audit");
+    add_audit_kind(&t, "FixtureAudit", 199, "fixture_audit");
     edit(
         &t,
         VAULT,
         "| 200 | `fixture_audit` | M2-21 | reserved |",
         "| 200 | `fixture_audit` | M2-21 | landed |",
     );
-    assert_fails(&t, "`fixture_audit` is 200 here and 47 in the code");
+    assert_fails(&t, "`fixture_audit` is 200 here and 199 in the code");
 }
 
 #[test]
@@ -677,7 +677,7 @@ fn two_audit_kinds_with_one_token_fail() {
     // Two numbers share the fixture token; only 200 is registered.
     let t = fixture();
     add_audit_kind(&t, "FixtureAudit", 200, "fixture_audit");
-    add_audit_kind(&t, "FixtureAuditAgain", 46, "fixture_audit");
+    add_audit_kind(&t, "FixtureAuditAgain", 198, "fixture_audit");
     edit(
         &t,
         VAULT,
@@ -1143,13 +1143,13 @@ fn a_variant_without_a_token_arm_the_reader_can_read_fails() {
     // A variant whose arm is missing, or written in a form the reader does
     // not take, is named, never left out of the registry.
     let t = fixture();
-    add_audit_variant(&t, "Login = 46,", None);
+    add_audit_variant(&t, "Login = 198,", None);
     assert_fails(
         &t,
         "`fn token` has no `AuditKind::<variant> => <value>` arm the reader can read for Login",
     );
     let t = fixture();
-    add_audit_variant(&t, "Login = 46,", Some(("Login", "Login")));
+    add_audit_variant(&t, "Login = 198,", Some(("Login", "Login")));
     assert_fails(&t, "the reader can read for Login");
     let t = fixture();
     edit(
