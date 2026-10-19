@@ -970,3 +970,224 @@ fn coverage_states_and_reasons_for_tier_2_and_tier_3_hosts() {
         }
     }
 }
+
+#[test]
+fn review_round1_regressions_f01_through_f07() {
+    let sb = |v: &Value| {
+        let bytes = serde_json::to_vec(v).unwrap();
+        let mut b = SecretBuf::with_capacity(bytes.len());
+        b.extend(&bytes).unwrap();
+        b
+    };
+
+    // F-04: XDG_CONFIG_HOME redirects OpenCode and Goose config dirs.
+    let mut fx = Fx::new();
+    let custom_xdg = fx.root.join("custom-xdg");
+    fx.vars.insert(
+        "XDG_CONFIG_HOME".into(),
+        custom_xdg.clone().into_os_string(),
+    );
+    let vars = fx.vars.clone();
+    let env = move |k: &str| vars.get(k).cloned();
+    let l = Locations::new(&env).unwrap();
+    assert_eq!(l.opencode_config_dir(), custom_xdg.join("opencode"));
+    assert_eq!(l.goose_config_dir(), custom_xdg.join("goose"));
+
+    // F-03: Generic `--version` output without product identification is rejected for
+    // Kimi, Goose, and Aider, and `named` is false for Cursor/Gemini/Qwen when `--version`
+    // prints only a bare version number.
+    assert_eq!(
+        envcloak_agents::detect::parse_version(Host::Kimi, b"1.2.3\n"),
+        None
+    );
+    assert_eq!(
+        envcloak_agents::detect::parse_version(Host::Goose, b"1.2.3\n"),
+        None
+    );
+    assert_eq!(
+        envcloak_agents::detect::parse_version(Host::Aider, b"1.2.3\n"),
+        None
+    );
+    let fx_det = Fx::new();
+    fx_det.add_fake_exe("cursor-agent", "echo 1.2.3");
+    fx_det.add_fake_exe("gemini", "echo 1.2.3");
+    fx_det.add_fake_exe("qwen", "echo 1.2.3");
+    let vars_det = fx_det.vars.clone();
+    let env_det = move |k: &str| vars_det.get(k).cloned();
+    for host in [Host::Cursor, Host::Gemini, Host::Qwen] {
+        let det = envcloak_agents::detect::detect(host, fx_det.bin.as_os_str(), &env_det).unwrap();
+        assert!(
+            !det.named,
+            "{host:?} with bare version output must have det.named == false"
+        );
+    }
+
+    // F-02 & F-07: Cursor hook event validation and Grep/Glob/unknown tool fail-closed behavior.
+    assert!(Event::PreToolUseLower.valid_for_host(Host::Cursor));
+    assert!(Event::SessionStartLower.valid_for_host(Host::Cursor));
+    assert!(!Event::PreToolUse.valid_for_host(Host::Cursor));
+    assert!(!Event::SessionStart.valid_for_host(Host::Cursor));
+    assert_eq!(
+        hook::decide(
+            Host::Cursor,
+            Event::PreToolUse,
+            &sb(&json!({"tool_name": "Shell", "tool_input": {"command": "printenv"}}))
+        ),
+        Decision::NoDecision
+    );
+    assert_eq!(
+        hook::decide(
+            Host::Cursor,
+            Event::PreToolUseLower,
+            &sb(&json!({"tool_name": "Grep", "tool_input": {}}))
+        ),
+        Decision::NoDecision
+    );
+    assert_eq!(
+        hook::decide(
+            Host::Cursor,
+            Event::PreToolUseLower,
+            &sb(&json!({"tool_name": "CustomTool", "tool_input": {"target": "/workspace/.env"}}))
+        ),
+        Decision::Deny(HookReason::EnvFile)
+    );
+    assert_eq!(
+        hook::decide(
+            Host::Gemini,
+            Event::BeforeTool,
+            &sb(&json!({"tool_name": "grep_search", "tool_input": {"type": "sh"}}))
+        ),
+        Decision::Deny(HookReason::EnvFile)
+    );
+    assert_eq!(
+        hook::decide(
+            Host::OpenCode,
+            Event::PreToolUse,
+            &sb(&json!({"tool": "grep", "args": {"type": "all"}}))
+        ),
+        Decision::Deny(HookReason::EnvFile)
+    );
+
+    // F-06: Aider marker validation, path update in place, and refusal on damaged/modified blocks.
+    let mut fx_aider = Fx::new();
+    fx_aider.add_fake_exe("aider", "echo 'aider 0.86.2'");
+    let r = fx_aider.run(&[Host::Aider], true, false, false);
+    assert!(r.complete(), "{r:?}");
+    let aider_conf = fx_aider.home().join(".aider.conf.yml");
+    let body1 = std::fs::read_to_string(&aider_conf).unwrap();
+    assert!(body1.contains("AGENTS.md"), "{body1}");
+
+    // When `agents_md` changes, `aider::apply_aider_conf` replaces the block in place.
+    let alt_md = fx_aider.home().join("ALT_AGENTS.md");
+    let changed = envcloak_agents::hosts::aider::apply_aider_conf(Some(body1.as_bytes()), &alt_md)
+        .unwrap()
+        .expect("must update when agents_md path changes");
+    let body2 = String::from_utf8(changed.bytes).unwrap();
+    assert!(
+        body2.contains("ALT_AGENTS.md") && !body2.contains("/AGENTS.md"),
+        "{body2}"
+    );
+
+    // Modifying inside the block causes refusal (`block_modified`) on both install and uninstall.
+    let modified = body2.replace("ALT_AGENTS.md", "TAMPERED.md\n  - extra.md");
+    let err_install =
+        envcloak_agents::hosts::aider::apply_aider_conf(Some(modified.as_bytes()), &alt_md)
+            .unwrap_err();
+    assert_eq!(err_install.name, "block_modified");
+    let err_remove =
+        envcloak_agents::hosts::aider::remove_aider_conf(modified.as_bytes(), true).unwrap_err();
+    assert_eq!(err_remove.name, "block_modified");
+
+    // Damaging a marker causes refusal (`block_damaged`).
+    let damaged_bytes = b"# envcloak:begin\nread:\n  - a\n";
+    let err_damaged =
+        envcloak_agents::hosts::aider::apply_aider_conf(Some(damaged_bytes), &alt_md).unwrap_err();
+    assert_eq!(err_damaged.name, "block_damaged");
+
+    // F-05: Symlinked Gemini settings.json is not followed by resolve_global_instruction_path.
+    let fx_sym = Fx::new();
+    let real_file = fx_sym.root.join("real-settings.json");
+    std::fs::write(&real_file, r#"{"context":{"fileName":"AGENTS.md"}}"#).unwrap();
+    let gemini_dir = fx_sym.home().join(".gemini");
+    std::fs::create_dir_all(&gemini_dir).unwrap();
+    let sym_settings = gemini_dir.join("settings.json");
+    std::os::unix::fs::symlink(&real_file, &sym_settings).unwrap();
+    assert_eq!(
+        envcloak_agents::hosts::gemini::resolve_global_instruction_path(&gemini_dir, &sym_settings),
+        gemini_dir.join("GEMINI.md"),
+        "symlinked settings.json must not be read by resolve_global_instruction_path"
+    );
+
+    // F-01 & F-07: ConfigSet tracks installed hooks/servers in `cs.installed` for Tier-2 hosts,
+    // and partial Cursor hooks leave `cs.hooks.tools == HookState::Missing`.
+    let mut fx_cov = Fx::new();
+    fx_cov.add_all_tier2_and_tier3_exes(kimi::KimiProduct::Code);
+    let r_cov = fx_cov.run(
+        &[
+            Host::Cursor,
+            Host::Gemini,
+            Host::Copilot,
+            Host::OpenCode,
+            Host::Kimi,
+            Host::Qwen,
+        ],
+        true,
+        false,
+        false,
+    );
+    assert!(r_cov.complete(), "{r_cov:?}");
+    let vars_cov = fx_cov.vars.clone();
+    let env_cov = move |k: &str| vars_cov.get(k).cloned();
+    let l_cov = Locations::new(&env_cov).unwrap();
+    for host in [
+        Host::Cursor,
+        Host::Gemini,
+        Host::Copilot,
+        Host::OpenCode,
+        Host::Kimi,
+        Host::Qwen,
+    ] {
+        let cs = ConfigSet::read(
+            host,
+            &l_cov,
+            &fx_cov.root.join("m"),
+            &fx_cov.proj(),
+            &env_cov,
+        );
+        assert!(
+            !cs.installed.hooks.is_empty(),
+            "{host:?} must populate cs.installed.hooks so config_digest hashes the hook binary"
+        );
+        assert!(
+            !cs.installed.servers.is_empty(),
+            "{host:?} must populate cs.installed.servers so config_digest hashes the server binary"
+        );
+    }
+
+    // Partial Cursor hook installation (missing `beforeShellExecution`, `beforeMCPExecution`, `preToolUse`)
+    // must report `HookState::Missing` for `tools` and `mcp`.
+    let cursor_hooks_path = l_cov.cursor_hooks();
+    let envcloak_exe = fx_cov.root.join("envcloak");
+    std::fs::write(
+        &cursor_hooks_path,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "hooks": {
+                "beforeReadFile": [
+                    { "command": format!("'{}' hook --agent cursor --event beforeReadFile", envcloak_exe.display()) }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let cs_partial = ConfigSet::read(
+        Host::Cursor,
+        &l_cov,
+        &fx_cov.root.join("m"),
+        &fx_cov.proj(),
+        &env_cov,
+    );
+    assert_eq!(cs_partial.hooks.tools, HookState::Missing);
+    assert_eq!(cs_partial.hooks.mcp, HookState::Missing);
+}

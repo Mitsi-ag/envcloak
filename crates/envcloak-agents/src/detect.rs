@@ -157,14 +157,13 @@ pub fn parse_version(host: Host, stdout: &[u8]) -> Option<String> {
             .or_else(|| body.strip_prefix("kimi-code, version "))
             .or_else(|| body.strip_prefix("kimi-cli "))
             .or_else(|| body.strip_prefix("kimi-code "))
-            .or_else(|| body.strip_prefix("kimi "))
-            .unwrap_or(body),
+            .or_else(|| body.strip_prefix("kimi "))?,
         Host::Qwen => body
             .strip_prefix("qwen-code ")
             .or_else(|| body.strip_prefix("qwen "))
             .unwrap_or(body),
-        Host::Goose => body.strip_prefix("goose ").unwrap_or(body),
-        Host::Aider => body.strip_prefix("aider ").unwrap_or(body),
+        Host::Goose => body.strip_prefix("goose ")?,
+        Host::Aider => body.strip_prefix("aider ")?,
     };
     is_version(v).then(|| v.to_owned())
 }
@@ -293,10 +292,14 @@ fn named_in_version(host: Host, stdout: &[u8]) -> bool {
     match host {
         Host::ClaudeCode => lower.contains("claude"),
         Host::Codex => lower.contains("codex"),
+        Host::Cursor => lower.contains("cursor"),
+        Host::Gemini => lower.contains("gemini"),
         Host::Copilot => lower.contains("copilot"),
         Host::OpenCode => lower.contains("opencode"),
+        Host::Kimi => lower.contains("kimi"),
+        Host::Qwen => lower.contains("qwen"),
         Host::Goose => lower.contains("goose"),
-        Host::Cursor | Host::Gemini | Host::Kimi | Host::Qwen | Host::Aider => true,
+        Host::Aider => lower.contains("aider"),
     }
 }
 

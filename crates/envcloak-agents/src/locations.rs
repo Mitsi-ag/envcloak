@@ -389,7 +389,7 @@ impl Locations {
 
     /// OpenCode's configuration directory (`~/.config/opencode`).
     pub fn opencode_config_dir(&self) -> PathBuf {
-        self.home.join(".config").join("opencode")
+        self.xdg_config.join("opencode")
     }
 
     /// OpenCode's global instructions (`~/.config/opencode/AGENTS.md`).
@@ -421,7 +421,7 @@ impl Locations {
 
     /// Goose's configuration directory (`~/.config/goose`).
     pub fn goose_config_dir(&self) -> PathBuf {
-        self.home.join(".config").join("goose")
+        self.xdg_config.join("goose")
     }
 
     /// Goose's global hints file (`~/.config/goose/.goosehints`).

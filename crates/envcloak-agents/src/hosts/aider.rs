@@ -21,10 +21,50 @@ fn yaml_quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
 }
 
+fn damaged() -> Refusal {
+    let e = crate::blocks::BlockError::Damaged;
+    Refusal::new(e.name(), e.message())
+}
+
+fn modified() -> Refusal {
+    let e = crate::blocks::BlockError::Modified;
+    Refusal::new(e.name(), e.message())
+}
+
+fn find_block(text: &str) -> Result<Option<(usize, usize)>, Refusal> {
+    let mut begins = Vec::new();
+    let mut ends = Vec::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n').trim_end_matches('\r');
+        if bare == BEGIN_MARKER {
+            begins.push(at);
+        } else if bare == END_MARKER {
+            ends.push(at + line.len());
+        } else if bare.contains("envcloak:begin") || bare.contains("envcloak:end") {
+            return Err(damaged());
+        }
+        at += line.len();
+    }
+    match (begins.as_slice(), ends.as_slice()) {
+        ([], []) => Ok(None),
+        ([b], [e]) if b < e => Ok(Some((*b, *e))),
+        _ => Err(damaged()),
+    }
+}
+
+fn is_ours(slice: &str) -> bool {
+    let lines: Vec<&str> = slice.lines().map(|l| l.trim_end_matches('\r')).collect();
+    matches!(
+        lines.as_slice(),
+        [BEGIN_MARKER, "read:", item, END_MARKER] if item.starts_with("  - ")
+    )
+}
+
 /// Applies the `read:` entry for `agents_md` to `~/.aider.conf.yml`.
 ///
 /// # Errors
-/// Returns a [`Refusal`] if `existing` is not valid UTF-8.
+/// Returns a [`Refusal`] if `existing` is not valid UTF-8 or has damaged/modified markers.
 pub fn apply_aider_conf(existing: Option<&[u8]>, agents_md: &Path) -> Result<Edited, Refusal> {
     let text = match existing {
         Some(b) => std::str::from_utf8(b).map_err(|_| {
@@ -35,17 +75,34 @@ pub fn apply_aider_conf(existing: Option<&[u8]>, agents_md: &Path) -> Result<Edi
         })?,
         None => "",
     };
+    let existing_range = find_block(text)?;
     let path_str = agents_md.to_string_lossy().into_owned();
     let quoted = yaml_quote(&path_str);
-    if text.contains(&path_str) || text.contains(&quoted) {
-        return Ok(None);
-    }
     let block = format!("{BEGIN_MARKER}\nread:\n  - {quoted}\n{END_MARKER}\n");
-    let mut out = text.to_owned();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&block);
+    let out = if let Some((start, end)) = existing_range {
+        if !is_ours(&text[start..end]) {
+            return Err(modified());
+        }
+        let norm = text[start..end].replace("\r\n", "\n");
+        if norm.trim_end_matches('\n') == block.trim_end_matches('\n') {
+            return Ok(None);
+        }
+        let mut s = String::with_capacity(text.len() + block.len());
+        s.push_str(&text[..start]);
+        s.push_str(&block);
+        s.push_str(&text[end..]);
+        s
+    } else {
+        if text.contains(&path_str) || text.contains(&quoted) {
+            return Ok(None);
+        }
+        let mut s = text.to_owned();
+        if !s.is_empty() && !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&block);
+        s
+    };
     let edit = Edit::TomlValue {
         path: vec!["read".to_owned()],
         value: json!(path_str),
@@ -58,7 +115,7 @@ pub fn apply_aider_conf(existing: Option<&[u8]>, agents_md: &Path) -> Result<Edi
 /// Removes EnvCloak's `read:` entry from `~/.aider.conf.yml`.
 ///
 /// # Errors
-/// Returns a [`Refusal`] if `existing` is not valid UTF-8.
+/// Returns a [`Refusal`] if `existing` is not valid UTF-8 or has damaged/modified markers.
 pub fn remove_aider_conf(existing: &[u8], created_file: bool) -> Result<Undo, Refusal> {
     let text = std::str::from_utf8(existing).map_err(|_| {
         Refusal::new(
@@ -66,17 +123,11 @@ pub fn remove_aider_conf(existing: &[u8], created_file: bool) -> Result<Undo, Re
             "Aider's ~/.aider.conf.yml is not UTF-8, so it was not changed",
         )
     })?;
-    let Some(start) = text.find(BEGIN_MARKER) else {
+    let Some((start, end)) = find_block(text)? else {
         return Ok(Undo::Nothing);
     };
-    let Some(rel_end) = text[start..].find(END_MARKER) else {
-        return Ok(Undo::Nothing);
-    };
-    let mut end = start + rel_end + END_MARKER.len();
-    if text[end..].starts_with("\r\n") {
-        end += 2;
-    } else if text[end..].starts_with('\n') {
-        end += 1;
+    if !is_ours(&text[start..end]) {
+        return Err(modified());
     }
     let mut out = String::with_capacity(text.len());
     out.push_str(&text[..start]);

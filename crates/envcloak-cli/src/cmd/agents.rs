@@ -105,10 +105,10 @@ use serde_json::{Value, json};
 
 use super::{fd_number, require_unlocked};
 
-const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
-       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents status --probe [--agent ID]... [--json]
        envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
        envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
        envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]";

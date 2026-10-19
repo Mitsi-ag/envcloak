@@ -114,7 +114,8 @@ fn check_tool(tool: &str, input: &Map<String, Value>) -> Decision {
                 .or_else(|| input.get("include"))
                 .or_else(|| input.get("glob"))
                 .and_then(Value::as_str);
-            if path.is_none() && pattern.is_none() {
+            let kind = input.get("type").and_then(Value::as_str);
+            if path.is_none() && pattern.is_none() && kind.is_none() {
                 return Decision::NoDecision;
             }
             if let Some(c) = path.and_then(shell::path_class) {
@@ -123,7 +124,10 @@ fn check_tool(tool: &str, input: &Map<String, Value>) -> Decision {
             if let Some(c) = pattern.and_then(shell::path_class) {
                 return Decision::Deny(Reason::of(c));
             }
-            if pattern.is_some_and(shell::grep_tool_glob_may_name_env_file) {
+            if pattern.is_some_and(shell::grep_tool_glob_may_name_env_file)
+                || kind
+                    .is_some_and(|t| shell::RG_ENV_TYPES.contains(&t.to_ascii_lowercase().as_str()))
+            {
                 return Decision::Deny(Reason::EnvFile);
             }
             Decision::Allow

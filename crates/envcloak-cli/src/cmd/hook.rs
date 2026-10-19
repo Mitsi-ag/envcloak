@@ -51,8 +51,7 @@ use envcloak_core::SecretBuf;
 use envcloak_policy::find_manifest;
 use zeroize::Zeroizing;
 
-const USAGE_TEXT: &str =
-    "envcloak hook --host claude-code|codex --event UserPromptSubmit|PreToolUse|SessionStart";
+const USAGE_TEXT: &str = "envcloak hook --host ID --event NAME";
 
 /// The handler's own time limit, from its start.
 const LIMIT: Duration = Duration::from_secs(2);
@@ -60,7 +59,9 @@ const LIMIT: Duration = Duration::from_secs(2);
 fn parse(args: &[&str]) -> Option<(Host, Event)> {
     match args {
         ["--host", h, "--event", e] | ["--event", e, "--host", h] => {
-            Some((Host::from_id(h)?, Event::from_name(e)?))
+            let host = Host::from_id(h)?;
+            let event = Event::from_name(e)?;
+            event.valid_for_host(host).then_some((host, event))
         }
         _ => None,
     }
@@ -268,11 +269,14 @@ mod tests {
         );
         assert_eq!(
             parse(&["--host", "cursor", "--event", "preToolUse"]),
-            Some((Host::Cursor, Event::PreToolUse))
+            Some((Host::Cursor, Event::PreToolUseLower))
         );
         for bad in [
             &["--host", "nosuch", "--event", "PreToolUse"][..],
             &["--host", "codex", "--event", "Stop"],
+            &["--host", "claude-code", "--event", "BeforeAgent"],
+            &["--host", "cursor", "--event", "PreToolUse"],
+            &["--host", "aider", "--event", "PreToolUse"],
             &["--host", "codex"],
             &["--host", "codex", "--event", "PreToolUse", "x"],
         ] {

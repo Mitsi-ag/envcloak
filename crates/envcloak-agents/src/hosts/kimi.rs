@@ -85,16 +85,31 @@ pub fn detect_product(
         if canon_str.contains("@moonshot-ai/kimi-code") || canon_str.contains("kimi-code") {
             return KimiProduct::Code;
         }
-        if let Ok(bytes) = std::fs::read(&canon) {
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]).to_ascii_lowercase();
-            if head.contains("kimi_cli") || head.contains("kimi-cli") || head.contains("python") {
-                return KimiProduct::Cli;
-            }
-            if head.contains("@moonshot-ai/kimi-code")
-                || head.contains("kimi-code")
-                || head.starts_with("#!/usr/bin/env node")
+        {
+            use std::io::Read as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            if let Ok(f) = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(&canon)
+                && f.metadata().is_ok_and(|m| m.is_file())
             {
-                return KimiProduct::Code;
+                let mut bytes = Vec::with_capacity(512);
+                if f.take(512).read_to_end(&mut bytes).is_ok() {
+                    let head = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                    if head.contains("kimi_cli")
+                        || head.contains("kimi-cli")
+                        || head.contains("python")
+                    {
+                        return KimiProduct::Cli;
+                    }
+                    if head.contains("@moonshot-ai/kimi-code")
+                        || head.contains("kimi-code")
+                        || head.starts_with("#!/usr/bin/env node")
+                    {
+                        return KimiProduct::Code;
+                    }
+                }
             }
         }
     }

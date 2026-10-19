@@ -36,12 +36,12 @@ pub fn fits(event: Event, p: &Map<String, Value>) -> bool {
                 && p.get("tool_input")
                     .is_some_and(|v| v.is_object() || v.is_string())
         }
-        Event::PreToolUseLower | Event::PreToolUse => {
+        Event::PreToolUseLower => {
             s("tool_name")
                 && p.get("tool_input")
                     .is_some_and(|v| v.is_object() || v.is_string())
         }
-        Event::SessionStartLower | Event::SessionStart => {
+        Event::SessionStartLower => {
             s("session_id")
                 || s("conversation_id")
                 || s("cursor_version")
@@ -55,7 +55,7 @@ pub fn fits(event: Event, p: &Map<String, Value>) -> bool {
 /// Evaluates a Cursor hook payload that [`fits`] accepted.
 pub fn decide(event: Event, p: &Map<String, Value>) -> Decision {
     match event {
-        Event::SessionStartLower | Event::SessionStart => Decision::Allow,
+        Event::SessionStartLower => Decision::Allow,
         Event::BeforeSubmitPrompt => match p.get("prompt").and_then(Value::as_str) {
             Some(text) if prompt::holds_key(text) => Decision::Deny(Reason::KeyInPrompt),
             Some(_) => Decision::Allow,
@@ -87,7 +87,7 @@ pub fn decide(event: Event, p: &Map<String, Value>) -> Decision {
                 check_mcp_or_tool(tool_name, input, true)
             })
         }
-        Event::PreToolUseLower | Event::PreToolUse => {
+        Event::PreToolUseLower => {
             let Some(tool_name) = p.get("tool_name").and_then(Value::as_str) else {
                 return Decision::NoDecision;
             };
@@ -156,6 +156,9 @@ fn check_mcp_or_tool(tool: &str, input: &Map<String, Value>, force_mcp: bool) ->
                 .or_else(|| input.get("pattern"))
                 .and_then(Value::as_str);
             let kind = input.get("type").and_then(Value::as_str);
+            if path.is_none() && glob.is_none() && kind.is_none() {
+                return Decision::NoDecision;
+            }
             if let Some(c) = path.and_then(shell::path_class) {
                 return Decision::Deny(Reason::of(c));
             }
@@ -170,10 +173,7 @@ fn check_mcp_or_tool(tool: &str, input: &Map<String, Value>, force_mcp: bool) ->
             }
             Decision::Allow
         }
-        t if t.starts_with("MCP:") || t.starts_with("mcp__") || t.starts_with("mcp:") => {
-            deny_if(strings_class(input.values(), 0))
-        }
-        _ => Decision::Allow,
+        _ => deny_if(strings_class(input.values(), 0)),
     }
 }
 

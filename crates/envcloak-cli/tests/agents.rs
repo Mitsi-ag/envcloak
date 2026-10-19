@@ -3157,10 +3157,13 @@ fn tier_2_and_tier_3_install_status_and_uninstall() {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let (r, code) = f.report(&["install", "--yes"]);
+    let xdg_config = f.path(".config");
+    let env = [("XDG_CONFIG_HOME", xdg_config.as_path())];
+
+    let (r, code) = f.report_with(&["install", "--yes"], &env);
     assert_eq!(code, 0, "{r}");
 
-    let v = f.status_json();
+    let v = f.status_in(&f.home.home(), &env);
     for agent in [
         "cursor", "gemini", "copilot", "opencode", "kimi", "qwen", "goose", "aider",
     ] {
@@ -3195,7 +3198,7 @@ fn tier_2_and_tier_3_install_status_and_uninstall() {
         );
     }
 
-    let (u, code) = f.report(&["uninstall", "--yes"]);
+    let (u, code) = f.report_with(&["uninstall", "--yes"], &env);
     assert_eq!(code, 0, "{u}");
     f.sweep();
 }

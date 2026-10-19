@@ -56,8 +56,7 @@ pub fn configured_context_filename(settings: &Value) -> Option<String> {
 }
 
 fn read_settings(path: &Path) -> Option<Value> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    crate::install::read_json(path)
 }
 
 /// Resolves the global instruction file path under `qwen_dir` (`~/.qwen`)
