@@ -45,6 +45,14 @@ enum MetadataRequest {
         guard canCopy(directory) else { return nil }
         return "cd -- '" + directory.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
+    static func rotateSlugCommand(_ slug: DaemonText) -> TerminalCopy? {
+        guard canCopy(slug), let text = terminalCommand(["rotate", slug.unescaped]) else { return nil }
+        return TerminalCopy(text)
+    }
+    static func deletePlaintextCommand(_ directory: DaemonText) -> TerminalCopy? {
+        guard let cd = changeDirectoryCommand(directory) else { return nil }
+        return TerminalCopy(cd + " && envcloak init --delete-plaintext")
+    }
     static func canCopy(_ text: DaemonText) -> Bool { TerminalCopy.isSafe(text.unescaped) }
     static func clipboardPath(_ directory: DaemonText) -> TerminalCopy? { TerminalCopy(directory.unescaped) }
     static func path(_ directory: DaemonText) -> String { directory.unescaped }

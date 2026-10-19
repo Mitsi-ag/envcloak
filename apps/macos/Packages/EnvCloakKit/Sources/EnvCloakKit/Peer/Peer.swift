@@ -218,3 +218,57 @@ final class Connection {
         }
     }
 }
+
+public enum FirstRunReportReader {
+    public static func defaultReportsDirectory() throws -> String {
+        try UserPaths.home() + "/Library/Application Support/EnvCloak/reports"
+    }
+
+    public static func read(inDirectory directory: String? = nil) throws -> FirstRunReportView? {
+        let dir = try directory ?? defaultReportsDirectory()
+        guard dir.hasPrefix("/"), !dir.utf8.contains(0),
+              !(dir.split(separator: "/").contains("..")), !dir.hasSuffix("/") else {
+            throw EnvCloakError.protocolError
+        }
+        let uid = geteuid()
+        var dirStat = stat()
+        if lstat(dir, &dirStat) != 0 {
+            if errno == ENOENT { return nil }
+            throw EnvCloakError.protocolError
+        }
+        guard dirStat.st_mode & S_IFMT == S_IFDIR,
+              dirStat.st_uid == uid,
+              dirStat.st_mode & 0o077 == 0 else {
+            throw EnvCloakError.protocolError
+        }
+        let path = dir + "/first-run.json"
+        let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        if fd < 0 {
+            if errno == ENOENT { return nil }
+            throw EnvCloakError.protocolError
+        }
+        defer { Darwin.close(fd) }
+        var fileStat = stat()
+        guard fstat(fd, &fileStat) == 0,
+              fileStat.st_mode & S_IFMT == S_IFREG,
+              fileStat.st_uid == uid,
+              fileStat.st_mode & 0o777 == 0o600,
+              fileStat.st_size > 0,
+              fileStat.st_size <= Int64(Frame.limit) else {
+            throw EnvCloakError.protocolError
+        }
+        let frame = try Frame.readDocument { buffer in
+            while true {
+                let n = Darwin.read(fd, buffer.baseAddress, buffer.count)
+                if n >= 0 { return n }
+                if errno != EINTR { throw EnvCloakError.protocolError }
+            }
+        }
+        return try frame.decodeDocument(as: FirstRunReportView.self)
+    }
+
+    public static func decode(json: String) throws -> FirstRunReportView {
+        let frame = try Frame(text: json)
+        return try frame.decodeDocument(as: FirstRunReportView.self)
+    }
+}

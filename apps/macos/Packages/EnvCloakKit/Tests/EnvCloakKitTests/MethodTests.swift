@@ -102,4 +102,72 @@ final class MethodTests: XCTestCase {
             XCTAssertEqual(try UserPaths.runtime(), original + "/Library/Application Support/EnvCloak/run")
         }
     }
+
+    func testFirstRunReportReaderDecodesAndValidatesPermissionsAndRejectsUnknownFields() throws {
+        let dir = URL(fileURLWithPath: "/tmp/ec-j4-reports-" + UUID().uuidString.prefix(8))
+        defer { try? FileManager.default.removeItem(at: dir) }
+        XCTAssertNil(try FirstRunReportReader.read(inDirectory: dir.path))
+
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        XCTAssertNil(try FirstRunReportReader.read(inDirectory: dir.path))
+
+        let reportObject: [String: Any] = [
+            "version": 1,
+            "keys_found": 47,
+            "projects": 23,
+            "already_leaked": 12,
+            "plaintext_files": 18,
+            "providers": [
+                ["provider": "stripe", "keys": 4, "live_keys": 2],
+                ["provider": "custom\u{202e}", "keys": 1, "live_keys": 0]
+            ],
+            "accounts": [
+                ["email": "you@acme.com", "keys": 4]
+            ],
+            "leaked": [
+                [
+                    "slug": "stripe/acme-live\u{202e}",
+                    "provider": "stripe",
+                    "classification": "live",
+                    "rotate_url": "https://dashboard.stripe.com/apikeys",
+                    "places": [
+                        ["source": "transcript", "subject": "Claude Code", "files": 14, "occurrences": 19]
+                    ]
+                ]
+            ],
+            "plaintext_projects": [
+                [
+                    "project": "acme-web",
+                    "dir": "/tmp/acme-web",
+                    "files": [".env", ".env.local"],
+                    "keys": 3
+                ]
+            ]
+        ]
+        let file = dir.appendingPathComponent("first-run.json")
+        let data = try JSONSerialization.data(withJSONObject: reportObject)
+        try data.write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+        XCTAssertThrowsError(try FirstRunReportReader.read(inDirectory: dir.path), "0644 report file must be rejected")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let report = try XCTUnwrap(try FirstRunReportReader.read(inDirectory: dir.path))
+        XCTAssertEqual(report.version, 1)
+        XCTAssertEqual(report.keys_found, 47)
+        XCTAssertEqual(report.projects, 23)
+        XCTAssertEqual(report.already_leaked, 12)
+        XCTAssertEqual(report.plaintext_files, 18)
+        XCTAssertEqual(report.providers.first?.summaryLabel, "Stripe 4, 2 live")
+        XCTAssertEqual(report.providers.last?.summaryLabel, "custom\\u{202e} 1")
+        XCTAssertEqual(report.accounts.first?.summaryLabel, "you@acme.com (4)")
+        XCTAssertEqual(report.leaked.first?.slug.escaped, "stripe/acme-live\\u{202e}")
+        XCTAssertEqual(report.leaked.first?.whereSummary, "Claude Code transcripts, 14 files")
+        XCTAssertEqual(report.plaintext_projects.first?.summaryLabel, "acme-web: .env, .env.local (3 keys)")
+
+        var withPreview = reportObject
+        withPreview["preview"] = "sk-ant-api03-canary"
+        let badBytes = try JSONSerialization.data(withJSONObject: withPreview)
+        XCTAssertThrowsError(try FirstRunReportReader.decode(json: String(decoding: badBytes, as: UTF8.self)),
+                             "unknown or preview fields must be rejected")
+    }
 }

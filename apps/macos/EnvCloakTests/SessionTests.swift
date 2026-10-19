@@ -61,12 +61,18 @@ actor ScriptedClient: WorkspaceClient {
         if let readOnly { self.readOnly = readOnly }
         self.failure = failure; self.projectFailure = projectFailure; self.itemCount = itemCount
     }
+    var exposedItemIndices: Set<Int> = []
+    func expose(_ indices: Set<Int>) { exposedItemIndices = indices }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
-        ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
+        var row: [String: Any] = ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
          "provider": "example" + hostileSuffix, "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
          "fields": ["value", "secondary"].map { ["name": $0 + fieldNameSuffix, "prior_count": 0, "created_secs": 1, "updated_secs": 1] as [String: Any] },
          "last_used_secs": 123, "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid" + hostileSuffix]]
+        if exposedItemIndices.contains(i) {
+            row["exposed"] = ["since_secs": 100, "sources": ["transcript"], "count": 14] as [String: Any]
+        }
+        return row
     }
     func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
         counts[M.name, default: 0] += 1
@@ -88,7 +94,7 @@ actor ScriptedClient: WorkspaceClient {
             let index = (method as? ItemsShow)?.slug.hasPrefix("fixture-1") == true ? 1 : 0
             var full = item(wrongDetail ? 99 : index)
             full["detail"] = ["allowed_hosts": ["api.example.invalid"], "tags": ["fixture"],
-                              "links": ["docs": "https://example.invalid/docs"], "last_used_secs": 123,
+                              "links": ["docs": "https://example.invalid/docs", "keys_page": "https://example.invalid/keys"], "last_used_secs": 123,
                               "notes": "Notes \(head)\u{202e}"] as [String: Any]
             result = full
         case "projects.list":
@@ -762,9 +768,20 @@ final class SessionTests: XCTestCase {
         for route in [Route.approvals, .activity, .agents] {
             XCTAssertEqual(route.unavailableMessage, "Arrives with Touch ID approvals")
         }
-        XCTAssertEqual(Route.keys(.exposed).unavailableMessage, "Leak checks arrive with envcloak doctor")
+        XCTAssertNil(Route.keys(.exposed).unavailableMessage)
         XCTAssertEqual(Route.later(.spend).unavailableMessage, "Spend arrives in M4")
         XCTAssertEqual(Route.later(.devices).unavailableMessage, "Devices arrive in M5")
+    }
+
+    @MainActor func testExposedKeysFilterOnlyReturnsItemsWithExposedMetadata() async {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(itemCount: 3)
+        await client.expose([1])
+        let session = VaultSession(client: client)
+        await session.poll()
+        XCTAssertEqual(session.filteredKeys(query: "", filter: .all, scope: nil).map(\.slug.escaped), ["fixture-0", "fixture-1", "fixture-2"])
+        XCTAssertEqual(session.filteredKeys(query: "", filter: .exposed, scope: nil).map(\.slug.escaped), ["fixture-1"])
     }
 }
 

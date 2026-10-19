@@ -81,6 +81,29 @@ public struct Frame: ~Copyable {
         }
     }
 
+    static func readDocument(using read: (UnsafeMutableRawBufferPointer) throws -> Int) throws -> Frame {
+        var buffer = try SecretBuffer(capacity: 16_384)
+        while true {
+            if buffer.count == buffer.capacity {
+                guard buffer.capacity < limit else { throw EnvCloakError.protocolError }
+                try buffer.reserveCapacity(min(limit, buffer.capacity * 2))
+            }
+            let n = try buffer.read(upTo: buffer.capacity - buffer.count, using: read)
+            if n == 0 { break }
+            guard n > 0 else { throw EnvCloakError.protocolError }
+        }
+        guard buffer.count > 0 else { throw EnvCloakError.protocolError }
+        return Frame(body: consume buffer)
+    }
+
+    borrowing func decodeDocument<T: WireDecodable>(as: T.Type = T.self) throws -> T {
+        try body.withUnsafeBytes { bytes in
+            var parser = JSONParser(bytes: bytes)
+            let root = try WireReader(bytes: bytes, node: parser.parse())
+            return try T(wire: root)
+        }
+    }
+
     borrowing func secret() throws -> SecretBuffer {
         // The result is noncopyable, so decode inside an explicitly typed
         // borrowing closure without Foundation's base64/Data conversion.

@@ -715,11 +715,160 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
             );
         }
     }
+    if options.report {
+        write_app_report(&groups, &machine, &plan, &r)?;
+    }
     Ok(if r.incomplete.is_empty() {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(FAILURE)
     })
+}
+
+fn write_app_report(
+    groups: &[Group],
+    machine: &[MachineEntry],
+    plan: &ImportPlanView,
+    r: &FirstRunReport,
+) -> Result<(), Failure> {
+    use envcloak_client::doctor_report::{
+        FIRST_RUN_REPORT_VERSION, FirstRunAccount, FirstRunLeakedItem, FirstRunProjectPlaintext,
+        FirstRunProvider, FirstRunReport as AppFirstRunReport, read_first_run_report,
+        write_first_run_report,
+    };
+    use envcloak_ipc::view::ClassificationView;
+
+    let vault_items = connect()
+        .ok()
+        .and_then(|mut c| c.items_list(true).ok())
+        .map(|v| v.items)
+        .unwrap_or_default();
+    let prior = read_first_run_report();
+
+    let (keys_found, providers, accounts) = if !plan.items.is_empty() {
+        let mut by_provider: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+        for item in &plan.items {
+            let p = item
+                .provider
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(safe_name)
+                .unwrap_or_else(|| "generic".to_owned());
+            let entry = by_provider.entry(p).or_insert((0, 0));
+            entry.0 = entry.0.saturating_add(1);
+            if item.classification == ClassificationView::Live {
+                entry.1 = entry.1.saturating_add(1);
+            }
+        }
+        let providers = by_provider
+            .into_iter()
+            .map(|(provider, (total, live))| FirstRunProvider::new(&provider, total, live))
+            .collect();
+        let (_, _, vault_accounts) = AppFirstRunReport::summarize_vault_items(&vault_items);
+        let accounts: Vec<FirstRunAccount> = vault_accounts;
+        (plan.items.len() as u64, providers, accounts)
+    } else {
+        AppFirstRunReport::summarize_vault_items(&vault_items)
+    };
+
+    let mut plaintext_projects: Vec<FirstRunProjectPlaintext> = Vec::new();
+    let mut project_count = 0u64;
+    for g in groups {
+        project_count = project_count.saturating_add(g.projects.len() as u64);
+        for p in &g.projects {
+            let dir = dir_of(&g.root, &p.rel_dir);
+            let mut files = Vec::new();
+            for f in &p.files {
+                if f.template || f.references_only() {
+                    continue;
+                }
+                let full = g.root.path().join(&f.rel);
+                let removed = r
+                    .sources
+                    .get(&full)
+                    .and_then(|s| s["cleanup"].as_str())
+                    .is_some_and(|c| c == "removed");
+                if !removed {
+                    let rel_in_project = f.rel.strip_prefix(&p.rel_dir).unwrap_or(&f.rel);
+                    files.push(shown_rel(rel_in_project));
+                }
+            }
+            if !files.is_empty() {
+                plaintext_projects.push(FirstRunProjectPlaintext::new(&dir, files));
+            }
+        }
+    }
+    let mut machine_by_dir: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
+    for m in machine {
+        let full = &m.found.source.path;
+        let cleaned = r
+            .sources
+            .get(full)
+            .and_then(|s| s["cleanup"].as_str())
+            .is_some_and(|c| c == "removed" || c == "commented");
+        if cleaned {
+            continue;
+        }
+        let parent = full
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .to_path_buf();
+        let file_name = full
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| display_path(full));
+        machine_by_dir.entry(parent).or_default().push(file_name);
+    }
+    for (dir, files) in machine_by_dir {
+        let dir_str = display_path(&dir);
+        if let Some(existing) = plaintext_projects
+            .iter_mut()
+            .find(|p| p.project_dir == dir_str)
+        {
+            for f in files {
+                let clean = display_path(Path::new(&f));
+                if !existing.files.contains(&clean) {
+                    existing.files.push(clean);
+                }
+            }
+            existing.files.sort();
+        } else {
+            plaintext_projects.push(FirstRunProjectPlaintext::new(&dir, files));
+        }
+    }
+    plaintext_projects.sort_by(|a, b| a.project_dir.cmp(&b.project_dir));
+    let projects = project_count.max(plaintext_projects.len() as u64);
+    let plaintext_files: u64 = plaintext_projects
+        .iter()
+        .map(|p| p.files.len() as u64)
+        .sum();
+
+    let mut leaked: Vec<FirstRunLeakedItem> =
+        envcloak_client::doctor_report::DoctorReport::default()
+            .to_first_run_leaked(&vault_items, prior.as_ref());
+    if let Some(p) = &prior {
+        for item in &p.leaked {
+            if !leaked.iter().any(|l| l.slug == item.slug) {
+                leaked.push(item.clone());
+            }
+        }
+        leaked.sort_by(|a, b| a.slug.cmp(&b.slug));
+    }
+    let already_leaked = leaked.len() as u64;
+
+    let app_report = AppFirstRunReport {
+        version: FIRST_RUN_REPORT_VERSION,
+        keys_found,
+        projects,
+        already_leaked,
+        plaintext_files,
+        providers,
+        accounts,
+        leaked,
+        plaintext_projects,
+    };
+    write_first_run_report(&app_report)?;
+    Ok(())
 }
 fn sanitize_legacy(value: &mut Value, key: Option<&str>) {
     match value {

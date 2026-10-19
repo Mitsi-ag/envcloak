@@ -30,6 +30,9 @@ struct EnvCloakApp: App {
             CommandGroup(replacing: .appInfo) {
                 AboutCommand()
             }
+            CommandGroup(replacing: .help) {
+                WelcomeCommand()
+            }
             CommandGroup(replacing: .newItem) {}
             SidebarCommands()
             InspectorCommands()
@@ -42,6 +45,13 @@ struct EnvCloakApp: App {
             AboutView()
         }
         .windowResizability(.contentSize)
+        .restorationBehavior(.disabled)
+        .commandsRemoved()
+
+        Window("Welcome to EnvCloak", id: WindowID.welcome) {
+            WelcomeView(session: session)
+        }
+        .defaultSize(width: 720, height: 560)
         .restorationBehavior(.disabled)
         .commandsRemoved()
     }
@@ -61,6 +71,16 @@ private struct AboutCommand: View {
     var body: some View {
         Button("About EnvCloak") {
             openWindow(id: WindowID.about)
+        }
+    }
+}
+
+private struct WelcomeCommand: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Show welcome") {
+            openWindow(id: WindowID.welcome)
         }
     }
 }

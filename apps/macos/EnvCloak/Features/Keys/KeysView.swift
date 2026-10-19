@@ -28,14 +28,26 @@ struct KeysView: View {
             if session.keysUnavailable(query: query, scope: scope) {
                 ContentUnavailableView("Keys could not be refreshed", systemImage: "exclamationmark.triangle", description: Text("Try again. No old listing is shown."))
             } else if rows.isEmpty {
-                ContentUnavailableView(query.isEmpty ? "No keys yet." : "No matching keys", systemImage: "key.horizontal", description: Text(query.isEmpty ? "Add a key with Add key or Command-N." : "Try another search."))
+                ContentUnavailableView(
+                    query.isEmpty ? (filter == .exposed ? "No exposed keys." : "No keys yet.") : "No matching keys",
+                    systemImage: "key.horizontal",
+                    description: Text(query.isEmpty ? (filter == .exposed ? "Keys flagged by envcloak doctor appear here." : "Add a key with Add key or Command-N.") : "Try another search.")
+                )
             } else {
                 Table(of: KeyRow.self, selection: $selection, sortOrder: $sortOrder, columnCustomization: $columns) {
                     TableColumn("Key", value: \.item.slug.escaped) { row in Text(row.item.slug.escaped).font(ECFont.martianMono(size: 12)) }.customizationID("key")
                     TableColumn("Title", value: \.item.title.escaped).customizationID("title")
                     TableColumn("Provider") { Text($0.item.provider?.escaped ?? "Unknown") }.customizationID("provider")
                     TableColumn("Account") { Text($0.item.account?.email?.escaped ?? "None") }.customizationID("account")
-                    TableColumn("Class") { Text($0.item.classification.rawValue.capitalized) }.customizationID("class")
+                    TableColumn("Class") { row in
+                        HStack(spacing: 6) {
+                            Text(row.item.classification.rawValue.capitalized)
+                            if row.item.exposed != nil {
+                                Label("Exposed", systemImage: "exclamationmark.triangle")
+                                    .foregroundStyle(ECToken.warning.color)
+                            }
+                        }
+                    }.customizationID("class")
                     TableColumn("Used by", value: \.usedBy).customizationID("used-by")
                     TableColumn("Last used") { row in DateLabel(seconds: row.item.last_used_secs) }.customizationID("last-used")
                     TableColumn("Rotated") { row in DateLabel(seconds: row.item.rotated_secs) }.customizationID("rotated").defaultVisibility(.hidden)
