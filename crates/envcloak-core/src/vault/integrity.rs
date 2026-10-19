@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::crypto::{Keyring, Purpose, TableTag, keyed_hash};
+use crate::crypto::{Keyring, Purpose, TableTag, VaultId, keyed_hash};
 
 use super::codec::{Dec, Enc};
 use super::error::{VaultError, VaultErrorKind};
@@ -177,6 +177,10 @@ pub enum TamperKind {
     SchemaAltered,
     /// A row changed on disk while this process had the vault open.
     ChangedWhileOpen,
+    /// The vault file is behind the keychain rollback anchor: an older copy
+    /// of the file was restored over a newer one (SPEC §5 "Keychain rollback
+    /// anchor", D3-12).
+    RolledBack,
 }
 
 impl TamperKind {
@@ -191,6 +195,90 @@ impl TamperKind {
             TamperKind::MetaAltered => "the vault's meta row is missing, doubled or altered",
             TamperKind::SchemaAltered => "the vault database's schema was altered",
             TamperKind::ChangedWhileOpen => "a vault row changed on disk while the vault was open",
+            TamperKind::RolledBack => {
+                "the vault file was rolled back to an older copy than the keychain anchor records"
+            }
+        }
+    }
+}
+
+/// The length in bytes of a serialized keychain rollback [`Anchor`]
+/// (`docs/VAULT.md` "Keychain rollback anchor", D3-12).
+pub const ANCHOR_LEN: usize = 16 + 4 + 8 + 32 + 8;
+
+/// The 68-byte keychain rollback anchor for a vault (`docs/VAULT.md` "Keychain
+/// rollback anchor", SPEC §5 "Keychain rollback anchor").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Anchor {
+    pub vault_id: VaultId,
+    pub epoch: u32,
+    pub write_counter: u64,
+    pub state_digest: [u8; 32],
+    pub audit_seq: u64,
+}
+
+/// How a vault's on-disk state compares against a stored keychain [`Anchor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorComparison {
+    /// The vault is at or ahead of the stored anchor and consistent with it.
+    Consistent,
+    /// The stored anchor is ahead of the vault file, or has the same
+    /// `write_counter` with a different `state_digest`.
+    RolledBack,
+}
+
+impl Anchor {
+    /// Encodes the 68-byte anchor record:
+    /// `vault_id(16) || epoch(4) || write_counter(8) || state_digest(32) || audit_seq(8)`.
+    pub fn encode(&self) -> [u8; ANCHOR_LEN] {
+        let mut out = [0u8; ANCHOR_LEN];
+        out[0..16].copy_from_slice(&self.vault_id.0);
+        out[16..20].copy_from_slice(&self.epoch.to_be_bytes());
+        out[20..28].copy_from_slice(&self.write_counter.to_be_bytes());
+        out[28..60].copy_from_slice(&self.state_digest);
+        out[60..68].copy_from_slice(&self.audit_seq.to_be_bytes());
+        out
+    }
+
+    /// Decodes a 68-byte anchor record.
+    pub fn decode(b: &[u8]) -> Result<Self, VaultError> {
+        if b.len() != ANCHOR_LEN {
+            return Err(VaultErrorKind::InvalidRecord.into());
+        }
+        let mut d = Dec::new(b);
+        let vault_id = VaultId(d.array()?);
+        let epoch = d.u32()?;
+        let write_counter = d.u64()?;
+        let state_digest = d.array()?;
+        let audit_seq = d.u64()?;
+        d.end()?;
+        Ok(Anchor {
+            vault_id,
+            epoch,
+            write_counter,
+            state_digest,
+            audit_seq,
+        })
+    }
+
+    /// Compares this stored keychain anchor against the vault's `current`
+    /// anchor (`D3-12`, SPEC §5 "Keychain rollback anchor").
+    ///
+    /// Returns [`AnchorComparison::RolledBack`] when the stored anchor is from
+    /// another vault id, a newer epoch, a higher `write_counter`, the same
+    /// `write_counter` with a different `state_digest`, or a higher
+    /// `audit_seq`. `state_digest` is compared in constant time.
+    pub fn compare_vault(&self, current: &Anchor) -> AnchorComparison {
+        let digest_matches = digest_eq(&self.state_digest, &current.state_digest);
+        if self.vault_id != current.vault_id
+            || current.epoch < self.epoch
+            || current.write_counter < self.write_counter
+            || (current.write_counter == self.write_counter && !digest_matches)
+            || current.audit_seq < self.audit_seq
+        {
+            AnchorComparison::RolledBack
+        } else {
+            AnchorComparison::Consistent
         }
     }
 }
@@ -446,6 +534,62 @@ mod tests {
         assert_ne!(
             field_body(&[0; 16], &[0; 32], b"a", b"b", None),
             field_body(&[0; 16], &[0; 32], b"a", b"b", Some(b""))
+        );
+    }
+
+    #[test]
+    fn anchor_round_trips_and_compares() {
+        let vid = VaultId::generate();
+        let stored = Anchor {
+            vault_id: vid,
+            epoch: 2,
+            write_counter: 5,
+            state_digest: [9; 32],
+            audit_seq: 12,
+        };
+        let encoded = stored.encode();
+        assert_eq!(encoded.len(), ANCHOR_LEN);
+        assert_eq!(Anchor::decode(&encoded).unwrap(), stored);
+        assert!(Anchor::decode(&encoded[..ANCHOR_LEN - 1]).is_err());
+
+        assert_eq!(stored.compare_vault(&stored), AnchorComparison::Consistent);
+        assert_eq!(
+            stored.compare_vault(&Anchor {
+                write_counter: 6,
+                state_digest: [8; 32],
+                ..stored
+            }),
+            AnchorComparison::Consistent
+        );
+        assert_eq!(
+            stored.compare_vault(&Anchor {
+                write_counter: 4,
+                ..stored
+            }),
+            AnchorComparison::RolledBack
+        );
+        assert_eq!(
+            stored.compare_vault(&Anchor {
+                state_digest: [8; 32],
+                ..stored
+            }),
+            AnchorComparison::RolledBack
+        );
+        assert_eq!(
+            stored.compare_vault(&Anchor {
+                epoch: 1,
+                write_counter: 6,
+                ..stored
+            }),
+            AnchorComparison::RolledBack
+        );
+        assert_eq!(
+            stored.compare_vault(&Anchor {
+                audit_seq: 11,
+                write_counter: 6,
+                ..stored
+            }),
+            AnchorComparison::RolledBack
         );
     }
 }

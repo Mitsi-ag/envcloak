@@ -20,8 +20,7 @@ enum Route: Hashable {
     }
     var unavailableMessage: String? {
         switch self {
-        case .approvals, .activity, .agents: "Arrives with Touch ID approvals"
-        case .keys(.exposed): "Leak checks arrive with envcloak doctor"
+        case .activity, .agents: "Arrives with Touch ID approvals"
         case .later(.spend), .later(.dashboard): "Spend arrives in M4"
         case .later(.devices): "Devices arrive in M5"
         default: nil
@@ -47,6 +46,7 @@ extension VaultSession {
         return items.rows.filter { item in
             if filter == .live && item.classification != .live { return false }
             if filter == .test && item.classification != .test { return false }
+            if filter == .exposed && item.exposed == nil { return false }
             let users = usedBy(item.slug)
             if let scope, !users.contains(where: { $0.dir == projects.canonicalDirectory(scope) }) { return false }
             let text = [item.slug.escaped, item.title.escaped, item.provider?.escaped ?? "", item.account?.email?.escaped ?? "", item.env_hint?.escaped ?? ""].joined(separator: " ").lowercased()

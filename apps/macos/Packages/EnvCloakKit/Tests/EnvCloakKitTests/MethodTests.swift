@@ -45,6 +45,48 @@ final class MethodTests: XCTestCase {
         XCTAssertEqual(add["account"] as? String, "account")
         XCTAssertEqual(add["env_hint"] as? String, "VARIABLE")
         XCTAssertEqual(add["allow_short"] as? Bool, true)
+
+        let enrollBegin = try params(AppUnlockerEnrollBegin(unlock_pub: "04aa", approve_pub: "04bb", label: "Touch ID", claims: ["ui"]))
+        XCTAssertEqual(enrollBegin["unlock_pub"] as? String, "04aa")
+        XCTAssertEqual(enrollBegin["approve_pub"] as? String, "04bb")
+        XCTAssertEqual(enrollBegin["label"] as? String, "Touch ID")
+        XCTAssertEqual(enrollBegin["claims"] as? [String], ["ui"])
+
+        let enrollPoll = try params(AppUnlockerEnroll(request: "REQ12345"))
+        XCTAssertEqual(enrollPoll["request"] as? String, "REQ12345")
+
+        XCTAssertTrue(try params(AppUnlockBegin()).isEmpty)
+        let unlockBeginWithId = try params(AppUnlockBegin(unlocker_id: "00112233445566778899aabbccddeeff"))
+        XCTAssertEqual(unlockBeginWithId["unlocker_id"] as? String, "00112233445566778899aabbccddeeff")
+
+        let unlockFinish = try params(AppUnlock(request_id: "REQ12345", sealed: "deadbeef"))
+        XCTAssertEqual(unlockFinish["request_id"] as? String, "REQ12345")
+        XCTAssertEqual(unlockFinish["sealed"] as? String, "deadbeef")
+
+        XCTAssertTrue(try params(AppPendingList()).isEmpty)
+        XCTAssertEqual(try params(AppPendingGet(request: "REQ12345"))["request"] as? String, "REQ12345")
+
+        let approveParams = try params(
+            AppApprove(
+                request: "REQ12345",
+                options: ApprovalOptions(uses: .session, ttl_secs: 3600, live: ["STRIPE_KEY"], standing: 86400),
+                digest: String(repeating: "ab", count: 32),
+                signature: String(repeating: "cd", count: 64)
+            )
+        )
+        XCTAssertEqual(approveParams["request"] as? String, "REQ12345")
+        XCTAssertEqual(approveParams["digest"] as? String, String(repeating: "ab", count: 32))
+        XCTAssertEqual(approveParams["signature"] as? String, String(repeating: "cd", count: 64))
+        let optsDict = approveParams["options"] as? [String: Any]
+        XCTAssertEqual(optsDict?["uses"] as? String, "session")
+        XCTAssertEqual((optsDict?["ttl_secs"] as? NSNumber)?.uint64Value, 3600)
+        XCTAssertEqual(optsDict?["live"] as? [String], ["STRIPE_KEY"])
+        XCTAssertEqual((optsDict?["standing"] as? NSNumber)?.uint64Value, 86400)
+
+        XCTAssertTrue(try params(StandingList()).isEmpty)
+        let standingRevoke = try params(StandingRevoke(id: "01JSTAND", all: false))
+        XCTAssertEqual(standingRevoke["id"] as? String, "01JSTAND")
+        XCTAssertEqual(standingRevoke["all"] as? Bool, false)
     }
 
     func testStatusSanitizesBothUntrustedStringsAndRejectsNestedExtras() throws {
@@ -101,5 +143,119 @@ final class MethodTests: XCTestCase {
             XCTAssertEqual(try UserPaths.home(), original)
             XCTAssertEqual(try UserPaths.runtime(), original + "/Library/Application Support/EnvCloak/run")
         }
+    }
+
+    func testFirstRunReportReaderDecodesAndValidatesPermissionsAndRejectsUnknownFields() throws {
+        let dir = URL(fileURLWithPath: "/tmp/ec-j4-reports-" + UUID().uuidString.prefix(8))
+        defer { try? FileManager.default.removeItem(at: dir) }
+        XCTAssertNil(try FirstRunReportReader.read(inDirectory: dir.path))
+
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        XCTAssertNil(try FirstRunReportReader.read(inDirectory: dir.path))
+
+        // Verify cross-language schema parity against crates/envcloak-client/src/doctor_report.rs.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let rustSource = try String(contentsOf: repoRoot.appendingPathComponent("crates/envcloak-client/src/doctor_report.rs"), encoding: .utf8)
+        var rustFields: [String: [String]] = [:]
+        var currentStruct: String?
+        for line in rustSource.split(separator: "\n", omittingEmptySubsequences: false) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("pub struct FirstRun") {
+                let rest = trimmed.dropFirst("pub struct ".count)
+                let name = String(rest.prefix { $0.isLetter || $0.isNumber || $0 == "_" })
+                currentStruct = name
+                rustFields[name] = []
+                continue
+            }
+            if let name = currentStruct {
+                if trimmed == "}" {
+                    currentStruct = nil
+                    continue
+                }
+                if trimmed.hasPrefix("pub "), let colon = trimmed.firstIndex(of: ":") {
+                    let fieldName = trimmed[trimmed.index(trimmed.startIndex, offsetBy: 4)..<colon]
+                        .trimmingCharacters(in: .whitespaces)
+                    rustFields[name, default: []].append(fieldName)
+                }
+            }
+        }
+        XCTAssertEqual(rustFields["FirstRunReport"], [
+            "version", "keys_found", "projects", "already_leaked", "plaintext_files",
+            "providers", "accounts", "leaked", "plaintext_projects"
+        ])
+        XCTAssertEqual(rustFields["FirstRunProvider"], ["provider", "total_count", "live_count"])
+        XCTAssertEqual(rustFields["FirstRunAccount"], ["account", "count"])
+        XCTAssertEqual(rustFields["FirstRunLeakedPlace"], ["display_path", "count"])
+        XCTAssertEqual(rustFields["FirstRunLeakedItem"], ["slug", "provider", "rotate_url", "sources", "places"])
+        XCTAssertEqual(rustFields["FirstRunProjectPlaintext"], ["project_dir", "files"])
+
+        let reportObject: [String: Any] = [
+            "version": 1,
+            "keys_found": 47,
+            "projects": 23,
+            "already_leaked": 12,
+            "plaintext_files": 18,
+            "providers": [
+                ["provider": "stripe", "total_count": 4, "live_count": 2],
+                ["provider": "custom\u{202e}", "total_count": 1, "live_count": 0]
+            ],
+            "accounts": [
+                ["account": "you@acme.com", "count": 4]
+            ],
+            "leaked": [
+                [
+                    "slug": "stripe/acme-live\u{202e}",
+                    "provider": "stripe",
+                    "rotate_url": "https://dashboard.stripe.com/apikeys",
+                    "sources": ["transcript"],
+                    "places": [
+                        ["display_path": "/tmp/claude.jsonl", "count": 19]
+                    ]
+                ]
+            ],
+            "plaintext_projects": [
+                [
+                    "project_dir": "/tmp/acme-web",
+                    "files": [".env", ".env.local"]
+                ]
+            ]
+        ]
+        let file = dir.appendingPathComponent("first-run.json")
+        let data = try JSONSerialization.data(withJSONObject: reportObject)
+        try data.write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
+        XCTAssertThrowsError(try FirstRunReportReader.read(inDirectory: dir.path), "0644 report file must be rejected")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        let hardlink = dir.appendingPathComponent("hardlink.json")
+        try FileManager.default.linkItem(at: file, to: hardlink)
+        XCTAssertThrowsError(try FirstRunReportReader.read(inDirectory: dir.path), "hard-linked report file must be rejected")
+        try FileManager.default.removeItem(at: hardlink)
+
+        let report = try XCTUnwrap(try FirstRunReportReader.read(inDirectory: dir.path))
+        XCTAssertEqual(report.version, 1)
+        XCTAssertEqual(report.keys_found, 47)
+        XCTAssertEqual(report.projects, 23)
+        XCTAssertEqual(report.already_leaked, 12)
+        XCTAssertEqual(report.plaintext_files, 18)
+        XCTAssertEqual(report.providers.first?.summaryLabel, "Stripe 4, 2 live")
+        XCTAssertEqual(report.providers.last?.summaryLabel, "custom\\u{202e} 1")
+        XCTAssertEqual(report.accounts.first?.summaryLabel, "you@acme.com (4)")
+        XCTAssertEqual(report.leaked.first?.slug.escaped, "stripe/acme-live\\u{202e}")
+        XCTAssertEqual(report.leaked.first?.whereSummary, "agent transcripts, 1 file")
+        XCTAssertEqual(report.plaintext_projects.first?.summaryLabel, "/tmp/acme-web: .env, .env.local")
+
+        var withPreview = reportObject
+        withPreview["preview"] = "sk-ant-api03-canary"
+        let badBytes = try JSONSerialization.data(withJSONObject: withPreview)
+        XCTAssertThrowsError(try FirstRunReportReader.decode(json: String(decoding: badBytes, as: UTF8.self)),
+                             "unknown or preview fields must be rejected")
     }
 }

@@ -256,10 +256,10 @@ fn linux_same_uid_ptrace_and_proc_reads_of_the_daemon_are_denied() {
         .read_line(&mut line)
         .unwrap();
     let cpid = i32::try_from(control.id()).unwrap();
-    try_attach(cpid).expect("control: ptrace attach to an ordinary child must work here");
     std::fs::File::open(format!("/proc/{cpid}/mem")).expect("control: /proc/<pid>/mem");
     let environ = std::fs::read(format!("/proc/{cpid}/environ")).expect("control: environ");
     assert!(!envcloak_testkit::find(&environ, &cs).is_empty());
+    try_attach(cpid).expect("control: ptrace attach to an ordinary child must work here");
     let _ = control.kill();
     let _ = control.wait();
 

@@ -1232,7 +1232,7 @@ fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {
 
 /// Updates the pending request's [`StandingSummary`] so a Linux self-update's
 /// `appends_to` target matches what `StandingStore::build_record` will do.
-fn refresh_pending_standing(
+pub(crate) fn refresh_pending_standing(
     shared: &Shared,
     s: &mut crate::state::State,
     id: &PendingId,
@@ -1842,11 +1842,13 @@ pub fn grants_revoke(
         (None, true) => RevokeSelector::All,
         _ => return Err(RpcError::new(ErrorKind::InvalidParams)),
     };
-    let revoked = locked(&shared.state).grants().revoke(selector);
-    shared.audit(AuditEvent::Revoked {
+    let mut s = locked(&shared.state);
+    let revoked = s.grants().revoke(selector);
+    s.audit(AuditEvent::Revoked {
         pid: peer.pid,
         count: revoked,
     });
+    s.anchor_now();
     Ok(RevokedView {
         revoked: u64::try_from(revoked).unwrap_or(u64::MAX),
     })

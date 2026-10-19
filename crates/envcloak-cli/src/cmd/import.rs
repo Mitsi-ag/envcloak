@@ -60,7 +60,7 @@ use super::require_unlocked;
 mod export;
 mod first_run;
 
-const USAGE: &str = "envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json] | envcloak import --from <kind> <file> [--dry-run | --yes] [--json]";
+const USAGE: &str = "envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json] [--report] | envcloak import --from <kind> <file> [--dry-run | --yes] [--json]";
 
 /// An env file read for an import or a deletion.
 pub(crate) struct ReadFile {
@@ -821,6 +821,7 @@ struct ImportArgs {
     delete: bool,
     yes: bool,
     json: bool,
+    report: bool,
 }
 
 fn parse(args: &[&str]) -> Option<ImportArgs> {
@@ -854,11 +855,12 @@ fn parse(args: &[&str]) -> Option<ImportArgs> {
             "--delete-plaintext" if !a.delete => a.delete = true,
             "--yes" if !a.yes => a.yes = true,
             "--json" if !a.json => a.json = true,
+            "--report" if !a.report => a.report = true,
             _ => return None,
         }
     }
     ((if a.from.is_some() {
-        a.dirs.is_empty() && !a.machine && !a.delete
+        a.dirs.is_empty() && !a.machine && !a.delete && !a.report
     } else {
         !a.dirs.is_empty() || a.machine
     }) && !(a.dry_run && a.yes)

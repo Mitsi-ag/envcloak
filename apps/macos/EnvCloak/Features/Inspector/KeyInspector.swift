@@ -20,6 +20,21 @@ struct KeyInspector: View {
             let item = session.items.selectedItem?.slug == slug ? session.items.selectedItem! : summary
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if let exposed = item.exposed ?? summary.exposed {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Exposed", systemImage: "exclamationmark.triangle")
+                                .font(.headline)
+                                .foregroundStyle(ECToken.warning.color)
+                            Text(exposed.bannerText)
+                                .foregroundStyle(ECToken.warning.color)
+                            if let url = MetadataRequest.safeLink(item.detail?.links.keys_page) {
+                                Link("Open keys page", destination: url)
+                            }
+                        }
+                        .padding(12)
+                        .background(ECToken.raised.color)
+                        .accessibilityIdentifier("inspector.exposed.banner")
+                    }
                     Text(item.title.escaped).font(.title3)
                     Text(item.slug.escaped).font(ECFont.martianMono(size: 12)).textSelection(.enabled)
                     Text([item.provider?.escaped, item.classification.rawValue.capitalized].compactMap { $0 }.joined(separator: " · "))

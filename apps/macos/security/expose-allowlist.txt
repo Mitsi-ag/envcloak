@@ -12,3 +12,4 @@ apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/Base64.swift  # encod
 apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Wire/Frame.swift  # framing, in-place parsing and verified-socket I/O
 apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/CLI/CLIRunner.swift  # validates bounded metadata-only CLI stdout
 apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Values/PasteDraft.swift  # copies the transient SecureField binding into wiping storage and slices env lines
+apps/macos/Packages/EnvCloakKit/Sources/EnvCloakKit/Auth/SEUnlock.swift  # wipes opened HPKE VMK Data and seals directly from SecretBuffer

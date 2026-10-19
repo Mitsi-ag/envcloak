@@ -21,6 +21,7 @@ struct ConnectionView: View {
                 if session.state == .locked {
                     Text(session.lockReason)
                     if session.proofWait > 0 { Text("Too many failed attempts. Try again in \(session.proofWait) seconds.") }
+                    UnlockView(session: session)
                 }
                 if let action = session.state.action {
                     Button(action) { perform() }.disabled(session.actionInProgress)

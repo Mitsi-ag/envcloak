@@ -29,5 +29,11 @@ final class LiveDaemonTests: XCTestCase, @unchecked Sendable {
         catch { XCTAssertEqual(error, .rpc(.noVault, nil)) }
         do { _ = try await client.call(BackupCreate()); XCTFail("absent vault backed up") }
         catch { XCTAssertEqual(error, .rpc(.noVault, nil)) }
+        do { _ = try await client.call(StandingList()); XCTFail("absent vault standing listed") }
+        catch { XCTAssertEqual(error, .rpc(.noVault, nil)) }
+        do { _ = try await client.call(AppPendingList()); XCTFail("non-app peer called app.pending.list") }
+        catch { XCTAssertEqual(error, .rpc(.roleDenied, nil)) }
+        do { _ = try await client.call(AppUnlockBegin()); XCTFail("non-app peer called app.unlock.begin") }
+        catch { XCTAssertEqual(error, .rpc(.roleDenied, nil)) }
     }
 }

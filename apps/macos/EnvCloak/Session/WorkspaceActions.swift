@@ -14,6 +14,10 @@ import Foundation
         guard let safe = MetadataRequest.clipboardPath(path) else { return false }
         return copy(safe, to: board)
     }
+    @discardableResult static func copyBindingCommand(_ edit: BindingEdit, to board: NSPasteboard = .general) -> Bool {
+        guard let args = edit.cliArguments, let text = MetadataRequest.terminalCommand(args) else { return false }
+        return copy(text, to: board)
+    }
     static func openTerminal() {
         let url = URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app")
         NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())

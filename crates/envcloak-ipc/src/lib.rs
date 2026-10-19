@@ -30,7 +30,9 @@ pub mod view;
 pub mod wait;
 mod wire_secret;
 
-pub use client::{Client, ClientError, ClientFds, DaemonIdentity, Unverified};
+pub use client::{
+    AskWaitOutcome, Client, ClientError, ClientFds, DaemonIdentity, RevealWaitOutcome, Unverified,
+};
 pub use frame::{DecodeError, Frame, FrameError, MAX_FRAME};
 pub use paths::{LOCK_NAME, RunPathError, RunPathErrorKind, RunPaths, SOCKET_NAME, SUN_PATH_MAX};
 pub use proto::{ErrorKind, Method, Role, RpcError};

@@ -1,8 +1,40 @@
+import CryptoKit
 import Foundation
 import XCTest
 import EnvCloakKitTestSupport
 @testable import EnvCloak
 @testable import EnvCloakKit
+
+extension SoftwareUnlockKey: @retroactive UnlockKeyAgreement {
+    public func openAndReseal(_ begin: AppUnlockBeginView, reason: String) async throws -> String {
+        try recordOpen(reason: reason)
+        return try SEHPKE.openAndResealWithKey(begin, privateKey: privateKey)
+    }
+
+    public static func sealEnvelope(
+        vmk: Data,
+        recipientPublicKey: P256.KeyAgreement.PublicKey,
+        vaultIDHex: String,
+        unlockerIDHex: String,
+        epoch: UInt32
+    ) throws -> SeEnvelopeView {
+        let hex = try sealEnvelopeHex(
+            vmk: vmk,
+            recipientPublicKey: recipientPublicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: unlockerIDHex,
+            epoch: epoch
+        )
+        return SeEnvelopeView(enc: DaemonText(hex.encHex), ciphertext: DaemonText(hex.ciphertextHex))
+    }
+}
+
+extension SoftwareApprovalSigner: @retroactive ApprovalSigner {
+    public func sign(_ statementBytes: Data, reason: String) async throws -> P256RawSignature {
+        let raw = try await signRaw(statementBytes, reason: reason)
+        return try P256RawSignature(rawRepresentation: raw)
+    }
+}
 
 /// Scripted metadata passes through FakeDaemon and the real socket client. No fixture reads the account's runtime path.
 actor ScriptedClient: WorkspaceClient {
@@ -61,12 +93,31 @@ actor ScriptedClient: WorkspaceClient {
         if let readOnly { self.readOnly = readOnly }
         self.failure = failure; self.projectFailure = projectFailure; self.itemCount = itemCount
     }
+    var exposedItemIndices: Set<Int> = []
+    func expose(_ indices: Set<Int>) { exposedItemIndices = indices }
+    var standingCount = 0
+    func setStandingCount(_ count: Int) { standingCount = count }
+    var enrollState = "enrolled"
+    func setEnrollState(_ state: String) { enrollState = state }
+    var unlockBeginData: [String: Any]?
+    func setUnlockBegin(_ data: [String: Any]) { unlockBeginData = data }
+    var approveError: EnvCloakError?
+    func setApproveError(_ err: EnvCloakError?) { approveError = err }
+    var pendingNonce = String(repeating: "ab", count: 32)
+    func setPendingNonce(_ nonce: String) { pendingNonce = nonce }
+    var lastApprovedDigest: String?
+    var lastApprovedSignature: String?
+    func approvedReceipt() -> (digest: String?, signature: String?) { (lastApprovedDigest, lastApprovedSignature) }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
-        ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
+        var row: [String: Any] = ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
          "provider": "example" + hostileSuffix, "classification": "test", "env_hint": "VARIABLE", "allow_short": false,
          "fields": ["value", "secondary"].map { ["name": $0 + fieldNameSuffix, "prior_count": 0, "created_secs": 1, "updated_secs": 1] as [String: Any] },
          "last_used_secs": 123, "created_secs": 1, "updated_secs": 1, "account": ["email": "fixture@example.invalid" + hostileSuffix]]
+        if exposedItemIndices.contains(i) {
+            row["exposed"] = ["since_secs": 100, "sources": ["transcript"], "count": 14] as [String: Any]
+        }
+        return row
     }
     func call<M: DaemonMethod>(_ method: M) async throws -> M.Output {
         counts[M.name, default: 0] += 1
@@ -88,7 +139,7 @@ actor ScriptedClient: WorkspaceClient {
             let index = (method as? ItemsShow)?.slug.hasPrefix("fixture-1") == true ? 1 : 0
             var full = item(wrongDetail ? 99 : index)
             full["detail"] = ["allowed_hosts": ["api.example.invalid"], "tags": ["fixture"],
-                              "links": ["docs": "https://example.invalid/docs"], "last_used_secs": 123,
+                              "links": ["docs": "https://example.invalid/docs", "keys_page": "https://example.invalid/keys"], "last_used_secs": 123,
                               "notes": "Notes \(head)\u{202e}"] as [String: Any]
             result = full
         case "projects.list":
@@ -115,13 +166,139 @@ actor ScriptedClient: WorkspaceClient {
             result = ["project_dir": "/tmp/project" + hostileSuffix, "project_name": checkedName as Any? ?? NSNull(), "bindings": [
             ["env_name": "VARIABLE" + hostileSuffix, "reference": hostileSurfaceMetadata ? "envcloak://fixture-0" + hostileSuffix : hostileSlugs ? "envcloak://fixture" : "envcloak://fixture-0", "status": "ok"],
             ["profile": "test", "env_name": "VARIABLE", "reference": "envcloak://second", "status": "unknown_item"]], "refs": []]
-        case "grants.list": result = ["grants": grants == 0 ? [] : [[
-            "id": "fixture-grant", "kind": "terminal", "label": "Fixture grant" + hostileSuffix, "root_pid": 42,
+        case "grants.list": result = ["grants": (0..<grants).map { idx in [
+            "id": idx == 0 ? "fixture-grant" : "fixture-grant-\(idx)",
+            "kind": "terminal", "label": "Fixture grant" + hostileSuffix, "root_pid": 42,
             "project_dir": "/tmp/project" + hostileSuffix, "bindings": [["env_name": "VARIABLE" + hostileSuffix, "slug": "fixture-0" + hostileSuffix, "live": false]],
-            "mode": "inject", "uses": "session", "created_secs": 1, "remaining_secs": 3600]]]
+            "mode": "inject", "uses": "session", "created_secs": 1, "remaining_secs": 3600] as [String: Any] }]
         case "grants.revoke":
             if revokeFailure { throw EnvCloakError.protocolError }
             result = ["revoked": 1]
+        case "standing.list":
+            result = [
+                "standing": standingCount == 0 ? [] : [[
+                    "id": "standing-1",
+                    "agent_id": "claude_code",
+                    "agent_name": "claude_code" + hostileSuffix,
+                    "identity": "com.anthropic.claude-code",
+                    "project_dir": "/tmp/project" + hostileSuffix,
+                    "bindings": ["VARIABLE"],
+                    "created_secs": 10,
+                    "remaining_secs": 604_800,
+                    "not_after_secs": 604_810,
+                ]],
+                "policy_epoch_unverified": false,
+            ]
+        case "standing.revoke":
+            standingCount = 0
+            result = ["revoked": 1, "grants_ended": 0]
+        case "app.pending.list":
+            result = [
+                "requests": (0..<pending).map { idx in
+                    [
+                        "request": "REQ\(idx)ABCD",
+                        "age_secs": 5,
+                        "expires_in_secs": 540,
+                        "kind": "agent",
+                        "agent": "claude_code" + hostileSuffix,
+                        "project": "/tmp/project" + hostileSuffix,
+                        "bindings": ["STRIPE_SECRET_KEY", "OPENAI_API_KEY"],
+                        "more_bindings": 0,
+                        "statement_domain": "envcloak-statement/2",
+                    ] as [String: Any]
+                }
+            ]
+        case "app.pending.get":
+            let reqId = (method as? AppPendingGet)?.requestID ?? "REQ0ABCD"
+            result = [
+                "request": reqId,
+                "nonce": pendingNonce,
+                "created_secs": 1000,
+                "expires_in_secs": 540,
+                "subject": [
+                    "kind": "agent",
+                    "label": "claude_code" + hostileSuffix,
+                    "caller_pid": 100,
+                    "root": [
+                        "pid": 90,
+                        "start_time": 123_456,
+                        "exe": "/usr/local/bin/claude",
+                    ],
+                ],
+                "project": [
+                    "dir": "/tmp/project" + hostileSuffix,
+                    "manifest": "/tmp/project/envcloak.toml",
+                    "manifest_sha256": String(repeating: "c", count: 64),
+                    "new_project": false,
+                ],
+                "bindings": [
+                    [
+                        "env_name": "STRIPE_SECRET_KEY",
+                        "slug": "stripe/acme-live",
+                        "item": "item-live-1",
+                        "field": "field-live-1",
+                        "field_name": "value",
+                        "classification": "live",
+                        "first_use": true,
+                        "granted": false,
+                    ],
+                    [
+                        "env_name": "OPENAI_API_KEY",
+                        "slug": "openai/acme-test",
+                        "item": "item-test-1",
+                        "field": "field-test-1",
+                        "field_name": "value",
+                        "classification": "test",
+                        "first_use": false,
+                        "granted": false,
+                    ],
+                    [
+                        "env_name": "ALREADY_COVERED",
+                        "slug": "cov/key",
+                        "item": "item-cov-1",
+                        "field": "field-cov-1",
+                        "field_name": "value",
+                        "classification": "test",
+                        "first_use": false,
+                        "granted": true,
+                    ],
+                ],
+                "proposals": [
+                    [
+                        "env_name": "STRIPE_SECRET_KEY",
+                        "live_slug": "stripe/acme-live",
+                        "test_slug": "stripe/acme-test",
+                        "source": ["layer": "env"],
+                    ]
+                ],
+                "mode": "inject",
+                "argv": ["npm", "test" + hostileSuffix],
+            ]
+        case "app.approve":
+            if let approveError { throw approveError }
+            if let req = method as? AppApprove {
+                lastApprovedDigest = req.digest
+                lastApprovedSignature = req.signature
+            }
+            if pending > 0 { pending -= 1 }
+            grants += 1
+            result = ["grant": "grant-approved-1", "expires_in_secs": 28800]
+        case "deny":
+            if pending > 0 { pending -= 1 }
+            result = ["root_auto_denied": false]
+        case "app.unlock.begin":
+            guard let unlockBeginData else { throw EnvCloakError.rpc(.noUnlocker, nil) }
+            result = unlockBeginData
+        case "app.unlock":
+            vault = "unlocked"
+            result = ["integrity": "ok", "read_only": false, "already": false]
+        case "app.unlocker.enroll.begin":
+            result = ["request": "ENROL123", "expires_in_secs": 600]
+        case "app.unlocker.enroll":
+            result = [
+                "state": enrollState,
+                "unlocker_id": enrollState == "enrolled" ? "unlocker-1" : NSNull(),
+            ]
         case "lock": vault = "locked"; result = ["was_unlocked": true]
         default: throw EnvCloakError.protocolError
         }
@@ -759,12 +936,448 @@ final class SessionTests: XCTestCase {
     }
 
     func testUnavailableRoutesNeverAdvertiseShippedFeatures() {
-        for route in [Route.approvals, .activity, .agents] {
+        XCTAssertNil(Route.approvals.unavailableMessage)
+        for route in [Route.activity, .agents] {
             XCTAssertEqual(route.unavailableMessage, "Arrives with Touch ID approvals")
         }
-        XCTAssertEqual(Route.keys(.exposed).unavailableMessage, "Leak checks arrive with envcloak doctor")
+        XCTAssertNil(Route.keys(.exposed).unavailableMessage)
         XCTAssertEqual(Route.later(.spend).unavailableMessage, "Spend arrives in M4")
         XCTAssertEqual(Route.later(.devices).unavailableMessage, "Devices arrive in M5")
+    }
+
+    @MainActor func testExposedKeysFilterOnlyReturnsItemsWithExposedMetadata() async {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(itemCount: 3)
+        await client.expose([1])
+        let session = VaultSession(client: client)
+        await session.poll()
+        XCTAssertEqual(session.filteredKeys(query: "", filter: .all, scope: nil).map(\.slug.escaped), ["fixture-0", "fixture-1", "fixture-2"])
+        XCTAssertEqual(session.filteredKeys(query: "", filter: .exposed, scope: nil).map(\.slug.escaped), ["fixture-1"])
+    }
+
+    @MainActor func testSoftwareKeyTouchIDUnlockEnrolmentAndSSHRefusal() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(vault: "locked")
+        let unlockKey = SoftwareUnlockKey()
+        let approveKey = SoftwareApprovalSigner()
+        let overrideKeys = EnrolledPublicKeys(
+            unlockPublicKeyHex: unlockKey.publicKeyHex,
+            approvePublicKeyHex: approveKey.publicKeyHex
+        )
+        let session = VaultSession(
+            client: client,
+            unlockKey: unlockKey,
+            approvalSigner: approveKey,
+            enrolledPublicKeysOverride: overrideKeys
+        )
+        session.sshSession = true
+        await session.poll()
+        XCTAssertEqual(session.state, .locked)
+
+        let sshUnlocked = await session.unlockWithTouchID()
+        XCTAssertFalse(sshUnlocked)
+        XCTAssertEqual(
+            session.notice,
+            "Touch ID cannot be used over SSH. Use envcloak unlock and envcloak approve in Terminal."
+        )
+        let sshBeginCalls = await client.calls("app.unlock.begin")
+        XCTAssertEqual(sshBeginCalls, 0)
+
+        session.sshSession = false
+        let started = await session.beginEnrolment()
+        XCTAssertTrue(started)
+        XCTAssertEqual(session.enrolmentPendingId?.escaped, "ENROL123")
+        XCTAssertFalse(session.enrolmentCompleted)
+        let enrollState = await session.pollEnrolment()
+        XCTAssertEqual(enrollState, .enrolled)
+        XCTAssertTrue(session.enrolmentCompleted)
+        XCTAssertNil(session.enrolmentPendingId)
+
+        let vmk = Data((0..<32).map { UInt8($0 + 1) })
+        let vaultIDHex = "00112233445566778899aabbccddeeff"
+        let unlockerIDHex = "ffeeddccbbaa99887766554433221100"
+        let sealedEnvelope = try SoftwareUnlockKey.sealEnvelope(
+            vmk: vmk,
+            recipientPublicKey: unlockKey.privateKey.publicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: unlockerIDHex,
+            epoch: 1
+        )
+        let daemonEphKey = Curve25519.KeyAgreement.PrivateKey()
+        let challengeHex = String(repeating: "ab", count: 32)
+        await client.setUnlockBegin([
+            "request_id": "UNLK0001",
+            "unlocker_id": unlockerIDHex,
+            "vault_id": vaultIDHex,
+            "epoch": 1,
+            "challenge": challengeHex,
+            "envelope": [
+                "enc": sealedEnvelope.enc.escaped,
+                "ciphertext": sealedEnvelope.ciphertext.escaped,
+            ],
+            "daemon_eph_pub": HexCoding.encode(daemonEphKey.publicKey.rawRepresentation),
+        ])
+
+        let unlocked = await session.unlockWithTouchID()
+        XCTAssertTrue(unlocked)
+        XCTAssertNil(session.notice)
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(unlockKey.lastReason, "unlock your vault")
+        let unlockCalls = await client.calls("app.unlock")
+        XCTAssertEqual(unlockCalls, 1)
+    }
+
+    @MainActor func testStandingApprovalsScopeLabelAndRevoke() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.setStandingCount(1)
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        XCTAssertEqual(session.grants.standing.count, 1)
+        let standing = try XCTUnwrap(session.grants.standing.first)
+        XCTAssertEqual(
+            standing.scopeLabel,
+            "any claude_code session in this project, including one started by another program, gets these keys without asking"
+        )
+
+        await session.revokeStanding(standing.id)
+        let revokeCalls = await client.calls("standing.revoke")
+        XCTAssertEqual(revokeCalls, 1)
+        XCTAssertTrue(session.grants.standing.isEmpty)
+    }
+
+    @MainActor func testApprovalWindowModelV2StatementGuardProposalsAndOutcomes() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(pending: 1)
+        let signer = SoftwareApprovalSigner()
+        let session = VaultSession(client: client, approvalSigner: signer)
+        await session.poll()
+
+        let model = ApprovalWindowModel(session: session)
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        let descriptor = try XCTUnwrap(model.descriptor)
+        XCTAssertEqual(descriptor.request.escaped, "REQ0ABCD")
+
+        // Immediately after open, the 0.5 s focus/change guard disables Approve.
+        XCTAssertTrue(model.isWithinGuardWindow)
+        XCTAssertFalse(model.canApprove)
+
+        // Even after the 0.5 s guard finishes, an unticked live key keeps Approve disabled (M3-J1).
+        model.completeGuardPeriodForTesting()
+        XCTAssertFalse(model.isWithinGuardWindow)
+        XCTAssertFalse(model.allLiveKeysTicked)
+        XCTAssertFalse(model.canApprove)
+        await model.approve()
+        let prematureApproveCalls = await client.calls("app.approve")
+        XCTAssertEqual(prematureApproveCalls, 0)
+
+        // Ticking the live key restarts the 0.5 s content-change guard.
+        model.toggleLiveKey("STRIPE_SECRET_KEY")
+        XCTAssertTrue(model.allLiveKeysTicked)
+        XCTAssertTrue(model.isWithinGuardWindow)
+        XCTAssertFalse(model.canApprove)
+
+        model.completeGuardPeriodForTesting()
+        XCTAssertTrue(model.canApprove)
+
+        let statementBytes = try XCTUnwrap(model.currentStatementData())
+        XCTAssertTrue(statementBytes.starts(with: Data("envcloak-statement/2\n".utf8)))
+        let expectedDigest = CanonicalStatement.digestHex(
+            descriptor,
+            options: model.currentApproveOptions()
+        )
+
+        await model.approve()
+        XCTAssertEqual(
+            model.outcome,
+            .approved(grantId: DaemonText("grant-approved-1"), expiresInSecs: 28800)
+        )
+        XCTAssertEqual(signer.lastReason, "approve npm test in project with 2 keys")
+        let receipt = await client.approvedReceipt()
+        XCTAssertEqual(receipt.digest, expectedDigest)
+        let sigHex = try XCTUnwrap(receipt.signature)
+        let sigData = try XCTUnwrap(HexCoding.decode(sigHex, expectedByteCount: 64))
+        let rawSig = try P256.Signing.ECDSASignature(rawRepresentation: sigData)
+        XCTAssertTrue(
+            signer.privateKey.publicKey.isValidSignature(
+                rawSig,
+                for: SHA256.hash(data: statementBytes)
+            )
+        )
+
+        // Proposal swap ("Use test key instead") denies the live request and records the swapped outcome.
+        var appliedEdit: BindingEdit?
+        session.bindings.applyOverride = { edit in
+            appliedEdit = edit
+            return true
+        }
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        let proposal = try XCTUnwrap(model.descriptor?.proposals.first)
+        await model.useTestKeyInstead(proposal)
+        XCTAssertEqual(
+            model.outcome,
+            .proposalApplied(envName: "STRIPE_SECRET_KEY", slug: "stripe/acme-test")
+        )
+        XCTAssertEqual(appliedEdit?.envName, "STRIPE_SECRET_KEY")
+        XCTAssertEqual(appliedEdit?.reference, "stripe/acme-test")
+        XCTAssertNil(appliedEdit?.profile)
+        let denyCalls = await client.calls("deny")
+        XCTAssertEqual(denyCalls, 1)
+
+        // Daemon refusal outcomes and expiry context invalidation.
+        for (error, expectedOutcome) in [
+            (EnvCloakError.rpc(.statementMismatch, nil), ApprovalOutcome.statementChanged),
+            (EnvCloakError.rpc(.vaultLocked, nil), .vaultLocked),
+            (EnvCloakError.rpc(.liveNotTicked, nil), .liveNotTicked),
+            (EnvCloakError.rpc(.noSuchRequest, nil), .expired),
+        ] {
+            await client.setApproveError(error)
+            await model.load(requestId: DaemonText("REQ0ABCD"))
+            model.toggleLiveKey("STRIPE_SECRET_KEY")
+            model.completeGuardPeriodForTesting()
+            await model.approve()
+            XCTAssertEqual(model.outcome, expectedOutcome)
+        }
+        await client.setApproveError(nil)
+
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        let invalidatedBefore = signer.invalidatedCount
+        model.triggerExpiry()
+        XCTAssertEqual(model.outcome, .expired)
+        XCTAssertEqual(signer.invalidatedCount, invalidatedBefore + 1)
+    }
+
+    @MainActor func testStandingCapCoveredLiveGuardAndProposalEditSemantics() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        // F-1: Standing choices are capped at 30 days and only offered when descriptor.standing != nil and all bindings are test.
+        XCTAssertEqual(
+            ApprovalDurationChoice.allCases.filter(\.isStanding).map(\.durationSecs),
+            [604_800, 2_592_000]
+        )
+
+        let model = ApprovalWindowModel(session: session)
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        XCTAssertFalse(model.isStandingCapable)
+        XCTAssertFalse(model.availableDurationChoices.contains(where: \.isStanding))
+
+        func decodeDescriptor(_ bodyJSON: String) throws -> PendingDescriptor {
+            let envelope = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\(bodyJSON)}"
+            return try Frame(text: envelope).response(id: 1)
+        }
+
+        let standingEligibleJSON = """
+        {
+          "request": "REQSTAND",
+          "nonce": "\(String(repeating: "ab", count: 32))",
+          "created_secs": 1000,
+          "expires_in_secs": 540,
+          "subject": {
+            "kind": "agent",
+            "label": "claude_code",
+            "caller_pid": 100,
+            "root": { "pid": 90, "start_time": 123456, "exe": "/usr/local/bin/claude" }
+          },
+          "project": {
+            "dir": "/tmp/project",
+            "manifest": "/tmp/project/envcloak.toml",
+            "manifest_sha256": "\(String(repeating: "c", count: 64))",
+            "new_project": false
+          },
+          "bindings": [
+            {
+              "env_name": "OPENAI_API_KEY",
+              "slug": "openai/acme-test",
+              "item": "item-test-1",
+              "field": "field-test-1",
+              "field_name": "value",
+              "classification": "test",
+              "first_use": false,
+              "granted": false
+            }
+          ],
+          "proposals": [],
+          "standing": {
+            "exe": "/usr/local/bin/claude"
+          },
+          "mode": "inject",
+          "argv": ["npm", "test"]
+        }
+        """
+        let standingDescriptor = try decodeDescriptor(standingEligibleJSON)
+        model.applyDescriptor(standingDescriptor)
+        XCTAssertTrue(model.isStandingCapable)
+        XCTAssertTrue(model.availableDurationChoices.contains(.standingDays7))
+        XCTAssertTrue(model.availableDurationChoices.contains(.standingDays30))
+
+        // F-2: Covered live binding must still be ticked for agent/unknown subjects; terminal subjects have no live guard.
+        let coveredLiveJSON = """
+        {
+          "request": "REQCOVLIVE",
+          "nonce": "\(String(repeating: "ab", count: 32))",
+          "created_secs": 1000,
+          "expires_in_secs": 540,
+          "subject": {
+            "kind": "agent",
+            "label": "claude_code",
+            "caller_pid": 100,
+            "root": { "pid": 90, "start_time": 123456, "exe": "/usr/local/bin/claude" }
+          },
+          "project": {
+            "dir": "/tmp/project",
+            "manifest": "/tmp/project/envcloak.toml",
+            "manifest_sha256": "\(String(repeating: "c", count: 64))",
+            "new_project": false
+          },
+          "bindings": [
+            {
+              "env_name": "OPENAI_API_KEY",
+              "slug": "openai/acme-test",
+              "item": "item-test-1",
+              "field": "field-test-1",
+              "field_name": "value",
+              "classification": "test",
+              "first_use": false,
+              "granted": false
+            },
+            {
+              "env_name": "COVERED_LIVE_KEY",
+              "slug": "stripe/acme-live",
+              "item": "item-live-1",
+              "field": "field-live-1",
+              "field_name": "value",
+              "classification": "live",
+              "first_use": false,
+              "granted": true
+            }
+          ],
+          "proposals": [
+            {
+              "env_name": "STRIPE_SECRET_KEY",
+              "live_slug": "stripe/acme-live",
+              "test_slug": "stripe/acme-test",
+              "test_field": "secret",
+              "source": { "layer": "profile", "profile": "dev" }
+            },
+            {
+              "env_name": "LOCAL_LIVE_KEY",
+              "live_slug": "stripe/acme-live",
+              "test_slug": "stripe/acme-test",
+              "source": { "layer": "ref" }
+            }
+          ],
+          "mode": "inject",
+          "argv": ["npm", "test"]
+        }
+        """
+        let coveredLiveDescriptor = try decodeDescriptor(coveredLiveJSON)
+        model.applyDescriptor(coveredLiveDescriptor)
+        XCTAssertTrue(model.isLiveGuarded)
+        XCTAssertEqual(model.liveBindings.map(\.env_name.escaped), ["COVERED_LIVE_KEY"])
+        XCTAssertFalse(model.allLiveKeysTicked)
+        model.toggleLiveKey("COVERED_LIVE_KEY")
+        XCTAssertTrue(model.allLiveKeysTicked)
+        XCTAssertEqual(model.currentApproveOptions().live, ["COVERED_LIVE_KEY"])
+
+        let terminalLiveJSON = coveredLiveJSON.replacingOccurrences(of: "\"kind\": \"agent\"", with: "\"kind\": \"terminal\"")
+        let terminalDescriptor = try decodeDescriptor(terminalLiveJSON)
+        model.applyDescriptor(terminalDescriptor)
+        XCTAssertFalse(model.isLiveGuarded)
+        XCTAssertTrue(model.liveBindings.isEmpty)
+        XCTAssertTrue(model.allLiveKeysTicked)
+        XCTAssertTrue(model.currentApproveOptions().live.isEmpty)
+
+        // F-3: Profile and test_field preservation, non-automatic refusal, and apply failure checks.
+        let profileProposal = try XCTUnwrap(coveredLiveDescriptor.proposals.first)
+        let localProposal = try XCTUnwrap(coveredLiveDescriptor.proposals.last)
+
+        var recordedEdits: [BindingEdit] = []
+        session.bindings.applyOverride = { edit in
+            recordedEdits.append(edit)
+            return false
+        }
+        let denyCallsBefore = await client.calls("deny")
+
+        // Local override proposal cannot be applied automatically.
+        await model.useTestKeyInstead(localProposal)
+        if case .failed = model.outcome {} else {
+            XCTFail("Expected .failed for non-automatic proposal, got \(model.outcome)")
+        }
+        XCTAssertTrue(recordedEdits.isEmpty)
+        let denyAfterLocal = await client.calls("deny")
+        XCTAssertEqual(denyAfterLocal, denyCallsBefore)
+
+        // When apply fails, outcome is .failed and pending request is not denied.
+        await model.useTestKeyInstead(profileProposal)
+        if case .failed = model.outcome {} else {
+            XCTFail("Expected .failed when apply returns false, got \(model.outcome)")
+        }
+        XCTAssertEqual(recordedEdits.count, 1)
+        XCTAssertEqual(recordedEdits.first?.profile, "dev")
+        XCTAssertEqual(recordedEdits.first?.reference, "stripe/acme-test#secret")
+        XCTAssertEqual(
+            recordedEdits.first?.cliArguments,
+            ["ref", "STRIPE_SECRET_KEY=stripe/acme-test#secret", "--profile", "dev", "--json"]
+        )
+        let denyAfterFailedApply = await client.calls("deny")
+        XCTAssertEqual(denyAfterFailedApply, denyCallsBefore)
+
+        // When apply succeeds, request is denied and outcome is .proposalApplied with slug#field.
+        session.bindings.applyOverride = { edit in
+            recordedEdits.append(edit)
+            return true
+        }
+        await model.useTestKeyInstead(profileProposal)
+        XCTAssertEqual(
+            model.outcome,
+            .proposalApplied(envName: "STRIPE_SECRET_KEY", slug: "stripe/acme-test#secret")
+        )
+        let denyAfterSuccess = await client.calls("deny")
+        XCTAssertEqual(denyAfterSuccess, denyCallsBefore + 1)
+    }
+
+    @MainActor func testNotificationManagerNeverIncludesArgvAndHandlesActions() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(pending: 1)
+        let session = VaultSession(client: client)
+        session.isFrontmostOverride = true
+        await session.poll()
+
+        let summary = try XCTUnwrap(session.grants.pending.first)
+        let body = NotificationManager.bodyText(for: summary)
+        XCTAssertEqual(body, "claude_code asked for 2 keys in project.")
+        XCTAssertFalse(body.contains("npm"))
+        XCTAssertFalse(body.contains("test"))
+
+        let mgr = session.notifications
+        await mgr.reconcile(pending: [summary], isFrontmost: true)
+        XCTAssertEqual(mgr.notifiedRequestIds, ["REQ0ABCD"])
+        XCTAssertEqual(
+            mgr.lastAnnouncement,
+            "Secret approval requested. claude_code asked for 2 keys in project."
+        )
+        XCTAssertNil(session.activeApprovalRequestId, "Notifications must never open the approval window by themselves")
+
+        await mgr.handleNotificationAction(
+            actionIdentifier: "com.apple.UNNotificationDefaultActionIdentifier",
+            requestId: DaemonText("REQ0ABCD")
+        )
+        XCTAssertEqual(session.activeApprovalRequestId?.escaped, "REQ0ABCD")
+
+        await mgr.handleNotificationAction(
+            actionIdentifier: NotificationManager.denyActionId,
+            requestId: DaemonText("REQ0ABCD")
+        )
+        let denyCalls = await client.calls("deny")
+        XCTAssertEqual(denyCalls, 1)
     }
 }
 

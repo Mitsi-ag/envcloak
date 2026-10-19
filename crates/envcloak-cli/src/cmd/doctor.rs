@@ -21,23 +21,26 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-const USAGE: &str = "envcloak doctor [--json] [--path <path>]... [--git-history]";
+const USAGE: &str = "envcloak doctor [--json] [--path <path>]... [--git-history] [--report]";
 struct Options {
     json: bool,
     paths: Vec<PathBuf>,
     git: bool,
+    report: bool,
 }
 fn options(args: &[&str]) -> Result<Options, ()> {
     let mut o = Options {
         json: false,
         paths: Vec::new(),
         git: false,
+        report: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match *arg {
             "--json" if !o.json => o.json = true,
             "--git-history" if !o.git => o.git = true,
+            "--report" if !o.report => o.report = true,
             "--path" if o.paths.len() < 64 => {
                 let p = it
                     .next()
@@ -57,6 +60,23 @@ pub fn run(args: &[&str]) -> ExitCode {
     };
     match execute(&o) {
         Ok(report) => {
+            if o.report {
+                let vault_items = connect()
+                    .ok()
+                    .and_then(|mut c| c.items_list(true).ok())
+                    .map(|v| v.items)
+                    .unwrap_or_default();
+                let prior = envcloak_client::doctor_report::read_first_run_report();
+                let app_report = envcloak_client::doctor_report::FirstRunReport::from_doctor(
+                    &report,
+                    &vault_items,
+                    prior.as_ref(),
+                );
+                if let Err(e) = envcloak_client::doctor_report::write_first_run_report(&app_report)
+                {
+                    return e.report(FAILURE);
+                }
+            }
             if o.json {
                 println!("{}", report.json());
             } else {

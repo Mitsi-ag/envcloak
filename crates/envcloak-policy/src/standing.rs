@@ -662,7 +662,7 @@ impl StandingStore {
         items: &[ItemMeta],
     ) -> Result<StandingRecord, StandingError> {
         if let Some(p) = proof
-            && p.approver.proof_refusal().is_some()
+            && p.is_refused()
         {
             return Err(StandingError::IdentityNotStandingCapable);
         }
@@ -731,7 +731,7 @@ impl StandingStore {
             bindings,
             created: now,
             not_after: now + standing_ttl,
-            proof_kind: ProofKind::Passphrase,
+            proof_kind: proof.map_or(ProofKind::Passphrase, |p| p.kind),
             signature: None,
         })
     }

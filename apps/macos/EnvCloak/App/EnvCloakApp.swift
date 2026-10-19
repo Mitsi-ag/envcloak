@@ -30,6 +30,9 @@ struct EnvCloakApp: App {
             CommandGroup(replacing: .appInfo) {
                 AboutCommand()
             }
+            CommandGroup(replacing: .help) {
+                WelcomeCommand()
+            }
             CommandGroup(replacing: .newItem) {}
             SidebarCommands()
             InspectorCommands()
@@ -40,6 +43,20 @@ struct EnvCloakApp: App {
         // the Window menu, which SwiftUI adds for a Window scene otherwise.
         Window("About EnvCloak", id: WindowID.about) {
             AboutView()
+        }
+        .windowResizability(.contentSize)
+        .restorationBehavior(.disabled)
+        .commandsRemoved()
+
+        Window("Welcome to EnvCloak", id: WindowID.welcome) {
+            WelcomeView(session: session)
+        }
+        .defaultSize(width: 720, height: 560)
+        .restorationBehavior(.disabled)
+        .commandsRemoved()
+
+        Window("Approval Request", id: WindowID.approval) {
+            ApprovalWindowView(model: ApprovalWindowModel(session: session))
         }
         .windowResizability(.contentSize)
         .restorationBehavior(.disabled)
@@ -61,6 +78,16 @@ private struct AboutCommand: View {
     var body: some View {
         Button("About EnvCloak") {
             openWindow(id: WindowID.about)
+        }
+    }
+}
+
+private struct WelcomeCommand: View {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Button("Show welcome") {
+            openWindow(id: WindowID.welcome)
         }
     }
 }

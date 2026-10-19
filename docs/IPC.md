@@ -299,6 +299,8 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `key_shaped` | `invalid_params` from `managed.register`, `managed.update_plan` and `managed.update`: a launch argument, variable value, working directory or `PATH`, or a bridged server's origin or header name, shaped like a key (gate 13 in the daemon) |
 | `invalid_header`, `header_bindings` | `invalid_params` from `managed.register` for a bridged server: a header whose name cannot name a binding (letters, digits, `-` and `_`, a letter first), or two headers that would share one; a manifest that does not bind exactly its headers' bindings (docs/MIGRATE-MCP.md) |
 | `code_identity` | client-side `daemon_unverified`; the daemon's identity or runtime policy failed; a pre-send failure sends no request, while loss after sending began reports uncertain delivery |
+| `rolled_back` | `vault_tampered` and the `keychain_anchor_mismatch` audit entry: the keychain rollback anchor is ahead of the vault file, which opens read-only |
+| `keychain_anchor_missing` | the `keychain_anchor_mismatch` audit entry: a vault that had a keychain rollback anchor had none at unlock, and the anchor was written again |
 
 ## Lock
 
@@ -670,8 +672,8 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | Token | Task | Status | Use |
 |---|---|---|---|
 | `code_identity` | M3-07 | landed | `daemon_unverified` on a signed build: signature, runtime conditions of SPEC §4.3 or peer binding failed; rejection before sending sends no request, while identity loss after sending began reports uncertain delivery |
-| `rolled_back` | M3-16 | reserved | `vault_tampered`: the keychain anchor is newer than the vault file, which opens read-only |
-| `keychain_anchor_missing` | M3-16 | reserved | a vault that had a keychain anchor has none: reported, and the anchor written again with an audit entry |
+| `rolled_back` | M3-16 | landed | `vault_tampered`: the keychain anchor is newer than the vault file, which opens read-only |
+| `keychain_anchor_missing` | M3-16 | landed | a vault that had a keychain anchor has none: reported, and the anchor written again with an audit entry |
 <!-- /reservations -->
 
 **Methods** (client role):
@@ -709,8 +711,8 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | `app.paste` | M3-14 | landed | saves the staged value as a new item, or as the answer to an ask |
 | `app.asks.list` | M3-14 | landed | the asks the CLI filed, with each requester's evidence |
 | `app.asks.decline` | M3-14 | landed | declines an ask |
-| `app.audit.list` | M3-16 | reserved | audit entries, paged within a frame: metadata with masked command lines; in the app role so that no client, an agent included, can page through the person's command history, and refused to an `app` peer whose evidence names an agent (SPEC §10b) |
-| `app.lock` | M3-16 | reserved | locks with a reason, `screen_lock` or `session_resign` (the two `status` rows below), audited and kept in `status.lock` (plan D3-11), and answered whatever the peer's evidence, since locking only tightens; the app's own Lock command calls M1's `lock`, whose reason is `request` |
+| `app.audit.list` | M3-16 | landed | audit entries, paged within a frame: metadata with masked command lines; in the app role so that no client, an agent included, can page through the person's command history, and refused to an `app` peer whose evidence names an agent (SPEC §10b) |
+| `app.lock` | M3-16 | landed | locks with a reason, `screen_lock` or `session_resign` (the two `status` rows below), audited and kept in `status.lock` (plan D3-11), and answered whatever the peer's evidence, since locking only tightens; the app's own Lock command calls M1's `lock`, whose reason is `request` |
 | `app.device.add` | M5 | reserved | pairs a device (SPEC §9) |
 | `app.device.remove` | M5 | reserved | revokes a device (SPEC §9) |
 | `app.policy.set` | spare | reserved | named by SPEC §4.3; no milestone builds it yet (there is no vault policy store, plan D3-16); kept so the name never means another method |
@@ -724,10 +726,10 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 |---|---|---|---|---|
 | `items.list` | `last_used_secs` | M3-05 | reserved | landed in code: optional last-use timestamp in each long item view, for the Keys table; same metadata as `items.show`. Kept reserved here because the field table has no code reader; `check-reservations.py` rejects landed field rows until a reader exists |
 | `items.show` | `last_used_secs` | M3-05 | reserved | landed in code: optional top-level last-use timestamp, matching the long inventory and the existing `detail.last_used_secs`; the field table has no code reader, so its status follows the `items.list` exception above |
-| `status` | `vault.keychain_anchor` | M3-16 | reserved | the keychain anchor: `matched`, `ahead` (the file was rolled back), `missing`, `none`, or `unavailable` (a build without the helper's profile, and Linux) |
+| `status` | `vault.keychain_anchor` | M3-16 | reserved | landed in code: the keychain anchor (`matched`, `ahead` when the file was rolled back, `missing`, `none`, or `unavailable` on a build without the helper's profile and on Linux); kept reserved here because the field table has no code reader |
 | `status` | `app_requests` | M3-14 | reserved | landed in code: how many asks and reveal requests wait for the app; kept reserved here because the field table has no code reader |
-| `status` | `lock.reason=screen_lock` | M3-16 | reserved | the vault locked because the screen locked (`app.lock`) |
-| `status` | `lock.reason=session_resign` | M3-16 | reserved | the vault locked because the login session was switched away from (`app.lock`) |
+| `status` | `lock.reason=screen_lock` | M3-16 | reserved | landed in code: the vault locked because the screen locked (`app.lock`); kept reserved here because the field table has no code reader |
+| `status` | `lock.reason=session_resign` | M3-16 | reserved | landed in code: the vault locked because the login session was switched away from (`app.lock`); kept reserved here because the field table has no code reader |
 <!-- /reservations -->
 
 **The CLI's own failure tokens**:
@@ -736,8 +738,8 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | Token | Task | Status | Use |
 |---|---|---|---|
 | `binding_absent` | M3-04 | landed | `envcloak ref --unset NAME` for a name the manifest does not bind; exit 1, and nothing is changed |
-| `declined` | M3-19 | reserved | `envcloak add --ask`: the person declined the paste sheet; exit 125. J5's `envcloak reveal` uses it again for a declined reveal |
-| `expired` | M3-19 | reserved | `envcloak add --ask`: the ask expired unanswered; exit 125. J5's `envcloak reveal` uses it again |
+| `declined` | M3-19 | landed | `envcloak add --ask`: the person declined the paste sheet; exit 125. J5's `envcloak reveal` uses it again for a declined reveal |
+| `expired` | M3-19 | landed | `envcloak add --ask`: the ask expired unanswered; exit 125. J5's `envcloak reveal` uses it again |
 <!-- /reservations -->
 
 **Statement domains**:
