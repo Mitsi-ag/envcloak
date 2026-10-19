@@ -52,6 +52,8 @@ pub struct Txn<'v> {
     /// A standing approval was added, changed or removed: the commit moves
     /// the standing set's generation and recomputes its digest.
     standing_changed: bool,
+    standing_min_generation: u64,
+    standing_freeze_generation: bool,
     now: u64,
 }
 
@@ -109,6 +111,8 @@ impl<'v> Txn<'v> {
             state,
             dirty: false,
             standing_changed: false,
+            standing_min_generation: 0,
+            standing_freeze_generation: false,
             now,
         })
     }
@@ -122,17 +126,25 @@ impl<'v> Txn<'v> {
             mut state,
             dirty,
             standing_changed,
+            standing_min_generation,
+            standing_freeze_generation,
             ..
         } = self;
         if dirty {
             let mut header = state.header;
             if standing_changed {
-                header.standing_set = StandingSetHeader {
-                    generation: header
+                let generation = if standing_freeze_generation {
+                    header.standing_set.generation.max(1)
+                } else {
+                    header
                         .standing_set
                         .generation
+                        .max(standing_min_generation)
                         .checked_add(1)
-                        .ok_or(VaultErrorKind::Corrupt)?,
+                        .ok_or(VaultErrorKind::Corrupt)?
+                };
+                header.standing_set = StandingSetHeader {
+                    generation,
                     set_digest: state.standing_set_digest(keys),
                 };
             }
@@ -1043,6 +1055,26 @@ impl<'v> Txn<'v> {
         self.state.header.policy_epoch = self.state.header.policy_epoch.saturating_add(1);
         self.dirty = true;
         self.state.header.policy_epoch
+    }
+
+    /// Forces the standing-approval set header to advance to at least
+    /// `max(header.standing_set.generation, min_generation) + 1` and
+    /// recompute `set_digest` on commit (D-10).
+    pub fn advance_standing_set(&mut self, min_generation: u64) {
+        self.standing_changed = true;
+        self.standing_min_generation = self.standing_min_generation.max(min_generation);
+        self.dirty = true;
+    }
+
+    /// Recomputes `standing_set.set_digest` on commit without incrementing
+    /// `standing_set.generation` (used when tightening a single standing
+    /// record while `EpochState::Unverified` so `vault.generation` does not
+    /// advance to or past `<data>/policy-epoch`'s high-water mark before a
+    /// passphrase confirmation or a complete clear).
+    pub fn freeze_unverified_standing_set(&mut self) {
+        self.standing_changed = true;
+        self.standing_freeze_generation = true;
+        self.dirty = true;
     }
 
     /// The fields whose current value equals `v`, including writes made in

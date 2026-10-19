@@ -200,6 +200,7 @@ fn ticking(names: &[&str], uses: Uses) -> ApprovalOptions {
         uses,
         ttl_secs: 3600,
         live: names.iter().map(|n| EnvName::new(n).unwrap()).collect(),
+        standing: None,
     }
 }
 
@@ -274,6 +275,7 @@ fn live_child() {
                 uses: Uses::Session,
                 ttl_secs: 3600,
                 live: Vec::new(),
+                standing: None,
             };
             let said = match Client::connect(&paths)
                 .unwrap()

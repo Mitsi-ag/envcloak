@@ -564,6 +564,10 @@ impl World {
     pub fn new(env: &[(&str, &str)]) -> World {
         let mut env = env.to_vec();
         env.push(("ENVCLOAK_TEST_TRACE", "1"));
+        env.push((
+            "ENVCLOAK_TEST_MAC_TEAM_IDS",
+            "opencode=5NZ4Q7NXJ4,com.anthropic.claude-code=Q6L2SF6YDW",
+        ));
         World::with(Harness::start_with(&env))
     }
 
@@ -571,6 +575,10 @@ impl World {
     pub fn new_from(bins: PathBuf, env: &[(&str, &str)]) -> World {
         let mut env = env.to_vec();
         env.push(("ENVCLOAK_TEST_TRACE", "1"));
+        env.push((
+            "ENVCLOAK_TEST_MAC_TEAM_IDS",
+            "opencode=5NZ4Q7NXJ4,com.anthropic.claude-code=Q6L2SF6YDW",
+        ));
         World::with(Harness::start_from(bins, &env))
     }
 
@@ -940,6 +948,179 @@ impl World {
         if self.traced() {
             self.h.expect_log(text, Duration::from_secs(10));
         }
+    }
+
+    /// Installs a copy of `fixture-agent` at `rel_path` under the test home
+    /// and (on macOS) ad hoc signs it with `identifier`.
+    pub fn install_standing_agent(&self, rel_path: &str, identifier: &str) -> PathBuf {
+        let dest = self.h.home.home().join(rel_path);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::copy(envcloak_testkit::testkit_bin("fixture-agent"), &dest).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            let signed = std::process::Command::new("/usr/bin/codesign")
+                .args(["-f", "-s", "-", "-i", identifier])
+                .arg(&dest)
+                .output()
+                .unwrap();
+            assert!(signed.status.success(), "{}", text(&signed));
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = identifier;
+            // ExeHashCache requires the agent binary's ctime to be at least
+            // SETTLE (2s) before the lookup begins on Linux (exe_hash.rs).
+            std::thread::sleep(Duration::from_millis(2100));
+        }
+        dest
+    }
+
+    /// Installs `opencode` in its documented install tree (`~/.opencode/bin/opencode`).
+    pub fn opencode_agent(&self) -> PathBuf {
+        self.install_standing_agent(".opencode/bin/opencode", "opencode")
+    }
+
+    /// Installs `claude` in its documented install tree (`~/.local/share/claude/versions/2.1.280`).
+    pub fn claude_agent(&self) -> PathBuf {
+        self.install_standing_agent(
+            ".local/share/claude/versions/2.1.280",
+            "com.anthropic.claude-code",
+        )
+    }
+
+    /// Runs `line` in `cwd` beneath a fresh `agent_bin` process leading its own
+    /// session without a terminal, so each call has a brand-new agent root with
+    /// no pre-existing session grant.
+    pub fn fresh_agent_line(
+        &mut self,
+        agent_bin: &Path,
+        cwd: &Path,
+        line: &str,
+    ) -> std::process::Output {
+        let py = envcloak_e2e::python3();
+        let script = "import os, subprocess, sys\n\
+                      os.setsid()\n\
+                      p = subprocess.run(sys.argv[2:], cwd=sys.argv[1])\n\
+                      sys.exit(p.returncode)\n";
+        self.h.program(
+            &py,
+            &[
+                "-c",
+                script,
+                cwd.to_str().unwrap(),
+                agent_bin.to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                line,
+            ],
+            None,
+        )
+    }
+
+    /// Runs the helper's `action` beneath a fresh `agent_bin` process root.
+    pub fn fresh_agent(&mut self, agent_bin: &Path, action: &str, input: &Value) -> Value {
+        let (i, o) = self.io_paths();
+        std::fs::write(&i, input.to_string()).unwrap();
+        let line = Self::shell_line(action, &i, &o);
+        let cwd = self.h.home.home();
+        let ran = self.fresh_agent_line(agent_bin, &cwd, &line);
+        assert!(ran.status.success(), "{}", text(&ran));
+        self.read_out(&o, &format!("the fresh agent's {action}"))
+    }
+
+    /// Requests `launch` from a fresh `agent_bin` root, sending `report` once started.
+    pub fn standing_request(&mut self, agent_bin: &Path, launch: &str) -> Value {
+        self.fresh_agent(
+            agent_bin,
+            "request",
+            &json!({"launch": launch, "send": ["report"], "hold_ms": 0}),
+        )
+    }
+
+    /// Runs `line` in `cwd` as an orphaned `setsid` process with no session
+    /// leader in its chain, no terminal, and no agent ancestor (`SubjectKind::Unknown`).
+    pub fn unknown_line(&mut self, cwd: &Path, line: &str) -> std::process::Output {
+        let done = self
+            .h
+            .files()
+            .join(format!("unk-{:016x}.json", fresh_seed()));
+        let py = envcloak_e2e::python3();
+        let script = r#"import json, os, subprocess, sys, time
+cwd, line, done = sys.argv[1:4]
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    pid2 = os.fork()
+    if pid2 == 0:
+        p = subprocess.run(['/bin/sh', '-c', line], cwd=cwd, capture_output=True)
+        tmp = done + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump({'code': p.returncode, 'stdout': p.stdout.decode('utf-8', 'replace'), 'stderr': p.stderr.decode('utf-8', 'replace')}, f)
+        os.rename(tmp, done)
+        os._exit(0)
+    os._exit(0)
+os.waitpid(pid, 0)
+deadline = time.time() + 60.0
+while not os.path.exists(done) and time.time() < deadline:
+    time.sleep(0.02)
+assert os.path.exists(done), 'unknown child did not finish'
+"#;
+        let out = self.h.program(
+            &py,
+            &[
+                "-c",
+                script,
+                cwd.to_str().unwrap(),
+                line,
+                done.to_str().unwrap(),
+            ],
+            None,
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        let res = self.read_out(&done, "unknown_line");
+        let code = res["code"].as_i64().unwrap_or(1) as i32;
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: res["stdout"].as_str().unwrap_or("").as_bytes().to_vec(),
+            stderr: res["stderr"].as_str().unwrap_or("").as_bytes().to_vec(),
+        }
+    }
+
+    /// `envcloak standing ls --json`.
+    pub fn standing_list(&mut self) -> Value {
+        let cli = self.h.cli();
+        let out = self.h.program(&cli, &["standing", "ls", "--json"], None);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// `envcloak status --json`.
+    pub fn status_json(&mut self) -> Value {
+        let cli = self.h.cli();
+        let out = self.h.program(&cli, &["status", "--json"], None);
+        assert!(out.status.success(), "{}", text(&out));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// Revokes all active session/once grants (`envcloak grants revoke --all`) and
+    /// verifies that zero grants remain in force.
+    pub fn revoke_all_grants(&mut self) {
+        let cli = self.h.cli();
+        let out = self.h.program(&cli, &["grants", "revoke", "--all"], None);
+        assert!(out.status.success(), "{}", text(&out));
+        let st = self.status_json();
+        assert_eq!(st["approvals"]["grants"], 0, "{st}");
+    }
+
+    /// How many `standing grant` audit events the daemon trace recorded.
+    pub fn standing_grant_count(&self) -> usize {
+        self.logs()
+            .matches("envcloakd: audit: standing grant standing=")
+            .count()
     }
 }
 

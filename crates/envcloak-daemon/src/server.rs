@@ -876,6 +876,15 @@ fn respond<'s>(
         GrantsRevoke::NAME => {
             answer::<GrantsRevoke>(id, &req, |p| requests::grants_revoke(shared, peer, p))
         }
+        proto::StandingList::NAME => answer::<proto::StandingList>(id, &req, |p| {
+            crate::standing::standing_list(shared, peer, p)
+        }),
+        proto::StandingRevoke::NAME => answer::<proto::StandingRevoke>(id, &req, |p| {
+            crate::standing::standing_revoke(shared, peer, p)
+        }),
+        proto::StandingConfirm::NAME => answer::<proto::StandingConfirm>(id, &req, |p| {
+            crate::standing::standing_confirm(shared, peer, p)
+        }),
         AuditVerify::NAME => {
             answer::<AuditVerify>(id, &req, |_| locked(&shared.state).audit_verify())
         }
