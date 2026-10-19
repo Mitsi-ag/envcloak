@@ -432,9 +432,10 @@ jobs:
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
              --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
+             variants::variant_sandboxed_claude_code \
              the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/s0-outside.log"
-          grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
-          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
+          grep -qx 'running 4 tests' "$RUNNER_TEMP/s0-outside.log"
+          grep -q '^test result: ok. 4 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
       # As agents-e2e: the tests' own group, whose packets to anywhere but
       # lo0 a pf rule refuses, and which the resolver's socket refuses.
       - name: Loopback only for the tests' group (macOS)
@@ -624,9 +625,10 @@ jobs:
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
              --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
+             variants::variant_sandboxed_claude_code \
              the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/s0-outside.log"
-          grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
-          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
+          grep -qx 'running 4 tests' "$RUNNER_TEMP/s0-outside.log"
+          grep -q '^test result: ok. 4 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
 
   # The pinned agent hosts against the scripted model (M2-04's harness,
   # probes and measurements; later tasks add theirs). Linux on pull
@@ -759,9 +761,10 @@ jobs:
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1 \
              --exact skeleton::s0_claude_code_sandboxed skeleton::s0_codex_workspace_write \
+             variants::variant_sandboxed_claude_code \
              the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/s0-outside.log"
-          grep -qx 'running 3 tests' "$RUNNER_TEMP/s0-outside.log"
-          grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
+          grep -qx 'running 4 tests' "$RUNNER_TEMP/s0-outside.log"
+          grep -q '^test result: ok. 4 passed; 0 failed' "$RUNNER_TEMP/s0-outside.log"
       # macOS has no network namespaces: the tests run as the runner's user
       # with one group of their own (ecnonet, gid 4242, made here), and a pf
       # rule in an anchor of the default ruleset refuses every TCP and UDP
