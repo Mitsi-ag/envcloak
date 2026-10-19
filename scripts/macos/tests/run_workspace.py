@@ -28,5 +28,8 @@ if '--eu1' in sys.argv and '--package' in sys.argv:
     for stale in ('m305-ui', 'm306-ui'):
         shutil.rmtree(pathlib.Path(env['CARGO_TARGET_DIR']) / stale, ignore_errors=True)
     command.append('--package')
+    target_dir = pathlib.Path(env['CARGO_TARGET_DIR'])
+    for ui_dir in ('m305-ui', 'm306-ui'):
+        shutil.rmtree(target_dir / ui_dir, ignore_errors=True)
 result = subprocess.run(command, cwd=root, env=env, stdin=subprocess.DEVNULL)
 sys.exit(result.returncode)
