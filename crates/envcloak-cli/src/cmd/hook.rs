@@ -51,8 +51,7 @@ use envcloak_core::SecretBuf;
 use envcloak_policy::find_manifest;
 use zeroize::Zeroizing;
 
-const USAGE_TEXT: &str =
-    "envcloak hook --host claude-code|codex --event UserPromptSubmit|PreToolUse|SessionStart";
+const USAGE_TEXT: &str = "envcloak hook --host ID --event NAME";
 
 /// The handler's own time limit, from its start.
 const LIMIT: Duration = Duration::from_secs(2);
@@ -60,7 +59,9 @@ const LIMIT: Duration = Duration::from_secs(2);
 fn parse(args: &[&str]) -> Option<(Host, Event)> {
     match args {
         ["--host", h, "--event", e] | ["--event", e, "--host", h] => {
-            Some((Host::from_id(h)?, Event::from_name(e)?))
+            let host = Host::from_id(h)?;
+            let event = Event::from_name(e)?;
+            event.valid_for_host(host).then_some((host, event))
         }
         _ => None,
     }
@@ -158,7 +159,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     // hold a pasted key (SPEC §5; the Codex review: the hook read it
     // first).
     if refuse_if_traced().is_err() {
-        if event == Event::SessionStart {
+        if event.is_session_start() {
             return ExitCode::SUCCESS;
         }
         return emit(&answer(host, event, Decision::Deny(Reason::Traced)));
@@ -166,7 +167,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     let deadline = start + LIMIT;
     let payload = match read_payload(deadline) {
         Ok(p) => p,
-        Err(Unread::Unchecked) if event != Event::SessionStart => {
+        Err(Unread::Unchecked) if !event.is_session_start() => {
             return emit(&answer(host, event, Decision::Deny(Reason::Unchecked)));
         }
         Err(Unread::Unchecked) => return ExitCode::SUCCESS,
@@ -177,28 +178,28 @@ pub fn run(args: &[&str]) -> ExitCode {
         if decision == Decision::NoDecision {
             return Reply::NoDecision;
         }
-        if event == Event::SessionStart {
-            return Reply::Answer(session_start(host, &payload, deadline));
+        if event.is_session_start() {
+            return Reply::Answer(session_start(host, event, &payload, deadline));
         }
         Reply::Answer(answer(host, event, decision))
     };
     match within(deadline, work) {
         Some(Reply::NoDecision) => no_decision(),
         Some(Reply::Answer(a)) => emit(&a),
-        None if event == Event::SessionStart => ExitCode::SUCCESS,
+        None if event.is_session_start() => ExitCode::SUCCESS,
         None => emit(&answer(host, event, Decision::Deny(Reason::Unchecked))),
     }
 }
 
 /// `SessionStart`: the project's bound names, when the daemon answers in
 /// time; nothing otherwise.
-fn session_start(host: Host, payload: &SecretBuf, deadline: Instant) -> hook::Answer {
+fn session_start(host: Host, event: Event, payload: &SecretBuf, deadline: Instant) -> hook::Answer {
     let nothing = hook::Answer {
         stdout: Vec::new(),
         stderr: Vec::new(),
         code: 0,
     };
-    let Some(cwd) = payload_cwd(host, Event::SessionStart, payload) else {
+    let Some(cwd) = payload_cwd(host, event, payload) else {
         return nothing;
     };
     let Ok(Some(manifest)) = find_manifest(Path::new(&cwd)) else {
@@ -266,9 +267,16 @@ mod tests {
             parse(&["--event", "SessionStart", "--host", "claude-code"]),
             Some((Host::ClaudeCode, Event::SessionStart))
         );
+        assert_eq!(
+            parse(&["--host", "cursor", "--event", "preToolUse"]),
+            Some((Host::Cursor, Event::PreToolUseLower))
+        );
         for bad in [
-            &["--host", "cursor", "--event", "PreToolUse"][..],
+            &["--host", "nosuch", "--event", "PreToolUse"][..],
             &["--host", "codex", "--event", "Stop"],
+            &["--host", "claude-code", "--event", "BeforeAgent"],
+            &["--host", "cursor", "--event", "PreToolUse"],
+            &["--host", "aider", "--event", "PreToolUse"],
             &["--host", "codex"],
             &["--host", "codex", "--event", "PreToolUse", "x"],
         ] {

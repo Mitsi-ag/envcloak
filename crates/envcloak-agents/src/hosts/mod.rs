@@ -1,9 +1,16 @@
-//! What the installer writes for each tier-1 host (SPEC §7; M2 plan
-//! M2-08): Claude Code ([`claude`]) and Codex ([`codex`]). The other
-//! hosts come with M2-24.
+//! What the installer writes for each host (SPEC §7; M2 plan M2-08 and
+//! M2-24).
 
+pub mod aider;
 pub mod claude;
 pub mod codex;
+pub mod copilot;
+pub mod cursor;
+pub mod gemini;
+pub mod goose;
+pub mod kimi;
+pub mod opencode;
+pub mod qwen;
 
 use std::path::Path;
 

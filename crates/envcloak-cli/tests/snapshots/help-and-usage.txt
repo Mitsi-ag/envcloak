@@ -341,10 +341,10 @@ envcloak: usage: envcloak mcp [--host ID] [--wait-ms 1000..20000]
 $ envcloak agents install --help
 exit: 0
 --- stdout
-usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
-       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+usage: envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents status --probe [--agent ID]... [--json]
        envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
        envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
        envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]
@@ -353,10 +353,10 @@ $ envcloak agents install --bogus
 exit: 2
 --- stdout
 --- stderr
-envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
-       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+envcloak: usage: envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents status --probe [--agent ID]... [--json]
        envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
        envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
        envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]
@@ -364,21 +364,21 @@ $ envcloak agents uninstall --consent-sandbox-sockets
 exit: 2
 --- stdout
 --- stderr
-envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
-       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+envcloak: usage: envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents status --probe [--agent ID]... [--json]
        envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
        envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
        envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]
-$ envcloak agents install --agent cursor
+$ envcloak agents install --agent nosuch
 exit: 2
 --- stdout
 --- stderr
-envcloak: usage: envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
-       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+envcloak: usage: envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents status --probe [--agent ID]... [--json]
        envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
        envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
        envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]
@@ -386,12 +386,12 @@ $ envcloak hook
 exit: 1
 --- stdout
 --- stderr
-envcloak: usage: envcloak hook --host claude-code|codex --event UserPromptSubmit|PreToolUse|SessionStart
+envcloak: usage: envcloak hook --host ID --event NAME
 $ envcloak hook --host claude-code --event Stop
 exit: 1
 --- stdout
 --- stderr
-envcloak: usage: envcloak hook --host claude-code|codex --event UserPromptSubmit|PreToolUse|SessionStart
+envcloak: usage: envcloak hook --host ID --event NAME
 $ envcloak init --undo X --agents-note
 exit: 2
 --- stdout

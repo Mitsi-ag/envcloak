@@ -57,8 +57,17 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::hook::{Event, Host};
-use crate::hosts::{claude, codex};
+use crate::hosts::{claude, codex, copilot, cursor, gemini, kimi, opencode, qwen};
 use crate::locations::Locations;
+
+/// Whether `host` has a headless CLI contract that `agents status --probe`
+/// can drive in a probe home (D-20; M2-24).
+pub fn is_drivable(host: Host) -> bool {
+    matches!(
+        host,
+        Host::ClaudeCode | Host::Codex | Host::Copilot | Host::OpenCode | Host::Kimi | Host::Qwen
+    )
+}
 
 /// A surface the coverage report states separately (SPEC §7.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -213,11 +222,14 @@ pub enum Reason {
     /// The host binary, its version or its configuration changed since the
     /// last probe, so its result no longer says anything (L-09).
     ChangedSinceProbe,
+    /// The host has no headless CLI contract that `agents status --probe`
+    /// can drive (D-20; M2-24).
+    NotDrivable,
 }
 
 impl Reason {
     /// Every reason.
-    pub const ALL: [Reason; 18] = [
+    pub const ALL: [Reason; 19] = [
         Reason::HooksUntrusted,
         Reason::WorkspaceUntrusted,
         Reason::SwitchedOffUser,
@@ -236,6 +248,7 @@ impl Reason {
         Reason::HookMissing,
         Reason::NotProbed,
         Reason::ChangedSinceProbe,
+        Reason::NotDrivable,
     ];
 
     /// Its token (docs/IPC.md, coverage tokens).
@@ -259,6 +272,7 @@ impl Reason {
             Reason::HookMissing => "hook_missing",
             Reason::NotProbed => "not_probed",
             Reason::ChangedSinceProbe => "changed_since_probe",
+            Reason::NotDrivable => "not_drivable",
         }
     }
 
@@ -1054,6 +1068,45 @@ fn installed_hooks(settings: &Value, host: Host, level: &str, out: &mut Installe
     }
 }
 
+/// EnvCloak's flat hook entries in `settings` (Cursor's `hooks.json` or
+/// Copilot's `hooks/*.json`, read at `level`), into `out`'s
+/// [`Installed::hooks`], and every other hook entry into its
+/// [`Installed::foreign`].
+fn installed_flat_hooks(
+    settings: &Value,
+    host: Host,
+    level: &str,
+    cmd_key: &str,
+    out: &mut Installed,
+) {
+    let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
+        return;
+    };
+    for (event, entries) in events {
+        let tail = format!(" hook --host {} --event {event}", host.id());
+        for h in entries.as_array().into_iter().flatten() {
+            let ours = h
+                .get(cmd_key)
+                .or_else(|| h.get("command"))
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.ends_with(&tail));
+            let set = if ours {
+                &mut out.hooks
+            } else {
+                &mut out.foreign
+            };
+            Installed::add(
+                set,
+                &serde_json::json!({
+                    "level": level,
+                    "event": event,
+                    "hook": h,
+                }),
+            );
+        }
+    }
+}
+
 /// Every reason the configuration gives, sorted: the switches the host
 /// documents (D-14: Claude Code's user, project, local and managed
 /// `disableAllHooks`, managed `allowManagedHooksOnly` and
@@ -1086,7 +1139,7 @@ pub fn degraders(cs: &ConfigSet) -> Vec<Reason> {
         // Interactive sessions run no settings-file hook until the
         // folder's trust is accepted, and where Claude Code records that
         // is not documented for the pinned version (D-14).
-        Some(Host::ClaudeCode) => {
+        Some(Host::ClaudeCode | Host::Cursor | Host::Gemini | Host::Qwen) => {
             out.insert(Reason::WorkspaceUntrusted);
         }
         // Codex records trust against each hook's hash where its docs do
@@ -1095,9 +1148,9 @@ pub fn degraders(cs: &ConfigSet) -> Vec<Reason> {
         Some(Host::Codex) => {
             out.insert(Reason::HooksUntrusted);
         }
-        None => {}
+        Some(_) | None => {}
     }
-    if host.is_some() {
+    if host.is_some_and(|h| h != Host::Aider) {
         out.insert(Reason::FailsOpenOnTimeout);
     }
     sorted(&out.into_iter().collect::<Vec<_>>())
@@ -1766,6 +1819,14 @@ impl ConfigSet {
         match host {
             Host::ClaudeCode => read_claude(&mut cs, locations, claude_managed, &cwd, env),
             Host::Codex => read_codex(&mut cs, locations, &cwd),
+            Host::Cursor => read_cursor(&mut cs, locations, &cwd),
+            Host::Gemini => read_gemini(&mut cs, locations, &cwd),
+            Host::Copilot => read_copilot(&mut cs, locations, &cwd),
+            Host::OpenCode => read_opencode(&mut cs, locations, &cwd),
+            Host::Kimi => read_kimi(&mut cs, locations),
+            Host::Qwen => read_qwen(&mut cs, locations, &cwd),
+            Host::Goose => read_goose(&mut cs, locations),
+            Host::Aider => read_aider(&mut cs, locations),
         }
         cs
     }
@@ -2625,6 +2686,657 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
     cs.context.stores_known = known;
 }
 
+fn flat_hook_in(
+    entries: Option<&Value>,
+    host: Host,
+    event: Event,
+    matcher: Option<&str>,
+    cmd_key: &str,
+    programs: &mut Vec<PathBuf>,
+) -> HookState {
+    let tail = format!(" hook --host {} --event {}", host.id(), event.name());
+    let mut best = HookState::Missing;
+    for h in entries.and_then(Value::as_array).into_iter().flatten() {
+        let entry_matcher = h.get("matcher").and_then(Value::as_str);
+        if matcher.is_some() && entry_matcher != matcher {
+            continue;
+        }
+        let Some(cmd) = h
+            .get(cmd_key)
+            .or_else(|| h.get("command"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        if !cmd.ends_with(&tail) {
+            continue;
+        }
+        programs.extend(command_program(cmd));
+        best = either(
+            best,
+            if command_present(cmd) {
+                HookState::Present
+            } else {
+                HookState::CommandMissing
+            },
+        );
+    }
+    best
+}
+
+fn all_hooks(states: &[HookState]) -> HookState {
+    if states.iter().all(|&s| s == HookState::Present) {
+        HookState::Present
+    } else if states.contains(&HookState::CommandMissing) {
+        HookState::CommandMissing
+    } else {
+        HookState::Missing
+    }
+}
+
+fn read_cursor(cs: &mut ConfigSet, l: &Locations, cwd: &Path) {
+    let mut programs = Vec::new();
+    let mut prompt = HookState::Missing;
+    let mut before_read = HookState::Missing;
+    let mut before_shell = HookState::Missing;
+    let mut before_mcp = HookState::Missing;
+    let mut pre_tool = HookState::Missing;
+    for (role, path) in [
+        ("cursor_user_hooks", l.cursor_hooks()),
+        (
+            "cursor_project_hooks",
+            cwd.join(".cursor").join("hooks.json"),
+        ),
+    ] {
+        if let Read::Json(v) = cs.context.json(role, &path, MAX_SETTINGS) {
+            installed_flat_hooks(&v, Host::Cursor, role, "command", &mut cs.installed);
+            let events = v.get("hooks");
+            prompt = either(
+                prompt,
+                flat_hook_in(
+                    events.and_then(|e| e.get(Event::BeforeSubmitPrompt.name())),
+                    Host::Cursor,
+                    Event::BeforeSubmitPrompt,
+                    None,
+                    "command",
+                    &mut programs,
+                ),
+            );
+            before_read = either(
+                before_read,
+                flat_hook_in(
+                    events.and_then(|e| e.get(Event::BeforeReadFile.name())),
+                    Host::Cursor,
+                    Event::BeforeReadFile,
+                    Some(cursor::READ_FILE_MATCHER),
+                    "command",
+                    &mut programs,
+                ),
+            );
+            before_shell = either(
+                before_shell,
+                flat_hook_in(
+                    events.and_then(|e| e.get(Event::BeforeShellExecution.name())),
+                    Host::Cursor,
+                    Event::BeforeShellExecution,
+                    None,
+                    "command",
+                    &mut programs,
+                ),
+            );
+            before_mcp = either(
+                before_mcp,
+                flat_hook_in(
+                    events.and_then(|e| e.get(Event::BeforeMcpExecution.name())),
+                    Host::Cursor,
+                    Event::BeforeMcpExecution,
+                    None,
+                    "command",
+                    &mut programs,
+                ),
+            );
+            pre_tool = either(
+                pre_tool,
+                flat_hook_in(
+                    events.and_then(|e| e.get(Event::PreToolUseLower.name())),
+                    Host::Cursor,
+                    Event::PreToolUseLower,
+                    Some(cursor::PRE_TOOL_MATCHER),
+                    "command",
+                    &mut programs,
+                ),
+            );
+            let _ = flat_hook_in(
+                events.and_then(|e| e.get(Event::SessionStartLower.name())),
+                Host::Cursor,
+                Event::SessionStartLower,
+                None,
+                "command",
+                &mut programs,
+            );
+            if events
+                .and_then(|e| e.get(Event::BeforeSubmitPrompt.name()))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|h| {
+                    !h.get("command").and_then(Value::as_str).is_some_and(|c| {
+                        envcloak_command(c, Host::Cursor, Event::BeforeSubmitPrompt)
+                    })
+                })
+            {
+                cs.foreign_prompt_hook = true;
+            }
+        }
+    }
+    cs.hooks = Hooks {
+        prompt,
+        tools: all_hooks(&[before_read, before_shell, pre_tool]),
+        mcp: all_hooks(&[before_mcp, pre_tool]),
+    };
+    for (role, path) in [
+        ("cursor_user_mcp", l.cursor_mcp()),
+        ("cursor_project_mcp", cwd.join(".cursor").join("mcp.json")),
+    ] {
+        if let Read::Json(v) = cs.context.json(role, &path, MAX_SETTINGS) {
+            if let Some(server) = v.get("mcpServers").and_then(|s| s.get(cursor::SERVER)) {
+                cs.server.registered = true;
+                Installed::add(
+                    &mut cs.installed.servers,
+                    &serde_json::json!({ "role": role, "server": server }),
+                );
+            }
+        }
+    }
+    cs.context.programs(programs);
+    cs.context.stores_known = true;
+}
+
+fn read_gemini(cs: &mut ConfigSet, l: &Locations, cwd: &Path) {
+    let mut programs = Vec::new();
+    for (level, path) in [
+        ("user", l.gemini_settings()),
+        ("project", cwd.join(".gemini").join("settings.json")),
+    ] {
+        match cs
+            .context
+            .json(&format!("gemini_{level}"), &path, MAX_SETTINGS)
+        {
+            Read::Absent => {}
+            Read::Unreadable | Read::Toml(_) => {
+                if level == "user" {
+                    cs.off_user = true;
+                } else {
+                    cs.off_project = true;
+                }
+            }
+            Read::Json(v) => {
+                installed_hooks(&v, Host::Gemini, level, &mut cs.installed);
+                let events = v.get("hooks");
+                let tools = hook_in(
+                    events.and_then(|e| e.get(Event::BeforeTool.name())),
+                    Host::Gemini,
+                    Event::BeforeTool,
+                    Some(gemini::BEFORE_TOOL_MATCHER),
+                    &mut programs,
+                );
+                let _ = hook_in(
+                    events.and_then(|e| e.get(Event::SessionStart.name())),
+                    Host::Gemini,
+                    Event::SessionStart,
+                    None,
+                    &mut programs,
+                );
+                let h = Hooks {
+                    prompt: hook_in(
+                        events.and_then(|e| e.get(Event::BeforeAgent.name())),
+                        Host::Gemini,
+                        Event::BeforeAgent,
+                        None,
+                        &mut programs,
+                    ),
+                    tools,
+                    mcp: tools,
+                };
+                cs.hooks = merge_hooks(cs.hooks, h);
+                if events
+                    .and_then(|e| e.get(Event::BeforeAgent.name()))
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|g| {
+                        g.get("hooks")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                    })
+                    .any(|h| {
+                        !h.get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|c| envcloak_command(c, Host::Gemini, Event::BeforeAgent))
+                    })
+                {
+                    cs.foreign_prompt_hook = true;
+                }
+                if v.get("hooksConfig")
+                    .and_then(|h| h.get("enabled"))
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                {
+                    if level == "user" {
+                        cs.off_user = true;
+                    } else {
+                        cs.off_project = true;
+                    }
+                }
+                if let Some(server) = v.get("mcpServers").and_then(|s| s.get(gemini::SERVER)) {
+                    cs.server.registered = true;
+                    Installed::add(
+                        &mut cs.installed.servers,
+                        &serde_json::json!({ "level": level, "server": server }),
+                    );
+                }
+            }
+        }
+    }
+    cs.context.programs(programs);
+    for s in l
+        .transcript_sources()
+        .into_iter()
+        .filter(|s| s.label.starts_with("Gemini"))
+    {
+        cs.context.store(&s.label, &s.path, s.names.as_deref());
+    }
+    cs.context.stores_known = true;
+}
+
+fn read_copilot(cs: &mut ConfigSet, l: &Locations, cwd: &Path) {
+    let mut programs = Vec::new();
+    let mut hook_files = vec![
+        ("copilot_user_hooks", l.copilot_hooks()),
+        (
+            "copilot_project_hooks",
+            cwd.join(".github").join("hooks").join("envcloak.json"),
+        ),
+    ];
+    for (role, dir) in [
+        ("copilot_user_hooks_extra", l.copilot_dir().join("hooks")),
+        (
+            "copilot_project_hooks_extra",
+            cwd.join(".github").join("hooks"),
+        ),
+    ] {
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut extra: Vec<PathBuf> = rd
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.extension().is_some_and(|ext| ext == "json")
+                        && p.file_name().is_some_and(|n| n != "envcloak.json")
+                })
+                .collect();
+            extra.sort();
+            for p in extra {
+                hook_files.push((role, p));
+            }
+        }
+    }
+    for (role, path) in hook_files {
+        if let Read::Json(v) = cs.context.json(role, &path, MAX_SETTINGS) {
+            installed_flat_hooks(&v, Host::Copilot, role, "bash", &mut cs.installed);
+            let state = flat_hook_in(
+                v.get("hooks")
+                    .and_then(|h| h.get(Event::PreToolUseLower.name())),
+                Host::Copilot,
+                Event::PreToolUseLower,
+                None,
+                "bash",
+                &mut programs,
+            );
+            let _ = flat_hook_in(
+                v.get("hooks")
+                    .and_then(|h| h.get(Event::SessionStartLower.name())),
+                Host::Copilot,
+                Event::SessionStartLower,
+                None,
+                "bash",
+                &mut programs,
+            );
+            cs.hooks = merge_hooks(
+                cs.hooks,
+                Hooks {
+                    prompt: HookState::Missing,
+                    tools: state,
+                    mcp: state,
+                },
+            );
+        }
+    }
+    if let Read::Json(v) = cs
+        .context
+        .json("copilot_mcp", &l.copilot_mcp(), MAX_SETTINGS)
+    {
+        if let Some(server) = v.get("mcpServers").and_then(|s| s.get(copilot::SERVER)) {
+            cs.server.registered = true;
+            Installed::add(
+                &mut cs.installed.servers,
+                &serde_json::json!({ "role": "copilot_mcp", "server": server }),
+            );
+        }
+    }
+    cs.context.programs(programs);
+    for s in l
+        .transcript_sources()
+        .into_iter()
+        .filter(|s| s.label.starts_with("Copilot"))
+    {
+        cs.context.store(&s.label, &s.path, s.names.as_deref());
+    }
+    cs.context.stores_known = true;
+}
+
+fn read_opencode(cs: &mut ConfigSet, l: &Locations, cwd: &Path) {
+    let mut programs = Vec::new();
+    for (role, path) in [
+        ("opencode_user_plugin", l.opencode_plugin()),
+        (
+            "opencode_project_plugin",
+            cwd.join(".opencode").join("plugins").join("envcloak.js"),
+        ),
+    ] {
+        let got = read_capped(&path, MAX_SETTINGS);
+        cs.context.note(role, &path, &got);
+        if let Some(Some(b)) = got {
+            let digest = hex(&Sha256::digest(&b));
+            if let Ok(text) = std::str::from_utf8(&b) {
+                if text.contains(opencode::PLUGIN_MARKER) || opencode::is_envcloak_plugin(text) {
+                    Installed::add(
+                        &mut cs.installed.hooks,
+                        &serde_json::json!({
+                            "role": role,
+                            "sha256": digest,
+                        }),
+                    );
+                    let exe = text
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("const ENVCLOAK_BIN = ")
+                                .or_else(|| line.strip_prefix("const ENVCLOAK = "))
+                        })
+                        .and_then(|s| s.strip_suffix(';'))
+                        .and_then(|s| serde_json::from_str::<String>(s).ok());
+                    let state = match exe {
+                        Some(p) => {
+                            let pb = PathBuf::from(&p);
+                            let ok = std::fs::metadata(&pb)
+                                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+                            programs.push(pb);
+                            if ok {
+                                HookState::Present
+                            } else {
+                                HookState::CommandMissing
+                            }
+                        }
+                        None => HookState::CommandMissing,
+                    };
+                    cs.hooks = merge_hooks(
+                        cs.hooks,
+                        Hooks {
+                            prompt: HookState::Missing,
+                            tools: state,
+                            mcp: state,
+                        },
+                    );
+                } else {
+                    Installed::add(
+                        &mut cs.installed.foreign,
+                        &serde_json::json!({
+                            "role": role,
+                            "sha256": digest,
+                        }),
+                    );
+                }
+            } else {
+                Installed::add(
+                    &mut cs.installed.foreign,
+                    &serde_json::json!({
+                        "role": role,
+                        "sha256": digest,
+                    }),
+                );
+            }
+        }
+    }
+    for (role, path) in [
+        ("opencode_user_config", l.opencode_config()),
+        ("opencode_project_config", cwd.join("opencode.json")),
+    ] {
+        if let Read::Json(v) = cs.context.json(role, &path, MAX_SETTINGS) {
+            if let Some(server) = v.get("mcp").and_then(|s| s.get(opencode::SERVER)) {
+                cs.server.registered = true;
+                Installed::add(
+                    &mut cs.installed.servers,
+                    &serde_json::json!({ "role": role, "server": server }),
+                );
+            }
+            if v.get("permission")
+                .and_then(|p| p.get("read"))
+                .and_then(|r| r.get("*.env"))
+                .and_then(Value::as_str)
+                == Some("deny")
+            {
+                cs.read_deny = true;
+            }
+        }
+    }
+    cs.context.programs(programs);
+    for s in l
+        .transcript_sources()
+        .into_iter()
+        .filter(|s| s.label.starts_with("OpenCode"))
+    {
+        cs.context.store(&s.label, &s.path, s.names.as_deref());
+    }
+    cs.context.stores_known = true;
+}
+
+fn read_kimi(cs: &mut ConfigSet, l: &Locations) {
+    let mut programs = Vec::new();
+    for (role, path) in [
+        ("kimi_code_config", l.kimi_code_config()),
+        ("kimi_cli_config", l.kimi_cli_config()),
+    ] {
+        if let Read::Toml(doc) = cs.context.toml(role, &path) {
+            if let Some(arr) = doc
+                .get("hooks")
+                .and_then(toml_edit::Item::as_array_of_tables)
+            {
+                for t in arr {
+                    let entry_json = serde_json::json!({
+                        "role": role,
+                        "hook": toml_json(&toml_edit::Item::Table(t.clone())),
+                    });
+                    let Some(event) = t.get("event").and_then(toml_edit::Item::as_str) else {
+                        Installed::add(&mut cs.installed.foreign, &entry_json);
+                        continue;
+                    };
+                    let Some(cmd) = t.get("command").and_then(toml_edit::Item::as_str) else {
+                        Installed::add(&mut cs.installed.foreign, &entry_json);
+                        continue;
+                    };
+                    let matcher = t.get("matcher").and_then(toml_edit::Item::as_str);
+                    let tail = format!(" hook --host kimi --event {event}");
+                    if !cmd.ends_with(&tail) {
+                        Installed::add(&mut cs.installed.foreign, &entry_json);
+                        if event == Event::UserPromptSubmit.name() {
+                            cs.foreign_prompt_hook = true;
+                        }
+                        continue;
+                    }
+                    Installed::add(&mut cs.installed.hooks, &entry_json);
+                    programs.extend(command_program(cmd));
+                    let state = if command_present(cmd) {
+                        HookState::Present
+                    } else {
+                        HookState::CommandMissing
+                    };
+                    if event == Event::UserPromptSubmit.name() {
+                        cs.hooks.prompt = either(cs.hooks.prompt, state);
+                    } else if event == Event::PreToolUse.name()
+                        && matcher == Some(kimi::PRE_TOOL_MATCHER)
+                    {
+                        cs.hooks.tools = either(cs.hooks.tools, state);
+                        cs.hooks.mcp = either(cs.hooks.mcp, state);
+                    }
+                }
+            }
+        }
+    }
+    for (role, path) in [
+        ("kimi_code_mcp", l.kimi_code_mcp()),
+        ("kimi_cli_mcp", l.kimi_cli_mcp()),
+    ] {
+        if let Read::Json(v) = cs.context.json(role, &path, MAX_SETTINGS) {
+            if let Some(server) = v.get("mcpServers").and_then(|s| s.get(kimi::SERVER)) {
+                cs.server.registered = true;
+                Installed::add(
+                    &mut cs.installed.servers,
+                    &serde_json::json!({ "role": role, "server": server }),
+                );
+            }
+        }
+    }
+    cs.context.programs(programs);
+    for s in l
+        .transcript_sources()
+        .into_iter()
+        .filter(|s| s.label.starts_with("Kimi"))
+    {
+        cs.context.store(&s.label, &s.path, s.names.as_deref());
+    }
+    cs.context.stores_known = true;
+}
+
+fn read_qwen(cs: &mut ConfigSet, l: &Locations, cwd: &Path) {
+    let mut programs = Vec::new();
+    for (level, path) in [
+        ("user", l.qwen_settings()),
+        ("project", cwd.join(".qwen").join("settings.json")),
+    ] {
+        match cs
+            .context
+            .json(&format!("qwen_{level}"), &path, MAX_SETTINGS)
+        {
+            Read::Absent => {}
+            Read::Unreadable | Read::Toml(_) => {
+                if level == "user" {
+                    cs.off_user = true;
+                } else {
+                    cs.off_project = true;
+                }
+            }
+            Read::Json(v) => {
+                installed_hooks(&v, Host::Qwen, level, &mut cs.installed);
+                let h = hooks_of(
+                    &v,
+                    Host::Qwen,
+                    qwen::PRE_TOOL_MATCHER,
+                    qwen::PRE_TOOL_MATCHER,
+                    &mut programs,
+                );
+                let _ = hook_in(
+                    v.get("hooks")
+                        .and_then(|e| e.get(Event::SessionStart.name())),
+                    Host::Qwen,
+                    Event::SessionStart,
+                    None,
+                    &mut programs,
+                );
+                cs.hooks = merge_hooks(cs.hooks, h);
+                cs.foreign_prompt_hook |= foreign_prompt_hook(&v, Host::Qwen);
+                if flag(&v, "disableAllHooks") {
+                    if level == "user" {
+                        cs.off_user = true;
+                    } else {
+                        cs.off_project = true;
+                    }
+                }
+                if let Some(server) = v.get("mcpServers").and_then(|s| s.get(qwen::SERVER)) {
+                    cs.server.registered = true;
+                    Installed::add(
+                        &mut cs.installed.servers,
+                        &serde_json::json!({ "level": level, "server": server }),
+                    );
+                }
+            }
+        }
+    }
+    cs.context.programs(programs);
+    for s in l
+        .transcript_sources()
+        .into_iter()
+        .filter(|s| s.label.starts_with("Qwen"))
+    {
+        cs.context.store(&s.label, &s.path, s.names.as_deref());
+    }
+    cs.context.stores_known = true;
+}
+
+fn read_goose(cs: &mut ConfigSet, l: &Locations) {
+    let mut programs = Vec::new();
+    if let Read::Json(v) = cs
+        .context
+        .json("goose_settings", &l.goose_plugin_hooks(), MAX_SETTINGS)
+    {
+        installed_hooks(&v, Host::Goose, "user", &mut cs.installed);
+        let h = hooks_of(&v, Host::Goose, ".*", ".*", &mut programs);
+        let _ = hook_in(
+            v.get("hooks")
+                .and_then(|e| e.get(Event::SessionStart.name())),
+            Host::Goose,
+            Event::SessionStart,
+            None,
+            &mut programs,
+        );
+        cs.hooks = merge_hooks(cs.hooks, h);
+    }
+    let cfg = l.goose_config_dir().join("config.yaml");
+    let got = read_capped(&cfg, MAX_SETTINGS);
+    cs.context.note("goose_config", &cfg, &got);
+    if let Some(Some(b)) = got {
+        if std::str::from_utf8(&b).is_ok_and(|t| t.contains("  envcloak:")) {
+            cs.server.registered = true;
+            Installed::add(
+                &mut cs.installed.servers,
+                &serde_json::json!({ "role": "goose_config", "registered": true }),
+            );
+        }
+    }
+    cs.context.programs(programs);
+    for s in l
+        .transcript_sources()
+        .into_iter()
+        .filter(|s| s.label.starts_with("Goose"))
+    {
+        cs.context.store(&s.label, &s.path, s.names.as_deref());
+    }
+    cs.context.stores_known = true;
+}
+
+fn read_aider(cs: &mut ConfigSet, l: &Locations) {
+    for (role, path) in [
+        ("aider_conf", l.aider_conf()),
+        (
+            "aider_instructions",
+            l.home().join(".agents").join("AGENTS.md"),
+        ),
+    ] {
+        let got = read_capped(&path, MAX_SETTINGS);
+        cs.context.note(role, &path, &got);
+    }
+    cs.context.stores_known = true;
+}
+
 // ---------------------------------------------------------------------------
 // From probe results and configuration to the report.
 
@@ -2788,7 +3500,7 @@ impl Identity {
     }
 }
 
-/// The coverage of tier-1 `host` at `version`, from its configuration and
+/// The coverage of `host` at `version`, from its configuration and
 /// the probe results there are (L-09: recomputed whenever it is shown).
 pub fn assemble(host: Host, version: &str, cs: &ConfigSet, probed: Probed<'_>) -> Coverage {
     let degr = degraders(cs);
@@ -2828,6 +3540,15 @@ fn surface_state(
     degr: &[Reason],
     probed: Probed<'_>,
 ) -> SurfaceState {
+    // Hosts with no prompt-rejection contract (SPEC §7.1, D-14, D-16) and
+    // instructions-only hosts (Aider) have no hook contract for those
+    // surfaces regardless of configuration.
+    if (matches!(host, Host::Copilot | Host::OpenCode | Host::Goose)
+        && matches!(surface, Surface::PromptToModel | Surface::Transcript))
+        || (host == Host::Aider && surface.hook_based())
+    {
+        return SurfaceState::new(surface, State::Unsupported, &[], Outcome::Skipped);
+    }
     let hook_reasons: Vec<Reason> = degr
         .iter()
         .copied()
@@ -2855,6 +3576,9 @@ fn surface_state(
     }
     if missing {
         let mut why = vec![Reason::HookMissing];
+        if !is_drivable(host) {
+            why.push(Reason::NotDrivable);
+        }
         why.extend(&hook_reasons);
         return s(State::Unverified, &why, outcome);
     }
@@ -2873,6 +3597,9 @@ fn surface_state(
             Outcome::Failed => s(State::Degraded, &hook_reasons, Outcome::Failed),
             other => {
                 let mut why = o.why.clone();
+                if !is_drivable(host) {
+                    why.push(Reason::NotDrivable);
+                }
                 why.extend(&hook_reasons);
                 s(State::Unverified, &why, other)
             }
@@ -2893,6 +3620,9 @@ fn surface_state(
                 Probed::Stale => Reason::ChangedSinceProbe,
                 _ => Reason::NotProbed,
             }];
+            if !is_drivable(host) {
+                why.push(Reason::NotDrivable);
+            }
             why.extend(&hook_reasons);
             s(State::Unverified, &why, outcome)
         }

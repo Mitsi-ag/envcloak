@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use envcloak_agents::blocks::INSTRUCTIONS;
-use envcloak_agents::hosts::{claude, codex};
+use envcloak_agents::hosts::{claude, codex, copilot, cursor, gemini, goose, kimi, opencode, qwen};
 use serde_json::{Map, Value, json};
 
 fn integrations() -> PathBuf {
@@ -76,4 +76,44 @@ fn the_codex_files_are_the_installers() {
         hooks_file(codex::hooks_additions(Path::new("envcloak")))
     );
     assert_eq!(read("codex/envcloak.rules"), codex::RULES);
+}
+
+#[test]
+fn the_tier_2_and_tier_3_files_are_the_installers() {
+    let envcloak = Path::new("envcloak");
+    let mut cursor_expected = hooks_file(cursor::hooks_additions(envcloak));
+    cursor_expected
+        .as_object_mut()
+        .unwrap()
+        .insert("version".to_owned(), json!(1));
+    assert_eq!(json_file("cursor/hooks.json"), cursor_expected);
+    assert_eq!(
+        json_file("gemini/hooks.json"),
+        hooks_file(gemini::hooks_additions(envcloak))
+    );
+    assert_eq!(
+        json_file("copilot/envcloak.json"),
+        copilot::hooks_file_json(envcloak)
+    );
+    assert_eq!(
+        read("opencode/envcloak.js"),
+        opencode::plugin_content(envcloak, "1.0.0")
+    );
+    let kimi_change = kimi::apply_config_toml(None, envcloak).unwrap().unwrap();
+    assert_eq!(
+        read("kimi/hooks.toml"),
+        String::from_utf8(kimi_change.bytes).unwrap()
+    );
+    assert_eq!(
+        json_file("qwen/hooks.json"),
+        hooks_file(qwen::hooks_additions(envcloak))
+    );
+    assert_eq!(
+        json_file("goose/hooks.json"),
+        goose::plugin_hooks_json(envcloak)
+    );
+    assert_eq!(
+        read("aider/CONVENTIONS.md"),
+        format!("{}\n", envcloak_agents::blocks::block().trim_end())
+    );
 }

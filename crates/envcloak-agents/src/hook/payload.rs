@@ -11,7 +11,9 @@ use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
 use zeroize::Zeroize;
 
-use super::{Event, Host, MAX_PAYLOAD, claude, codex};
+use super::{
+    Event, Host, MAX_PAYLOAD, claude, codex, copilot, cursor, gemini, kimi, opencode, qwen,
+};
 
 /// A payload's JSON object, its strings and keys wiped on drop (lesson
 /// L-12: a pasted key read out of the wiped input buffer is wiped again
@@ -50,6 +52,20 @@ impl Drop for Wiped {
     }
 }
 
+/// Parses a JSON-encoded string (such as Copilot CLI's `toolArgs` or
+/// Cursor's `tool_input`) into a [`Wiped`] object whose strings are
+/// zeroized on drop.
+pub(super) fn parse_wiped_object(s: &str) -> Option<Wiped> {
+    match serde_json::from_str::<Value>(s) {
+        Ok(Value::Object(map)) => Some(Wiped(map)),
+        Ok(other) => {
+            wipe(other);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
 /// A payload as read.
 pub(super) enum Parsed {
     /// Over [`MAX_PAYLOAD`]: not read.
@@ -79,6 +95,14 @@ pub(super) fn parse(host: Host, event: Event, payload: &SecretBuf) -> Parsed {
     let fits = match host {
         Host::ClaudeCode => claude::fits(event, &p),
         Host::Codex => codex::fits(event, &p),
+        Host::Cursor => cursor::fits(event, &p),
+        Host::Gemini => gemini::fits(event, &p),
+        Host::Copilot => copilot::fits(event, &p),
+        Host::OpenCode => opencode::fits(event, &p),
+        Host::Kimi => kimi::fits(event, &p),
+        Host::Qwen => qwen::fits(event, &p),
+        Host::Goose => claude::fits(event, &p) || opencode::fits(event, &p),
+        Host::Aider => false,
     };
     if fits { Parsed::Fits(p) } else { Parsed::Unfit }
 }

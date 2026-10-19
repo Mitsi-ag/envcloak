@@ -88,6 +88,46 @@ pub fn run_surfaces(
         config_shape: String::new(),
     };
     let want = |s: Surface| surfaces.contains(&s);
+    if !coverage::is_drivable(host.host) {
+        let mut p = Prober {
+            host,
+            home,
+            flags,
+            runs: Vec::new(),
+            config: None,
+        };
+        let exe_sha = std::fs::canonicalize(&host.exe)
+            .ok()
+            .and_then(|e| coverage::file_sha256(&e))
+            .unwrap_or_default();
+        p.config = p.read_config();
+        report.config_digest = p
+            .config
+            .as_ref()
+            .and_then(|c| c.fingerprint(&home.envcloak))
+            .unwrap_or_default();
+        report.config_shape = p
+            .config
+            .as_ref()
+            .and_then(|c| c.shape(&home.home, &home.envcloak))
+            .unwrap_or_default();
+        report.exe_sha256 = exe_sha;
+        for s in Surface::ALL.into_iter().filter(|s| want(*s)) {
+            let unsupported = (matches!(host.host, Host::Copilot | Host::OpenCode | Host::Goose)
+                && matches!(s, Surface::PromptToModel | Surface::Transcript))
+                || (host.host == Host::Aider && s.hook_based());
+            let why: &[Reason] = if unsupported {
+                &[]
+            } else {
+                &[Reason::NotDrivable]
+            };
+            report.surfaces.push(skipped(s, Outcome::Skipped, why));
+        }
+        if server {
+            report.server.outcome = Outcome::Skipped;
+        }
+        return report;
+    }
     if !model::qualified(host.host.id(), &host.version) {
         for s in Surface::ALL.into_iter().filter(|s| want(*s)) {
             report.surfaces.push(skipped(s, Outcome::NotQualified, &[]));
@@ -139,7 +179,14 @@ pub fn run_surfaces(
         return report;
     };
     if want(Surface::PromptToModel) || want(Surface::Transcript) {
-        let (prompt, transcript) = p.prompt_and_transcript();
+        let (prompt, transcript) = if matches!(host.host, Host::Copilot | Host::OpenCode) {
+            (
+                skipped(Surface::PromptToModel, Outcome::Skipped, &[]),
+                skipped(Surface::Transcript, Outcome::Skipped, &[]),
+            )
+        } else {
+            p.prompt_and_transcript()
+        };
         if want(Surface::PromptToModel) {
             report.surfaces.push(prompt);
         }
@@ -390,6 +437,10 @@ impl Prober<'_, '_> {
         self.host.host == Host::ClaudeCode
     }
 
+    fn codex(&self) -> bool {
+        self.host.host == Host::Codex
+    }
+
     fn spec(&self, name: &'static str, script: Value, prompt: String) -> Spec {
         Spec {
             name,
@@ -495,7 +546,7 @@ impl Prober<'_, '_> {
             (Session::New, Host::Codex) => {
                 flags.extend(["--sandbox".to_owned(), spec.sandbox.to_owned()]);
             }
-            (Session::New, Host::ClaudeCode) => {}
+            _ => {}
         }
         flags.extend(self.flags.args.iter().cloned());
         RunSummary {
@@ -586,6 +637,59 @@ impl Prober<'_, '_> {
                     ),
                 }
             }
+            Host::Copilot => {
+                cmd.env("COPILOT_OFFLINE", "true")
+                    .env("COPILOT_AUTO_UPDATE", "false")
+                    .env("COPILOT_PROVIDER_BASE_URL", base)
+                    .env("COPILOT_PROVIDER_TYPE", "anthropic")
+                    .env("COPILOT_PROVIDER_API_KEY", token.as_str())
+                    .env("COPILOT_MODEL", "ec-scripted");
+                let mut a = vec![
+                    "-p".to_owned(),
+                    spec.prompt.as_str().to_owned(),
+                    "--allow-all-tools".to_owned(),
+                ];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            Host::OpenCode => {
+                cmd.env("EC_MODEL_TOKEN", token.as_str())
+                    .env("OPENAI_API_KEY", token.as_str())
+                    .env("OPENAI_BASE_URL", format!("{base}/v1"));
+                let mut a = vec!["run".to_owned(), spec.prompt.as_str().to_owned()];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            Host::Kimi => {
+                cmd.env("EC_MODEL_TOKEN", token.as_str())
+                    .env("KIMI_API_KEY", token.as_str())
+                    .env("KIMI_BASE_URL", format!("{base}/v1"))
+                    .env("OPENAI_API_KEY", token.as_str())
+                    .env("OPENAI_BASE_URL", format!("{base}/v1"));
+                let mut a = vec!["-p".to_owned(), spec.prompt.as_str().to_owned()];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            Host::Qwen => {
+                cmd.env("EC_MODEL_TOKEN", token.as_str())
+                    .env("OPENAI_API_KEY", token.as_str())
+                    .env("OPENAI_BASE_URL", format!("{base}/v1"))
+                    .env("OPENAI_MODEL", "ec-scripted");
+                let mut a = vec![
+                    spec.prompt.as_str().to_owned(),
+                    "--approval-mode".to_owned(),
+                    "default".to_owned(),
+                    "--allowed-tools".to_owned(),
+                    "run_shell_command".to_owned(),
+                ];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            _ => Vec::new(),
         };
         cmd.args(&args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
@@ -827,15 +931,17 @@ impl Prober<'_, '_> {
         let l = self.locations()?;
         let root = if self.claude() {
             l.claude_dir().join("projects")
-        } else {
+        } else if self.codex() {
             l.codex_home().join("sessions")
+        } else {
+            return None;
         };
         let swept = controls::sweep(&[(root, None)], &[ctl_forms]);
         let id_of = |p: &Path| -> Option<String> {
             let name = p.file_name()?.to_str()?;
             match claude_id {
                 Some(id) => (name == format!("{id}.jsonl")).then(|| id.to_owned()),
-                None if !self.claude() => {
+                None if self.codex() => {
                     let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
                     let id = stem.get(stem.len().checked_sub(36)?..)?;
                     uuid_shaped(id).then(|| id.to_owned())
@@ -866,7 +972,7 @@ impl Prober<'_, '_> {
         };
         let mut roots = c.context.sweep_roots();
         let mut known = c.context.stores_known;
-        if !self.claude() {
+        if self.codex() {
             for (key, value) in codex::settings(&self.flags.args) {
                 let names = match key.as_str() {
                     "log_dir" => None,
@@ -890,12 +996,16 @@ impl Prober<'_, '_> {
     /// tools; Codex's refusal carries the justification of EnvCloak's own
     /// rule ([`controls::codex_rule_refused`]).
     fn rule_is_ours(&self) -> bool {
-        !self.claude()
-            || (self
-                .config
+        if self.codex() {
+            true
+        } else if self.claude() {
+            self.config
                 .as_ref()
                 .is_some_and(|c| c.read_deny && !c.foreign_read_deny)
-                && !flags_add_rules_or_hooks(self.host.host, &self.flags.args))
+                && !flags_add_rules_or_hooks(self.host.host, &self.flags.args)
+        } else {
+            false
+        }
     }
 
     /// File read: a control read; the hook's case, a read of a `.env`
@@ -925,22 +1035,29 @@ impl Prober<'_, '_> {
             );
         };
         let steps = if self.claude() {
-            [
+            vec![
                 claude::read_step(&project.join("README.md")),
                 claude::read_step(&fx.elsewhere.join(".env")),
                 claude::read_step(&project.join(".env")),
+                json!({"say": "done"}),
             ]
-        } else {
-            [
+        } else if self.codex() {
+            vec![
                 json!({"shell": "cat README.md"}),
                 json!({"shell": "cat -- .env"}),
                 json!({"shell": "cat .env"}),
+                json!({"say": "done"}),
+            ]
+        } else {
+            vec![
+                json!({"shell": "cat README.md"}),
+                json!({"shell": "cat .env"}),
+                json!({"say": "done"}),
             ]
         };
-        let [control, hook, rule] = steps;
         let mut spec = self.spec(
             "file read",
-            json!({"steps": [control, hook, rule, {"say": "done"}]}),
+            json!({"steps": steps}),
             "Read the project's README and the .env files.".to_owned(),
         );
         if self.claude() {
@@ -949,7 +1066,9 @@ impl Prober<'_, '_> {
         let r = self.run(&spec);
         let env_forms = forms(fx.env_file.as_bytes());
         let mut checks = denial_checks(&r, &fx.readme, Denied::EnvFile, &env_forms);
-        checks.push(rule_check(&r, 3, self.host.host, self.rule_is_ours()));
+        if self.claude() || self.codex() {
+            checks.push(rule_check(&r, 3, self.host.host, self.rule_is_ours()));
+        }
         drop(r);
         let mut skipped = Vec::new();
         if self.claude() {
@@ -1051,10 +1170,10 @@ impl Prober<'_, '_> {
         };
         let (a, b) = halves(&ctl);
         let mut steps = vec![json!({"shell": format!("printf '%s%s\\n' '{a}' '{b}'")})];
-        if self.claude() {
+        if self.codex() {
+            steps.push(json!({"shell": "env"}));
             steps.push(json!({"shell": "printenv"}));
         } else {
-            steps.push(json!({"shell": "env"}));
             steps.push(json!({"shell": "printenv"}));
         }
         steps.push(json!({"say": "done"}));
@@ -1070,7 +1189,7 @@ impl Prober<'_, '_> {
         let r = self.run(&spec);
         let env_forms = forms(fx.env_var.as_bytes());
         let mut checks = denial_checks(&r, &ctl, Denied::EnvDump, &env_forms);
-        if !self.claude() {
+        if self.codex() {
             checks.push(rule_check(&r, 3, self.host.host, self.rule_is_ours()));
         }
         surface(Surface::Shell, checks)
@@ -1119,7 +1238,7 @@ impl Prober<'_, '_> {
                 "--mcp-config".to_owned(),
                 config.to_string_lossy().into_owned(),
             ]);
-        } else {
+        } else if self.codex() {
             spec.probe = codex::mcp_server(&fixture.to_string_lossy());
         }
         let r = self.run(&spec);
@@ -1164,7 +1283,7 @@ impl Prober<'_, '_> {
         );
         if self.claude() {
             spec.probe = claude::permissions(&["Bash"]);
-        } else {
+        } else if self.codex() {
             // What this surface measures is EnvCloak's redaction, not the
             // host's sandbox: the run must reach the daemon, which no
             // pinned Linux sandbox lets it (K-01).
@@ -1229,7 +1348,7 @@ impl Prober<'_, '_> {
         if std::fs::DirBuilder::new().mode(0o700).create(&dir).is_err() {
             out.outcome = Outcome::Failed;
             return out;
-        }
+        };
         let denied = dir.join("shell");
         let allowed = self.home.project.join(format!("{nonce}-ok"));
         let sentinel = dir.join("mcp");
@@ -1257,7 +1376,7 @@ impl Prober<'_, '_> {
             spec.probe = claude::permissions(&["Bash", "mcp__envcloak__run_with_secrets"]);
             spec.probe
                 .extend(["--settings".to_owned(), claude::sandbox_settings()]);
-        } else {
+        } else if self.codex() {
             spec.sandbox = "workspace-write";
             spec.probe = codex::sentinel_settings();
         }
@@ -1336,6 +1455,7 @@ fn flags_add_rules_or_hooks(host: Host, args: &[String]) -> bool {
                 .iter()
                 .any(|t| k == *t || k.starts_with(&format!("{t}.")))
         }),
+        _ => false,
     }
 }
 
@@ -1614,6 +1734,11 @@ mod tests {
                 "hook_event_name": "PreToolUse", "model": "m", "turn_id": "t",
                 "permission_mode": "bypassPermissions",
                 "tool_name": tool, "tool_input": input, "tool_use_id": "u",
+            }),
+            _ => json!({
+                "session_id": "s", "cwd": "/p",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool, "tool_input": input,
             }),
         };
         let bytes = serde_json::to_vec(&v).unwrap_or_default();

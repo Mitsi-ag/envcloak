@@ -46,6 +46,7 @@ fn captured(host: Host, event: &str) -> Value {
     let dir = match host {
         Host::ClaudeCode => "claude-code-2.1.280",
         Host::Codex => "codex-0.159.2",
+        _ => unreachable!("tier-1 fixture only: {host:?}"),
     };
     let p = repo()
         .join("crates/envcloak-e2e/tests/fixtures/hook-payloads")

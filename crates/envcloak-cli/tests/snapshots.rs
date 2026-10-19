@@ -834,7 +834,7 @@ const HELP_AND_USAGE: &[&[&str]] = &[
     &["agents", "install", "--help"],
     &["agents", "install", "--bogus"],
     &["agents", "uninstall", "--consent-sandbox-sockets"],
-    &["agents", "install", "--agent", "cursor"],
+    &["agents", "install", "--agent", "nosuch"],
     &["hook"],
     &["hook", "--host", "claude-code", "--event", "Stop"],
     &["init", "--undo", "X", "--agents-note"],

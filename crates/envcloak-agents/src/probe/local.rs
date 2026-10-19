@@ -191,6 +191,15 @@ pub struct LocalRun {
 /// there or the probe's projects could not be set up: nothing was probed,
 /// and the probe home is removed.
 pub fn probe_host(host: &ProbeHost, opts: &LocalOptions) -> Result<LocalRun, LocalError> {
+    if !crate::coverage::is_drivable(host.host) {
+        return Ok(LocalRun {
+            report: not_drivable(host),
+            qualification: Qualification::Qualified,
+            approvals: 0,
+            needs_terminal: false,
+            home_removed: true,
+        });
+    }
     let qualification = qualify(host.host, &host.version);
     if !qualification.is_qualified() {
         return Ok(LocalRun {
@@ -263,8 +272,50 @@ pub fn host_flags(host: Host) -> HostFlags {
     HostFlags {
         args: match host {
             Host::Codex => vec!["--dangerously-bypass-hook-trust".to_owned()],
-            Host::ClaudeCode => Vec::new(),
+            _ => Vec::new(),
         },
+    }
+}
+
+/// The report of a host that has no headless CLI contract (`not_drivable`).
+pub fn not_drivable(host: &ProbeHost) -> ProbeReport {
+    ProbeReport {
+        host: host.host,
+        version: host.version.clone(),
+        surfaces: Surface::ALL
+            .into_iter()
+            .map(|surface| {
+                let unsupported =
+                    (matches!(host.host, Host::Copilot | Host::OpenCode | Host::Goose)
+                        && matches!(surface, Surface::PromptToModel | Surface::Transcript))
+                        || (host.host == Host::Aider && surface.hook_based());
+                super::SurfaceProbe {
+                    surface,
+                    outcome: Outcome::Skipped,
+                    checks: Vec::new(),
+                    persisted: false,
+                    why: if unsupported {
+                        Vec::new()
+                    } else {
+                        vec![crate::coverage::Reason::NotDrivable]
+                    },
+                    skipped: Vec::new(),
+                }
+            })
+            .collect(),
+        server: ServerProbe {
+            outcome: Outcome::Skipped,
+            sentinel: Sentinel::NotRun,
+            control_ran: false,
+            allowed_write: false,
+            control_denied: false,
+            checks: Vec::new(),
+        },
+        runs: Vec::new(),
+        flags: Vec::new(),
+        exe_sha256: String::new(),
+        config_digest: String::new(),
+        config_shape: String::new(),
     }
 }
 
@@ -409,7 +460,7 @@ pub fn keep_record(
     if before != after {
         return Err(NotKept::ChangedWhileProbing);
     }
-    if run.qualification.is_qualified() {
+    if run.qualification.is_qualified() && crate::coverage::is_drivable(run.report.host) {
         if run.report.exe_sha256.is_empty()
             || run.report.config_digest.is_empty()
             || run.report.config_shape.is_empty()
@@ -486,6 +537,7 @@ pub fn inherited_configuration(
             ],
             l.codex_managed_preferences(),
         ),
+        _ => return Vec::new(),
     };
     match profiles {
         Ok(ps) => candidates.extend(ps),
@@ -1321,7 +1373,7 @@ mod tests {
             );
             let other = match host {
                 Host::ClaudeCode => Host::Codex,
-                Host::Codex => Host::ClaudeCode,
+                _ => Host::ClaudeCode,
             };
             assert!(
                 inherited_configuration(other, &l, &claude).is_empty(),

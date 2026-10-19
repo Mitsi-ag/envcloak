@@ -105,10 +105,10 @@ use serde_json::{Value, json};
 
 use super::{fd_number, require_unlocked};
 
-const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent claude-code|codex]... [--consent-sandbox-sockets] [--yes] [--json]
-       envcloak agents uninstall [--global] [--project] [--agent claude-code|codex]... [--yes] [--json]
+const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+       envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
-       envcloak agents status --probe [--agent claude-code|codex]... [--json]
+       envcloak agents status --probe [--agent ID]... [--json]
        envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
        envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
        envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]";
@@ -313,7 +313,10 @@ fn run_probe(a: &ProbeArgs) -> Result<ExitCode, Failure> {
     let mut version_env = version_home.env();
     version_env.push(("PATH".into(), path.clone()));
     let hosts: Vec<Host> = if a.hosts.is_empty() {
-        install::TIER_1.to_vec()
+        Host::ALL
+            .into_iter()
+            .filter(|h| coverage::is_drivable(*h))
+            .collect()
     } else {
         a.hosts.clone()
     };
@@ -672,7 +675,8 @@ fn coverage_report(detect: &Detector<'_>) -> Result<Vec<Row>, Failure> {
     // directory was read, and a nested directory's settings were not).
     let cwd = working_dir()?;
     let mut rows = Vec::new();
-    for host in install::TIER_1 {
+    for host in Host::ALL {
+        let tier = install::host_tier(host);
         let detected = detect(host, &path);
         let d = match detected {
             Ok(d) => d,
@@ -691,8 +695,8 @@ fn coverage_report(detect: &Detector<'_>) -> Result<Vec<Row>, Failure> {
                 c.version = None;
                 rows.push(Row {
                     name: host_name(host),
-                    tier: 1,
-                    exe: detect::find_on_path(detect::exe_name(host), &path),
+                    tier,
+                    exe: detect::find_host_on_path(host, &path),
                     probed: ProbeStatus::NotProbed,
                     identified_by: Identity::ExecutableName,
                     coverage: c,
@@ -719,47 +723,21 @@ fn coverage_report(detect: &Detector<'_>) -> Result<Vec<Row>, Failure> {
             .and_then(|me| cs.fingerprint(&me))
             .unwrap_or_default();
         let probed = cache.probed(host.id(), &sha, &d.version, &fingerprint);
+        let identified_by = if d.named {
+            Identity::Version
+        } else {
+            Identity::ExecutableName
+        };
         rows.push(Row {
             name: host_name(host),
-            tier: 1,
+            tier,
             exe: Some(d.exe.clone()),
             probed: probed.status(),
-            identified_by: Identity::Version,
+            identified_by,
             coverage: coverage::assemble(host, &d.version, &cs, probed),
         });
     }
-    for (id, exe) in coverage::STATIC_HOSTS {
-        let Some(found) = detect::find_on_path(exe, &path) else {
-            continue;
-        };
-        let Some(surfaces) = coverage::static_rows(id) else {
-            continue;
-        };
-        rows.push(Row {
-            name: static_name(id),
-            tier: 2,
-            exe: Some(found),
-            probed: ProbeStatus::NotProbed,
-            identified_by: Identity::ExecutableName,
-            coverage: Coverage {
-                agent: id.to_owned(),
-                version: None,
-                surfaces,
-                envcloak_server: None,
-            }
-            .sorted(),
-        });
-    }
     Ok(rows)
-}
-
-fn static_name(id: &str) -> &'static str {
-    match id {
-        "copilot" => "Copilot CLI",
-        "opencode" => "OpenCode",
-        "goose" => "Goose",
-        _ => "an agent host",
-    }
 }
 
 fn print_coverage(rows: &[Row], json: bool) {
@@ -788,10 +766,12 @@ fn print_coverage(rows: &[Row], json: bool) {
             .and_then(|p| p.file_name())
             .map(|n| escape_for_display(&n.to_string_lossy()))
             .unwrap_or_default();
-        match &r.coverage.version {
-            Some(v) => println!("{} {}", r.name, escape_for_display(v)),
-            None if r.tier == 1 => println!("{} (version not read)", r.name),
-            None => println!(
+        match (&r.coverage.version, r.identified_by) {
+            (Some(v), _) if r.coverage.agent != "goose" || r.identified_by == Identity::Version => {
+                println!("{} {}", r.name, escape_for_display(v));
+            }
+            (None, _) if r.tier == 1 => println!("{} (version not read)", r.name),
+            _ => println!(
                 "{} (not identified: an executable named {exe} is on PATH, which may be another \
                  program)",
                 r.name
@@ -1316,7 +1296,7 @@ fn run_uninstall(mut a: Args) -> Result<ExitCode, Failure> {
     if !a.yes {
         let (_file, state) = StateFile::open(&ctx.data_dir).map_err(|r| state_failure(&r))?;
         let hosts: Vec<Host> = if a.opts.hosts.is_empty() {
-            install::TIER_1.to_vec()
+            Host::ALL.to_vec()
         } else {
             a.opts.hosts.clone()
         };
