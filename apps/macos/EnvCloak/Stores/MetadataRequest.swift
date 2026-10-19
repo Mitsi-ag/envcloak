@@ -56,6 +56,23 @@ enum MetadataRequest {
     static func canCopy(_ text: DaemonText) -> Bool { TerminalCopy.isSafe(text.unescaped) }
     static func clipboardPath(_ directory: DaemonText) -> TerminalCopy? { TerminalCopy(directory.unescaped) }
     static func path(_ directory: DaemonText) -> String { directory.unescaped }
+    static func raw(_ text: DaemonText) -> String { text.unescaped }
+    static func pendingGet(_ id: DaemonText) -> AppPendingGet { AppPendingGet(request: id.unescaped) }
+    static func deny(_ id: DaemonText) -> Deny { Deny(request: id.unescaped) }
+    static func unlockBegin(unlockerID: DaemonText? = nil) -> AppUnlockBegin { AppUnlockBegin(unlocker_id: unlockerID?.unescaped) }
+    static func unlockFinish(requestID: DaemonText, sealed: String) -> AppUnlock { AppUnlock(request_id: requestID.unescaped, sealed: sealed) }
+    static func enrollBegin(unlockPublicKeyHex: String, approvePublicKeyHex: String, label: String = "This Mac") -> AppUnlockerEnrollBegin {
+        AppUnlockerEnrollBegin(unlock_pub: unlockPublicKeyHex, approve_pub: approvePublicKeyHex, label: label)
+    }
+    static func enrollPoll(_ request: DaemonText) -> AppUnlockerEnroll { AppUnlockerEnroll(request: request.unescaped) }
+    static func approve(request: DaemonText, options: ApprovalOptions, digestHex: String, signatureHex: String) -> AppApprove {
+        AppApprove(request: request.unescaped, options: options, digest: digestHex, signature: signatureHex)
+    }
+    static func standingRevoke(_ id: DaemonText) -> StandingRevoke { StandingRevoke(id: id.unescaped, all: false) }
+    static func enrollApprovalCommand(request: DaemonText) -> TerminalCopy? {
+        guard canCopy(request), let text = terminalCommand(["approve", request.unescaped]) else { return nil }
+        return TerminalCopy(text)
+    }
 }
 
 /// Views can display or copy this text, but cannot obtain its raw String.

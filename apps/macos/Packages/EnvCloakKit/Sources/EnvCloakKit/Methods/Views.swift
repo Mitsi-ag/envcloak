@@ -321,7 +321,7 @@ public struct GrantsView: Sendable, WireDecodable, CustomStringConvertible, Cust
     }
 }
 
-public struct GrantView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct GrantView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `id`: DaemonText
     public let `kind`: SubjectKind
     public let `label`: DaemonText?
@@ -335,6 +335,21 @@ public struct GrantView: Sendable, WireDecodable, CustomStringConvertible, Custo
     public let `remaining_secs`: UInt64
     public var description: String { "[GrantView]" }
     public var debugDescription: String { description }
+    public init(id: DaemonText, kind: SubjectKind, label: DaemonText? = nil, root_pid: Int32, root_exe: DaemonText? = nil,
+                project_dir: DaemonText, bindings: [GrantBindingView], mode: Mode, uses: Uses,
+                created_secs: UInt64, remaining_secs: UInt64) {
+        self.id = id
+        self.kind = kind
+        self.label = label
+        self.root_pid = root_pid
+        self.root_exe = root_exe
+        self.project_dir = project_dir
+        self.bindings = bindings
+        self.mode = mode
+        self.uses = uses
+        self.created_secs = created_secs
+        self.remaining_secs = remaining_secs
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["id", "kind", "label", "root_pid", "root_exe", "project_dir", "bindings", "mode", "uses", "created_secs", "remaining_secs"])
         self.`id` = try o.decode("id")
@@ -351,12 +366,17 @@ public struct GrantView: Sendable, WireDecodable, CustomStringConvertible, Custo
     }
 }
 
-public struct GrantBindingView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct GrantBindingView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `env_name`: DaemonText
     public let `slug`: DaemonText
     public let `live`: Bool
     public var description: String { "[GrantBindingView]" }
     public var debugDescription: String { description }
+    public init(env_name: DaemonText, slug: DaemonText, live: Bool) {
+        self.env_name = env_name
+        self.slug = slug
+        self.live = live
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["env_name", "slug", "live"])
         self.`env_name` = try o.decode("env_name")
@@ -866,3 +886,571 @@ public struct FirstRunReportView: Sendable, Equatable, WireDecodable, CustomStri
         self.`plaintext_projects` = try o.decode("plaintext_projects")
     }
 }
+
+public enum UnlockerEnrollState: String, Sendable, Equatable, WireDecodable {
+    case `pending` = "pending"
+    case `enrolled` = "enrolled"
+    case `denied` = "denied"
+    case `expired` = "expired"
+    init(wire: WireReader) throws {
+        guard let value = Self(rawValue: try wire.string()) else { throw EnvCloakError.protocolError }
+        self = value
+    }
+}
+
+public struct AppUnlockerEnrollBeginView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `request`: DaemonText
+    public let `expires_in_secs`: UInt64
+    public var description: String { "[AppUnlockerEnrollBeginView]" }
+    public var debugDescription: String { description }
+    public init(request: DaemonText, expires_in_secs: UInt64) {
+        self.request = request
+        self.expires_in_secs = expires_in_secs
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["request", "expires_in_secs"])
+        self.`request` = try o.decode("request")
+        self.`expires_in_secs` = try o.decode("expires_in_secs")
+    }
+}
+
+public struct AppUnlockerEnrollView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `state`: UnlockerEnrollState
+    public let `unlocker_id`: DaemonText?
+    public var description: String { "[AppUnlockerEnrollView]" }
+    public var debugDescription: String { description }
+    public init(state: UnlockerEnrollState, unlocker_id: DaemonText? = nil) {
+        self.state = state
+        self.unlocker_id = unlocker_id
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["state", "unlocker_id"])
+        let state: UnlockerEnrollState = try o.decode("state")
+        let unlockerID: DaemonText? = try o.optional("unlocker_id")
+        guard (state == .enrolled) == (unlockerID != nil) else { throw EnvCloakError.protocolError }
+        self.`state` = state
+        self.`unlocker_id` = unlockerID
+    }
+}
+
+public struct SeEnvelopeView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `enc`: DaemonText
+    public let `ciphertext`: DaemonText
+    public var description: String { "[SeEnvelopeView]" }
+    public var debugDescription: String { description }
+    public init(enc: DaemonText, ciphertext: DaemonText) {
+        self.enc = enc
+        self.ciphertext = ciphertext
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["enc", "ciphertext"])
+        self.`enc` = try o.decode("enc")
+        self.`ciphertext` = try o.decode("ciphertext")
+    }
+}
+
+public struct AppUnlockBeginView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `request_id`: DaemonText
+    public let `unlocker_id`: DaemonText
+    public let `vault_id`: DaemonText
+    public let `epoch`: UInt32
+    public let `challenge`: DaemonText
+    public let `envelope`: SeEnvelopeView
+    public let `daemon_eph_pub`: DaemonText
+    public var description: String { "[AppUnlockBeginView]" }
+    public var debugDescription: String { description }
+    public init(request_id: DaemonText, unlocker_id: DaemonText, vault_id: DaemonText, epoch: UInt32,
+                challenge: DaemonText, envelope: SeEnvelopeView, daemon_eph_pub: DaemonText) {
+        self.request_id = request_id
+        self.unlocker_id = unlocker_id
+        self.vault_id = vault_id
+        self.epoch = epoch
+        self.challenge = challenge
+        self.envelope = envelope
+        self.daemon_eph_pub = daemon_eph_pub
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["request_id", "unlocker_id", "vault_id", "epoch", "challenge", "envelope", "daemon_eph_pub"])
+        self.`request_id` = try o.decode("request_id")
+        self.`unlocker_id` = try o.decode("unlocker_id")
+        self.`vault_id` = try o.decode("vault_id")
+        self.`epoch` = try o.decode("epoch")
+        self.`challenge` = try o.decode("challenge")
+        self.`envelope` = try o.decode("envelope")
+        self.`daemon_eph_pub` = try o.decode("daemon_eph_pub")
+    }
+}
+
+public struct UnlockedView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `integrity`: Integrity
+    public let `read_only`: Bool
+    public let `already`: Bool
+    public var description: String { "[UnlockedView]" }
+    public var debugDescription: String { description }
+    public init(integrity: Integrity, read_only: Bool, already: Bool) {
+        self.integrity = integrity
+        self.read_only = read_only
+        self.already = already
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["integrity", "read_only", "already"])
+        self.`integrity` = try o.decode("integrity")
+        self.`read_only` = try o.decode("read_only")
+        self.`already` = try o.decode("already")
+    }
+}
+
+public struct AppPendingView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `request`: DaemonText
+    public let `age_secs`: UInt64
+    public let `expires_in_secs`: UInt64
+    public let `kind`: SubjectKind
+    public let `agent`: DaemonText?
+    public let `project`: DaemonText
+    public let `bindings`: [DaemonText]
+    public let `more_bindings`: UInt64
+    public let `statement_domain`: DaemonText
+    public var description: String { "[AppPendingView]" }
+    public var debugDescription: String { description }
+    public init(request: DaemonText, age_secs: UInt64, expires_in_secs: UInt64, kind: SubjectKind,
+                agent: DaemonText? = nil, project: DaemonText, bindings: [DaemonText],
+                more_bindings: UInt64 = 0, statement_domain: DaemonText = DaemonText("envcloak-statement/2")) {
+        self.request = request
+        self.age_secs = age_secs
+        self.expires_in_secs = expires_in_secs
+        self.kind = kind
+        self.agent = agent
+        self.project = project
+        self.bindings = bindings
+        self.more_bindings = more_bindings
+        self.statement_domain = statement_domain
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["request", "age_secs", "expires_in_secs", "kind", "agent", "project", "bindings", "more_bindings", "statement_domain"])
+        self.`request` = try o.decode("request")
+        self.`age_secs` = try o.decode("age_secs")
+        self.`expires_in_secs` = try o.decode("expires_in_secs")
+        self.`kind` = try o.decode("kind")
+        self.`agent` = try o.optional("agent")
+        self.`project` = try o.decode("project")
+        self.`bindings` = try o.decode("bindings")
+        self.`more_bindings` = try o.decode("more_bindings")
+        self.`statement_domain` = try o.decode("statement_domain")
+    }
+}
+
+public struct AppPendingListView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `requests`: [AppPendingView]
+    public var description: String { "[AppPendingListView]" }
+    public var debugDescription: String { description }
+    public init(requests: [AppPendingView]) {
+        self.requests = requests
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["requests"])
+        self.`requests` = try o.decode("requests")
+    }
+}
+
+public struct ProcessSummary: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `pid`: Int32
+    public let `start_time`: UInt64
+    public let `exe`: DaemonText?
+    public var description: String { "[ProcessSummary]" }
+    public var debugDescription: String { description }
+    public init(pid: Int32, start_time: UInt64, exe: DaemonText? = nil) {
+        self.pid = pid
+        self.start_time = start_time
+        self.exe = exe
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["pid", "start_time", "exe"])
+        self.`pid` = try o.decode("pid")
+        self.`start_time` = try o.decode("start_time")
+        self.`exe` = try o.optional("exe")
+    }
+}
+
+public struct SubjectSummary: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `kind`: SubjectKind
+    public let `label`: DaemonText?
+    public let `caller_pid`: Int32
+    public let `root`: ProcessSummary
+    public var description: String { "[SubjectSummary]" }
+    public var debugDescription: String { description }
+    public init(kind: SubjectKind, label: DaemonText? = nil, caller_pid: Int32, root: ProcessSummary) {
+        self.kind = kind
+        self.label = label
+        self.caller_pid = caller_pid
+        self.root = root
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["kind", "label", "caller_pid", "root"])
+        self.`kind` = try o.decode("kind")
+        self.`label` = try o.optional("label")
+        self.`caller_pid` = try o.decode("caller_pid")
+        self.`root` = try o.decode("root")
+    }
+}
+
+public struct ProjectSummary: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `dir`: DaemonText
+    public let `manifest`: DaemonText
+    public let `manifest_sha256`: DaemonText
+    public let `new_project`: Bool
+    public var description: String { "[ProjectSummary]" }
+    public var debugDescription: String { description }
+    public init(dir: DaemonText, manifest: DaemonText, manifest_sha256: DaemonText, new_project: Bool) {
+        self.dir = dir
+        self.manifest = manifest
+        self.manifest_sha256 = manifest_sha256
+        self.new_project = new_project
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["dir", "manifest", "manifest_sha256", "new_project"])
+        self.`dir` = try o.decode("dir")
+        self.`manifest` = try o.decode("manifest")
+        self.`manifest_sha256` = try o.decode("manifest_sha256")
+        self.`new_project` = try o.decode("new_project")
+    }
+}
+
+public struct BindingSummary: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `env_name`: DaemonText
+    public let `slug`: DaemonText
+    public let `item`: DaemonText
+    public let `field`: DaemonText
+    public let `field_name`: DaemonText
+    public let `classification`: DaemonText
+    public let `first_use`: Bool
+    public let `granted`: Bool
+    public var description: String { "[BindingSummary]" }
+    public var debugDescription: String { description }
+    public init(env_name: DaemonText, slug: DaemonText, item: DaemonText, field: DaemonText,
+                field_name: DaemonText, classification: DaemonText, first_use: Bool, granted: Bool) {
+        self.env_name = env_name
+        self.slug = slug
+        self.item = item
+        self.field = field
+        self.field_name = field_name
+        self.classification = classification
+        self.first_use = first_use
+        self.granted = granted
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["env_name", "slug", "item", "field", "field_name", "classification", "first_use", "granted"])
+        self.`env_name` = try o.decode("env_name")
+        self.`slug` = try o.decode("slug")
+        self.`item` = try o.decode("item")
+        self.`field` = try o.decode("field")
+        self.`field_name` = try o.decode("field_name")
+        self.`classification` = try o.decode("classification")
+        self.`first_use` = try o.decode("first_use")
+        self.`granted` = try o.decode("granted")
+    }
+    public var classificationView: ClassificationView {
+        ClassificationView(rawValue: classification.raw) ?? .unknown
+    }
+}
+
+public enum BindingSource: Sendable, Equatable, Hashable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    case env
+    case profile(DaemonText)
+    case envFile(UInt32)
+    case ref
+    public var description: String { "[BindingSource]" }
+    public var debugDescription: String { description }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["layer", "profile", "line"])
+        let layer: String = try o.decode("layer")
+        let profile: DaemonText? = try o.optional("profile")
+        let line: UInt32? = try o.optional("line")
+        switch (layer, profile, line) {
+        case ("env", nil, nil): self = .env
+        case ("profile", let p?, nil): self = .profile(p)
+        case ("env_file", nil, let l?): self = .envFile(l)
+        case ("ref", nil, nil): self = .ref
+        default: throw EnvCloakError.protocolError
+        }
+    }
+}
+
+public struct Proposal: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `env_name`: DaemonText
+    public let `live_slug`: DaemonText
+    public let `test_slug`: DaemonText
+    public let `test_field`: DaemonText?
+    public let `source`: BindingSource
+    public var description: String { "[Proposal]" }
+    public var debugDescription: String { description }
+    public init(env_name: DaemonText, live_slug: DaemonText, test_slug: DaemonText,
+                test_field: DaemonText? = nil, source: BindingSource = .env) {
+        self.env_name = env_name
+        self.live_slug = live_slug
+        self.test_slug = test_slug
+        self.test_field = test_field
+        self.source = source
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["env_name", "live_slug", "test_slug", "test_field", "source"])
+        self.`env_name` = try o.decode("env_name")
+        self.`live_slug` = try o.decode("live_slug")
+        self.`test_slug` = try o.decode("test_slug")
+        self.`test_field` = try o.optional("test_field")
+        self.`source` = try o.decode("source")
+    }
+    public var testReferenceDisplay: String {
+        if let field = test_field {
+            return "\(test_slug.escaped)#\(field.escaped)"
+        }
+        return test_slug.escaped
+    }
+}
+
+public struct ManagedSummary: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `name`: DaemonText
+    public let `written_by_migrate_mcp`: Bool
+    public let `launch`: DaemonText?
+    public let `revision`: UInt64?
+    public let `class`: DaemonText?
+    public let `strength`: DaemonText?
+    public let `origin`: DaemonText?
+    public var description: String { "[ManagedSummary]" }
+    public var debugDescription: String { description }
+    public init(name: DaemonText, written_by_migrate_mcp: Bool, launch: DaemonText? = nil,
+                revision: UInt64? = nil, class: DaemonText? = nil, strength: DaemonText? = nil,
+                origin: DaemonText? = nil) {
+        self.name = name
+        self.written_by_migrate_mcp = written_by_migrate_mcp
+        self.launch = launch
+        self.revision = revision
+        self.class = `class`
+        self.strength = strength
+        self.origin = origin
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["name", "written_by_migrate_mcp", "launch", "revision", "class", "strength", "origin"])
+        self.`name` = try o.decode("name")
+        self.`written_by_migrate_mcp` = try o.decode("written_by_migrate_mcp")
+        self.`launch` = try o.optional("launch")
+        self.`revision` = try o.optional("revision")
+        self.`class` = try o.optional("class")
+        self.`strength` = try o.optional("strength")
+        self.`origin` = try o.optional("origin")
+    }
+}
+
+public struct StandingSummary: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `exe`: DaemonText
+    public let `linux_sha256`: DaemonText?
+    public let `recognized_release`: DaemonText?
+    public let `appends_to`: DaemonText?
+    public var description: String { "[StandingSummary]" }
+    public var debugDescription: String { description }
+    public init(exe: DaemonText, linux_sha256: DaemonText? = nil,
+                recognized_release: DaemonText? = nil, appends_to: DaemonText? = nil) {
+        self.exe = exe
+        self.linux_sha256 = linux_sha256
+        self.recognized_release = recognized_release
+        self.appends_to = appends_to
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["exe", "linux_sha256", "recognized_release", "appends_to"])
+        self.`exe` = try o.decode("exe")
+        self.`linux_sha256` = try o.optional("linux_sha256")
+        self.`recognized_release` = try o.optional("recognized_release")
+        self.`appends_to` = try o.optional("appends_to")
+    }
+}
+
+public struct PendingDescriptor: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `request`: DaemonText
+    public let `nonce`: DaemonText
+    public let `created_secs`: UInt64
+    public let `expires_in_secs`: UInt64
+    public let `subject`: SubjectSummary
+    public let `project`: ProjectSummary
+    public let `bindings`: [BindingSummary]
+    public let `proposals`: [Proposal]
+    public let `mode`: Mode
+    public let `argv`: [DaemonText]
+    public let `managed`: ManagedSummary?
+    public let `standing`: StandingSummary?
+    public var description: String { "[PendingDescriptor]" }
+    public var debugDescription: String { description }
+    public init(request: DaemonText, nonce: DaemonText, created_secs: UInt64, expires_in_secs: UInt64,
+                subject: SubjectSummary, project: ProjectSummary, bindings: [BindingSummary],
+                proposals: [Proposal] = [], mode: Mode = .inject, argv: [DaemonText],
+                managed: ManagedSummary? = nil, standing: StandingSummary? = nil) {
+        self.request = request
+        self.nonce = nonce
+        self.created_secs = created_secs
+        self.expires_in_secs = expires_in_secs
+        self.subject = subject
+        self.project = project
+        self.bindings = bindings
+        self.proposals = proposals
+        self.mode = mode
+        self.argv = argv
+        self.managed = managed
+        self.standing = standing
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["request", "nonce", "created_secs", "expires_in_secs", "subject", "project", "bindings", "proposals", "mode", "argv", "managed", "standing"])
+        self.`request` = try o.decode("request")
+        self.`nonce` = try o.decode("nonce")
+        self.`created_secs` = try o.decode("created_secs")
+        self.`expires_in_secs` = try o.decode("expires_in_secs")
+        self.`subject` = try o.decode("subject")
+        self.`project` = try o.decode("project")
+        self.`bindings` = try o.decode("bindings")
+        self.`proposals` = try o.decode("proposals")
+        self.`mode` = try o.decode("mode")
+        self.`argv` = try o.decode("argv")
+        self.`managed` = try o.optional("managed")
+        self.`standing` = try o.optional("standing")
+    }
+}
+
+public struct ApprovalOptions: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `uses`: Uses
+    public let `ttl_secs`: UInt64
+    public let `live`: [String]
+    public let `standing`: UInt64?
+    public var description: String { "[ApprovalOptions]" }
+    public var debugDescription: String { description }
+    public init(uses: Uses, ttl_secs: UInt64, live: [String] = [], standing: UInt64? = nil) {
+        self.uses = uses
+        self.ttl_secs = ttl_secs
+        self.live = live
+        self.standing = standing
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["uses", "ttl_secs", "live", "standing"])
+        self.`uses` = try o.decode("uses")
+        self.`ttl_secs` = try o.decode("ttl_secs")
+        self.`live` = try o.decode("live")
+        self.`standing` = try o.optional("standing")
+    }
+}
+
+public typealias ApproveOptions = ApprovalOptions
+
+public struct ApprovedView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `grant`: DaemonText
+    public let `expires_in_secs`: UInt64
+    public let `standing`: DaemonText?
+    public let `standing_expires_in_secs`: UInt64?
+    public var description: String { "[ApprovedView]" }
+    public var debugDescription: String { description }
+    public init(grant: DaemonText, expires_in_secs: UInt64, standing: DaemonText? = nil, standing_expires_in_secs: UInt64? = nil) {
+        self.grant = grant
+        self.expires_in_secs = expires_in_secs
+        self.standing = standing
+        self.standing_expires_in_secs = standing_expires_in_secs
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["grant", "expires_in_secs", "standing", "standing_expires_in_secs"])
+        self.`grant` = try o.decode("grant")
+        self.`expires_in_secs` = try o.decode("expires_in_secs")
+        self.`standing` = try o.optional("standing")
+        self.`standing_expires_in_secs` = try o.optional("standing_expires_in_secs")
+    }
+}
+
+public struct StandingView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `id`: DaemonText
+    public let `agent_id`: DaemonText
+    public let `agent_name`: DaemonText
+    public let `identity`: DaemonText
+    public let `project_dir`: DaemonText
+    public let `launch`: DaemonText?
+    public let `revision`: UInt64?
+    public let `bindings`: [DaemonText]
+    public let `created_secs`: UInt64
+    public let `remaining_secs`: UInt64
+    public let `not_after_secs`: UInt64
+    public var description: String { "[StandingView]" }
+    public var debugDescription: String { description }
+    public init(id: DaemonText, agent_id: DaemonText, agent_name: DaemonText, identity: DaemonText,
+                project_dir: DaemonText, launch: DaemonText? = nil, revision: UInt64? = nil,
+                bindings: [DaemonText], created_secs: UInt64, remaining_secs: UInt64, not_after_secs: UInt64) {
+        self.id = id
+        self.agent_id = agent_id
+        self.agent_name = agent_name
+        self.identity = identity
+        self.project_dir = project_dir
+        self.launch = launch
+        self.revision = revision
+        self.bindings = bindings
+        self.created_secs = created_secs
+        self.remaining_secs = remaining_secs
+        self.not_after_secs = not_after_secs
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["id", "agent_id", "agent_name", "identity", "project_dir", "launch", "revision", "bindings", "created_secs", "remaining_secs", "not_after_secs"])
+        self.`id` = try o.decode("id")
+        self.`agent_id` = try o.decode("agent_id")
+        self.`agent_name` = try o.decode("agent_name")
+        self.`identity` = try o.decode("identity")
+        self.`project_dir` = try o.decode("project_dir")
+        self.`launch` = try o.optional("launch")
+        self.`revision` = try o.optional("revision")
+        self.`bindings` = try o.decode("bindings")
+        self.`created_secs` = try o.decode("created_secs")
+        self.`remaining_secs` = try o.decode("remaining_secs")
+        self.`not_after_secs` = try o.decode("not_after_secs")
+    }
+    public var scopeLabel: String {
+        "any \(agent_name.escaped) session in this project, including one started by another program, gets these keys without asking"
+    }
+}
+
+public struct StandingListView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `standing`: [StandingView]
+    public let `policy_epoch_unverified`: Bool
+    public var description: String { "[StandingListView]" }
+    public var debugDescription: String { description }
+    public init(standing: [StandingView], policy_epoch_unverified: Bool = false) {
+        self.standing = standing
+        self.policy_epoch_unverified = policy_epoch_unverified
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["standing", "policy_epoch_unverified"])
+        self.`standing` = try o.decode("standing")
+        self.`policy_epoch_unverified` = try o.optional("policy_epoch_unverified") ?? false
+    }
+}
+
+public struct StandingRevokedView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `revoked`: UInt64
+    public let `grants_ended`: UInt64
+    public var description: String { "[StandingRevokedView]" }
+    public var debugDescription: String { description }
+    public init(revoked: UInt64, grants_ended: UInt64) {
+        self.revoked = revoked
+        self.grants_ended = grants_ended
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["revoked", "grants_ended"])
+        self.`revoked` = try o.decode("revoked")
+        self.`grants_ended` = try o.decode("grants_ended")
+    }
+}
+
+public struct StandingConfirmedView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `records`: UInt64
+    public let `generation`: UInt64
+    public var description: String { "[StandingConfirmedView]" }
+    public var debugDescription: String { description }
+    public init(records: UInt64, generation: UInt64) {
+        self.records = records
+        self.generation = generation
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["records", "generation"])
+        self.`records` = try o.decode("records")
+        self.`generation` = try o.decode("generation")
+    }
+}
+

@@ -14,7 +14,10 @@ let package = Package(
         .target(
             name: "EnvCloakKit"
         ),
-        .target(name: "EnvCloakKitTestSupport"),
+        .target(
+            name: "EnvCloakKitTestSupport",
+            dependencies: ["EnvCloakKit"]
+        ),
         .testTarget(
             name: "EnvCloakKitTests",
             dependencies: ["EnvCloakKit", "EnvCloakKitTestSupport"]

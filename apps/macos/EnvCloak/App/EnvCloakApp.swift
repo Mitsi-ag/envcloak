@@ -54,6 +54,13 @@ struct EnvCloakApp: App {
         .defaultSize(width: 720, height: 560)
         .restorationBehavior(.disabled)
         .commandsRemoved()
+
+        Window("Approval Request", id: WindowID.approval) {
+            ApprovalWindowView(model: ApprovalWindowModel(session: session))
+        }
+        .windowResizability(.contentSize)
+        .restorationBehavior(.disabled)
+        .commandsRemoved()
     }
 }
 

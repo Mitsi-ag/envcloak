@@ -83,13 +83,25 @@ struct WelcomeView: View {
                     next: .vault
                 )
             case .vault:
-                stepContainer(
-                    title: "Vault",
-                    bodyText: session.state == .noVault
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Vault")
+                        .font(.title2)
+                        .foregroundStyle(ECToken.text.color)
+                    Text(session.state == .noVault
                         ? "Create one in Terminal with envcloak vault create."
-                        : "Found your vault. Unlock in Terminal with envcloak unlock.",
-                    next: .cliTool
-                )
+                        : "Found your vault. Add Touch ID to it.")
+                        .foregroundStyle(ECToken.text.color)
+                    if session.state != .noVault {
+                        EnrolView(session: session)
+                    }
+                    Spacer()
+                    HStack {
+                        Spacer()
+                        Button("Continue") { step = .cliTool }
+                            .buttonStyle(.borderedProminent)
+                    }
+                }
+                .padding(24)
             case .cliTool:
                 stepContainer(
                     title: "Command-line tool",
