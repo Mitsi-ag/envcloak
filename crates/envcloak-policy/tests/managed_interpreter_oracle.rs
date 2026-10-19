@@ -320,6 +320,60 @@ fn npx_reads_its_options_after_an_option_value() {
             vec!["--c".to_owned(), "echo CONTROL".to_owned()],
         ]
     );
+    // `nopt` also expands multi-character clusters of 1-character shorthands
+    // (`-yc`, `--yc`), unambiguous prefix abbreviations of long options
+    // (`--scr`, `--node-o`, `--userc`, `--globalc`), and leading `no-`
+    // prefixes while still consuming a string value for `[null, String]`
+    // options (`--no-script-shell`, `--no-node-options`).
+    for args in [
+        &["-yc=echo CONTROL"][..],
+        &["--yc=echo CONTROL"],
+        &["-yc", "echo CONTROL"],
+        &["--yc", "echo CONTROL"],
+    ] {
+        let out = run(&npx, h, &argv(args)[1..], &env);
+        assert_eq!(out, "CONTROL\n", "{args:?}");
+        assert_eq!(
+            classify_argv(&argv(args)),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+            "{args:?}"
+        );
+    }
+    let cfg_args = |flag: &str, val: &str, key: &str| -> Vec<String> {
+        vec![
+            "--userconfig".into(),
+            user.to_str().unwrap().into(),
+            "--globalconfig".into(),
+            global.to_str().unwrap().into(),
+            flag.into(),
+            val.into(),
+            "config".into(),
+            "get".into(),
+            key.into(),
+        ]
+    };
+    for (flag, val, key) in [
+        ("--scr", "/fixture/shell", "script-shell"),
+        ("--no-script-shell", "/fixture/shell", "script-shell"),
+        ("--no-scr", "/fixture/shell", "script-shell"),
+        ("--node-o", "--require=/fixture/p.js", "node-options"),
+        (
+            "--no-node-options",
+            "--require=/fixture/p.js",
+            "node-options",
+        ),
+    ] {
+        assert_eq!(
+            run(&npm, h, &cfg_args(flag, val, key), &env),
+            format!("{val}\n"),
+            "{flag}"
+        );
+        assert_eq!(
+            classify_argv(&argv(&[flag, val, "foo"])),
+            Err(DeclError::CodeSelecting(CodeSelecting::InterpreterOption)),
+            "{flag}"
+        );
+    }
 }
 
 /// Deno 2.9.7 takes no value for any `--allow-`, `--deny-` or `--no-`
