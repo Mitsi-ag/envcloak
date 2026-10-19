@@ -914,7 +914,7 @@ impl GrantStore {
         if !unticked_live(&shown, opts).is_empty() {
             return Err(ApproveError::LiveNotTicked);
         }
-        if self.grants.len() >= MAX_GRANTS {
+        if self.grants.values().filter(|g| !g.expired(now)).count() >= MAX_GRANTS {
             return Err(ApproveError::TooManyGrants);
         }
         Ok(())

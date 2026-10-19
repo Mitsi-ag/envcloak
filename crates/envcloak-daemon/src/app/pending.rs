@@ -10,6 +10,7 @@ use envcloak_ipc::proto::ErrorKind;
 use envcloak_policy::{PendingDescriptor, PendingId};
 use envcloak_sys::PeerIdentity;
 
+use crate::audit::AuditEvent;
 use crate::clock::now_of;
 use crate::requests::{self, pending_view};
 use crate::server::{Shared, locked};
@@ -21,7 +22,15 @@ pub(crate) fn list(
     peer: &PeerIdentity,
     p: AppPendingListParams,
 ) -> Result<AppPendingListView, RpcError> {
-    let _caller = requests::evidence(shared, peer, &p.claims)?;
+    let caller = requests::evidence(shared, peer, &p.claims)?;
+    if caller.nearest_agent().is_some() || caller.claims().claims_agent() || caller.cut() {
+        shared.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "app.pending.list",
+            reason: if caller.cut() { "chain_cut" } else { "agent" },
+        });
+        return Err(RpcError::new(ErrorKind::ProofRefused));
+    }
     let mut s = locked(&shared.state);
     s.refuse_if_tampered()?;
     let now = now_of(&shared.clocks);
@@ -55,7 +64,15 @@ pub(crate) fn get(
     p: AppPendingGetParams,
 ) -> Result<PendingDescriptor, RpcError> {
     let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
-    let _caller = requests::evidence(shared, peer, &p.claims)?;
+    let caller = requests::evidence(shared, peer, &p.claims)?;
+    if caller.nearest_agent().is_some() || caller.claims().claims_agent() || caller.cut() {
+        shared.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "app.pending.get",
+            reason: if caller.cut() { "chain_cut" } else { "agent" },
+        });
+        return Err(RpcError::new(ErrorKind::ProofRefused));
+    }
     let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
     s.refuse_if_tampered()?;

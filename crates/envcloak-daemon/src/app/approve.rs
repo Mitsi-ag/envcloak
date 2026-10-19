@@ -34,6 +34,14 @@ pub(crate) fn approve(
         decode_fixed_bytes(&p.signature).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     refuse_if_traced()?;
     let approver = requests::evidence(shared, peer, &p.claims)?;
+    if approver.nearest_agent().is_some() || approver.claims().claims_agent() || approver.cut() {
+        shared.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "app.approve",
+            reason: if approver.cut() { "chain_cut" } else { "agent" },
+        });
+        return Err(RpcError::new(ErrorKind::ProofRefused));
+    }
 
     let mut s = locked(&shared.state);
     let now = now_of(&shared.clocks);
