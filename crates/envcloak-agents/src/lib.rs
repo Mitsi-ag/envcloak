@@ -29,6 +29,7 @@ pub mod hunks;
 pub mod install;
 pub mod jsonedit;
 pub mod locations;
+pub mod migrate;
 pub mod probe;
 pub mod tool_timeouts;
 pub mod writer;
