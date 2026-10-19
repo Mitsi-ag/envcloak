@@ -39,9 +39,10 @@ pub struct Reading {
 
 impl Reading {
     pub fn now(c: &dyn Clocks) -> Self {
+        let offset = envcloak_sys::test_clock_offset();
         Reading {
-            awake: c.awake(),
-            including_sleep: c.including_sleep(),
+            awake: c.awake() + offset,
+            including_sleep: c.including_sleep() + offset,
         }
     }
 }

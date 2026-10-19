@@ -984,3 +984,108 @@ fn a_proposed_name_shaped_like_a_key_is_not_shown() {
     let text = render_statement(&d, &ticking(&[]));
     assert!(text.contains(&format!("stripe/{token}")), "{text}");
 }
+
+#[test]
+fn unlocker_statement_encoding_and_rendering_and_oracle() {
+    use envcloak_policy::{
+        UNLOCKER_STATEMENT_DOMAIN, UnlockerAddDescriptor, UnlockerRequestKind,
+        canonical_unlocker_statement, render_unlocker_statement, unlocker_statement_digest,
+    };
+
+    let base = UnlockerAddDescriptor {
+        kind: UnlockerRequestKind::UnlockerAdd,
+        request: "ABCDEFGH".to_owned(),
+        nonce: "11".repeat(32),
+        vault_id: "22".repeat(16),
+        label: "Touch ID\u{202e}\nMac Studio".to_owned(),
+        unlock_pub_sha256: "33".repeat(32),
+        approve_pub_sha256: "44".repeat(32),
+        team_id: "TEAMID1234".to_owned(),
+        signing_id: "ai.envcloak.app".to_owned(),
+        created_secs: 1_800_000_000,
+        expires_in_secs: 600,
+    };
+    let bytes = canonical_unlocker_statement(&base);
+    assert!(bytes.starts_with(UNLOCKER_STATEMENT_DOMAIN));
+    assert_eq!(
+        UNLOCKER_STATEMENT_DOMAIN,
+        b"envcloak-unlocker-statement/1\n"
+    );
+    let base_digest = unlocker_statement_digest(&base);
+
+    // Every field is bound into the canonical statement digest.
+    let mutations: [fn(&mut UnlockerAddDescriptor); 10] = [
+        |d| d.request = "ABCDEFGJ".to_owned(),
+        |d| d.nonce = "12".repeat(32),
+        |d| d.vault_id = "23".repeat(16),
+        |d| d.label.push('!'),
+        |d| d.unlock_pub_sha256 = "34".repeat(32),
+        |d| d.approve_pub_sha256 = "45".repeat(32),
+        |d| d.team_id = "OTHERTEAM1".to_owned(),
+        |d| d.signing_id = "ai.envcloak.other".to_owned(),
+        |d| d.created_secs += 1,
+        |d| d.expires_in_secs -= 1,
+    ];
+    let mut cases = vec![base.clone()];
+    for mutate in mutations {
+        let mut d = base.clone();
+        mutate(&mut d);
+        assert_ne!(unlocker_statement_digest(&d), base_digest, "{d:?}");
+        cases.push(d);
+    }
+
+    // Compare byte-for-byte with the independent Python oracle.
+    let input = serde_json::to_vec(
+        &cases
+            .iter()
+            .map(|d| serde_json::json!({"unlocker_add": d}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let oracle =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles/statement.py");
+    let mut child = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(&oracle)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 is needed on PATH");
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let got: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got.len(), cases.len());
+    for (d, g) in cases.iter().zip(&got) {
+        assert_eq!(
+            hex(&canonical_unlocker_statement(d)),
+            g["unlocker"],
+            "{d:?}"
+        );
+    }
+
+    // Rendering escapes hostile control and directional characters and shows
+    // the label, both key fingerprints, and the app's Team ID and signing ID.
+    let rendered = render_unlocker_statement(&base);
+    assert!(
+        rendered.contains("label: Touch ID\\u{202e}\\nMac Studio"),
+        "{rendered}"
+    );
+    assert!(rendered.contains(&"33".repeat(32)), "{rendered}");
+    assert!(rendered.contains(&"44".repeat(32)), "{rendered}");
+    assert!(
+        rendered.contains("team_id=TEAMID1234 signing_id=ai.envcloak.app"),
+        "{rendered}"
+    );
+    for c in rendered.chars() {
+        assert!(
+            c == '\n' || (!c.is_control() && c != '\u{202e}'),
+            "raw {c:?} in rendered unlocker statement"
+        );
+    }
+}

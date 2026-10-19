@@ -14,6 +14,8 @@ A change to any layout, label or number here is a format change: it needs a new 
 | Keyed hashes, commitments | BLAKE3 keyed mode, 32-byte output | `blake3` 1.8.7 |
 | Constant-time comparison | | `subtle` 2.6.1 |
 | Randomness | The OS CSPRNG (`getrandom`) | `getrandom` 0.4.3 |
+| Secure Enclave unlocker envelope (M3-08) | HPKE Base, DHKEM(P-256, HKDF-SHA256), HKDF-SHA256, AES-256-GCM | `hpke` 0.14.1, `p256` 0.14.0 |
+| Daemon unlock channel (`app.unlock`, M3-08) | HPKE Base, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305 | `hpke` 0.14.1 |
 
 All integers are unsigned and big-endian. `||` is concatenation.
 
@@ -155,6 +157,28 @@ The user sees it once, as 28 symbols of Crockford's base32 alphabet `0123456789A
 Parsing ignores case, hyphens, spaces, tabs and line ends, and reads `O` as 0 and `I` and `L` as 1. Anything else, a `U` included, is refused, as is a count other than 28 or a nonzero padding bit. Parse errors carry no part of the input.
 
 The kit's text is built in a buffer that is wiped when freed, and EnvCloak writes it only to the terminal or to a file descriptor the user names, never to stdout. A wrong kit gives the same error as a wrong passphrase.
+
+## Secure Enclave unlocker envelope (M3-08)
+
+A Secure Enclave unlocker (`UnlockerKind::SecureEnclave = 3`, SPEC §5) stores two uncompressed SEC1 P-256 public keys (`0x04 || x(32) || y(32)`, 65 bytes each, validated on the curve before storage), the device label, the enrolment timestamp, the macOS code-signing identity (`team_id` and `signing_id`) under which the unlocker was enrolled, and the VMK sealed to `unlock_pub` with RFC 9180 HPKE Base (`DHKEM(P-256, HKDF-SHA256)`, `HKDF-SHA256`, `AES-256-GCM`):
+
+```
+magic "ECSE"(4) || version 1(1) || kind 3(1) || vault_id(16) || unlocker_id(16) || epoch(4)
+|| created_secs(8) || unlock_pub(65) || approve_pub(65) || enc(65) || ciphertext(48)
+|| u32(len(label)) || label (1..=128 bytes UTF-8, no control characters)
+|| u32(len(team_id)) || team_id (1..=64 bytes UTF-8, no control characters)
+|| u32(len(signing_id)) || signing_id (1..=128 bytes UTF-8, no control characters)
+```
+
+Sealing and opening the HPKE envelope (`enc(65) || ciphertext(48)`) use HPKE Base with the 59-byte `info` string `"envcloak/v1/unlocker/se" || vault_id(16) || unlocker_id(16) || epoch(4)` and empty associated data (`""`). Any change to `vault_id`, `unlocker_id` or `epoch` fails the AEAD tag check.
+
+During `app.unlock.begin` and `app.unlock` (SPEC §5 "Unlock flow"), the daemon generates a single-use 32-byte random `challenge` and a single-use X25519 keypair (`daemon_eph_pub`, 32 bytes), bound to the `app` peer's `(pid, start_time)` and a 60-second awake-time window. The app opens the Secure Enclave unlocker envelope in its own memory, wipes the intermediate buffer on drop, and seals the 32-byte VMK to `daemon_eph_pub` using HPKE Base (`DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, `ChaCha20-Poly1305`) with empty `info` (`""`) and associated data:
+
+```
+request_id || challenge(32)
+```
+
+The resulting 80-byte payload (`enc(32) || ciphertext(32) || tag(16)`) is the one VMK crossing of an unlock (SPEC §4.4). `crates/envcloak-core/tests/hpke_vectors.rs` and `apps/macos/Tools/hpke-vectors` check both HPKE suites across the Rust (`hpke`) and Swift (`CryptoKit`) implementations.
 
 ## Errors
 

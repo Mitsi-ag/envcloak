@@ -762,7 +762,7 @@ fn dispatch<'s>(
     shared: &'s Shared,
     fds: Vec<OwnedFd>,
     stream: &UnixStream,
-    app_role: &mut Option<bool>,
+    app_role: &mut Option<Option<envcloak_core::crypto::SeEnrolledUnder>>,
 ) -> (Option<Frame>, Option<backups::Delivering<'s>>) {
     let mut delivering = None;
     let answer = respond(frame, peer, shared, &mut delivering, fds, stream, app_role);
@@ -778,7 +778,7 @@ fn respond<'s>(
     delivering: &mut Option<backups::Delivering<'s>>,
     fds: Vec<OwnedFd>,
     stream: &UnixStream,
-    app_role: &mut Option<bool>,
+    app_role: &mut Option<Option<envcloak_core::crypto::SeEnrolledUnder>>,
 ) -> Option<Frame> {
     let req = match IncomingRequest::parse(frame) {
         Ok(r) => r,
@@ -793,16 +793,24 @@ fn respond<'s>(
     }
     // The sleep and idle checks run before every request too.
     observe(shared);
-    if required_role(req.method) == Role::App
-        && !*app_role.get_or_insert_with(|| crate::app::verified(stream, peer))
-    {
-        shared.audit(AuditEvent::RoleDenied {
-            method: loggable_method(req.method),
-            pid: peer.pid,
-            uid: peer.uid,
-        });
-        return proto::error_frame(Some(id), &RpcError::new(ErrorKind::RoleDenied)).ok();
-    }
+    let enrolled_under = if required_role(req.method) == Role::App {
+        match app_role
+            .get_or_insert_with(|| crate::app::verified(stream, peer))
+            .clone()
+        {
+            Some(u) => Some(u),
+            None => {
+                shared.audit(AuditEvent::RoleDenied {
+                    method: loggable_method(req.method),
+                    pid: peer.pid,
+                    uid: peer.uid,
+                });
+                return proto::error_frame(Some(id), &RpcError::new(ErrorKind::RoleDenied)).ok();
+            }
+        }
+    } else {
+        None
+    };
     if required_role(req.method) == Role::App && req.method != "app.lock" {
         let checked = req.claimed_markers().and_then(|claims| {
             let evidence = requests::evidence(shared, peer, &claims)?;
@@ -937,6 +945,43 @@ fn respond<'s>(
             })
         }),
         BackupList::NAME => answer::<BackupList>(id, &req, |p| backups::list(shared, p)),
+        proto::AppUnlockBegin::NAME => {
+            answer::<proto::AppUnlockBegin>(id, &req, |p| crate::app::unlock::begin(shared, p))
+        }
+        proto::AppUnlock::NAME => {
+            answer::<proto::AppUnlock>(id, &req, |p| crate::app::unlock::finish(shared, peer, p))
+        }
+        proto::AppUnlockerEnrollBegin::NAME => {
+            answer::<proto::AppUnlockerEnrollBegin>(id, &req, |p| {
+                crate::app::enroll::begin(
+                    shared,
+                    peer,
+                    enrolled_under
+                        .as_ref()
+                        .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                    p,
+                )
+            })
+        }
+        proto::AppUnlockerEnroll::NAME => {
+            answer::<proto::AppUnlockerEnroll>(id, &req, |p| crate::app::enroll::poll(shared, p))
+        }
+        proto::AppPendingList::NAME => answer::<proto::AppPendingList>(id, &req, |p| {
+            crate::app::pending::list(shared, peer, p)
+        }),
+        proto::AppPendingGet::NAME => {
+            answer::<proto::AppPendingGet>(id, &req, |p| crate::app::pending::get(shared, peer, p))
+        }
+        proto::AppApprove::NAME => answer::<proto::AppApprove>(id, &req, |p| {
+            crate::app::approve::approve(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                p,
+            )
+        }),
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }

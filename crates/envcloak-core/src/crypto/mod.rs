@@ -27,6 +27,7 @@ mod aead;
 mod envelope;
 mod kdf;
 mod keys;
+mod se_unlocker;
 
 pub use aad::{Aad, FieldTag, ItemClass, TableTag};
 #[cfg(test)]
@@ -42,6 +43,15 @@ pub use envelope::{
 pub use kdf::{Argon2id, Kdf, KdfParams, Kek, StoredKdfParams};
 pub use keys::{Keyring, Purpose, SubKey, UnlockerId, VaultId, Vmk, keyed_hash};
 pub(crate) use keys::{keyed_hash_parts, keyed_hash_prefixes, open_subkey, seal_subkey};
+pub use se_unlocker::{
+    MAX_SE_LABEL_LEN, MAX_SE_SIGNING_ID_LEN, MAX_SE_TEAM_ID_LEN, P256_PUBLIC_KEY_LEN,
+    P256_SIGNATURE_LEN, SE_CHALLENGE_LEN, SE_HPKE_CIPHERTEXT_LEN, SE_HPKE_ENC_LEN,
+    SE_HPKE_INFO_PREFIX, SE_RESEAL_LEN, SeEnrolledUnder, SeEphemeralKey, SeHpkeEnvelope,
+    SeUnlockerEnvelope, SeUnlockerRecord, X25519_PUBLIC_KEY_LEN, check_p256_public_key,
+    check_se_label, derive_p256_keypair, generate_se_challenge, open_se_envelope, p256_fingerprint,
+    recreate_se_unlocker, se_hpke_info, se_reseal_aad, seal_se_unlocker, seal_vmk_to_daemon,
+    seal_vmk_to_se, sign_p256_prehash, verify_p256_prehash,
+};
 
 /// A crypto failure. Carries its kind only: no values, sizes of secrets or
 /// upstream error text.

@@ -43,8 +43,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::crypto::{
-    Envelope, FieldTag, Keyring, Purpose, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk,
-    fill_random_or_panic,
+    Envelope, FieldTag, Keyring, P256_SIGNATURE_LEN, Purpose, SeEnrolledUnder, SeUnlockerEnvelope,
+    SeUnlockerRecord, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk, fill_random_or_panic,
+    seal_se_unlocker, verify_p256_prehash,
 };
 use crate::secret::SecretBytes;
 
@@ -351,6 +352,50 @@ impl LockedVault {
         Ok(out)
     }
 
+    /// The well-formed Secure Enclave unlocker rows of the current epoch and
+    /// vault id.
+    pub fn se_unlockers(&self) -> Result<Vec<SeUnlockerEnvelope>, VaultError> {
+        let rows = state::query(
+            &self.conn,
+            "SELECT id, vault_id, kind, envelope, created_at FROM unlockers",
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )?;
+        let mut out = Vec::new();
+        for (id, vault_id, kind, bytes, created_at) in rows {
+            if kind != i64::from(UnlockerKind::SecureEnclave as u8) {
+                continue;
+            }
+            if let Ok(env) = SeUnlockerEnvelope::from_bytes(&bytes) {
+                if id.as_slice() == env.unlocker_id().0.as_slice()
+                    && vault_id.as_slice() == self.vault_id.0.as_slice()
+                    && env.vault_id() == self.vault_id
+                    && env.epoch() == self.epoch
+                    && u64::try_from(created_at).ok() == Some(env.record().created_secs)
+                {
+                    out.push(env);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Looks up a well-formed Secure Enclave unlocker row of the current
+    /// epoch by its id.
+    pub fn se_unlocker(&self, id: UnlockerId) -> Result<Option<SeUnlockerEnvelope>, VaultError> {
+        Ok(self
+            .se_unlockers()?
+            .into_iter()
+            .find(|e| e.unlocker_id() == id))
+    }
+
     /// Whether an unlocker row whose `kind` column names `kind` holds no
     /// well-formed envelope of that kind and epoch: a damaged envelope,
     /// which [`LockedVault::unlockers`] leaves out. Unreadable rows count
@@ -391,7 +436,16 @@ impl LockedVault {
     /// restored `meta` or header row), the vault opens under the first one
     /// its header or rows open under, and reports the row read-only.
     pub fn unlock(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
-        self.unlock_with(vmk, true)
+        self.unlock_with(vmk, true, false)
+    }
+
+    /// Unlocks with a VMK unsealed from a Secure Enclave unlocker (`app.unlock`,
+    /// SPEC §5 step 4): requires the sealed `header` row to open under the
+    /// derived `header` subkey so a caller-supplied VMK is always verified
+    /// against the vault's sealed header even when the vault holds no other
+    /// sealed rows.
+    pub fn unlock_se(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
+        self.unlock_with(vmk, true, true)
     }
 
     /// Unlocks as [`LockedVault::unlock`] does but never migrates: the
@@ -399,10 +453,15 @@ impl LockedVault {
     /// stored. For a restore, which checks a staged vault against its
     /// backup's manifest before migrating it.
     pub(crate) fn unlock_as_stored(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
-        self.unlock_with(vmk, false)
+        self.unlock_with(vmk, false, false)
     }
 
-    fn unlock_with(mut self, vmk: Vmk, migrate: bool) -> Result<Vault, (Self, VaultError)> {
+    fn unlock_with(
+        mut self,
+        vmk: Vmk,
+        migrate: bool,
+        require_header: bool,
+    ) -> Result<Vault, (Self, VaultError)> {
         // A vault locked after opening read-only is judged afresh.
         if let Err(e) = self.conn.pragma_update(None, "query_only", "OFF") {
             return Err((self, e.into()));
@@ -430,6 +489,9 @@ impl LockedVault {
                 epoch: self.epoch,
             };
             match load_verified(&self.conn, &keys, &ctx, &self.plan) {
+                Ok(l)
+                    if require_header
+                        && l.integrity == Integrity::Tampered(TamperKind::HeaderUnreadable) => {}
                 Ok(l) => {
                     opened = Some((ctx, l));
                     break;
@@ -595,8 +657,12 @@ fn read_identity(conn: &Connection, target: u16) -> Result<Identity, VaultError>
 
     let envelope_epochs: std::collections::BTreeSet<u32> = unlockers
         .iter()
-        .filter_map(|u| Envelope::from_bytes(&u.1).ok())
-        .map(|e| e.epoch())
+        .filter_map(|u| {
+            Envelope::from_bytes(&u.1)
+                .map(|e| e.epoch())
+                .or_else(|_| SeUnlockerEnvelope::from_bytes(&u.1).map(|e| e.epoch()))
+                .ok()
+        })
         .collect();
     let header_epoch = match headers.as_slice() {
         [h] => u32::try_from(h.0).ok(),
@@ -797,6 +863,11 @@ impl Vault {
     /// read outside the crypto module.
     pub fn vmk(&self) -> &Vmk {
         &self.vmk
+    }
+
+    /// Whether `other` equals this vault's VMK, compared in constant time.
+    pub fn verify_vmk(&self, other: &Vmk) -> bool {
+        self.vmk.ct_eq(other)
     }
 
     /// The subkeys of the vault's epoch.
@@ -1042,6 +1113,63 @@ impl Vault {
 
     pub fn unlocker(&self, id: UnlockerId) -> Option<&Envelope> {
         self.state.unlockers.get(&id)
+    }
+
+    /// The Secure Enclave unlockers that verified at unlock.
+    pub fn se_unlockers(&self) -> impl Iterator<Item = &SeUnlockerEnvelope> {
+        self.state.se_unlockers.values()
+    }
+
+    pub fn se_unlocker(&self, id: UnlockerId) -> Option<&SeUnlockerEnvelope> {
+        self.state.se_unlockers.get(&id)
+    }
+
+    /// Seals the vault's VMK to `record.unlock_pub` without writing the row
+    /// yet, so the daemon can stage [`Txn::add_se_unlocker`] inside a
+    /// transaction that writes its durable audit entry before committing.
+    pub fn prepare_se_unlocker(
+        &self,
+        record: SeUnlockerRecord,
+    ) -> Result<SeUnlockerEnvelope, VaultError> {
+        seal_se_unlocker(&self.vmk, self.ctx.vault_id, self.ctx.epoch, record).map_err(|e| match e
+            .kind()
+        {
+            crate::crypto::CryptoErrorKind::EnvelopeFormat => {
+                VaultError::from(VaultErrorKind::InvalidRecord)
+            }
+            _ => VaultError::from(e),
+        })
+    }
+
+    /// Checks `signature` over the 32-byte statement `digest` against the
+    /// pinned `approve_pub` of every enrolled Secure Enclave unlocker whose
+    /// `enrolled_under` matches the caller's verified identity, returning the
+    /// matching unlocker's id.
+    pub fn verify_se_approval(
+        &self,
+        enrolled_under: &SeEnrolledUnder,
+        digest: &[u8; 32],
+        signature: &[u8; P256_SIGNATURE_LEN],
+    ) -> Option<UnlockerId> {
+        self.state
+            .se_unlockers
+            .values()
+            .find(|env| {
+                env.record().enrolled_under == *enrolled_under
+                    && verify_p256_prehash(&env.record().approve_pub, digest, signature).is_ok()
+            })
+            .map(SeUnlockerEnvelope::unlocker_id)
+    }
+
+    /// Seals the vault's VMK to `record.unlock_pub` and stores the new Secure
+    /// Enclave unlocker row in one transaction.
+    pub fn enroll_se_unlocker(
+        &mut self,
+        record: SeUnlockerRecord,
+    ) -> Result<SeUnlockerEnvelope, VaultError> {
+        let env = self.prepare_se_unlocker(record)?;
+        self.transact(|t| t.add_se_unlocker(env.clone()))?;
+        Ok(env)
     }
 
     /// Runs `f` in one write transaction. Its writes, and the header that

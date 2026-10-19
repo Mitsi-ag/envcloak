@@ -79,6 +79,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use envcloak_core::crypto::UnlockerId;
 use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, ItemMeta, LaunchRef, Slug};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -90,9 +91,14 @@ use crate::flood::{FloodControl, MAX_PENDING, MAX_PENDING_PER_ROOT};
 use crate::ids;
 use crate::manifest::{BindingSource, Mode};
 use crate::names::EnvName;
-use crate::pending::{Busy, Outcomes, Pending, PendingId, PendingState, PollLimiter};
+use crate::pending::{
+    Busy, Outcomes, Pending, PendingId, PendingState, PendingUnlockerAdd, PollLimiter,
+    UnlockerAddRequest, UnlockerEnrollOutcome, UnlockerOutcomes,
+};
 use crate::project::ProjectIdentity;
-use crate::statement::{PendingDescriptor, live_guarded, statement_digest, unticked_live};
+use crate::statement::{
+    PendingDescriptor, live_guarded, statement_digest, unlocker_statement_digest, unticked_live,
+};
 
 /// A session grant's length when the approver names none.
 pub const DEFAULT_TTL: Duration = Duration::from_secs(8 * 3600);
@@ -201,16 +207,33 @@ impl ApprovalOptions {
 pub enum ProofKind {
     /// The vault passphrase, checked against the envelope (SPEC §10b).
     Passphrase,
+    /// A P-256 ECDSA signature by the `approve` key of an enrolled Secure
+    /// Enclave unlocker (SPEC §10b, M3-09).
+    SecureEnclave { unlocker_id: UnlockerId },
 }
 
 /// A verified proof, and who gave it. The store refuses one from an
-/// approver that may not give a proof
-/// ([`SubjectEvidence::proof_refusal`]: an agent by any evidence, or no
-/// terminal session), whatever the daemon checked.
+/// approver that may not give a proof: for a passphrase proof,
+/// [`SubjectEvidence::proof_refusal`] (an agent by any evidence, or no
+/// terminal session); for a Secure Enclave signature from the verified app
+/// role, any agent ancestry, agent marker claim or cut chain.
 #[derive(Debug, Clone)]
 pub struct ApprovalProof {
     pub approver: SubjectEvidence,
     pub kind: ProofKind,
+}
+
+impl ApprovalProof {
+    fn is_refused(&self) -> bool {
+        match self.kind {
+            ProofKind::Passphrase => self.approver.proof_refusal().is_some(),
+            ProofKind::SecureEnclave { .. } => {
+                self.approver.nearest_agent().is_some()
+                    || self.approver.claims().claims_agent()
+                    || self.approver.cut()
+            }
+        }
+    }
 }
 
 /// A binding as a request asks for it: bound to the vault's item, with
@@ -532,8 +555,10 @@ pub struct NoSuchRequest;
 pub struct GrantStore {
     grants: BTreeMap<GrantId, Grant>,
     pending: BTreeMap<PendingId, Pending>,
+    pending_unlockers: BTreeMap<PendingId, PendingUnlockerAdd>,
     /// How requests that left `pending` ended, for their waiters.
     ended: Outcomes,
+    ended_unlockers: UnlockerOutcomes,
     polls: PollLimiter,
     flood: FloodControl,
     vault_epoch: u32,
@@ -640,7 +665,9 @@ impl GrantStore {
         GrantStore {
             grants: BTreeMap::new(),
             pending: BTreeMap::new(),
+            pending_unlockers: BTreeMap::new(),
             ended: Outcomes::default(),
+            ended_unlockers: UnlockerOutcomes::default(),
             polls: PollLimiter::default(),
             flood: FloodControl::new(),
             vault_epoch: 0,
@@ -684,8 +711,50 @@ impl GrantStore {
                     .record(id, p.request.subject.root(), PendingState::Expired, now);
             }
         }
+        let expired_unlockers: Vec<PendingId> = self
+            .pending_unlockers
+            .values()
+            .filter(|p| p.expired(now))
+            .map(|p| p.id)
+            .collect();
+        for id in expired_unlockers {
+            if self.pending_unlockers.remove(&id).is_some() {
+                self.ended_unlockers
+                    .record(id, UnlockerEnrollOutcome::Expired, now);
+            }
+        }
         self.ended.expire(now);
+        self.ended_unlockers.expire(now);
         self.flood.expire(now);
+    }
+
+    fn pending_per_root(&self, root: &ProcessInstance) -> usize {
+        self.pending
+            .values()
+            .filter(|p| p.request.subject.root() == *root)
+            .count()
+            + self
+                .pending_unlockers
+                .values()
+                .filter(|p| p.request.subject.root() == *root)
+                .count()
+    }
+
+    fn pending_total(&self) -> usize {
+        self.pending.len() + self.pending_unlockers.len()
+    }
+
+    fn fresh_pending_id(&self) -> PendingId {
+        loop {
+            let id = PendingId::generate();
+            if !self.pending.contains_key(&id)
+                && !self.pending_unlockers.contains_key(&id)
+                && !self.ended.contains(&id)
+                && !self.ended_unlockers.contains(&id)
+            {
+                break id;
+            }
+        }
     }
 
     /// Whether grant `g` is in force at `now` for `r`'s caller: not
@@ -764,15 +833,10 @@ impl GrantStore {
         {
             return Decision::Pending(p.id);
         }
-        let per_root = self
-            .pending
-            .values()
-            .filter(|p| p.request.subject.root() == root)
-            .count();
-        if per_root >= MAX_PENDING_PER_ROOT {
+        if self.pending_per_root(&root) >= MAX_PENDING_PER_ROOT {
             return Decision::TooManyPending(PendingCap::PerRoot);
         }
-        if self.pending.len() >= MAX_PENDING {
+        if self.pending_total() >= MAX_PENDING {
             return Decision::TooManyPending(PendingCap::Total);
         }
         // Every denial is kept for its whole window: with the list full,
@@ -782,12 +846,7 @@ impl GrantStore {
         }
         // Unique among the outcomes too, so a waiter of an ended request
         // is never told another request's state.
-        let id = loop {
-            let id = PendingId::generate();
-            if !self.pending.contains_key(&id) && !self.ended.contains(&id) {
-                break id;
-            }
-        };
+        let id = self.fresh_pending_id();
         let granted = self.granted_bindings(&r, now);
         self.pending
             .insert(id, Pending::open(id, r, fp, &granted, now));
@@ -855,7 +914,7 @@ impl GrantStore {
         if !unticked_live(&shown, opts).is_empty() {
             return Err(ApproveError::LiveNotTicked);
         }
-        if self.grants.len() >= MAX_GRANTS {
+        if self.grants.values().filter(|g| !g.expired(now)).count() >= MAX_GRANTS {
             return Err(ApproveError::TooManyGrants);
         }
         Ok(())
@@ -888,6 +947,16 @@ impl GrantStore {
             .collect()
     }
 
+    /// Draws a fresh [`GrantId`] not held by any grant in this store.
+    pub fn fresh_grant_id(&self) -> GrantId {
+        loop {
+            let id = GrantId::generate();
+            if !self.grants.contains_key(&id) {
+                break id;
+            }
+        }
+    }
+
     /// Approves pending request `id` with a verified `proof`, the
     /// approver's `opts` and the `digest` of the statement the approver
     /// read, creating a grant at `now`.
@@ -913,11 +982,29 @@ impl GrantStore {
         now: &Now,
         items: &[ItemMeta],
     ) -> Result<GrantId, ApproveError> {
+        let grant_id = self.fresh_grant_id();
+        self.approve_with_id(id, grant_id, proof, opts, digest, now, items)
+    }
+
+    /// Like [`GrantStore::approve`], using the caller-supplied `grant_id`
+    /// so the daemon can durably write the `approved` audit entry before
+    /// committing the grant to the store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_with_id(
+        &mut self,
+        id: &PendingId,
+        grant_id: GrantId,
+        proof: ApprovalProof,
+        opts: ApprovalOptions,
+        digest: [u8; 32],
+        now: &Now,
+        items: &[ItemMeta],
+    ) -> Result<GrantId, ApproveError> {
         self.expire(now);
         if self.pending(id, now).is_none() {
             return Err(ApproveError::NoSuchRequest);
         }
-        if proof.approver.proof_refusal().is_some() {
+        if proof.is_refused() {
             return Err(ApproveError::ProofRefused);
         }
         self.check_approval(id, &opts, digest, now, items)?;
@@ -927,11 +1014,10 @@ impl GrantStore {
         let kind = p.request.subject.kind();
         let r = p.request;
         let ttl = Duration::from_secs(opts.ttl_secs);
-        let id = loop {
-            let id = GrantId::generate();
-            if !self.grants.contains_key(&id) {
-                break id;
-            }
+        let id = if self.grants.contains_key(&grant_id) {
+            self.fresh_grant_id()
+        } else {
+            grant_id
         };
         let origin = ManagedRequest::origin(&r).map(str::to_owned);
         let grant = Grant {
@@ -999,12 +1085,126 @@ impl GrantStore {
     /// [`NoSuchRequest`] for an unknown or expired id.
     pub fn deny(&mut self, id: &PendingId, now: &Now) -> Result<DenyOutcome, NoSuchRequest> {
         self.expire(now);
-        let p = self.pending.remove(id).ok_or(NoSuchRequest)?;
-        let root = p.request.subject.root();
-        self.ended
-            .record(*id, root.clone(), PendingState::Denied, now);
-        let root_auto_denied = self.flood.record_denial(root, p.fingerprint, now);
-        Ok(DenyOutcome { root_auto_denied })
+        if let Some(p) = self.pending.remove(id) {
+            let root = p.request.subject.root();
+            self.ended
+                .record(*id, root.clone(), PendingState::Denied, now);
+            let root_auto_denied = self.flood.record_denial(root, p.fingerprint, now);
+            return Ok(DenyOutcome { root_auto_denied });
+        }
+        if self.pending_unlockers.remove(id).is_some() {
+            self.ended_unlockers
+                .record(*id, UnlockerEnrollOutcome::Denied, now);
+            return Ok(DenyOutcome {
+                root_auto_denied: false,
+            });
+        }
+        Err(NoSuchRequest)
+    }
+
+    /// Opens a pending `unlocker_add` request under the existing pending caps
+    /// (SPEC §10a, D3-08). An identical request already pending returns the
+    /// existing id.
+    pub fn open_unlocker_add(
+        &mut self,
+        r: UnlockerAddRequest,
+        now: &Now,
+    ) -> Result<PendingId, PendingCap> {
+        self.expire(now);
+        let fp = r.fingerprint();
+        if let Some(p) = self
+            .pending_unlockers
+            .values()
+            .find(|p| p.fingerprint == fp)
+        {
+            return Ok(p.id);
+        }
+        let root = r.subject.root();
+        if self.pending_per_root(&root) >= MAX_PENDING_PER_ROOT {
+            return Err(PendingCap::PerRoot);
+        }
+        if self.pending_total() >= MAX_PENDING {
+            return Err(PendingCap::Total);
+        }
+        let id = self.fresh_pending_id();
+        self.pending_unlockers
+            .insert(id, PendingUnlockerAdd::open(id, r, fp, now));
+        Ok(id)
+    }
+
+    /// The pending `unlocker_add` request `id`, unless it expired.
+    pub fn pending_unlocker(&self, id: &PendingId, now: &Now) -> Option<&PendingUnlockerAdd> {
+        self.pending_unlockers.get(id).filter(|p| !p.expired(now))
+    }
+
+    /// The pending `unlocker_add` requests, unexpired, oldest first.
+    pub fn pending_unlockers_all(&self, now: &Now) -> impl Iterator<Item = &PendingUnlockerAdd> {
+        let mut all: Vec<&PendingUnlockerAdd> = self
+            .pending_unlockers
+            .values()
+            .filter(|p| !p.expired(now))
+            .collect();
+        all.sort_by_key(|p| (p.opened, p.id));
+        all.into_iter()
+    }
+
+    /// Checks a pending `unlocker_add` approval before Argon2id runs: the
+    /// request exists and `digest` matches its canonical statement.
+    pub fn check_unlocker_approval(
+        &self,
+        id: &PendingId,
+        digest: [u8; 32],
+        now: &Now,
+    ) -> Result<(), ApproveError> {
+        let p = self
+            .pending_unlocker(id, now)
+            .ok_or(ApproveError::NoSuchRequest)?;
+        if unlocker_statement_digest(&p.descriptor) != digest {
+            return Err(ApproveError::StatementMismatch);
+        }
+        Ok(())
+    }
+
+    /// Completes approval of pending `unlocker_add` request `id` after the
+    /// passphrase proof and vault enrolment succeed, recording `unlocker_id`
+    /// for `app.unlocker.enroll`.
+    pub fn complete_unlocker_approval(
+        &mut self,
+        id: &PendingId,
+        proof: ApprovalProof,
+        digest: [u8; 32],
+        unlocker_id: UnlockerId,
+        now: &Now,
+    ) -> Result<PendingUnlockerAdd, ApproveError> {
+        self.expire(now);
+        if self.pending_unlocker(id, now).is_none() {
+            return Err(ApproveError::NoSuchRequest);
+        }
+        if proof.approver.proof_refusal().is_some() {
+            return Err(ApproveError::ProofRefused);
+        }
+        self.check_unlocker_approval(id, digest, now)?;
+        let p = self
+            .pending_unlockers
+            .remove(id)
+            .ok_or(ApproveError::NoSuchRequest)?;
+        self.ended_unlockers
+            .record(*id, UnlockerEnrollOutcome::Enrolled(unlocker_id), now);
+        Ok(p)
+    }
+
+    /// How pending `unlocker_add` request `id` stands, for
+    /// `app.unlocker.enroll`.
+    pub fn unlocker_enroll_outcome(
+        &mut self,
+        id: &PendingId,
+        now: &Now,
+    ) -> Option<UnlockerEnrollOutcome> {
+        self.expire(now);
+        if self.pending_unlockers.contains_key(id) {
+            return Some(UnlockerEnrollOutcome::Pending);
+        }
+        self.ended_unlockers.get(id)
     }
 
     /// How pending request `id` stands, for `caller` at `now`
@@ -1089,7 +1289,9 @@ impl GrantStore {
     pub fn on_lock(&mut self) {
         self.grants.clear();
         self.pending.clear();
+        self.pending_unlockers.clear();
         self.ended.clear();
+        self.ended_unlockers.clear();
         self.polls.clear();
     }
 
@@ -1146,7 +1348,12 @@ impl GrantStore {
     pub fn counts(&self, now: &Now) -> (usize, usize) {
         (
             self.grants.values().filter(|g| !g.expired(now)).count(),
-            self.pending.values().filter(|p| !p.expired(now)).count(),
+            self.pending.values().filter(|p| !p.expired(now)).count()
+                + self
+                    .pending_unlockers
+                    .values()
+                    .filter(|p| !p.expired(now))
+                    .count(),
         )
     }
 

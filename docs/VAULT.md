@@ -182,7 +182,8 @@ The code is in `crates/envcloak-core/src/unlock.rs`; the envelope, passphrase an
 - `unlock_with_passphrase` and `unlock_with_kit` try each envelope of that kind from `LockedVault::unlockers` with the vault id and epoch the file names, then unlock with the VMK the first one gives. A wrong secret and a damaged envelope give the one generic error, also when the damage is in the envelope's plaintext header (its magic, version, kind, epoch or Argon2id parameters), which keeps it off the list: an unlocker row whose `kind` column names that kind but holds no well-formed envelope of that kind and epoch counts as a damaged envelope. Only a vault with no unlocker row of that kind says it has none. The locked vault comes back with the error, for another try.
 - `change_passphrase` checks the new passphrase, wraps the VMK under it with the current default parameters and a fresh salt, and in one transaction replaces the passphrase envelope under the same unlocker id (and removes any other passphrase envelope). The kit envelope is unchanged. The caller has already checked a proof.
 - `confirm_recovery_kit` unwraps a kit envelope with the kit and requires the result to equal the vault's VMK (compared in constant time); it then sets `recovery_confirmed` in the sealed header. SPEC §6.4 deletes imported plaintext only after that.
-- A vault that failed its integrity check, or could not be migrated, refuses a passphrase change and a kit confirmation before any key derivation.
+- `Vault::enroll_se_unlocker` (M3-08) wraps the open vault's VMK under a Secure Enclave unlocker's P-256 `unlock_pub` using HPKE Base (CRYPTO.md) and inserts an `unlockers` row of kind 3 (`secure_enclave`), updating the state digest and header in one transaction. `LockedVault::se_unlockers` and `LockedVault::se_unlocker` list and look up kind-3 rows at the vault's current epoch without the key, and `Vault::verify_vmk` checks a candidate VMK unwrapped by `app.unlock` against an already open vault's VMK in constant time.
+- A vault that failed its integrity check, or could not be migrated, refuses a passphrase change, a kit confirmation and a Secure Enclave unlocker enrolment before any key derivation.
 
 ## Backups
 
@@ -448,7 +449,7 @@ Status: M3 plan decision D3-02 and lane C's rule 9, written by task M3-01. The v
 <!-- reservations:audit_kind -->
 | Number | Token | Task | Status | Use |
 |---|---|---|---|---|
-| 46 | `unlocker_add` | M3-08 | reserved | a Secure Enclave unlocker enrolled (approved with the passphrase, or later signed in the app), with its label and both public keys' fingerprints |
+| 46 | `unlocker_add` | M3-08 | landed | a Secure Enclave unlocker enrolled (approved with the passphrase, or later signed in the app), with its label and both public keys' fingerprints |
 | 47 | `unlocker_remove` | M3-14 | reserved | an unlocker removed under a signed write statement (`app.unlocker.remove`): the passphrase unlocker, or a Secure Enclave unlocker with its label and both public keys' fingerprints |
 | 48 | `reveal_app` | M3-14 | reserved | a reveal in the app, written durably before the sealed value is released |
 | 49 | `ask` | M3-14 | reserved | an ask filed by `envcloak add --ask`, and its outcome (added, declined or expired), with the requester's evidence |
@@ -460,5 +461,5 @@ Status: M3 plan decision D3-02 and lane C's rule 9, written by task M3-01. The v
 <!-- reservations:unlocker_kind -->
 | Number | Kind | Task | Status | Use |
 |---|---|---|---|---|
-| 3 | `secure_enclave` | M3-08 | reserved | the macOS Secure Enclave unlocker: the VMK HPKE-sealed to the `unlock` public key, beside the pinned `approve` public key, the label, the creation time and the Team ID and signing identifier it was enrolled under; public keys only (SPEC §5) |
+| 3 | `secure_enclave` | M3-08 | landed | the macOS Secure Enclave unlocker: the VMK HPKE-sealed to the `unlock` public key, beside the pinned `approve` public key, the label, the creation time and the Team ID and signing identifier it was enrolled under; public keys only (SPEC §5) |
 <!-- /reservations -->

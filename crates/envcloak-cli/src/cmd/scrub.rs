@@ -149,58 +149,7 @@ fn fail(reason: &'static str) -> Failure {
     )
 }
 fn selected_sources(path: PathBuf, catalog: &[ConfigSource]) -> Vec<ConfigSource> {
-    use std::os::unix::ffi::OsStrExt;
-    let normalize = |p: PathBuf| envcloak_scan::sources::system_path(&p).unwrap_or(p);
-    let path = normalize(path);
-    let catalog: Vec<_> = catalog
-        .iter()
-        .cloned()
-        .map(|mut s| {
-            s.path = normalize(s.path);
-            s
-        })
-        .collect();
-    let mut selected: Vec<_> = catalog
-        .iter()
-        .filter(|s| s.path.starts_with(&path))
-        .cloned()
-        .collect();
-    // Named sources select direct children only, never the enclosing directory.
-    // A known store's grammar wins over an arbitrary file extension.
-    let enclosing = catalog
-        .iter()
-        .filter(|s| match &s.names {
-            Some(name) => {
-                path.parent() == Some(s.path.as_path())
-                    && path.file_name().is_some_and(|n| {
-                        n.as_bytes()
-                            .windows(name.len().max(1))
-                            .any(|w| w == name.as_bytes())
-                    })
-            }
-            None => path.starts_with(&s.path),
-        })
-        .max_by_key(|s| s.path.components().count());
-    let format = enclosing.map_or_else(
-        || {
-            if std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
-                ConfigFormat::Mixed
-            } else if path.extension().is_some_and(|e| e == "json") {
-                ConfigFormat::Json
-            } else {
-                ConfigFormat::Mixed
-            }
-        },
-        |s| s.format,
-    );
-    selected.push(ConfigSource {
-        path,
-        format,
-        source_kind: SourceKind::Transcript,
-        label: "scrub path".into(),
-        names: None,
-    });
-    selected
+    scrub::selected_sources(path, catalog)
 }
 fn execute(o: &Options) -> Result<bool, Failure> {
     let locations = Locations::from_env().map_err(|_| fail("invalid_home"))?;

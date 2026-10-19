@@ -1003,3 +1003,181 @@ print('{"escaped":"'+''.join('\\u%04x'%ord(c) for c in v)+'"}')
     assert!(parsed.status.success(), "Python rejected scrubbed JSONL");
     assert!(parsed.stdout.is_empty() && parsed.stderr.is_empty());
 }
+
+#[test]
+fn gate37_alias_selections_preserve_catalog_formats_rewrite_refusal_and_undo() {
+    let home = TestHome::new();
+    let relocated_disk = home.root().join("relocated-codex");
+    std::fs::create_dir_all(relocated_disk.join("sessions")).unwrap();
+    std::fs::create_dir_all(relocated_disk.join("archived_sessions/alias-suite")).unwrap();
+    let case_insensitive = std::fs::metadata(home.root().join("RELOCATED-CODEX")).is_ok();
+    let codex_env = if case_insensitive {
+        home.root().join("RELOCATED-CODEX")
+    } else {
+        home.root().join("relocated-codex/.")
+    };
+    let tmp_dir = home.root().join("tmp");
+    let mut f = Fixture::configured(
+        home,
+        vec![("CLAUDE_CODE_TMPDIR", tmp_dir), ("CODEX_HOME", codex_env)],
+    );
+    std::fs::remove_file(&f.path).unwrap();
+
+    let secret = by_label(&f.values, labels::OPENAI_API_KEY);
+    let raw = secret.as_str();
+    let first = raw.as_bytes()[0];
+    let rest = &raw[1..];
+    let escaped_jsonl =
+        format!("{{\"text\":\"\\u{first:04x}{rest}\"}}\n{{\"second\":\"\\u{first:04x}{rest}\"}}\n")
+            .into_bytes();
+    let escaped_json = format!("{{\"backup\":\"\\u{first:04x}{rest}\"}}\n").into_bytes();
+
+    let store_leaf = relocated_disk.join("archived_sessions/alias-suite/record.log");
+    let catalog_leaf = relocated_disk.join("sessions/capture.log");
+    let named_backup = f.home.home().join(".claude.json.backup.alias");
+
+    let file_alias = if case_insensitive {
+        f.home
+            .root()
+            .join("relocated-codex/ARCHIVED_SESSIONS/ALIAS-SUITE/RECORD.LOG")
+    } else {
+        f.home
+            .root()
+            .join("relocated-codex/./archived_sessions/./alias-suite/./record.log")
+    };
+    let dir_alias = if case_insensitive {
+        f.home
+            .root()
+            .join("relocated-codex/ARCHIVED_SESSIONS/ALIAS-SUITE")
+    } else {
+        f.home
+            .root()
+            .join("relocated-codex/./archived_sessions/./alias-suite")
+    };
+    let named_alias = if case_insensitive {
+        f.home.home().join(".CLAUDE.JSON.BACKUP.ALIAS")
+    } else {
+        f.home.home().join("./.claude.json.backup.alias")
+    };
+
+    let cases = [
+        (
+            "alias-file",
+            store_leaf.clone(),
+            file_alias.clone(),
+            &escaped_jsonl,
+            false,
+            true,
+        ),
+        (
+            "alias-directory",
+            store_leaf.clone(),
+            dir_alias,
+            &escaped_jsonl,
+            false,
+            true,
+        ),
+        (
+            "alias-catalog",
+            catalog_leaf.clone(),
+            catalog_leaf,
+            &escaped_jsonl,
+            false,
+            true,
+        ),
+        (
+            "alias-named-backup",
+            named_backup,
+            named_alias,
+            &escaped_json,
+            true,
+            false,
+        ),
+    ];
+
+    for (label, disk_path, selected_path, original, agent, multi_line) in cases {
+        std::fs::create_dir_all(disk_path.parent().unwrap()).unwrap();
+        std::fs::write(&disk_path, original).unwrap();
+        age(&disk_path);
+
+        f.path = selected_path;
+        let out = f.scrub(agent);
+        assert!(
+            out.status.success(),
+            "{label}: {} {}",
+            stderr(&out),
+            stdout(&out)
+        );
+        envcloak_testkit::assert_no_canary(&out.stdout, &f.values);
+        envcloak_testkit::assert_no_canary(&out.stderr, &f.values);
+
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["complete"], true, "{label}");
+        assert_eq!(report["files"][0]["state"], "scrubbed", "{label}");
+        let id = backup(&out);
+
+        let after = std::fs::read(&disk_path).unwrap();
+        envcloak_testkit::assert_no_canary(&after, &f.values);
+        let lines: Vec<_> = after
+            .split(|b| *b == b'\n')
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(lines.len(), if multi_line { 2 } else { 1 }, "{label}");
+        for line in lines {
+            let parsed: Value = serde_json::from_slice(line).unwrap();
+            let text = serde_json::to_string(&parsed).unwrap();
+            assert!(
+                text.contains("[envcloak:redacted:openai/acme-web]"),
+                "{label}: {text}"
+            );
+        }
+
+        let undo = f.undo(&id, if agent { &["--created-by-agent"] } else { &[] });
+        assert!(undo.status.success(), "{label}: {}", stderr(&undo));
+        envcloak_testkit::assert_no_canary(&undo.stdout, &f.values);
+        envcloak_testkit::assert_no_canary(&undo.stderr, &f.values);
+        assert_eq!(std::fs::read(&disk_path).unwrap(), *original, "{label}");
+        std::fs::remove_file(&disk_path).unwrap();
+    }
+
+    // Verify identical refusal disposition between canonical and alias selections:
+    // 1. Un-aged (recently_changed) file refusal.
+    std::fs::write(&store_leaf, &escaped_jsonl).unwrap();
+    for (tag, sel) in [
+        ("canonical-recent", &store_leaf),
+        ("alias-recent", &file_alias),
+    ] {
+        f.path = sel.clone();
+        let out = f.scrub(false);
+        assert!(!out.status.success(), "{tag}");
+        envcloak_testkit::assert_no_canary(&out.stdout, &f.values);
+        envcloak_testkit::assert_no_canary(&out.stderr, &f.values);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["complete"], false, "{tag}");
+        assert_eq!(report["files"][0]["state"], "refused", "{tag}");
+        assert_eq!(report["files"][0]["reason"], "recently_changed", "{tag}");
+        assert_eq!(std::fs::read(&store_leaf).unwrap(), escaped_jsonl, "{tag}");
+    }
+    std::fs::remove_file(&store_leaf).unwrap();
+
+    // 2. Symlink leaf refusal.
+    let target = f.home.root().join("outside-target.log");
+    std::fs::write(&target, &escaped_jsonl).unwrap();
+    age(&target);
+    std::os::unix::fs::symlink(&target, &store_leaf).unwrap();
+    for (tag, sel) in [
+        ("canonical-symlink", &store_leaf),
+        ("alias-symlink", &file_alias),
+    ] {
+        f.path = sel.clone();
+        let out = f.scrub(false);
+        assert!(!out.status.success(), "{tag}");
+        envcloak_testkit::assert_no_canary(&out.stdout, &f.values);
+        envcloak_testkit::assert_no_canary(&out.stderr, &f.values);
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(report["complete"], false, "{tag}");
+        assert!(stdout(&out).contains("symlink"), "{tag}: {}", stdout(&out));
+        assert_eq!(std::fs::read(&target).unwrap(), escaped_jsonl, "{tag}");
+    }
+    std::fs::remove_file(&store_leaf).unwrap();
+}

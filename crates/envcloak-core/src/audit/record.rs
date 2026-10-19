@@ -140,11 +140,15 @@ pub enum AuditKind {
     /// new device, inode and digest prefix), or a runner the daemon could
     /// not start (`runner_unavailable`).
     ManagedLaunch = 43,
+    /// A Secure Enclave unlocker enrolled (approved with the passphrase, or
+    /// later signed in the app), with its label and both public keys'
+    /// fingerprints.
+    UnlockerAdd = 46,
 }
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 30] = [
+    pub const ALL: [AuditKind; 31] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -175,6 +179,7 @@ impl AuditKind {
         AuditKind::Reclassify,
         AuditKind::LiveRefused,
         AuditKind::ManagedLaunch,
+        AuditKind::UnlockerAdd,
     ];
 
     /// The kind's stable token.
@@ -210,6 +215,7 @@ impl AuditKind {
             AuditKind::Reclassify => "reclassify",
             AuditKind::LiveRefused => "live_refused",
             AuditKind::ManagedLaunch => "managed_launch",
+            AuditKind::UnlockerAdd => "unlocker_add",
         }
     }
 
@@ -550,7 +556,7 @@ mod tests {
         }
         assert_eq!(AuditKind::from_u8(0), None);
         // These kinds remain reserved for later tasks.
-        for n in [27, 46] {
+        for n in [27, 47] {
             assert_eq!(AuditKind::from_u8(n), None, "{n}");
         }
         // Numbers in order, each token its own.
@@ -568,9 +574,10 @@ mod tests {
         assert_eq!(AuditKind::from_u8(25), Some(AuditKind::BackupV2));
         assert_eq!(AuditKind::from_u8(26), Some(AuditKind::RestoreV2));
         assert_eq!(AuditKind::from_u8(22), Some(AuditKind::Reveal));
-        // And M2-11's.
+        // And M2-11's and M3-08's.
         assert_eq!(AuditKind::from_u8(23), Some(AuditKind::ScanMatch));
         assert_eq!(AuditKind::from_u8(24), Some(AuditKind::MarkExposed));
+        assert_eq!(AuditKind::from_u8(46), Some(AuditKind::UnlockerAdd));
     }
 
     /// A record's named counts (M2-11: `scan.match`'s counts by kind) come

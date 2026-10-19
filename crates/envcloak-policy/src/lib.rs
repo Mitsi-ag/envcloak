@@ -87,14 +87,16 @@ pub use manifest::{
 pub use names::{Binding, EnvName, ProfileName, Reference, VALUE_RUN, value_shaped};
 pub use pending::{
     Busy, MAX_OUTCOMES, MAX_POLL_ROOTS, OUTCOME_TTL, PENDING_TTL, POLLS_PER_REQUEST, Pending,
-    PendingId, PendingState,
+    PendingId, PendingState, PendingUnlockerAdd, UnlockerAddRequest, UnlockerEnrollOutcome,
 };
 pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
 };
 pub use statement::{
     BindingSummary, HIDDEN, ManagedSummary, PendingDescriptor, ProcessSummary, ProjectSummary,
-    Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, SubjectSummary, canonical_statement, display_escaped,
-    escape_for_display, live_guarded, proposals, proposed_for, render_statement,
-    render_statement_with, shell_word, shown_name, statement_digest, unticked_live,
+    Proposal, RENDER_LIMIT, STATEMENT_DOMAIN, SubjectSummary, UNLOCKER_STATEMENT_DOMAIN,
+    UnlockerAddDescriptor, UnlockerRequestKind, canonical_statement, canonical_unlocker_statement,
+    display_escaped, escape_for_display, live_guarded, proposals, proposed_for, render_statement,
+    render_statement_with, render_unlocker_statement, shell_word, shown_name, statement_digest,
+    unlocker_statement_digest, unticked_live,
 };

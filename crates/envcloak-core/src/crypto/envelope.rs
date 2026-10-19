@@ -38,13 +38,15 @@ use crate::secret::SecretBytes;
 pub enum UnlockerKind {
     Passphrase = 1,
     RecoveryKit = 2,
+    SecureEnclave = 3,
 }
 
 impl UnlockerKind {
-    fn from_byte(b: u8) -> Option<Self> {
+    pub(crate) fn from_byte(b: u8) -> Option<Self> {
         match b {
             1 => Some(UnlockerKind::Passphrase),
             2 => Some(UnlockerKind::RecoveryKit),
+            3 => Some(UnlockerKind::SecureEnclave),
             _ => None,
         }
     }
@@ -154,7 +156,10 @@ impl Envelope {
             return Err(format());
         }
         let [kind] = r.take::<1>();
-        let kind = UnlockerKind::from_byte(kind).ok_or_else(format)?;
+        let kind = match UnlockerKind::from_byte(kind) {
+            Some(kind @ (UnlockerKind::Passphrase | UnlockerKind::RecoveryKit)) => kind,
+            _ => return Err(format()),
+        };
         let unlocker_id = UnlockerId(r.take());
         let epoch = u32::from_be_bytes(r.take());
         if r.take::<1>() != [KDF_ARGON2ID] {
@@ -222,6 +227,9 @@ pub fn wrap_vmk_with<K: Kdf + ?Sized>(
     params: &KdfParams,
     kdf: &K,
 ) -> Result<Envelope, CryptoError> {
+    if !matches!(kind, UnlockerKind::Passphrase | UnlockerKind::RecoveryKit) {
+        return Err(CryptoErrorKind::EnvelopeFormat.into());
+    }
     params.check_bounds()?;
     let mut salt = [0u8; 16];
     fill_random(&mut salt)?;

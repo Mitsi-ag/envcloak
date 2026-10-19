@@ -95,11 +95,11 @@ use std::path::PathBuf;
 
 use envcloak_core::SecretBytes;
 use envcloak_core::audit::{ProjectSummary, SubjectSummary};
-use envcloak_core::crypto::CryptoErrorKind;
+use envcloak_core::crypto::{CryptoErrorKind, SeUnlockerRecord, UnlockerId, p256_fingerprint};
 use envcloak_core::vault::{FieldId, ItemId, ItemMeta, Slug, Vault, VaultErrorKind};
 use envcloak_ipc::control::{ExecSpec, LaunchSpec, Recipient, Release, ToRunner};
 use envcloak_ipc::proto::{
-    ApproveParams, EnvFileParams, ErrorKind, PendingGetParams, PendingListParams,
+    ApproveParams, EnvFileParams, ErrorKind, PendingGetOutput, PendingGetParams, PendingListParams,
     PendingStateParams, ReleasedValue, RequestParams, RevokeParams, RunAnswer, RunRequest,
     RunRequestParams,
 };
@@ -111,9 +111,9 @@ use envcloak_ipc::{Frame, RpcError, WireSecret};
 use envcloak_policy::{
     AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BindError, BindErrorKind, Binding,
     BindingSource, BoundRef, Claims, Decision, DenyReason, EvidenceError, GrantId, ManifestError,
-    Mode, Now, PENDING_TTL, Pending, PendingDescriptor, PendingId, PendingState, ProcessInstance,
-    ProfileName, ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy,
-    bind_items, effective_policy, gather_hashed, load_project, resolve_sourced,
+    Mode, Now, PENDING_TTL, Pending, PendingId, PendingState, ProcessInstance, ProfileName,
+    ProofKind, RevokeSelector, SubjectEvidence, SubjectKind, Uses, VaultProjectPolicy, bind_items,
+    effective_policy, gather_hashed, load_project, resolve_sourced,
 };
 use envcloak_sys::PeerIdentity;
 
@@ -228,10 +228,12 @@ fn refuse_requester_terminal(
     now: &envcloak_policy::Now,
     method: &'static str,
 ) -> Result<(), RpcError> {
-    let refusal = s
-        .grants()
+    let grants = s.grants();
+    let refusal = grants
         .pending(id, now)
-        .and_then(|p| approver.approval_refusal(&p.request.subject, &alive));
+        .map(|p| &p.request.subject)
+        .or_else(|| grants.pending_unlocker(id, now).map(|p| &p.request.subject))
+        .and_then(|subj| approver.approval_refusal(subj, &alive));
     match refusal {
         None => Ok(()),
         Some(r) => {
@@ -283,7 +285,7 @@ fn bind_error(e: &BindError) -> RpcError {
     }
 }
 
-fn approve_error(e: ApproveError) -> RpcError {
+pub(crate) fn approve_error(e: ApproveError) -> RpcError {
     match e {
         ApproveError::NoSuchRequest => RpcError::new(ErrorKind::NoSuchRequest),
         ApproveError::StatementMismatch => RpcError::new(ErrorKind::StatementMismatch),
@@ -1182,7 +1184,7 @@ pub fn pending_get(
     shared: &Shared,
     peer: &PeerIdentity,
     p: PendingGetParams,
-) -> Result<PendingDescriptor, RpcError> {
+) -> Result<PendingGetOutput, RpcError> {
     let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "pending.get")?;
@@ -1192,6 +1194,21 @@ pub fn pending_get(
     // `approve` would be refused before its proof (review T9 open 6).
     s.refuse_if_tampered()?;
     refuse_requester_terminal(&mut s, peer, &caller, &id, &now, "pending.get")?;
+    if let Some(u) = s.grants().pending_unlocker(&id, &now).cloned() {
+        let vault_id = s.unlocked()?.vault_id();
+        if u.request.vault_id != vault_id {
+            return Err(RpcError::new(ErrorKind::NoSuchRequest));
+        }
+        if let Some(r) = requester_terminal_in(&mut s, &caller, &now) {
+            s.audit(AuditEvent::ProofRefused {
+                pid: peer.pid,
+                method: "pending.get",
+                reason: r.token(),
+            });
+            return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+        }
+        return Ok(PendingGetOutput::UnlockerAdd(u.descriptor));
+    }
     if s.grants().pending(&id, &now).is_none() {
         return Err(RpcError::new(ErrorKind::NoSuchRequest));
     }
@@ -1200,13 +1217,14 @@ pub fn pending_get(
     let items = s.unlocked()?.items().to_vec();
     s.grants()
         .pending_descriptor(&id, &now, &items)
+        .map(PendingGetOutput::Run)
         .ok_or(RpcError::new(ErrorKind::NoSuchRequest))
 }
 
 /// Audits an approval of request `id` that the live-key guard refused,
 /// with the items whose live bindings `opts` left unticked, and returns
 /// the refusal.
-fn live_refused(
+pub(crate) fn live_refused(
     s: &mut crate::state::State,
     peer: &PeerIdentity,
     approver: SubjectSummary,
@@ -1293,7 +1311,7 @@ pub fn pending_list(
 }
 
 /// What `envcloak pending` shows of one request.
-fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
+pub(crate) fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
     let kind = p.request.subject.kind();
     let age = p.age(now);
     PendingView {
@@ -1351,27 +1369,56 @@ pub fn approve(
     let approver = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &approver, "approve")?;
     let _gate = locked(&shared.proof_gate);
-    let (vault, generation, pass) = {
+    let (vault, generation, pass, is_unlocker) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
+        let vault_id = s.unlocked()?.vault_id();
         let items = s.unlocked()?.items().to_vec();
         refuse_requester_terminal(&mut s, peer, &approver, &id, &now, "approve")?;
-        // Everything but the passphrase is checked before Argon2id runs,
-        // the live-key guard included: an approval that leaves a live
-        // binding unticked is refused, and audited, before the passphrase
-        // is looked at (L-10).
-        match s
-            .grants()
-            .check_approval(&id, &p.options, digest, &now, &items)
-        {
-            Ok(()) => {}
-            Err(ApproveError::LiveNotTicked) => {
-                let who = subject_summary(peer, &approver);
-                return Err(live_refused(
-                    &mut s, peer, who, &id, &p.options, &now, &items,
-                ));
+        let is_unlocker = s.grants().pending_unlocker(&id, &now).is_some();
+        if is_unlocker {
+            if p.options.uses != Uses::Once
+                || p.options.ttl_secs != envcloak_policy::DEFAULT_TTL.as_secs()
+                || !p.options.live.is_empty()
+            {
+                return Err(RpcError::new(ErrorKind::InvalidOptions));
             }
-            Err(e) => return Err(approve_error(e)),
+            if let Some(r) = requester_terminal_in(&mut s, &approver, &now) {
+                s.audit(AuditEvent::ProofRefused {
+                    pid: peer.pid,
+                    method: "approve",
+                    reason: r.token(),
+                });
+                return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+            }
+            s.grants()
+                .check_unlocker_approval(&id, digest, &now)
+                .map_err(approve_error)?;
+            let req_vault_id = s
+                .grants()
+                .pending_unlocker(&id, &now)
+                .map(|u| u.request.vault_id);
+            if req_vault_id != Some(vault_id) {
+                return Err(RpcError::new(ErrorKind::StatementMismatch));
+            }
+        } else {
+            // Everything but the passphrase is checked before Argon2id runs,
+            // the live-key guard included: an approval that leaves a live
+            // binding unticked is refused, and audited, before the passphrase
+            // is looked at (L-10).
+            match s
+                .grants()
+                .check_approval(&id, &p.options, digest, &now, &items)
+            {
+                Ok(()) => {}
+                Err(ApproveError::LiveNotTicked) => {
+                    let who = subject_summary(peer, &approver);
+                    return Err(live_refused(
+                        &mut s, peer, who, &id, &p.options, &now, &items,
+                    ));
+                }
+                Err(e) => return Err(approve_error(e)),
+            }
         }
         // A check ends here, before the attempt limiter: no attempt is
         // made, and none counted.
@@ -1380,7 +1427,7 @@ pub fn approve(
             .check(&now)
             .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
         let (vault, generation) = s.begin_proof()?;
-        (vault, generation, pass)
+        (vault, generation, pass, is_unlocker)
     };
     let verified = vault.verify_passphrase(&pass);
     drop(pass);
@@ -1393,9 +1440,78 @@ pub fn approve(
             back?;
             let who = subject_summary(peer, &approver);
             let proof = ApprovalProof {
-                approver,
+                approver: approver.clone(),
                 kind: ProofKind::Passphrase,
             };
+            if is_unlocker {
+                if p.options.uses != Uses::Once
+                    || p.options.ttl_secs != envcloak_policy::DEFAULT_TTL.as_secs()
+                    || !p.options.live.is_empty()
+                {
+                    return Err(RpcError::new(ErrorKind::InvalidOptions));
+                }
+                refuse_requester_terminal(&mut s, peer, &approver, &id, &now, "approve")?;
+                if let Some(r) = requester_terminal_in(&mut s, &approver, &now) {
+                    s.audit(AuditEvent::ProofRefused {
+                        pid: peer.pid,
+                        method: "approve",
+                        reason: r.token(),
+                    });
+                    return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+                }
+                let vault_id = s.unlocked()?.vault_id();
+                s.grants()
+                    .check_unlocker_approval(&id, digest, &now)
+                    .map_err(approve_error)?;
+                let pending = s
+                    .grants()
+                    .pending_unlocker(&id, &now)
+                    .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?
+                    .clone();
+                if pending.request.vault_id != vault_id {
+                    return Err(RpcError::new(ErrorKind::StatementMismatch));
+                }
+                let unlocker_id = {
+                    let v = s.unlocked()?;
+                    loop {
+                        let candidate = UnlockerId::generate();
+                        if v.unlocker(candidate).is_none() && v.se_unlocker(candidate).is_none() {
+                            break candidate;
+                        }
+                    }
+                };
+                let created_secs = now
+                    .wall
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs());
+                let record = SeUnlockerRecord {
+                    unlocker_id,
+                    unlock_pub: pending.request.unlock_pub,
+                    approve_pub: pending.request.approve_pub,
+                    label: pending.request.label.clone(),
+                    created_secs,
+                    enrolled_under: pending.request.enrolled_under.clone(),
+                };
+                let unlocker_hex = crate::app::hex_encode(&unlocker_id.0);
+                let audit_event = AuditEvent::UnlockerAdd {
+                    pid: peer.pid,
+                    subject: who,
+                    request: id.to_string(),
+                    unlocker: unlocker_hex.clone(),
+                    label: pending.request.label.clone(),
+                    unlock_pub_sha256: p256_fingerprint(&pending.request.unlock_pub),
+                    approve_pub_sha256: p256_fingerprint(&pending.request.approve_pub),
+                };
+                s.enroll_se_unlocker(record, audit_event)?;
+                s.grants()
+                    .complete_unlocker_approval(&id, proof, digest, unlocker_id, &now)
+                    .map_err(approve_error)?;
+                s.touch(Reading::now(&shared.clocks));
+                return Ok(ApprovedView {
+                    grant: unlocker_hex,
+                    expires_in_secs: 0,
+                });
+            }
             let ttl = p.options.ttl_secs;
             let uses = match p.options.uses {
                 Uses::Once => "once",

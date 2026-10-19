@@ -50,7 +50,7 @@ use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use envcloak_client::render::looks_like_value;
 use envcloak_client::tty::{Terminal, read_secret_fd};
-use envcloak_ipc::proto::ErrorKind;
+use envcloak_ipc::proto::{ErrorKind, PendingGetOutput};
 use envcloak_policy::{
     ApprovalOptions, DEFAULT_TTL, EnvName, GrantId, MAX_AGENT_TTL, PendingId, Uses,
     escape_for_display, proposed_for, render_statement_with, statement_digest, unticked_live,
@@ -67,6 +67,7 @@ const DENY_USAGE: &str = "envcloak deny <REQUEST>";
 struct ApproveArgs {
     request: PendingId,
     options: ApprovalOptions,
+    has_run_options: bool,
     passphrase_fd: Option<i32>,
 }
 
@@ -116,6 +117,7 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
     }
     live.sort();
     live.dedup();
+    let has_run_options = uses.is_some() || ttl.is_some() || !live.is_empty();
     Some(ApproveArgs {
         request,
         options: ApprovalOptions {
@@ -123,6 +125,7 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
             ttl_secs: ttl.unwrap_or(DEFAULT_TTL).as_secs(),
             live,
         },
+        has_run_options,
         passphrase_fd,
     })
 }
@@ -141,7 +144,18 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
     // The daemon serves the request only to a caller that may give a
     // proof, so where none is taken this stops before the statement is
     // shown or the passphrase read.
-    let descriptor = connect()?.pending_get(&id, &claims)?;
+    let descriptor = match connect()?.pending_get_any(&id, &claims)? {
+        PendingGetOutput::Run(d) => d,
+        PendingGetOutput::UnlockerAdd(u) => {
+            if a.has_run_options {
+                return Err(Failure::new(
+                    ErrorKind::InvalidOptions.token(),
+                    "--once, --for and --live do not apply to an unlocker enrolment request",
+                ));
+            }
+            return super::approve_unlocker::run(&id, u, a.passphrase_fd, &claims);
+        }
+    };
     // The statement is rendered from what the daemon sent, escaped (a
     // proposed name shaped like a key hidden), and its digest is computed
     // over exactly that (gate 23: a statement that differs from the

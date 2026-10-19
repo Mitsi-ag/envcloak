@@ -20,8 +20,10 @@ FIXTURES = Path(FIXTURES)
 IDENTITIES = json.loads((FIXTURES / "identities.json").read_text())
 EXCEPTIONS = ["allow-jit", "allow-unsigned-executable-memory", "allow-dyld-environment-variables",
               "disable-library-validation", "disable-executable-page-protection", "debugger"]
-METHODS = ["app.unlock", "app.approve", "app.reveal", "app.paste", "app.policy.set",
-           "app.device.add", "app.device.remove", "app.registry.override", "app.future"]
+METHODS = ["app.unlock.begin", "app.unlock", "app.unlocker.enroll.begin", "app.unlocker.enroll",
+           "app.pending.list", "app.pending.get", "app.approve", "app.reveal", "app.paste",
+           "app.policy.set", "app.device.add", "app.device.remove", "app.registry.override",
+           "app.future"]
 
 
 def read_exact(pipe, count):
@@ -36,7 +38,7 @@ def read_exact(pipe, count):
     return result
 
 
-def send(child, method="app.unlock", params=None):
+def send(child, method="app.policy.set", params=None):
     data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method,
                        "params": params or {}}).encode()
     child.stdin.write(struct.pack("!I", len(data)) + data)

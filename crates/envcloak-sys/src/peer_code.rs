@@ -28,8 +28,24 @@ impl AuditToken {
 }
 
 /// A requirement produced only by this build's pins.
-#[derive(Debug)]
-pub struct PinnedRequirement(String);
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedRequirement {
+    requirement: String,
+    team_id: String,
+    signing_id: String,
+}
+
+impl PinnedRequirement {
+    #[must_use]
+    pub fn team_id(&self) -> &str {
+        &self.team_id
+    }
+
+    #[must_use]
+    pub fn signing_id(&self) -> &str {
+        &self.signing_id
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeVerdict {
@@ -140,7 +156,7 @@ pub fn peer_satisfies(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (token, &pin.0);
+        let _ = (token, &pin.requirement);
         Err(PeerCodeError::Unsupported)
     }
 }
@@ -218,8 +234,10 @@ mod macos {
         attrs.set_audit_token(data.as_concrete_TypeRef());
         let code = SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE)
             .map_err(|_| PeerCodeError::Security)?;
-        let requirement: SecRequirement =
-            pin.0.parse().map_err(|_| PeerCodeError::Configuration)?;
+        let requirement: SecRequirement = pin
+            .requirement
+            .parse()
+            .map_err(|_| PeerCodeError::Configuration)?;
         if let Err(error) = code.check_validity(Flags::NONE, &requirement) {
             return Ok(CodeVerdict::Fails(if error.code() == -67062 {
                 Why::Unsigned

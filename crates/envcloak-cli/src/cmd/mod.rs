@@ -25,6 +25,7 @@
 pub mod add;
 pub mod agents;
 pub mod approve;
+pub mod approve_unlocker;
 pub mod audit;
 pub mod backup;
 pub mod check;

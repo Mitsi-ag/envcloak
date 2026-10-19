@@ -1264,6 +1264,8 @@ def classify(rel):
         return "product"
     if len(parts) >= 3 and parts[2] in ("EnvCloakTests", "EnvCloakUITests", "EnvCloakHardwareTests"):
         return "test"
+    if rel.startswith(APP + "/Tools/hpke-vectors/"):
+        return "test"
     if len(parts) >= 5 and parts[2] == "Packages" and parts[4] == "Tests":
         return "test"
     if rel == APP + "/Package.swift" or (len(parts) == 5 and parts[2] == "Packages" and parts[4] == "Package.swift"):

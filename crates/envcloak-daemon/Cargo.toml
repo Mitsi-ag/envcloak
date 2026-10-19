@@ -28,6 +28,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+envcloak-core = { workspace = true, features = ["testing"] }
 envcloak-ipc = { workspace = true, features = ["testing"] }
 # A backup v2 restore writes files back as a client does (R-M2-73).
 envcloak-scan.workspace = true

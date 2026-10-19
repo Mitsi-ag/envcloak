@@ -101,10 +101,30 @@ def encode(d, o, pid, version, sourced=True):
     return bytes(out)
 
 
+def encode_unlocker(d):
+    out = bytearray(b"envcloak-unlocker-statement/1\n")
+    for k in (
+        "request",
+        "nonce",
+        "vault_id",
+        "label",
+        "unlock_pub_sha256",
+        "approve_pub_sha256",
+        "team_id",
+        "signing_id",
+    ):
+        out += text(d[k])
+    out += num(d["created_secs"]) + num(d["expires_in_secs"])
+    return bytes(out)
+
+
 def main():
     cases = json.load(sys.stdin)
     out = []
     for c in cases:
+        if "unlocker_add" in c:
+            out.append({"unlocker": encode_unlocker(c["unlocker_add"]).hex()})
+            continue
         d, o = c["descriptor"], c["options"]
         out.append(
             {

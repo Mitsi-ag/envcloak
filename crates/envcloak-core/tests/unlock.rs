@@ -256,6 +256,7 @@ fn every_wrong_secret_or_damaged_envelope_gives_one_generic_error() {
             let e = match kind {
                 UnlockerKind::Passphrase => f.open().unlock_with_passphrase(&f.pass()),
                 UnlockerKind::RecoveryKit => f.open().unlock_with_kit(&f.kit()),
+                UnlockerKind::SecureEnclave => unreachable!(),
             }
             .unwrap_err()
             .1;
@@ -449,6 +450,7 @@ fn a_missing_unlocker_kind_is_named() {
         let e = match kind {
             UnlockerKind::Passphrase => f.open().unlock_with_passphrase(&f.pass()),
             UnlockerKind::RecoveryKit => f.open().unlock_with_kit(&f.kit()),
+            UnlockerKind::SecureEnclave => unreachable!(),
         }
         .unwrap_err()
         .1;

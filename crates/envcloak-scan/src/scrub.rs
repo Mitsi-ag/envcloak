@@ -419,15 +419,19 @@ pub fn current_digest(path: &std::path::Path) -> Result<[u8; 32], &'static str> 
     crate::atomic::digest_of(&mut file, &stamp, &dir).map_err(|e| e.token())
 }
 
+pub use crate::sources::{
+    ObjectIdentity, ResolveOptions, ResolvedObject, SelectionWitness, perturb_witness_device,
+    resolve_beneath, select_sources_with_options, selected_sources, selection_witness,
+};
+
 /// Discover possible restore leftovers beside selected files, including missing
 /// leaves, without reading any contents. A name never grants cleanup authority.
 pub fn inspect_leftovers(sources: &[crate::source::ConfigSource]) -> crate::candidates::ScanReport {
     let mut report = crate::candidates::ScanReport::default();
-    crate::sources::walk_sources(
+    crate::sources::walk_sources_leftovers(
         sources,
         crate::candidates::Budget::default(),
         &mut report,
-        |_, _, _, _, _, _| {},
     );
     report
 }
