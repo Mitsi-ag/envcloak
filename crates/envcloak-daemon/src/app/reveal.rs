@@ -42,6 +42,9 @@ pub(crate) fn request(
     refuse_item_prover(&mut s, peer, &caller, &now, "reveal.request")?;
     let (vault_id, t, field_id, field_name, classification) = {
         let v = s.unlocked()?;
+        if v.se_unlockers().next().is_none() {
+            return Err(RpcError::new(ErrorKind::NoUnlocker));
+        }
         let t = resolve_target(v, &p.slug, p.field.as_deref(), None)?;
         let (fid, fname) = t
             .field
@@ -82,19 +85,24 @@ pub(crate) fn begin(
     let _caller = requests::evidence(shared, peer, &p.claims)?;
 
     match (p.request.as_deref(), p.slug.as_deref()) {
-        (Some(req_str), None) => {
+        (req_opt, None) => {
             if p.field.is_some() {
                 return Err(RpcError::new(ErrorKind::InvalidParams));
             }
-            let id = PendingId::parse(req_str).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
+            let id_opt = match req_opt {
+                Some(req_str) => {
+                    Some(PendingId::parse(req_str).ok_or(RpcError::new(ErrorKind::InvalidParams))?)
+                }
+                None => None,
+            };
             let mut s = locked(&shared.state);
             s.refuse_if_tampered()?;
             let now = now_of(&shared.clocks);
-            let pending = s
-                .grants()
-                .pending_reveal(&id, &now)
-                .cloned()
-                .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?;
+            let pending = match id_opt {
+                Some(id) => s.grants().pending_reveal(&id, &now).cloned(),
+                None => s.grants().oldest_pending_client_reveal(&now).cloned(),
+            }
+            .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?;
             let v = s.unlocked()?;
             if v.vault_id() != pending.spec.vault_id {
                 return Err(RpcError::new(ErrorKind::NoSuchRequest));

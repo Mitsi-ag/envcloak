@@ -253,6 +253,28 @@ impl From<RunPathError> for ClientError {
     }
 }
 
+/// Outcome of [`Client::wait_for_ask`] (`envcloak add --ask`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AskWaitOutcome {
+    /// The person pasted and saved the new item under `slug`.
+    Added { slug: String },
+    /// The person declined the ask.
+    Declined,
+    /// The ask expired or the wait deadline passed while it was still pending.
+    Expired,
+}
+
+/// Outcome of [`Client::wait_for_reveal`] (`envcloak reveal` on macOS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevealWaitOutcome {
+    /// The person completed the signed reveal in the app.
+    Shown,
+    /// The person declined the reveal request.
+    Declined,
+    /// The reveal request expired or the wait deadline passed while it was still pending.
+    Expired,
+}
+
 /// A connection to a verified daemon.
 #[derive(Debug)]
 pub struct Client {
@@ -1430,6 +1452,96 @@ impl Client {
         })
     }
 
+    /// Files `items.ask` and polls `items.ask_state` on fresh connections
+    /// using [`crate::wait::Backoff`] up to `wait` (`envcloak add --ask`,
+    /// SPEC §6.3, M3 plan M3-19). Holds no connection between polls.
+    pub fn wait_for_ask(
+        paths: &RunPaths,
+        p: &crate::proto::AskParams,
+        wait: Duration,
+    ) -> Result<AskWaitOutcome, ClientError> {
+        let start = Instant::now();
+        let deadline = start
+            .checked_add(wait)
+            .ok_or(ClientError::Frame(FrameError::Io(
+                io::ErrorKind::InvalidInput,
+            )))?;
+        let limit = deadline
+            .checked_add(crate::wait::CALL_GRACE)
+            .unwrap_or(deadline);
+        let mut backoff = crate::wait::Backoff::new();
+        let id = loop {
+            if Instant::now() >= deadline {
+                return Ok(AskWaitOutcome::Expired);
+            }
+            match Self::connect_by(paths, limit)?.items_ask(p) {
+                Ok(opened) => {
+                    break PendingId::parse(&opened.ask).ok_or(ClientError::Protocol)?;
+                }
+                Err(ClientError::Rpc(RpcError {
+                    kind: crate::ErrorKind::TooManyPending | crate::ErrorKind::Busy,
+                    ..
+                })) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(AskWaitOutcome::Expired);
+                    }
+                    backoff.after_busy();
+                    std::thread::sleep(
+                        backoff
+                            .interval()
+                            .min(deadline.saturating_duration_since(now)),
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let id_str = id.to_string();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(AskWaitOutcome::Expired);
+            }
+            let sleep_for = backoff
+                .interval()
+                .min(deadline.saturating_duration_since(now));
+            if !sleep_for.is_zero() {
+                std::thread::sleep(sleep_for);
+            }
+            match Self::connect_by(paths, limit)?.items_ask_state(&id_str) {
+                Ok(envcloak_policy::AskStateOutcome::Added { slug }) => {
+                    envcloak_core::vault::Slug::new(&slug).map_err(|_| ClientError::Protocol)?;
+                    return Ok(AskWaitOutcome::Added { slug });
+                }
+                Ok(envcloak_policy::AskStateOutcome::Declined) => {
+                    return Ok(AskWaitOutcome::Declined);
+                }
+                Ok(
+                    envcloak_policy::AskStateOutcome::Expired
+                    | envcloak_policy::AskStateOutcome::Unknown,
+                ) => {
+                    return Ok(AskWaitOutcome::Expired);
+                }
+                Ok(envcloak_policy::AskStateOutcome::Pending) => {
+                    if Instant::now() >= deadline {
+                        return Ok(AskWaitOutcome::Expired);
+                    }
+                    backoff.after_pending();
+                }
+                Err(ClientError::Rpc(RpcError {
+                    kind: crate::ErrorKind::Busy,
+                    ..
+                })) => {
+                    if Instant::now() >= deadline {
+                        return Ok(AskWaitOutcome::Expired);
+                    }
+                    backoff.after_busy();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     /// `reveal.request`: files a reveal request for the app from a terminal
     /// subject.
     pub fn reveal_request(
@@ -1443,6 +1555,89 @@ impl Client {
             field: field.map(str::to_owned),
             claims: claims.to_vec(),
         })
+    }
+
+    /// Files `reveal.request` and polls `pending.state` on fresh connections
+    /// using [`crate::wait::Backoff`] up to `wait` (`envcloak reveal` on
+    /// macOS, SPEC §6.7, M3 plan M3-J5). Holds no connection between polls.
+    pub fn wait_for_reveal(
+        paths: &RunPaths,
+        slug: &str,
+        field: Option<&str>,
+        claims: &[String],
+        wait: Duration,
+    ) -> Result<RevealWaitOutcome, ClientError> {
+        let start = Instant::now();
+        let deadline = start
+            .checked_add(wait)
+            .ok_or(ClientError::Frame(FrameError::Io(
+                io::ErrorKind::InvalidInput,
+            )))?;
+        let limit = deadline
+            .checked_add(crate::wait::CALL_GRACE)
+            .unwrap_or(deadline);
+        let mut backoff = crate::wait::Backoff::new();
+        let id = loop {
+            if Instant::now() >= deadline {
+                return Ok(RevealWaitOutcome::Expired);
+            }
+            match Self::connect_by(paths, limit)?.reveal_request(slug, field, claims) {
+                Ok(opened) => {
+                    break PendingId::parse(&opened.request).ok_or(ClientError::Protocol)?;
+                }
+                Err(ClientError::Rpc(RpcError {
+                    kind: crate::ErrorKind::TooManyPending | crate::ErrorKind::Busy,
+                    ..
+                })) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(RevealWaitOutcome::Expired);
+                    }
+                    backoff.after_busy();
+                    std::thread::sleep(
+                        backoff
+                            .interval()
+                            .min(deadline.saturating_duration_since(now)),
+                    );
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(RevealWaitOutcome::Expired);
+            }
+            let sleep_for = backoff
+                .interval()
+                .min(deadline.saturating_duration_since(now));
+            if !sleep_for.is_zero() {
+                std::thread::sleep(sleep_for);
+            }
+            match Self::connect_by(paths, limit)?.pending_state(&id) {
+                Ok(PendingState::Approved) => return Ok(RevealWaitOutcome::Shown),
+                Ok(PendingState::Denied) => return Ok(RevealWaitOutcome::Declined),
+                Ok(PendingState::Expired | PendingState::Unknown) => {
+                    return Ok(RevealWaitOutcome::Expired);
+                }
+                Ok(PendingState::Pending) => {
+                    if Instant::now() >= deadline {
+                        return Ok(RevealWaitOutcome::Expired);
+                    }
+                    backoff.after_pending();
+                }
+                Err(ClientError::Rpc(RpcError {
+                    kind: crate::ErrorKind::Busy,
+                    ..
+                })) => {
+                    if Instant::now() >= deadline {
+                        return Ok(RevealWaitOutcome::Expired);
+                    }
+                    backoff.after_busy();
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// `app.unlocker.add`: enrols another Secure Enclave unlocker under a

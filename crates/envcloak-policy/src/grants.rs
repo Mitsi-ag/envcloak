@@ -745,7 +745,20 @@ impl GrantStore {
                 self.expired_asks.push(p);
             }
         }
-        self.pending_reveals.retain(|_, p| !p.expired(now));
+        let expired_reveals: Vec<PendingId> = self
+            .pending_reveals
+            .values()
+            .filter(|p| p.expired(now))
+            .map(|p| p.id)
+            .collect();
+        for id in expired_reveals {
+            if let Some(p) = self.pending_reveals.remove(&id)
+                && let Some(sub) = p.spec.requester
+            {
+                self.ended
+                    .record(id, sub.root(), PendingState::Expired, now);
+            }
+        }
         self.ended.expire(now);
         self.ended_unlockers.expire(now);
         self.ended_asks.expire(now);
@@ -1143,6 +1156,15 @@ impl GrantStore {
                 root_auto_denied: false,
             });
         }
+        if let Some(p) = self.pending_reveals.remove(id) {
+            if let Some(sub) = p.spec.requester {
+                self.ended
+                    .record(*id, sub.root(), PendingState::Denied, now);
+            }
+            return Ok(DenyOutcome {
+                root_auto_denied: false,
+            });
+        }
         Err(NoSuchRequest)
     }
 
@@ -1274,12 +1296,23 @@ impl GrantStore {
             .pending
             .values()
             .filter(|p| p.request.subject.root() == root)
-            .count();
+            .count()
+            + self
+                .pending_reveals
+                .values()
+                .filter(|p| p.spec.requester.as_ref().is_some_and(|s| s.root() == root))
+                .count();
         self.polls.take(&root, live, now.awake)?;
         let state = if let Some(p) = self.pending.get(id) {
             caller
                 .descends_from(&p.request.subject.root())
                 .then_some(PendingState::Pending)
+        } else if let Some(p) = self.pending_reveals.get(id) {
+            p.spec.requester.as_ref().and_then(|sub| {
+                caller
+                    .descends_from(&sub.root())
+                    .then_some(PendingState::Pending)
+            })
         } else {
             self.ended
                 .get(id)
@@ -1495,11 +1528,24 @@ impl GrantStore {
         self.pending_reveals.get(id).filter(|p| !p.expired(now))
     }
 
+    /// The oldest unexpired client-originated pending reveal request, if any.
+    pub fn oldest_pending_client_reveal(&self, now: &Now) -> Option<&PendingReveal> {
+        self.pending_reveals
+            .values()
+            .filter(|p| p.spec.requester.is_some() && !p.expired(now))
+            .min_by_key(|p| (p.opened, p.id))
+    }
+
     /// Removes and returns the pending reveal request `id`, unless it
-    /// expired.
+    /// expired, and records [`PendingState::Approved`] for its requester.
     pub fn take_pending_reveal(&mut self, id: &PendingId, now: &Now) -> Option<PendingReveal> {
         self.expire(now);
-        self.pending_reveals.remove(id)
+        let p = self.pending_reveals.remove(id)?;
+        if let Some(sub) = &p.spec.requester {
+            self.ended
+                .record(*id, sub.root(), PendingState::Approved, now);
+        }
+        Some(p)
     }
 
     /// How many asks and reveal requests wait for the app (`status.app_requests`).
