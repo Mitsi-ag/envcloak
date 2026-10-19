@@ -942,15 +942,27 @@ const NODE_RUNNERS: [&str; 6] = ["npx", "pnpx", "bunx", "npm", "pnpm", "yarn"];
 /// (`--script-shell`, npx's `--shell`) and a configuration file that may
 /// set any of these (`--userconfig`, `--globalconfig`; the same
 /// configuration as the `npm_config_*` variables [`is_code_selecting`]
-/// refuses).
-const RUNNER_LOADING_LONG: [&str; 6] = [
-    "--call",
-    "--node-options",
-    "--script-shell",
-    "--shell",
-    "--userconfig",
-    "--globalconfig",
+/// refuses), along with the shortest unambiguous prefix `nopt`'s `abbrev`
+/// table accepts for each in npm 11.19.0's `@npmcli/config`.
+const RUNNER_LOADING_ABBREVS: [(&str, usize); 6] = [
+    ("call", 3),
+    ("node-options", 6),
+    ("script-shell", 3),
+    ("shell", 3),
+    ("userconfig", 5),
+    ("globalconfig", 7),
 ];
+
+/// Whether `stem` (after leading `-` and `nopt`'s leading `no-` prefixes are
+/// stripped) names or abbreviates one of [`RUNNER_LOADING_ABBREVS`].
+fn is_runner_loading_stem(mut stem: &str) -> bool {
+    while stem.len() >= 3 && stem[..3].eq_ignore_ascii_case("no-") {
+        stem = &stem[3..];
+    }
+    RUNNER_LOADING_ABBREVS
+        .iter()
+        .any(|&(full, min_len)| stem.len() >= min_len && full.starts_with(stem))
+}
 
 /// The shorthands of npm 11.19.0's `@npmcli/config` (`lib/definitions`):
 /// `npx-cli.js` and `nopt` strip every leading `-` before looking up
@@ -1070,7 +1082,7 @@ fn runner_options_end(name: &str, argv: &[String]) -> usize {
 }
 
 /// Whether the runner's option `a` runs other code or chooses it
-/// ([`is_code_loading_option`], [`RUNNER_LOADING_LONG`], or an
+/// ([`is_code_loading_option`], [`RUNNER_LOADING_ABBREVS`], or an
 /// [`NPM_SHORTHANDS`] expansion in `-<key>` or `--<key>` form).
 fn runner_option_loads(a: &str) -> bool {
     if is_code_loading_option(a) {
@@ -1084,7 +1096,7 @@ fn runner_option_loads(a: &str) -> bool {
         .iter()
         .find_map(|&(k, target)| (k == key).then_some(target))
     {
-        return RUNNER_LOADING_LONG.contains(&long);
+        return is_runner_loading_stem(long.trim_start_matches('-'));
     }
     if key.len() > 1
         && key.chars().all(|ch| {
@@ -1096,14 +1108,12 @@ fn runner_option_loads(a: &str) -> bool {
             NPM_SHORTHANDS
                 .iter()
                 .find_map(|&(k, target)| (k.len() == 1 && k.starts_with(ch)).then_some(target))
-                .is_some_and(|target| RUNNER_LOADING_LONG.contains(&target))
+                .is_some_and(|target| is_runner_loading_stem(target.trim_start_matches('-')))
         })
     {
         return true;
     }
-    RUNNER_LOADING_LONG
-        .iter()
-        .any(|o| o.strip_prefix("--") == Some(key))
+    is_runner_loading_stem(key)
 }
 
 /// The label of a package runner `name` with `argv` (see
@@ -2551,6 +2561,18 @@ mod tests {
             &["npx", "--c", "echo CONTROL"],
             &["npx", "--yes", "--c=echo CONTROL"],
             &["npm", "exec", "--c=echo CONTROL"],
+            &["npx", "--cal=echo CONTROL"],
+            &["npx", "--no-script-shell=/bin/sh", "pkg"],
+            &["npx", "--no-no-script-shell=/bin/sh", "pkg"],
+            &["npx", "--no-scr", "/bin/sh", "pkg"],
+            &["npx", "--node-o=--require=/tmp/p.js", "pkg"],
+            &["npx", "--no-node-options=--require=/tmp/p.js", "pkg"],
+            &["npx", "--no-no-node-options=--require=/tmp/p.js", "pkg"],
+            &["npx", "-", "--node-options=--require=/tmp/p.js"],
+            &["npx", "-", "foo", "--node-options=--require=/tmp/p.js"],
+            &["npx", "--userc=/tmp/rc", "pkg"],
+            &["npx", "--globalc=/tmp/rc", "pkg"],
+            &["npx", "--she=/bin/sh", "pkg"],
             &[
                 "npx",
                 "--cache",

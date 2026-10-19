@@ -1183,6 +1183,10 @@ mod tests {
             &["npx", "--c", "echo CONTROL"],
             &["npx", "--yes", "--c=echo CONTROL"],
             &["npm", "exec", "--c=echo CONTROL"],
+            &["npx", "--cal=echo CONTROL"],
+            &["npx", "--no-script-shell=/bin/sh", "fixture"],
+            &["npx", "--node-o=--require=/tmp/p.js", "fixture"],
+            &["npx", "--userc=/tmp/rc", "fixture"],
             &[
                 "npx",
                 "--cache",

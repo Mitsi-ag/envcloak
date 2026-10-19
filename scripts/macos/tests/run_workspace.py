@@ -2,6 +2,7 @@
 """CI entry point for the real-daemon UI story, with a private short HOME."""
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,8 @@ if 'DEVELOPER_DIR' in os.environ:
 # Keep fixtures for diagnosis. The harness contains generated values only.
 command = [str(root / ('scripts/macos/test-eu1.sh' if '--eu1' in sys.argv else 'scripts/macos/test-workspace.sh'))]
 if '--eu1' in sys.argv and '--package' in sys.argv:
+    for stale in ('m305-ui', 'm306-ui'):
+        shutil.rmtree(pathlib.Path(env['CARGO_TARGET_DIR']) / stale, ignore_errors=True)
     command.append('--package')
 result = subprocess.run(command, cwd=root, env=env, stdin=subprocess.DEVNULL)
 sys.exit(result.returncode)
