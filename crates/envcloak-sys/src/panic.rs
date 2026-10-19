@@ -210,3 +210,16 @@ pub fn test_clock_offset() -> std::time::Duration {
         std::time::Duration::ZERO
     }
 }
+
+/// Whether `ENVCLOAK_TEST_LINUX_STANDING=1` is set in a test build; always
+/// `false` in release builds.
+pub fn linux_standing_forced() -> bool {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::linux_standing_forced()
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        false
+    }
+}

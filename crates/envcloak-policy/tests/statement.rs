@@ -63,6 +63,7 @@ fn descriptor(argv: Vec<String>) -> PendingDescriptor {
         mode: Mode::Inject,
         argv,
         managed: None,
+        standing: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn opts() -> ApprovalOptions {
         uses: Uses::Session,
         ttl_secs: 3600,
         live: vec![EnvName::new("STRIPE_SECRET_KEY").unwrap()],
+        standing: None,
     }
 }
 
@@ -480,6 +482,7 @@ fn the_canonical_statement_matches_an_independent_encoder() {
         uses: Uses::Once,
         ttl_secs: 1,
         live: Vec::new(),
+        standing: None,
     };
     cases.push((bare, once.clone()));
     cases.push((descriptor(Vec::new()), once.clone()));
@@ -625,6 +628,7 @@ fn ticking(names: &[&str]) -> ApprovalOptions {
         uses: Uses::Once,
         ttl_secs: 600,
         live: names.iter().map(|n| EnvName::new(n).unwrap()).collect(),
+        standing: None,
     }
 }
 
@@ -1174,6 +1178,7 @@ fn write_and_reveal_statement_encoding_and_rendering_and_oracle() {
     let reveal_app = RevealDescriptor {
         request: "7HM9P2QA".to_owned(),
         nonce: "55".repeat(32),
+        app_eph_pub: "66".repeat(32),
         vault_id: "bb".repeat(16),
         item: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
         slug: "openai/dev\u{202e}".to_owned(),
@@ -1198,12 +1203,18 @@ fn write_and_reveal_statement_encoding_and_rendering_and_oracle() {
         expires_in_secs: 600,
         ..reveal_app.clone()
     };
+    let mut reveal_swapped_eph = reveal_app.clone();
+    reveal_swapped_eph.app_eph_pub = "77".repeat(32);
 
     assert!(canonical_reveal_statement(&reveal_app).starts_with(REVEAL_STATEMENT_DOMAIN));
     assert_eq!(REVEAL_STATEMENT_DOMAIN, b"envcloak-reveal-statement/1\n");
     assert_ne!(
         reveal_statement_digest(&reveal_app),
         reveal_statement_digest(&reveal_cli)
+    );
+    assert_ne!(
+        reveal_statement_digest(&reveal_app),
+        reveal_statement_digest(&reveal_swapped_eph)
     );
 
     let write_cases = vec![
@@ -1214,7 +1225,7 @@ fn write_and_reveal_statement_encoding_and_rendering_and_oracle() {
         rm_passphrase,
         rm_se,
     ];
-    let reveal_cases = vec![reveal_app.clone(), reveal_cli.clone()];
+    let reveal_cases = vec![reveal_app.clone(), reveal_cli.clone(), reveal_swapped_eph];
 
     let mut payload = Vec::new();
     for w in &write_cases {

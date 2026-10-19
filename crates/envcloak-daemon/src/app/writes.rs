@@ -22,7 +22,7 @@ use crate::items::{check_value, detected_class, target as resolve_target, write_
 use crate::lock::Reading;
 use crate::requests::{self, digest_of, subject_summary};
 use crate::server::{Shared, locked, refuse_if_traced};
-use crate::state::{WRITE_TARGET_TTL, WriteTarget, backup_reason};
+use crate::state::{UnlockerWriteKind, WRITE_TARGET_TTL, WriteTarget, backup_reason};
 
 use super::{decode_bytes, decode_fixed_bytes, hex_encode};
 
@@ -39,6 +39,42 @@ pub(crate) fn target(
     let mut s = locked(&shared.state);
     s.refuse_if_tampered()?;
     let now = now_of(&shared.clocks);
+    if p.slug == "unlocker:add" || p.slug == "unlocker:remove" {
+        if p.field.is_some() {
+            return Err(RpcError::new(ErrorKind::InvalidParams));
+        }
+        let kind = if p.slug == "unlocker:add" {
+            UnlockerWriteKind::Add
+        } else {
+            UnlockerWriteKind::Remove
+        };
+        let vault_id = s.unlocked()?.vault_id();
+        let nonce = generate_se_challenge().map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        let ephemeral =
+            SeEphemeralKey::generate().map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        let daemon_eph_pub = *ephemeral.public_key();
+        let created_secs = now
+            .wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let target_id = s.open_unlocker_write_target(kind, nonce, vault_id, now.awake);
+        s.touch(Reading::now(&shared.clocks));
+        return Ok(AppItemsTargetOutput {
+            target: target_id.to_string(),
+            nonce: hex_encode(&nonce),
+            daemon_eph_pub: hex_encode(&daemon_eph_pub),
+            vault_id: hex_encode(&vault_id.0),
+            item: String::new(),
+            slug: p.slug,
+            field: None,
+            field_name: None,
+            classification: ClassificationView::Unknown,
+            prior_count: 0,
+            grants: 0,
+            created_secs,
+            expires_in_secs: WRITE_TARGET_TTL.as_secs(),
+        });
+    }
     let (vault_id, t, classification, prior_count) = {
         let v = s.unlocked()?;
         let t = resolve_target(v, &p.slug, p.field.as_deref(), None)?;
@@ -370,7 +406,25 @@ pub(crate) fn remove(
         }
     };
 
-    let grants = s.grants().on_item_removed(wt.item);
+    let mut grants = s.grants().on_item_removed(wt.item);
+    let standing_ids: Vec<envcloak_policy::StandingId> = s
+        .standing()
+        .all_records()
+        .filter(|r| r.bindings.iter().any(|b| b.item == wt.item))
+        .map(|r| r.id)
+        .collect();
+    if !standing_ids.is_empty()
+        && let Ok((revoked, extra_grants)) = crate::standing::delete_records(&mut s, &standing_ids)
+        && revoked > 0
+    {
+        grants = grants.saturating_add(extra_grants);
+        s.audit(AuditEvent::StandingRevoked {
+            pid: peer.pid,
+            revoked,
+            grants: extra_grants,
+            reason: Some("item_removed"),
+        });
+    }
     s.audit(AuditEvent::Removed {
         pid: peer.pid,
         subject: subject_summary(peer, &caller),

@@ -44,6 +44,7 @@ mod items;
 mod launch_check;
 mod lock;
 mod managed;
+mod policy_epoch;
 mod projects;
 mod redact;
 mod requests;
@@ -52,6 +53,7 @@ mod reveal;
 mod scan_match;
 mod server;
 mod spawn_envcloak;
+mod standing;
 mod state;
 
 use std::io::Write;

@@ -109,5 +109,7 @@ pub(crate) fn approve(
     Ok(ApprovedView {
         grant: grant.to_string(),
         expires_in_secs: ttl,
+        standing: None,
+        standing_expires_in_secs: None,
     })
 }

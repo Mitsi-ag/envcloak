@@ -38,6 +38,7 @@
 //! bound) ends the session at once, while the host keeps its input open
 //! and sends nothing: the calls in hand are stopped then too.
 
+pub mod bridge;
 pub mod child;
 pub mod lifecycle;
 pub mod router;

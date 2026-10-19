@@ -50,8 +50,8 @@ pub use se_unlocker::{
     SeHpkeEnvelope, SeUnlockerEnvelope, SeUnlockerRecord, X25519_PUBLIC_KEY_LEN,
     check_p256_public_key, check_se_label, derive_p256_keypair, generate_se_challenge,
     open_se_envelope, open_secret_from_x25519, p256_fingerprint, recreate_se_unlocker,
-    se_hpke_info, se_reseal_aad, seal_se_unlocker, seal_secret_to_x25519, seal_vmk_to_daemon,
-    seal_vmk_to_se, secret_sha256, sign_p256_prehash, verify_p256_prehash,
+    se_hpke_info, se_reseal_aad, se_reveal_aad, seal_se_unlocker, seal_secret_to_x25519,
+    seal_vmk_to_daemon, seal_vmk_to_se, secret_sha256, sign_p256_prehash, verify_p256_prehash,
 };
 
 /// A crypto failure. Carries its kind only: no values, sizes of secrets or
