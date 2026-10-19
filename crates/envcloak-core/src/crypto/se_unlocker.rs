@@ -372,6 +372,20 @@ pub fn se_reseal_aad(request_id: &str, challenge: &[u8; SE_CHALLENGE_LEN]) -> Ve
     aad
 }
 
+/// Builds the associated data for the daemon-to-app HPKE reveal seal:
+/// `request_id || challenge || app_eph_pub` (SPEC §6.3; M3-14).
+pub fn se_reveal_aad(
+    request_id: &str,
+    challenge: &[u8; SE_CHALLENGE_LEN],
+    app_eph_pub: &[u8; X25519_PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(request_id.len() + SE_CHALLENGE_LEN + X25519_PUBLIC_KEY_LEN);
+    aad.extend_from_slice(request_id.as_bytes());
+    aad.extend_from_slice(challenge);
+    aad.extend_from_slice(app_eph_pub);
+    aad
+}
+
 /// Generates a fresh 32-byte random challenge for `app.unlock.begin`.
 pub fn generate_se_challenge() -> Result<[u8; SE_CHALLENGE_LEN], CryptoError> {
     let mut challenge = [0u8; SE_CHALLENGE_LEN];

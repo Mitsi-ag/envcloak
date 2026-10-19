@@ -1254,6 +1254,38 @@ pub(crate) fn clock_offset() -> std::time::Duration {
         .unwrap_or(std::time::Duration::ZERO)
 }
 
+/// Names the test-only Team IDs (`<cdhash_hex>=<team>` or
+/// `<identifier>=<team>`, comma-separated) a test build on macOS fills in
+/// for an ad hoc signed test binary whose kernel signature has no Team ID,
+/// since macOS AMFI refuses an ad hoc signature that carries one.
+pub const MAC_TEAM_IDS: &str = "ENVCLOAK_TEST_MAC_TEAM_IDS";
+
+#[cfg(target_os = "macos")]
+pub(crate) fn pretended_team_id(
+    identifier: &str,
+    cdhash: Option<&[u8; crate::CDHASH_LEN]>,
+) -> Option<String> {
+    let raw = std::env::var(MAC_TEAM_IDS).ok()?;
+    let hex = cdhash.map(|h| h.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some((key, team)) = entry.split_once('=') {
+            if (key == identifier || hex.as_deref() == Some(key)) && !team.is_empty() {
+                return Some(team.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Environment variable that forces Linux-style SHA-256 standing identity
+/// (with zero settle window) in test builds on any OS.
+pub const LINUX_STANDING: &str = "ENVCLOAK_TEST_LINUX_STANDING";
+
+/// Whether [`LINUX_STANDING`] is enabled in this test process.
+pub fn linux_standing_forced() -> bool {
+    std::env::var_os(LINUX_STANDING).is_some_and(|v| v == "1")
+}
+
 /// The memory a process holds now and the most it has held since it
 /// started, in KiB ([`process_memory`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

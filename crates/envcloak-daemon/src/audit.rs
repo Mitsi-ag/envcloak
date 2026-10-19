@@ -454,6 +454,42 @@ pub enum AuditEvent {
         outcome: &'static str,
         reason: &'static str,
     },
+    /// A standing approval was created, or updated in place on Linux
+    /// self-update (`approve` with `options.standing`).
+    StandingCreated {
+        pid: i32,
+        subject: SubjectSummary,
+        standing: String,
+        grant: String,
+        project: ProjectSummary,
+        items: Vec<(ItemId, Slug)>,
+        ttl_secs: u64,
+        appended: bool,
+    },
+    /// Standing approvals were revoked (`standing.revoke`, or ended by item
+    /// reclassification/removal or managed launch update).
+    StandingRevoked {
+        pid: i32,
+        revoked: usize,
+        grants: usize,
+        reason: Option<&'static str>,
+    },
+    /// A standing approval minted a session grant (`run.request`), written
+    /// durably before release.
+    StandingGranted {
+        pid: i32,
+        standing: String,
+        grant: String,
+        subject: SubjectSummary,
+        project: ProjectSummary,
+        items: Vec<(ItemId, Slug)>,
+    },
+    /// The standing-approval set was confirmed (`standing.confirm`).
+    StandingConfirmed {
+        pid: i32,
+        subject: SubjectSummary,
+        confirmed: usize,
+    },
 }
 
 /// A managed launch's counts, as its audit entries record them.
@@ -796,6 +832,37 @@ impl AuditEvent {
             } => format!(
                 "envcloakd: audit: keychain anchor mismatch outcome={outcome} reason={reason} pid={pid}"
             ),
+            AuditEvent::StandingCreated {
+                pid,
+                standing,
+                grant,
+                ttl_secs,
+                appended,
+                ..
+            } => format!(
+                "envcloakd: audit: standing {} id={standing} grant={grant} ttl_secs={ttl_secs} \
+                 pid={pid}",
+                if *appended { "updated" } else { "created" }
+            ),
+            AuditEvent::StandingRevoked {
+                pid,
+                revoked,
+                grants,
+                ..
+            } => format!(
+                "envcloakd: audit: standing revoked records={revoked} grants={grants} pid={pid}"
+            ),
+            AuditEvent::StandingGranted {
+                pid,
+                standing,
+                grant,
+                ..
+            } => format!(
+                "envcloakd: audit: standing grant standing={standing} grant={grant} pid={pid}"
+            ),
+            AuditEvent::StandingConfirmed { pid, confirmed, .. } => {
+                format!("envcloakd: audit: standing confirmed records={confirmed} pid={pid}")
+            }
         })
     }
 
@@ -1385,6 +1452,82 @@ impl AuditEvent {
                 subject: subject(*pid),
                 decision: decision(outcome, Some(reason), Some("unlock"), None),
                 ..AuditRecord::new(AuditKind::KeychainAnchorMismatch, outcome)
+            },
+            AuditEvent::StandingCreated {
+                subject,
+                standing,
+                grant,
+                project,
+                items,
+                ttl_secs,
+                appended,
+                ..
+            } => {
+                let outcome = if *appended { "updated" } else { "created" };
+                AuditRecord {
+                    request_id: Some(standing.clone()),
+                    grant_id: Some(grant.clone()),
+                    subject: subject.clone(),
+                    project: Some(project.clone()),
+                    items: items.clone(),
+                    decision: decision(outcome, None, Some("approve"), Some(*ttl_secs)),
+                    ..AuditRecord::new(AuditKind::StandingCreate, outcome)
+                }
+            }
+            AuditEvent::StandingRevoked {
+                pid,
+                revoked,
+                grants,
+                reason,
+            } => AuditRecord {
+                subject: subject(*pid),
+                decision: DecisionSummary {
+                    counts: vec![
+                        (
+                            "revoked".to_owned(),
+                            u64::try_from(*revoked).unwrap_or(u64::MAX),
+                        ),
+                        (
+                            "grants".to_owned(),
+                            u64::try_from(*grants).unwrap_or(u64::MAX),
+                        ),
+                    ],
+                    ..decision(
+                        "revoked",
+                        *reason,
+                        Some("standing.revoke"),
+                        Some(u64::try_from(*revoked).unwrap_or(u64::MAX)),
+                    )
+                },
+                ..AuditRecord::new(AuditKind::StandingRevoke, "revoked")
+            },
+            AuditEvent::StandingGranted {
+                standing,
+                grant,
+                subject,
+                project,
+                items,
+                ..
+            } => AuditRecord {
+                request_id: Some(standing.clone()),
+                grant_id: Some(grant.clone()),
+                subject: subject.clone(),
+                project: Some(project.clone()),
+                items: items.clone(),
+                decision: decision("granted", None, Some("run.request"), None),
+                ..AuditRecord::new(AuditKind::StandingGrant, "granted")
+            },
+            AuditEvent::StandingConfirmed {
+                subject, confirmed, ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                decision: decision(
+                    "confirmed",
+                    None,
+                    Some("standing.confirm"),
+                    Some(u64::try_from(*confirmed).unwrap_or(u64::MAX)),
+                ),
+                ..AuditRecord::new(AuditKind::StandingConfirm, "confirmed")
             },
         }
     }

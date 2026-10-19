@@ -78,9 +78,6 @@ impl AnchorStore for KeychainAnchorStore {
             return Ok(None);
         };
         let anchor = Anchor::decode(&raw).map_err(|_| AnchorError::Corrupt)?;
-        if anchor.vault_id != vault {
-            return Err(AnchorError::Corrupt);
-        }
         Ok(Some(anchor))
     }
 

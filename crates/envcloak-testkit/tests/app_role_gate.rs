@@ -260,8 +260,8 @@ fn each_rule_refuses_a_copy_changed_one_way() {
         ]
     );
     let unlisted = ipc.replacen(
-        "| `app.paste` | M3-14 |",
-        "| `app.paste_value` | M3-14 |",
+        "| `app.paste` | M3-14 | landed |",
+        "| `app.paste_value` | M3-14 | reserved |",
         1,
     );
     assert_ne!(unlisted, ipc);

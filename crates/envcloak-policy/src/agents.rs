@@ -658,6 +658,15 @@ impl AgentCatalog {
         self.agents.iter().map(|a| a.id.as_str())
     }
 
+    /// The display name of agent `id` ([`AgentLabel::name`]), if the
+    /// catalog knows it.
+    pub fn name(&self, id: &str) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.name.as_str())
+    }
+
     /// The product of agent `id` ([`AgentLabel::product`]), if the catalog
     /// knows it.
     pub fn product(&self, id: &str) -> Option<&str> {
@@ -665,6 +674,23 @@ impl AgentCatalog {
             .iter()
             .find(|a| a.id == id)
             .map(|a| a.product.as_str())
+    }
+
+    /// Whether `(team, identifier)` is a code signature the builtin
+    /// catalog lists for agent `id` (with a Team ID). For macOS standing
+    /// approvals (SPEC §10b, task M2-15): a process that matched an agent
+    /// by executable path alone, with no signature or another program's
+    /// signature, has no standing identity for that agent.
+    pub fn has_builtin_signature(&self, id: &str, team: &str, identifier: &str) -> bool {
+        !team.is_empty()
+            && self.agents.iter().any(|a| {
+                a.id == id
+                    && a.signatures.iter().any(|(sig, source)| {
+                        *source == CatalogSource::Builtin
+                            && sig.identifier == identifier
+                            && sig.team.as_deref() == Some(team)
+                    })
+            })
     }
 
     /// Whether `exe`, an absolute executable path as the kernel reports

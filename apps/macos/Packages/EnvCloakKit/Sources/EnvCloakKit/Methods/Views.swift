@@ -264,14 +264,18 @@ public struct LockView: Sendable, WireDecodable, CustomStringConvertible, Custom
 public struct ApprovalsView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `grants`: UInt32
     public let `pending`: UInt32
+    public let `standing`: UInt32
+    public let `policy_epoch_unverified`: Bool
     public let `proof_failures`: UInt32
     public let `proof_wait_secs`: UInt64
     public var description: String { "[ApprovalsView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
-        let o = try wire.object(["grants", "pending", "proof_failures", "proof_wait_secs"])
+        let o = try wire.object(["grants", "pending", "standing", "policy_epoch_unverified", "proof_failures", "proof_wait_secs"])
         self.`grants` = try o.decode("grants")
         self.`pending` = try o.decode("pending")
+        self.`standing` = try o.optional("standing") ?? 0
+        self.`policy_epoch_unverified` = try o.optional("policy_epoch_unverified") ?? false
         self.`proof_failures` = try o.decode("proof_failures")
         self.`proof_wait_secs` = try o.decode("proof_wait_secs")
     }

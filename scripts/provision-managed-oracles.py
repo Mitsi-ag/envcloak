@@ -96,10 +96,15 @@ def provision(root):
         stamp = source / ".envcloak-oracle-build"
         fingerprint = json.dumps([digest, flags])
         if flags != [] and (not stamp.exists() or stamp.read_text() != fingerprint or not built_binary().is_file()):
-            if flags is not None:
-                subprocess.run(["./configure", *flags], cwd=source, check=True)
             env = dict(os.environ)
             env.setdefault("MACOSX_DEPLOYMENT_TARGET", "11.0")
+            if platform.system() == "Darwin":
+                cflags = env.get("CFLAGS", "")
+                env["CFLAGS"] = (
+                    f"{cflags} -Wno-incompatible-pointer-types-discards-qualifiers".strip()
+                )
+            if flags is not None:
+                subprocess.run(["./configure", *flags], cwd=source, check=True, env=env)
             subprocess.run(["make", "-j3"], cwd=source, check=True, env=env)
             stamp.write_text(fingerprint)
         if not built_binary().is_file():

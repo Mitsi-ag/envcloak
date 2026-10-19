@@ -131,3 +131,15 @@ pub(super) fn proc_argv(pid: i32) -> io::Result<Argv> {
     let bytes = read_proc_wiped(pid, "cmdline", cap)?;
     Ok(parse_cmdline(&bytes))
 }
+
+pub(super) fn proc_env_any(pid: i32, pred: &dyn Fn(&[u8]) -> bool) -> io::Result<bool> {
+    const MAX_ENVIRON: usize = 256 * 1024;
+    let bytes = read_proc_wiped(pid, "environ", MAX_ENVIRON + 1)?;
+    if bytes.len() > MAX_ENVIRON {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "a /proc environ file past the cap",
+        ));
+    }
+    Ok(super::environ_env_any(&bytes, pred))
+}

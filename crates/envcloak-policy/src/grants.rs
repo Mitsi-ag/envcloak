@@ -112,6 +112,9 @@ pub const MAX_AGENT_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const MAX_TERMINAL_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Grants held at once.
 pub const MAX_GRANTS: usize = 256;
+/// Maximum concurrent app-originated reveal stages (`app.reveal.begin` with
+/// `slug`, `requester == None`).
+pub const MAX_APP_REVEAL_STAGES: usize = 64;
 
 /// One reading of the clocks a decision needs: the wall clock (UTC), time
 /// awake, and time including sleep.
@@ -170,9 +173,10 @@ pub enum Uses {
     Session,
 }
 
-/// What the approver chooses: `--once` or `--for <duration>`, and the
-/// live bindings ticked (`--live NAME`), which the live-key guard requires
-/// for an agent's or an unknown subject's live bindings.
+/// What the approver chooses: `--once`, `--for <duration>` or `--standing
+/// <duration>`, and the live bindings ticked (`--live NAME`), which the
+/// live-key guard requires for an agent's or an unknown subject's live
+/// bindings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalOptions {
@@ -181,6 +185,31 @@ pub struct ApprovalOptions {
     pub ttl_secs: u64,
     /// The bindings whose live-classified values the approver allows.
     pub live: Vec<EnvName>,
+    /// A standing approval's duration, at most 30 days (SPEC §10b, M2-15).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "standing_secs"
+    )]
+    pub standing: Option<Duration>,
+}
+
+mod standing_secs {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(d) => s.serialize_some(&d.as_secs()),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        let secs = Option::<u64>::deserialize(d)?;
+        Ok(secs.map(Duration::from_secs))
+    }
 }
 
 impl ApprovalOptions {
@@ -190,6 +219,7 @@ impl ApprovalOptions {
             uses: Uses::Session,
             ttl_secs: ttl.as_secs(),
             live: Vec::new(),
+            standing: None,
         }
     }
 
@@ -199,6 +229,17 @@ impl ApprovalOptions {
             uses: Uses::Once,
             ttl_secs: ttl.as_secs(),
             live: Vec::new(),
+            standing: None,
+        }
+    }
+
+    /// A standing approval of `ttl` (up to 30 days).
+    pub fn standing(ttl: Duration) -> Self {
+        ApprovalOptions {
+            uses: Uses::Session,
+            ttl_secs: ttl.as_secs(),
+            live: Vec::new(),
+            standing: Some(ttl),
         }
     }
 }
@@ -347,6 +388,10 @@ pub struct Grant {
     /// For a bridged server: the origin the grant was made for (rule 6);
     /// it covers no other, and no request of a project not bridged.
     pub origin: Option<String>,
+    /// When minted from a standing approval: every item id bound by that
+    /// standing approval, so reclassifying or removing any sibling item on
+    /// the standing record also ends subset-derived session grants.
+    pub standing_items: Vec<ItemId>,
 }
 
 impl Grant {
@@ -518,6 +563,10 @@ pub enum OptionsError {
     TtlTooLong,
     /// A `live` name is not among the request's bindings.
     LiveNotBound,
+    /// `--standing` was combined with `--once` or `--live`.
+    StandingInvalid,
+    /// `--standing` was requested for a binding that is not `test`-classified.
+    StandingNotTest,
 }
 
 impl OptionsError {
@@ -527,6 +576,7 @@ impl OptionsError {
             OptionsError::TtlZero => "ttl_zero",
             OptionsError::TtlTooLong => "ttl_too_long",
             OptionsError::LiveNotBound => "live_not_bound",
+            OptionsError::StandingInvalid | OptionsError::StandingNotTest => "invalid_options",
         }
     }
 }
@@ -856,6 +906,18 @@ impl GrantStore {
             .collect()
     }
 
+    /// Whether `r` at `now` is neither root-denied, recently denied for
+    /// this exact request fingerprint, nor already covered by an active
+    /// grant, so a standing approval may be consulted before
+    /// [`GrantStore::decide`] opens a pending request.
+    pub fn can_try_standing(&mut self, r: &AccessRequest, now: &Now) -> bool {
+        self.expire(now);
+        let root = r.subject.root();
+        !self.flood.root_denied(&root, now)
+            && self.covering(r, now).is_none()
+            && !self.flood.recently_denied(&fingerprint(r), now)
+    }
+
     /// Decides `r` at `now`: covered, pending or denied. See the module
     /// documentation. A root auto-denied after repeated denials is denied
     /// first, before any grant is looked at. An identical request already
@@ -928,6 +990,17 @@ impl GrantStore {
         self.pending(id, now).and_then(|p| p.current(items))
     }
 
+    /// Sets the standing summary on pending request `id`'s descriptor.
+    pub fn set_pending_standing(
+        &mut self,
+        id: &PendingId,
+        standing: Option<crate::statement::StandingSummary>,
+    ) {
+        if let Some(p) = self.pending.get_mut(id) {
+            p.descriptor.standing = standing;
+        }
+    }
+
     /// Everything [`GrantStore::approve`] checks apart from the proof, so
     /// a daemon can refuse before it runs Argon2id: the request exists,
     /// the options are within bounds, the digest is this request's with
@@ -949,7 +1022,18 @@ impl GrantStore {
         // The statement as it reads now: classifications and proposals
         // from the vault, never the ones of an earlier reading (L-09).
         let shown = p.current(items).ok_or(ApproveError::NoSuchRequest)?;
-        let max = max_ttl(&p.request.subject);
+        let max = match opts.standing {
+            Some(d) => {
+                if d.is_zero() || d.subsec_nanos() != 0 {
+                    return Err(ApproveError::InvalidOptions(OptionsError::TtlZero));
+                }
+                if d > crate::standing::MAX_STANDING_TTL {
+                    return Err(ApproveError::InvalidOptions(OptionsError::TtlTooLong));
+                }
+                crate::standing::MAX_STANDING_TTL
+            }
+            None => max_ttl(&p.request.subject),
+        };
         if opts.ttl_secs == 0 {
             return Err(ApproveError::InvalidOptions(OptionsError::TtlZero));
         }
@@ -970,6 +1054,14 @@ impl GrantStore {
         // daemon rebuilt: the same classifications.
         if !unticked_live(&shown, opts).is_empty() {
             return Err(ApproveError::LiveNotTicked);
+        }
+        if opts.standing.is_some() {
+            if opts.uses != Uses::Session || !opts.live.is_empty() {
+                return Err(ApproveError::InvalidOptions(OptionsError::StandingInvalid));
+            }
+            if shown.bindings.iter().any(|b| b.classification != "test") {
+                return Err(ApproveError::InvalidOptions(OptionsError::StandingNotTest));
+            }
         }
         if self.grants.values().filter(|g| !g.expired(now)).count() >= MAX_GRANTS {
             return Err(ApproveError::TooManyGrants);
@@ -1070,7 +1162,10 @@ impl GrantStore {
             .record(*id, p.request.subject.root(), PendingState::Approved, now);
         let kind = p.request.subject.kind();
         let r = p.request;
-        let ttl = Duration::from_secs(opts.ttl_secs);
+        let ttl = match opts.standing {
+            Some(standing) => DEFAULT_TTL.min(max_ttl(&r.subject)).min(standing),
+            None => Duration::from_secs(opts.ttl_secs),
+        };
         let id = if self.grants.contains_key(&grant_id) {
             self.fresh_grant_id()
         } else {
@@ -1104,9 +1199,75 @@ impl GrantStore {
             policy_epoch: self.policy_epoch,
             launch: r.managed.as_ref().and_then(|m| m.launch),
             origin,
+            standing_items: Vec::new(),
         };
         self.grants.insert(id, grant);
         Ok(id)
+    }
+
+    /// Mints a `session` grant in `self` from a matching standing approval
+    /// for `r` at `now` with lifetime `ttl`.
+    pub fn mint_from_standing(
+        &mut self,
+        r: &AccessRequest,
+        ttl: Duration,
+        now: &Now,
+    ) -> Option<GrantId> {
+        let standing_items = r.bindings.iter().map(|b| b.binding.item).collect();
+        self.mint_from_standing_items(r, ttl, now, standing_items)
+    }
+
+    /// Mints a `session` grant in `self` from a matching standing approval
+    /// for `r` at `now` with lifetime `ttl`, recording `standing_items` as
+    /// the full set of item ids bound by the minting standing record.
+    pub fn mint_from_standing_items(
+        &mut self,
+        r: &AccessRequest,
+        ttl: Duration,
+        now: &Now,
+        standing_items: Vec<ItemId>,
+    ) -> Option<GrantId> {
+        self.expire(now);
+        if ttl.is_zero() || self.grants.len() >= MAX_GRANTS {
+            return None;
+        }
+        let id = loop {
+            let id = GrantId::generate();
+            if !self.grants.contains_key(&id) {
+                break id;
+            }
+        };
+        let grant = Grant {
+            id,
+            root: r.subject.root(),
+            kind: r.subject.kind(),
+            label: r.subject.label().map(|l| l.name.clone()),
+            project: r.project.clone(),
+            manifest_sha256: r.manifest_sha256,
+            bindings: r
+                .bindings
+                .iter()
+                .map(|b| GrantBinding {
+                    env_name: b.binding.env_name.clone(),
+                    item: b.binding.item,
+                    field: b.binding.field,
+                    slug: b.slug.clone(),
+                    live: false,
+                })
+                .collect(),
+            mode: r.mode,
+            uses: Uses::Session,
+            created: now.wall,
+            not_after_wall: now.wall + ttl,
+            not_after_awake: now.awake + ttl,
+            vault_epoch: self.vault_epoch,
+            policy_epoch: self.policy_epoch,
+            launch: ManagedRequest::launch(r),
+            origin: ManagedRequest::origin(r).map(str::to_owned),
+            standing_items,
+        };
+        self.grants.insert(id, grant);
+        Some(id)
     }
 
     /// Uses grant `g` for one request: a `once` grant is removed, so a
@@ -1340,12 +1501,14 @@ impl GrantStore {
         self.end_item(item)
     }
 
-    /// Ends every grant and pending request that binds `item`. Returns how
-    /// many grants ended.
+    /// Ends every grant and pending request that binds `item` (or was minted
+    /// from a standing approval that binds `item`). Returns how many grants
+    /// ended.
     fn end_item(&mut self, item: ItemId) -> usize {
         let before = self.grants.len();
-        self.grants
-            .retain(|_, g| !g.bindings.iter().any(|b| b.item == item));
+        self.grants.retain(|_, g| {
+            !g.bindings.iter().any(|b| b.item == item) && !g.standing_items.contains(&item)
+        });
         self.pending
             .retain(|_, p| !p.request.bindings.iter().any(|b| b.binding.item == item));
         self.pending_reveals.retain(|_, p| p.spec.item != item);
@@ -1356,7 +1519,9 @@ impl GrantStore {
     pub fn binding_item(&self, item: ItemId) -> usize {
         self.grants
             .values()
-            .filter(|g| g.bindings.iter().any(|b| b.item == item))
+            .filter(|g| {
+                g.bindings.iter().any(|b| b.item == item) || g.standing_items.contains(&item)
+            })
             .count()
     }
 
@@ -1513,9 +1678,27 @@ impl GrantStore {
     }
 
     /// Opens an app-originated `app.reveal.begin` request (60-second awake
-    /// TTL).
+    /// TTL), evicting the oldest app-originated reveal stage if at cap.
     pub fn open_app_reveal(&mut self, spec: RevealRequestSpec, now: &Now) -> PendingId {
         self.expire(now);
+        while self
+            .pending_reveals
+            .values()
+            .filter(|p| p.spec.requester.is_none())
+            .count()
+            >= MAX_APP_REVEAL_STAGES
+        {
+            let Some(oldest) = self
+                .pending_reveals
+                .values()
+                .filter(|p| p.spec.requester.is_none())
+                .min_by_key(|p| (p.opened, p.id))
+                .map(|p| p.id)
+            else {
+                break;
+            };
+            self.pending_reveals.remove(&oldest);
+        }
         let fp = spec.fingerprint();
         let id = self.fresh_pending_id();
         self.pending_reveals
@@ -1557,7 +1740,7 @@ impl GrantStore {
             + self
                 .pending_reveals
                 .values()
-                .filter(|p| !p.expired(now))
+                .filter(|p| !p.expired(now) && p.spec.requester.is_some())
                 .count()
     }
 

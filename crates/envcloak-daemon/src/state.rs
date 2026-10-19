@@ -56,7 +56,7 @@ use envcloak_ipc::view::{
     Integrity as IntegrityView, KeychainAnchorState, LockReason, LockView, RecoveredView,
     StatusView, UnlockedView, VaultState, VaultView,
 };
-use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now, ProcessInstance};
+use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now, ProcessInstance, StandingStore};
 
 use crate::anchor::{AnchorError, AnchorStore, KeychainAnchorStore};
 
@@ -64,6 +64,7 @@ use crate::audit::{AuditEvent, AuditLog, RequestAudit};
 use crate::clock::{Clocks, now_of};
 use crate::crowded::Crowded;
 use crate::lock::{LockTimer, Reading};
+use crate::policy_epoch::{EpochState, PolicyEpoch, SidecarState};
 
 /// The vault as the daemon holds it.
 pub enum Slot {
@@ -135,9 +136,23 @@ pub(crate) const PASTE_STAGE_TTL: Duration = Duration::from_secs(120);
 /// Maximum concurrent in-flight `app.paste` stages.
 const MAX_PASTE_STAGES: usize = 64;
 
-/// Maximum remembered single-use nonces for `app.unlocker.add` and
-/// `app.unlocker.remove`.
-const MAX_USED_WRITE_NONCES: usize = 256;
+/// Kind of unlocker write target issued by `app.items.target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockerWriteKind {
+    Add,
+    Remove,
+}
+
+/// A single-use target and daemon-generated 32-byte nonce for
+/// `app.unlocker.add` and `app.unlocker.remove` (M3-14).
+#[derive(Debug)]
+pub(crate) struct UnlockerWriteTarget {
+    pub(crate) target: envcloak_policy::PendingId,
+    pub(crate) kind: UnlockerWriteKind,
+    pub(crate) nonce: [u8; 32],
+    pub(crate) vault_id: envcloak_core::crypto::VaultId,
+    pub(crate) opened_awake: Duration,
+}
 
 /// A single-use challenge and daemon ephemeral X25519 key for `app.unlock`
 /// (SPEC §5 "Unlock flow" step 2).
@@ -189,6 +204,9 @@ pub struct State {
     generation: u64,
     failed_unlocks: u32,
     grants: GrantStore,
+    standing: StandingStore,
+    epoch_state: EpochState,
+    standing_generation_floor: u64,
     limiter: AttemptLimiter,
     audit: AuditLog,
     /// The head of a log closed while a proof had the vault out: saved in
@@ -207,11 +225,11 @@ pub struct State {
     se_challenges: Vec<SeUnlockChallenge>,
     /// Single-use item write targets (`app.items.target`).
     write_targets: Vec<WriteTarget>,
+    /// Single-use unlocker write targets (`app.items.target` with
+    /// `"unlocker:add"` or `"unlocker:remove"`).
+    unlocker_targets: Vec<UnlockerWriteTarget>,
     /// Single-use paste stages (`app.paste.begin`, `app.paste.inspect`).
     paste_stages: Vec<PasteStage>,
-    /// Single-use nonces consumed by `app.unlocker.add` and
-    /// `app.unlocker.remove`.
-    used_write_nonces: Vec<[u8; 32]>,
     /// Keychain rollback anchor store (M3-16).
     anchor_store: Arc<dyn AnchorStore>,
     /// Current keychain rollback anchor status reported in `status.vault`.
@@ -239,6 +257,9 @@ impl State {
             generation: 0,
             failed_unlocks: 0,
             grants: GrantStore::new(),
+            standing: StandingStore::new(),
+            epoch_state: EpochState::Verified,
+            standing_generation_floor: 0,
             limiter: AttemptLimiter::new(),
             audit: AuditLog::default(),
             unsaved_head: None,
@@ -249,8 +270,8 @@ impl State {
             backups: crate::backups::Registry::default(),
             se_challenges: Vec::new(),
             write_targets: Vec::new(),
+            unlocker_targets: Vec::new(),
             paste_stages: Vec::new(),
-            used_write_nonces: Vec::new(),
             anchor_store,
             keychain_anchor,
             anchored_vaults: BTreeSet::new(),
@@ -289,6 +310,51 @@ impl State {
     /// The grants and pending requests.
     pub fn grants(&mut self) -> &mut GrantStore {
         &mut self.grants
+    }
+
+    /// The standing approvals.
+    pub fn standing(&self) -> &StandingStore {
+        &self.standing
+    }
+
+    /// Mutable access to standing approvals.
+    pub fn standing_mut(&mut self) -> &mut StandingStore {
+        &mut self.standing
+    }
+
+    /// Current policy-epoch verification state, refreshed against the
+    /// on-disk sidecar while unlocked.
+    pub fn epoch_state(&mut self) -> EpochState {
+        if self.epoch_state == EpochState::Verified
+            && let Slot::Unlocked(v) = &self.slot
+        {
+            match v.header() {
+                Ok(h) => {
+                    self.epoch_state = PolicyEpoch::new(v.vault_id().0, &self.paths.data_dir)
+                        .verify_live(h.standing_set);
+                }
+                Err(_) => {
+                    self.epoch_state = EpochState::Unverified;
+                }
+            }
+        }
+        self.epoch_state
+    }
+
+    /// Sets the policy-epoch verification state.
+    pub fn set_epoch_state(&mut self, state: EpochState) {
+        self.epoch_state = state;
+    }
+
+    /// Highest standing-set generation observed for the currently unlocked
+    /// vault or its `<data>/policy-epoch` sidecar.
+    pub fn standing_generation_floor(&self) -> u64 {
+        self.standing_generation_floor
+    }
+
+    /// Raises the standing-set generation floor to at least `generation`.
+    pub fn raise_standing_generation_floor(&mut self, generation: u64) {
+        self.standing_generation_floor = self.standing_generation_floor.max(generation);
     }
 
     /// Backups v2 in progress and restore leases.
@@ -426,11 +492,14 @@ impl State {
         // request (SPEC §5 "Lock"), every backup v2 in progress and every
         // restore lease.
         self.grants.on_lock();
+        self.standing.clear();
+        self.epoch_state = EpochState::Verified;
+        self.standing_generation_floor = 0;
         self.backups.on_lock();
         self.se_challenges.clear();
         self.write_targets.clear();
+        self.unlocker_targets.clear();
         self.paste_stages.clear();
-        self.used_write_nonces.clear();
         let recorded = matches!(self.slot, Slot::Unlocked(_))
             || (matches!(self.slot, Slot::Busy) && reason != LockReason::Idle);
         if recorded {
@@ -551,6 +620,8 @@ impl State {
     pub(crate) fn prune_app_stages(&mut self, awake: Duration) {
         self.write_targets
             .retain(|t| awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL);
+        self.unlocker_targets
+            .retain(|t| awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL);
         self.paste_stages
             .retain(|s| awake.saturating_sub(s.opened_awake) < PASTE_STAGE_TTL);
     }
@@ -590,11 +661,14 @@ impl State {
         }
     }
 
-    /// Allocates a fresh `PendingId` not currently in use by `write_targets`.
+    /// Allocates a fresh `PendingId` not currently in use by `write_targets`
+    /// or `unlocker_targets`.
     pub(crate) fn fresh_write_target_id(&self) -> envcloak_policy::PendingId {
         loop {
             let id = envcloak_policy::PendingId::generate();
-            if !self.write_targets.iter().any(|t| t.target == id) {
+            if !self.write_targets.iter().any(|t| t.target == id)
+                && !self.unlocker_targets.iter().any(|t| t.target == id)
+            {
                 break id;
             }
         }
@@ -703,17 +777,46 @@ impl State {
             .and_then(|mut s| s.staged_secret.take())
     }
 
-    /// Records a single-use nonce for `app.unlocker.add` or
-    /// `app.unlocker.remove`. Returns `false` if the nonce was already used.
-    pub(crate) fn record_write_nonce(&mut self, nonce: [u8; 32]) -> bool {
-        if self.used_write_nonces.contains(&nonce) {
-            return false;
+    /// Allocates and stores a single-use `UnlockerWriteTarget` for
+    /// `app.unlocker.add` or `app.unlocker.remove`, evicting the oldest if at
+    /// cap.
+    pub(crate) fn open_unlocker_write_target(
+        &mut self,
+        kind: UnlockerWriteKind,
+        nonce: [u8; 32],
+        vault_id: envcloak_core::crypto::VaultId,
+        awake: Duration,
+    ) -> envcloak_policy::PendingId {
+        self.prune_app_stages(awake);
+        let target = self.fresh_write_target_id();
+        if self.unlocker_targets.len() >= MAX_WRITE_TARGETS {
+            self.unlocker_targets.remove(0);
         }
-        if self.used_write_nonces.len() >= MAX_USED_WRITE_NONCES {
-            self.used_write_nonces.remove(0);
-        }
-        self.used_write_nonces.push(nonce);
-        true
+        self.unlocker_targets.push(UnlockerWriteTarget {
+            target,
+            kind,
+            nonce,
+            vault_id,
+            opened_awake: awake,
+        });
+        target
+    }
+
+    /// Atomically consumes a live single-use `UnlockerWriteTarget` matching
+    /// `(nonce, kind)` if still within `WRITE_TARGET_TTL` on the awake clock.
+    pub(crate) fn take_unlocker_write_target(
+        &mut self,
+        nonce: &[u8; 32],
+        kind: UnlockerWriteKind,
+        awake: Duration,
+    ) -> Option<UnlockerWriteTarget> {
+        let found = self
+            .unlocker_targets
+            .iter()
+            .position(|t| t.nonce == *nonce)
+            .map(|idx| self.unlocker_targets.remove(idx));
+        self.prune_app_stages(awake);
+        found.filter(|t| t.kind == kind && awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL)
     }
 
     fn se_unlock_failed(&mut self, pid: i32) -> RpcError {
@@ -914,8 +1017,7 @@ impl State {
                 k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
             });
         }
-        self.anchor_if_due(None);
-        self.sync_anchor();
+        self.anchor_now();
         Ok(env)
     }
 
@@ -955,19 +1057,38 @@ impl State {
                 k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
             });
         }
-        self.anchor_if_due(None);
-        self.sync_anchor();
+        self.anchor_now();
         Ok(())
     }
 
-    /// An unlocked vault: the grant store starts empty at its epochs.
+    /// An unlocked vault: the grant store starts empty at its epochs, and
+    /// standing approvals are loaded and reconciled with `<data>/policy-epoch`.
     fn start_grants(&mut self, v: &Vault) {
         self.grants.on_lock();
         self.write_targets.clear();
+        self.unlocker_targets.clear();
         self.paste_stages.clear();
-        self.used_write_nonces.clear();
         let policy_epoch = v.header().map(|h| h.policy_epoch).unwrap_or(0);
         self.grants.set_epochs(v.epoch(), policy_epoch);
+        match (v.header(), StandingStore::from_vault(v)) {
+            (Ok(h), Ok(store)) => {
+                self.standing = store;
+                let vault_id = v.vault_id().0;
+                let pe = PolicyEpoch::new(vault_id, &self.paths.data_dir);
+                let sidecar = pe.load();
+                let sidecar_gen = match sidecar {
+                    SidecarState::Present(sc) if sc.vault_id == vault_id => sc.generation,
+                    _ => 0,
+                };
+                self.standing_generation_floor = h.standing_set.generation.max(sidecar_gen);
+                self.epoch_state = pe.reconcile(h.standing_set, sidecar);
+            }
+            _ => {
+                self.standing.clear();
+                self.standing_generation_floor = 0;
+                self.epoch_state = EpochState::Unverified;
+            }
+        }
     }
 
     /// Starts `vault create`: there must be no vault.
@@ -1125,13 +1246,27 @@ impl State {
     /// written now when the log is open, queued otherwise (see
     /// [`crate::audit::AuditLog`]).
     pub fn audit(&mut self, e: AuditEvent) {
+        let critical = matches!(
+            e,
+            AuditEvent::Removed { .. }
+                | AuditEvent::RecoveryConfirmed { .. }
+                | AuditEvent::UnlockerAdd { .. }
+                | AuditEvent::UnlockerRemove { .. }
+                | AuditEvent::StandingCreated { .. }
+                | AuditEvent::StandingRevoked { .. }
+                | AuditEvent::StandingConfirmed { .. }
+        );
         if let Some(line) = e.line() {
             log_line!("{line}");
         }
         self.audit_open();
         self.audit.record(e.record());
-        self.anchor_if_due(None);
-        self.sync_anchor();
+        if critical {
+            self.anchor_now();
+        } else {
+            self.anchor_if_due(None);
+            self.sync_anchor();
+        }
     }
 
     /// Writes a delivery's entry durably, before anything is released
@@ -1424,6 +1559,30 @@ impl State {
         }
     }
 
+    /// Immediately saves the current audit head in the unlocked vault's header
+    /// and syncs the keychain rollback anchor (SPEC §5 "Integrity", D3-12).
+    pub fn anchor_now(&mut self) {
+        let saved = match &mut self.slot {
+            Slot::Unlocked(v) if v.integrity() == Integrity::Ok => {
+                if let Some(head) = self.audit.head() {
+                    if v.header().ok().and_then(|h| h.audit_head) != Some(head) {
+                        Some((self.save_head)(v, head))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(res) = saved {
+            let ok = res.is_ok();
+            let _ = self.audit.anchor_saved(ok, None);
+        }
+        self.sync_anchor();
+    }
+
     /// Compares `v` at unlock against the stored keychain rollback anchor
     /// (SPEC §5 "Keychain rollback anchor", D3-12).
     fn check_anchor_at_unlock(&mut self, pid: i32, v: &mut Vault) -> Option<AuditEvent> {
@@ -1460,8 +1619,10 @@ impl State {
             }
             Ok(None) => {
                 let had_anchor = self.anchored_vaults.contains(&vault_id.0)
-                    || v.header().is_ok_and(|h| h.audit_head.is_some())
+                    || v.header()
+                        .is_ok_and(|h| h.write_counter > 1 || h.audit_head.is_some())
                     || v.se_unlockers().next().is_some();
+                let mut wrote_ok = false;
                 if v.integrity() == Integrity::Ok
                     && let Ok(anchor) = v.anchor()
                 {
@@ -1469,6 +1630,7 @@ impl State {
                         Ok(()) => {
                             self.anchored_vaults.insert(vault_id.0);
                             self.last_synced_anchor = Some(anchor);
+                            wrote_ok = true;
                         }
                         Err(AnchorError::Unavailable) => {
                             self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1489,9 +1651,21 @@ impl State {
                         reason: "keychain_anchor_missing",
                     })
                 } else {
-                    self.keychain_anchor = KeychainAnchorState::Matched;
+                    if wrote_ok {
+                        self.keychain_anchor = KeychainAnchorState::Matched;
+                    }
                     None
                 }
+            }
+            Err(AnchorError::Corrupt) => {
+                let _ = v.mark_tampered(TamperKind::RolledBack);
+                self.anchored_vaults.insert(vault_id.0);
+                self.keychain_anchor = KeychainAnchorState::Ahead;
+                Some(AuditEvent::KeychainAnchorMismatch {
+                    pid,
+                    outcome: "tampered",
+                    reason: "rolled_back",
+                })
             }
             Err(AnchorError::Unavailable) => {
                 self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1524,7 +1698,9 @@ impl State {
             Ok(()) => {
                 self.anchored_vaults.insert(v.vault_id().0);
                 self.last_synced_anchor = Some(anchor);
-                self.keychain_anchor = KeychainAnchorState::Matched;
+                if self.keychain_anchor != KeychainAnchorState::Missing {
+                    self.keychain_anchor = KeychainAnchorState::Matched;
+                }
             }
             Err(AnchorError::Unavailable) => {
                 self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1559,7 +1735,9 @@ impl State {
             Ok(()) => {
                 self.anchored_vaults.insert(vault_id.0);
                 self.last_synced_anchor = Some(anchor);
-                self.keychain_anchor = KeychainAnchorState::Matched;
+                if self.keychain_anchor != KeychainAnchorState::Missing {
+                    self.keychain_anchor = KeychainAnchorState::Matched;
+                }
             }
             Err(AnchorError::Unavailable) => {
                 self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1589,14 +1767,39 @@ impl State {
         Ok(view)
     }
 
-    /// The grants, pending requests and limiter parts of `status`.
+    /// The grants, standing approvals, pending requests and limiter parts
+    /// of `status`.
     pub fn approvals(&self, at: &Now) -> ApprovalsView {
         let (grants, pending) = self.grants.counts(at);
+        let standing = match &self.slot {
+            Slot::Unlocked(v) => self
+                .standing
+                .records(at.wall)
+                .filter(|r| r.items_are_test(v.items()))
+                .count(),
+            _ => 0,
+        };
+        let policy_epoch_unverified = match &self.slot {
+            Slot::Unlocked(v) => {
+                if self.epoch_state == EpochState::Unverified {
+                    true
+                } else if let Ok(h) = v.header() {
+                    PolicyEpoch::new(v.vault_id().0, &self.paths.data_dir)
+                        .verify_live(h.standing_set)
+                        == EpochState::Unverified
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
         ApprovalsView {
             grants: u32::try_from(grants).unwrap_or(u32::MAX),
+            standing: u32::try_from(standing).unwrap_or(u32::MAX),
             pending: u32::try_from(pending).unwrap_or(u32::MAX),
             proof_failures: self.limiter.failures(),
             proof_wait_secs: self.limiter.wait_remaining(at).as_secs(),
+            policy_epoch_unverified,
         }
     }
 }
@@ -1963,6 +2166,7 @@ mod tests {
                 uses: Uses::Session,
                 ttl_secs: DEFAULT_TTL.as_secs(),
                 live: Vec::new(),
+                standing: None,
             };
             let vault = metas(&first);
             let digest = statement_digest(

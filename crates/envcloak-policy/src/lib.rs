@@ -52,6 +52,7 @@ mod manifest;
 mod names;
 mod pending;
 mod project;
+pub mod standing;
 mod statement;
 
 pub use agents::{
@@ -75,9 +76,9 @@ pub use flood::{
 };
 pub use grants::{
     AccessRequest, ApprovalOptions, ApprovalProof, ApproveError, BoundRef, DEFAULT_TTL, Decision,
-    DenyOutcome, DenyReason, Grant, GrantBinding, GrantId, GrantStore, MAX_AGENT_TTL, MAX_GRANTS,
-    MAX_TERMINAL_TTL, ManagedRequest, NoSuchRequest, Now, OptionsError, PendingCap, ProofKind,
-    RevokeSelector, Uses,
+    DenyOutcome, DenyReason, Grant, GrantBinding, GrantId, GrantStore, MAX_AGENT_TTL,
+    MAX_APP_REVEAL_STAGES, MAX_GRANTS, MAX_TERMINAL_TTL, ManagedRequest, NoSuchRequest, Now,
+    OptionsError, PendingCap, ProofKind, RevokeSelector, Uses,
 };
 pub use limiter::{AttemptLimiter, FIRST_WAIT, FREE_ATTEMPTS, MAX_WAIT};
 pub use manifest::{
@@ -94,11 +95,17 @@ pub use pending::{
 pub use project::{
     MANIFEST_NAME, Project, ProjectIdentity, find_manifest, load_project, project_identity,
 };
+pub use standing::{
+    AGENTS_DIGESTS_TOML, MAX_STANDING_TTL, STANDING_CONFIRM_DOMAIN, StandingError, StandingId,
+    StandingRecord, StandingRecordSummary, StandingRevokeSelector, StandingStore,
+    canonical_confirm_statement, check_test_bindings, confirm_statement_digest, describe_standing,
+    extract_code_identity, extract_launch, recognized_release, render_confirm_statement,
+};
 pub use statement::{
     BindingSummary, HIDDEN, ManagedSummary, PendingDescriptor, ProcessSummary, ProjectSummary,
     Proposal, RENDER_LIMIT, REVEAL_STATEMENT_DOMAIN, RevealDescriptor, STATEMENT_DOMAIN,
-    SubjectSummary, UNLOCKER_STATEMENT_DOMAIN, UnlockerAddDescriptor, UnlockerRequestKind,
-    UnlockerTarget, WRITE_STATEMENT_DOMAIN, WriteAction, WriteStatement,
+    StandingSummary, SubjectSummary, UNLOCKER_STATEMENT_DOMAIN, UnlockerAddDescriptor,
+    UnlockerRequestKind, UnlockerTarget, WRITE_STATEMENT_DOMAIN, WriteAction, WriteStatement,
     canonical_reveal_statement, canonical_statement, canonical_unlocker_statement,
     canonical_write_statement, display_escaped, escape_for_display, live_guarded, proposals,
     proposed_for, render_reveal_statement, render_statement, render_statement_with,

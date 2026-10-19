@@ -76,7 +76,14 @@ views!(
     BackupEntryView,
     ScanMatchView,
     MarkedView,
+    StandingListView,
+    StandingRevokedView,
+    StandingConfirmedView,
 );
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
 
 /// What [`StatusView::sanitize`] puts in place of a version that is not
 /// one a daemon would send.
@@ -84,10 +91,6 @@ pub const UNRECOGNIZED_VERSION: &str = "unrecognized";
 /// What [`StatusView::sanitize`] puts in place of a reason that is not one
 /// of [`REASONS`].
 pub const UNKNOWN_REASON: &str = "unknown";
-
-fn is_zero_u32(n: &u32) -> bool {
-    *n == 0
-}
 
 /// `status`: the daemon, its vault, its lock, and its grants and proofs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +305,13 @@ pub struct ApprovalsView {
     pub grants: u32,
     /// Requests waiting for an approval.
     pub pending: u32,
+    /// Standing approvals in the vault.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub standing: u32,
+    /// Standing approvals are paused (`policy_epoch_unverified`) until
+    /// `envcloak standing confirm`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub policy_epoch_unverified: bool,
     /// Failed proofs (wrong passphrases) since the last success.
     pub proof_failures: u32,
     /// Seconds before the next proof is admitted.
@@ -448,7 +458,8 @@ pub struct PendingView {
     pub more_bindings: u64,
 }
 
-/// `approve`: the grant created.
+/// `approve`: the grant created, and the standing approval when
+/// `--standing` was given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovedView {
@@ -456,6 +467,44 @@ pub struct ApprovedView {
     pub grant: String,
     /// The grant's length, in seconds.
     pub expires_in_secs: u64,
+    /// 26 Crockford base32 characters, when `--standing` was given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing: Option<String>,
+    /// The standing approval's length, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_expires_in_secs: Option<u64>,
+}
+
+/// One standing approval (SPEC §10b; M2 plan D-10).
+pub use envcloak_policy::StandingRecordSummary as StandingView;
+
+/// `standing.list`: the standing approvals in the vault, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingListView {
+    pub standing: Vec<StandingView>,
+    /// Standing approvals are paused (`policy_epoch_unverified`) until
+    /// `envcloak standing confirm`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub policy_epoch_unverified: bool,
+}
+
+/// `standing.revoke`: how many standing approvals and derived session
+/// grants ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingRevokedView {
+    pub revoked: u64,
+    pub grants_ended: u64,
+}
+
+/// `standing.confirm`: the policy record was re-sealed over the standing
+/// approvals in the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingConfirmedView {
+    pub records: u64,
+    pub generation: u64,
 }
 
 /// `deny`: the request was refused.

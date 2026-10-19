@@ -742,6 +742,60 @@ impl Client {
         })
     }
 
+    /// `standing.list`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn standing_list(&mut self) -> Result<crate::view::StandingListView, ClientError> {
+        self.call::<crate::proto::StandingList>(&NoParams {})
+    }
+
+    /// `standing.revoke`.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn standing_revoke(
+        &mut self,
+        p: &crate::proto::StandingRevokeParams,
+    ) -> Result<crate::view::StandingRevokedView, ClientError> {
+        self.call::<crate::proto::StandingRevoke>(p)
+    }
+
+    /// `standing.confirm` with the passphrase proof.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn standing_confirm(
+        &mut self,
+        digest: &[u8; 32],
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<crate::view::StandingConfirmedView, ClientError> {
+        self.call::<crate::proto::StandingConfirm>(&crate::proto::StandingConfirmParams {
+            digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            passphrase: Some(WireSecret::new(passphrase)),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `standing.confirm` without the passphrase: a pre-prompt check that
+    /// verifies the caller may give a proof and that `digest` matches the
+    /// current standing set.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn standing_confirm_check(
+        &mut self,
+        digest: &[u8; 32],
+        claims: &[String],
+    ) -> Result<crate::view::StandingConfirmedView, ClientError> {
+        self.call::<crate::proto::StandingConfirm>(&crate::proto::StandingConfirmParams {
+            digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
+            passphrase: None,
+            claims: claims.to_vec(),
+        })
+    }
+
     /// `audit.verify`.
     ///
     /// # Errors
