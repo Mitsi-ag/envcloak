@@ -614,12 +614,13 @@ pub fn scan_transcript_sources(
         |root, rel, source, opened, _attempts, report| {
             let path = root.path().join(rel);
             let obj_id = crate::sources::ObjectIdentity::of(&opened.1);
+            let single_link = crate::FileStamp::of(&opened.1).nlink == 1;
             let format = crate::sources::effective_format(rel, source.format);
-            if let Some(previous) = scanned
-                .get(&path)
-                .copied()
-                .or_else(|| scanned_ids.get(&obj_id).copied())
-            {
+            if let Some(previous) = scanned.get(&path).copied().or_else(|| {
+                single_link
+                    .then(|| scanned_ids.get(&obj_id).copied())
+                    .flatten()
+            }) {
                 if previous != format && matches!(format, ConfigFormat::Json | ConfigFormat::Jsonl)
                 {
                     report.issue(path, "conflicting_formats");
@@ -627,7 +628,9 @@ pub fn scan_transcript_sources(
                 return;
             }
             scanned.insert(path.clone(), format);
-            scanned_ids.insert(obj_id, format);
+            if single_link {
+                scanned_ids.insert(obj_id, format);
+            }
             report.transcript_formats.insert(path, format);
             scan_file(
                 root,

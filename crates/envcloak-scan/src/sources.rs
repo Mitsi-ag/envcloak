@@ -1748,7 +1748,7 @@ fn process(
         .get(&actual_id)
         .is_some_and(|state| match state {
             ReadState::Closed => true,
-            ReadState::Read(formats) => formats.contains(&format),
+            ReadState::Read(formats) => m.nlink() == 1 && formats.contains(&format),
         })
     {
         return;
