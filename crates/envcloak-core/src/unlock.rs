@@ -154,6 +154,7 @@ fn missing(kind: UnlockerKind) -> VaultError {
     match kind {
         UnlockerKind::Passphrase => VaultErrorKind::NoPassphrase.into(),
         UnlockerKind::RecoveryKit => VaultErrorKind::NoRecoveryKit.into(),
+        UnlockerKind::SecureEnclave => VaultErrorKind::UnknownUnlocker.into(),
     }
 }
 

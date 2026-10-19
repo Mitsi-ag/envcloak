@@ -40,15 +40,18 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use envcloak_core::crypto::{SeEnrolledUnder, UnlockerId, VaultId};
 use envcloak_core::vault::{Classification, ItemMeta};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::effective::SubjectKind;
-use crate::evidence::ProcessInstance;
+use crate::evidence::{ProcessInstance, SubjectEvidence};
 use crate::grants::{AccessRequest, Now};
 use crate::ids;
 use crate::statement::{
-    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, SubjectSummary, proposals,
+    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, SubjectSummary,
+    UnlockerAddDescriptor, UnlockerRequestKind, proposals,
 };
 
 /// How long a pending request waits for an approval.
@@ -441,5 +444,163 @@ fn describe(
                 strength: m.strength.map(str::to_owned),
                 origin: m.origin.clone(),
             }),
+    }
+}
+
+/// A request to add a Secure Enclave unlocker, as the daemon built it from
+/// `app.unlocker.enroll.begin`, the vault and the caller's verified code
+/// identity (SPEC §10b, D3-08).
+#[derive(Debug, Clone)]
+pub struct UnlockerAddRequest {
+    pub subject: SubjectEvidence,
+    pub vault_id: VaultId,
+    pub unlock_pub: [u8; 65],
+    pub approve_pub: [u8; 65],
+    pub label: String,
+    pub enrolled_under: SeEnrolledUnder,
+}
+
+impl UnlockerAddRequest {
+    /// The request's identity for deduplication and flood control.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let root = self.subject.root();
+        let mut h = Sha256::new();
+        let mut str = |s: &[u8]| {
+            h.update(u32::try_from(s.len()).unwrap_or(u32::MAX).to_be_bytes());
+            h.update(s);
+        };
+        str(b"unlocker_add");
+        str(&root.pid.to_be_bytes());
+        str(&root.start_time.raw().to_be_bytes());
+        str(&self.vault_id.0);
+        str(&self.unlock_pub);
+        str(&self.approve_pub);
+        str(self.label.as_bytes());
+        str(self.enrolled_under.team_id.as_bytes());
+        str(self.enrolled_under.signing_id.as_bytes());
+        h.finalize().into()
+    }
+}
+
+/// A pending `unlocker_add` request waiting for passphrase approval.
+#[derive(Debug, Clone)]
+pub struct PendingUnlockerAdd {
+    pub id: PendingId,
+    pub nonce: [u8; 32],
+    pub request: UnlockerAddRequest,
+    pub descriptor: UnlockerAddDescriptor,
+    pub fingerprint: [u8; 32],
+    pub opened: Duration,
+}
+
+impl PendingUnlockerAdd {
+    /// Opens `request` as pending request `id` at `now`.
+    pub(crate) fn open(
+        id: PendingId,
+        request: UnlockerAddRequest,
+        fingerprint: [u8; 32],
+        now: &Now,
+    ) -> Self {
+        let nonce: [u8; 32] = ids::random();
+        let unlock_pub_sha256 = hex(&Sha256::digest(request.unlock_pub));
+        let approve_pub_sha256 = hex(&Sha256::digest(request.approve_pub));
+        let created_secs = now
+            .wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let descriptor = UnlockerAddDescriptor {
+            kind: UnlockerRequestKind::UnlockerAdd,
+            request: id.to_string(),
+            nonce: hex(&nonce),
+            vault_id: hex(&request.vault_id.0),
+            label: request.label.clone(),
+            unlock_pub_sha256,
+            approve_pub_sha256,
+            team_id: request.enrolled_under.team_id.clone(),
+            signing_id: request.enrolled_under.signing_id.clone(),
+            created_secs,
+            expires_in_secs: PENDING_TTL.as_secs(),
+        };
+        PendingUnlockerAdd {
+            id,
+            nonce,
+            request,
+            descriptor,
+            fingerprint,
+            opened: now.awake,
+        }
+    }
+
+    /// Whether the request has expired at `now`.
+    pub fn expired(&self, now: &Now) -> bool {
+        now.awake.saturating_sub(self.opened) >= PENDING_TTL
+    }
+
+    /// How long it has waited at `now`, in awake time.
+    pub fn age(&self, now: &Now) -> Duration {
+        now.awake.saturating_sub(self.opened)
+    }
+}
+
+/// How a pending `unlocker_add` request stands, as `app.unlocker.enroll`
+/// answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnlockerEnrollOutcome {
+    Pending,
+    Enrolled(UnlockerId),
+    Denied,
+    Expired,
+}
+
+#[derive(Debug, Clone)]
+struct EndedUnlocker {
+    outcome: UnlockerEnrollOutcome,
+    at: Duration,
+}
+
+/// Outcomes of `unlocker_add` requests that ended, for `app.unlocker.enroll`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnlockerOutcomes {
+    ended: BTreeMap<PendingId, EndedUnlocker>,
+}
+
+impl UnlockerOutcomes {
+    pub(crate) fn record(&mut self, id: PendingId, outcome: UnlockerEnrollOutcome, now: &Now) {
+        self.expire(now);
+        if self.ended.len() >= MAX_OUTCOMES && !self.ended.contains_key(&id) {
+            let oldest = self
+                .ended
+                .iter()
+                .min_by_key(|(_, e)| e.at)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.ended.remove(&oldest);
+            }
+        }
+        self.ended.insert(
+            id,
+            EndedUnlocker {
+                outcome,
+                at: now.awake,
+            },
+        );
+    }
+
+    pub(crate) fn expire(&mut self, now: &Now) {
+        self.ended
+            .retain(|_, e| now.awake.saturating_sub(e.at) < OUTCOME_TTL);
+    }
+
+    pub(crate) fn get(&self, id: &PendingId) -> Option<UnlockerEnrollOutcome> {
+        self.ended.get(id).map(|e| e.outcome)
+    }
+
+    pub(crate) fn contains(&self, id: &PendingId) -> bool {
+        self.ended.contains_key(id)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ended.clear();
     }
 }

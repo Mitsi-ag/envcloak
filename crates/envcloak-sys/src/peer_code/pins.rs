@@ -36,9 +36,11 @@ fn requirement(identifier: &str) -> Result<Option<PinnedRequirement>, PeerCodeEr
         if hash.len() != 40 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(PeerCodeError::Configuration);
         }
-        return Ok(Some(PinnedRequirement(format!(
-            "identifier \"{identifier}\" and certificate leaf = H\"{hash}\""
-        ))));
+        return Ok(Some(PinnedRequirement {
+            requirement: format!("identifier \"{identifier}\" and certificate leaf = H\"{hash}\""),
+            team_id: hash[..10].to_ascii_uppercase(),
+            signing_id: identifier.to_owned(),
+        }));
     }
     production_requirement(identifier, TEAM_ID)
 }
@@ -55,9 +57,13 @@ fn production_requirement(
                     .bytes()
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) =>
         {
-            Ok(Some(PinnedRequirement(format!(
-                "identifier \"{identifier}\" and anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
-            ))))
+            Ok(Some(PinnedRequirement {
+                requirement: format!(
+                    "identifier \"{identifier}\" and anchor apple generic and certificate leaf[subject.OU] = \"{team}\""
+                ),
+                team_id: team.to_owned(),
+                signing_id: identifier.to_owned(),
+            }))
         }
         Some(_) => Err(PeerCodeError::Configuration),
     }
@@ -83,7 +89,9 @@ mod tests {
             let requirement = production_requirement(identifier, Some("AB12CD34EF"))
                 .expect("valid test Team ID")
                 .expect("pinned requirement");
-            let parsed: Result<SecRequirement, _> = requirement.0.parse();
+            assert_eq!(requirement.team_id(), "AB12CD34EF");
+            assert_eq!(requirement.signing_id(), identifier);
+            let parsed: Result<SecRequirement, _> = requirement.requirement.parse();
             assert!(
                 parsed.is_ok(),
                 "Security.framework rejected the production syntax"

@@ -78,6 +78,8 @@ chacha20poly1305 = { version = "=0.11.0", default-features = false, features = [
 getrandom = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
+hpke = { version = "=0.14.1", default-features = false, features = ["alloc", "getrandom", "x25519", "nistp", "aes", "chacha"] }
+p256 = { version = "=0.14.0", default-features = false, features = ["ecdsa"] }
 poly1305 = { version = "=0.9.1", default-features = false, features = ["zeroize"] }
 sha2 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }
 sha1 = { version = "=0.11.0", default-features = false, features = ["zeroize"] }

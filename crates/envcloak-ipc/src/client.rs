@@ -51,10 +51,10 @@ use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
 use crate::proto::{
     self, AddParams, Approve, ApproveParams, AuditVerify, CheckParams, Deny, GrantsList,
     GrantsRevoke, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
-    ItemsTarget, ListParams, Lock, Method, NoParams, PendingGet, PendingGetParams, RemoveParams,
-    RequestParams, ResponseError, RevokeParams, RotateParams, RpcError, RunAnswer, RunRequest,
-    RunRequestParams, SlugParams, Status, TargetParams, Unlock, UnlockParams, VaultCreate,
-    VaultCreateParams,
+    ItemsTarget, ListParams, Lock, Method, NoParams, PendingGet, PendingGetOutput,
+    PendingGetParams, RemoveParams, RequestParams, ResponseError, RevokeParams, RotateParams,
+    RpcError, RunAnswer, RunRequest, RunRequestParams, SlugParams, Status, TargetParams, Unlock,
+    UnlockParams, VaultCreate, VaultCreateParams,
 };
 use crate::proto::{
     BackupBegin, BackupBeginParams, BackupChunk, BackupCommit, BackupIdParams, BackupList,
@@ -581,16 +581,33 @@ impl Client {
         }
     }
 
-    /// `pending.get` for request `id`, with the caller's claims (the
+    /// `pending.get` for a run request `id`, with the caller's claims (the
     /// daemon serves it only to a caller that may give a proof).
     ///
     /// # Errors
-    /// As [`Client::call`].
+    /// As [`Client::call`], and [`ClientError::Protocol`] when `id` is an
+    /// `unlocker_add` request rather than a run request.
     pub fn pending_get(
         &mut self,
         id: &str,
         claims: &[String],
     ) -> Result<PendingDescriptor, ClientError> {
+        match self.pending_get_any(id, claims)? {
+            PendingGetOutput::Run(d) => Ok(d),
+            PendingGetOutput::UnlockerAdd(_) => Err(ClientError::Protocol),
+        }
+    }
+
+    /// `pending.get` for request `id`, returning either a run request's
+    /// [`PendingDescriptor`] or an `unlocker_add` request's descriptor.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn pending_get_any(
+        &mut self,
+        id: &str,
+        claims: &[String],
+    ) -> Result<PendingGetOutput, ClientError> {
         self.call::<PendingGet>(&PendingGetParams {
             request: id.to_owned(),
             claims: claims.to_vec(),
@@ -1286,5 +1303,59 @@ impl Client {
         after: Option<crate::view::ProjectCursor>,
     ) -> Result<crate::view::ProjectsView, ClientError> {
         self.call::<crate::proto::ProjectsList>(&crate::proto::ProjectsListParams { after })
+    }
+
+    /// `app.unlock.begin`: starts a Secure Enclave unlock.
+    pub fn app_unlock_begin(
+        &mut self,
+        unlocker_id: Option<&str>,
+        claims: &[String],
+    ) -> Result<crate::app::AppUnlockBeginOutput, ClientError> {
+        self.call::<crate::app::AppUnlockBegin>(&crate::app::AppUnlockBeginParams {
+            unlocker_id: unlocker_id.map(str::to_owned),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.unlock`: completes a Secure Enclave unlock with the HPKE-sealed VMK.
+    pub fn app_unlock(
+        &mut self,
+        request_id: &str,
+        sealed: &str,
+        claims: &[String],
+    ) -> Result<UnlockedView, ClientError> {
+        self.call::<crate::app::AppUnlock>(&crate::app::AppUnlockParams {
+            request_id: request_id.to_owned(),
+            sealed: sealed.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.unlocker.enroll.begin`: opens a pending `unlocker_add` request.
+    pub fn app_unlocker_enroll_begin(
+        &mut self,
+        unlock_pub: &str,
+        approve_pub: &str,
+        label: &str,
+        claims: &[String],
+    ) -> Result<crate::app::AppUnlockerEnrollBeginOutput, ClientError> {
+        self.call::<crate::app::AppUnlockerEnrollBegin>(&crate::app::AppUnlockerEnrollBeginParams {
+            unlock_pub: unlock_pub.to_owned(),
+            approve_pub: approve_pub.to_owned(),
+            label: label.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.unlocker.enroll`: polls the outcome of a pending `unlocker_add` request.
+    pub fn app_unlocker_enroll(
+        &mut self,
+        request: &str,
+        claims: &[String],
+    ) -> Result<crate::app::AppUnlockerEnrollOutput, ClientError> {
+        self.call::<crate::app::AppUnlockerEnroll>(&crate::app::AppUnlockerEnrollParams {
+            request: request.to_owned(),
+            claims: claims.to_vec(),
+        })
     }
 }

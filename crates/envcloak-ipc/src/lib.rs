@@ -20,6 +20,7 @@
 //! that present a same-uid server as a foreign one. Release binaries never
 //! enable it.
 
+pub mod app;
 pub mod client;
 pub mod control;
 pub mod frame;

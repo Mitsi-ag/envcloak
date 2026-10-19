@@ -112,6 +112,22 @@ pub enum BeginUnlock {
 /// How the audit log's head is saved in the vault's header.
 type SaveHead = fn(&mut Vault, AuditHead) -> Result<(), VaultError>;
 
+/// How long an `app.unlock.begin` challenge and ephemeral key stay valid.
+const SE_UNLOCK_TTL: Duration = Duration::from_secs(60);
+
+/// Maximum concurrent in-flight `app.unlock.begin` challenges.
+const MAX_SE_UNLOCK_CHALLENGES: usize = 64;
+
+/// A single-use challenge and daemon ephemeral X25519 key for `app.unlock`
+/// (SPEC §5 "Unlock flow" step 2).
+#[derive(Debug)]
+struct SeUnlockChallenge {
+    request_id: envcloak_policy::PendingId,
+    challenge: [u8; envcloak_core::crypto::SE_CHALLENGE_LEN],
+    ephemeral: envcloak_core::crypto::SeEphemeralKey,
+    opened_awake: Duration,
+}
+
 /// The daemon's vault state.
 #[derive(Debug)]
 pub struct State {
@@ -136,6 +152,8 @@ pub struct State {
     crowded: Crowded,
     /// Backups v2 in progress and restore leases ([`crate::backups`]).
     backups: crate::backups::Registry,
+    /// Single-use Secure Enclave unlock challenges (`app.unlock.begin`).
+    se_challenges: Vec<SeUnlockChallenge>,
 }
 
 impl State {
@@ -157,6 +175,7 @@ impl State {
             delivery_fault: |_| Ok(()),
             crowded: Crowded::default(),
             backups: crate::backups::Registry::default(),
+            se_challenges: Vec::new(),
         }
     }
 
@@ -298,6 +317,7 @@ impl State {
         // restore lease.
         self.grants.on_lock();
         self.backups.on_lock();
+        self.se_challenges.clear();
         let recorded = matches!(self.slot, Slot::Unlocked(_))
             || (matches!(self.slot, Slot::Busy) && reason != LockReason::Idle);
         if recorded {
@@ -387,6 +407,156 @@ impl State {
                     self.failed_unlocks = self.failed_unlocks.saturating_add(1);
                 }
                 Err(e)
+            }
+        }
+    }
+
+    fn prune_se_challenges(&mut self, awake: Duration) {
+        self.se_challenges
+            .retain(|c| awake.saturating_sub(c.opened_awake) < SE_UNLOCK_TTL);
+    }
+
+    fn se_unlock_failed(&mut self, pid: i32) -> RpcError {
+        self.failed_unlocks = self.failed_unlocks.saturating_add(1);
+        self.audit(AuditEvent::AppUnlockFailed { pid });
+        RpcError::new(ErrorKind::UnlockFailed)
+    }
+
+    /// Starts a Secure Enclave unlock (`app.unlock.begin`, SPEC §5 step 2):
+    /// returns the unlocker's HPKE envelope, a 32-byte random challenge and a
+    /// fresh single-use X25519 daemon public key kept for 60 seconds.
+    pub fn begin_se_unlock(
+        &mut self,
+        unlocker_id: Option<envcloak_core::crypto::UnlockerId>,
+        now: Reading,
+    ) -> Result<envcloak_ipc::app::AppUnlockBeginOutput, RpcError> {
+        self.prune_se_challenges(now.awake);
+        let env = match &self.slot {
+            Slot::Locked(locked) => {
+                let list = locked.se_unlockers().map_err(|e| {
+                    RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(e.kind()))
+                })?;
+                match unlocker_id {
+                    Some(id) => list.into_iter().find(|e| e.unlocker_id() == id),
+                    None => list.into_iter().next(),
+                }
+            }
+            Slot::Unlocked(v) => match unlocker_id {
+                Some(id) => v.se_unlocker(id).cloned(),
+                None => v.se_unlockers().next().cloned(),
+            },
+            Slot::Absent => return Err(RpcError::new(ErrorKind::NoVault)),
+            Slot::Busy => return Err(RpcError::new(ErrorKind::Busy)),
+            Slot::Unavailable(r) => {
+                return Err(RpcError::with_reason(ErrorKind::VaultUnavailable, r));
+            }
+        }
+        .ok_or(RpcError::new(ErrorKind::NoUnlocker))?;
+
+        let request_id = loop {
+            let id = envcloak_policy::PendingId::generate();
+            if !self.se_challenges.iter().any(|c| c.request_id == id) {
+                break id;
+            }
+        };
+        let challenge = envcloak_core::crypto::generate_se_challenge()
+            .map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        let ephemeral = envcloak_core::crypto::SeEphemeralKey::generate()
+            .map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        let daemon_eph_pub = *ephemeral.public_key();
+        if self.se_challenges.len() >= MAX_SE_UNLOCK_CHALLENGES {
+            self.se_challenges.remove(0);
+        }
+        self.se_challenges.push(SeUnlockChallenge {
+            request_id,
+            challenge,
+            ephemeral,
+            opened_awake: now.awake,
+        });
+        let hpke = env.hpke();
+        Ok(envcloak_ipc::app::AppUnlockBeginOutput {
+            request_id: request_id.to_string(),
+            unlocker_id: crate::app::hex_encode(&env.unlocker_id().0),
+            vault_id: crate::app::hex_encode(&env.vault_id().0),
+            epoch: env.epoch(),
+            challenge: crate::app::hex_encode(&challenge),
+            envelope: envcloak_ipc::app::SeEnvelopeView {
+                enc: crate::app::hex_encode(&hpke.enc),
+                ciphertext: crate::app::hex_encode(&hpke.ciphertext),
+            },
+            daemon_eph_pub: crate::app::hex_encode(&daemon_eph_pub),
+        })
+    }
+
+    /// Finishes a Secure Enclave unlock (`app.unlock`, SPEC §5 steps 3 to 4):
+    /// consumes the single-use challenge `request_id`, opens the resealed VMK,
+    /// checks it against the sealed header, derives subkeys and unlocks the
+    /// vault. Any failure increments `failed_unlocks`, records
+    /// `app_unlock_failed`, and returns `unlock_failed`.
+    pub fn finish_se_unlock(
+        &mut self,
+        pid: i32,
+        request_id: envcloak_policy::PendingId,
+        sealed: &[u8; envcloak_core::crypto::SE_RESEAL_LEN],
+        now: Reading,
+    ) -> Result<UnlockedView, RpcError> {
+        match &self.slot {
+            Slot::Absent => return Err(RpcError::new(ErrorKind::NoVault)),
+            Slot::Busy => return Err(RpcError::new(ErrorKind::Busy)),
+            Slot::Unavailable(r) => {
+                return Err(RpcError::with_reason(ErrorKind::VaultUnavailable, r));
+            }
+            Slot::Locked(_) | Slot::Unlocked(_) => {}
+        }
+        let found = self
+            .se_challenges
+            .iter()
+            .position(|c| c.request_id == request_id)
+            .map(|idx| self.se_challenges.remove(idx));
+        self.prune_se_challenges(now.awake);
+        let Some(challenge) =
+            found.filter(|c| now.awake.saturating_sub(c.opened_awake) < SE_UNLOCK_TTL)
+        else {
+            return Err(self.se_unlock_failed(pid));
+        };
+        let req_str = challenge.request_id.to_string();
+        let chal_bytes = challenge.challenge;
+        let Ok(vmk) = challenge.ephemeral.open_vmk(&req_str, &chal_bytes, sealed) else {
+            return Err(self.se_unlock_failed(pid));
+        };
+        if let Slot::Unlocked(v) = &self.slot {
+            if v.verify_vmk(&vmk) {
+                return Ok(unlocked_view(v, true));
+            }
+            return Err(self.se_unlock_failed(pid));
+        }
+        let Slot::Locked(locked) = std::mem::replace(&mut self.slot, Slot::Absent) else {
+            return Err(RpcError::new(ErrorKind::Internal));
+        };
+        match locked.unlock(vmk) {
+            Ok(v) => {
+                let view = unlocked_view(&v, false);
+                self.start_grants(&v);
+                self.slot = Slot::Unlocked(Box::new(v));
+                self.timer.touch(now);
+                self.audit_open();
+                self.audit(AuditEvent::Unlocked {
+                    pid,
+                    created: false,
+                });
+                Ok(view)
+            }
+            Err((locked, e)) => {
+                self.slot = Slot::Locked(locked);
+                match e.kind() {
+                    VaultErrorKind::Crypto(_) | VaultErrorKind::KeyMismatch => {
+                        Err(self.se_unlock_failed(pid))
+                    }
+                    k => Err(RpcError::with_reason(
+                        ErrorKind::VaultUnavailable,
+                        vault_reason(k),
+                    )),
+                }
             }
         }
     }

@@ -20,10 +20,11 @@ pub trait Clocks: Send + Sync {
 
 /// One reading of every clock, for the grant store.
 pub fn now_of(c: &dyn Clocks) -> envcloak_policy::Now {
+    let offset = envcloak_sys::test_clock_offset();
     envcloak_policy::Now {
-        wall: c.wall(),
-        awake: c.awake(),
-        including_sleep: c.including_sleep(),
+        wall: c.wall() + offset,
+        awake: c.awake() + offset,
+        including_sleep: c.including_sleep() + offset,
     }
 }
 

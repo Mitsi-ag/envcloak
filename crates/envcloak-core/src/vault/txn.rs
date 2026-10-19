@@ -13,7 +13,10 @@
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-use crate::crypto::{Envelope, FieldTag, ItemClass, Keyring, Purpose, TableTag, UnlockerId};
+use crate::crypto::{
+    Envelope, FieldTag, ItemClass, Keyring, Purpose, SeUnlockerEnvelope, TableTag, UnlockerId,
+    UnlockerKind,
+};
 use crate::secret::SecretBytes;
 
 use super::error::{VaultError, VaultErrorKind};
@@ -926,10 +929,43 @@ impl<'v> Txn<'v> {
 
     /// Adds an unlocker envelope for this vault's epoch.
     pub fn add_unlocker(&mut self, env: Envelope) -> Result<(), VaultError> {
-        if self.state.unlockers.contains_key(&env.unlocker_id()) {
+        if self.state.unlockers.contains_key(&env.unlocker_id())
+            || self.state.se_unlockers.contains_key(&env.unlocker_id())
+        {
             return Err(VaultErrorKind::DuplicateUnlocker.into());
         }
         self.write_unlocker(env, false)
+    }
+
+    /// Adds a Secure Enclave unlocker envelope for this vault's id and epoch.
+    pub fn add_se_unlocker(&mut self, env: SeUnlockerEnvelope) -> Result<(), VaultError> {
+        if self.ctx.schema_version < super::items::RECORDS_V2_FROM {
+            return Err(VaultErrorKind::Migration.into());
+        }
+        if env.vault_id() != self.ctx.vault_id
+            || env.epoch() != self.ctx.epoch
+            || env.record().check().is_err()
+        {
+            return Err(VaultErrorKind::InvalidRecord.into());
+        }
+        let id = env.unlocker_id();
+        if self.state.unlockers.contains_key(&id) || self.state.se_unlockers.contains_key(&id) {
+            return Err(VaultErrorKind::DuplicateUnlocker.into());
+        }
+        let vault_id = &self.ctx.vault_id.0[..];
+        let kind = i64::from(UnlockerKind::SecureEnclave as u8);
+        let created_at = to_i64(env.record().created_secs)?;
+        let bytes = env.to_bytes();
+        let n = self.tx.execute(
+            "INSERT INTO unlockers (id, vault_id, kind, envelope, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![&id.0[..], vault_id, kind, &bytes[..], created_at],
+        )?;
+        one_row(n)?;
+        let body = unlocker_body(vault_id, kind, created_at, &bytes);
+        self.stamp(TableTag::Unlockers, &id.0, 0, body);
+        self.state.se_unlockers.insert(id, env);
+        Ok(())
     }
 
     /// Replaces the envelope of an existing unlocker (a new passphrase, or
@@ -972,10 +1008,12 @@ impl<'v> Txn<'v> {
 
     /// Removes an unlocker. The last one cannot be removed.
     pub fn remove_unlocker(&mut self, id: UnlockerId) -> Result<(), VaultError> {
-        if !self.state.unlockers.contains_key(&id) {
+        let in_argon = self.state.unlockers.contains_key(&id);
+        let in_se = self.state.se_unlockers.contains_key(&id);
+        if !in_argon && !in_se {
             return Err(VaultErrorKind::UnknownUnlocker.into());
         }
-        if self.state.unlockers.len() == 1 {
+        if self.state.unlockers.len() + self.state.se_unlockers.len() == 1 {
             return Err(VaultErrorKind::LastUnlocker.into());
         }
         let n = self
@@ -983,6 +1021,7 @@ impl<'v> Txn<'v> {
             .execute("DELETE FROM unlockers WHERE id = ?1", params![&id.0[..]])?;
         one_row(n)?;
         self.state.unlockers.remove(&id);
+        self.state.se_unlockers.remove(&id);
         self.unstamp(TableTag::Unlockers, &id.0);
         Ok(())
     }

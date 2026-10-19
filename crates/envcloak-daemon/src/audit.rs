@@ -403,6 +403,20 @@ pub enum AuditEvent {
         old: Option<IdentityMeta>,
         new: Option<IdentityMeta>,
     },
+    /// A Secure Enclave unlock failed (`app.unlock` with an invalid or
+    /// expired challenge or sealed VMK).
+    AppUnlockFailed { pid: i32 },
+    /// A Secure Enclave unlocker was enrolled (`approve` for an
+    /// `unlocker_add` request).
+    UnlockerAdd {
+        pid: i32,
+        subject: SubjectSummary,
+        request: String,
+        unlocker: String,
+        label: String,
+        unlock_pub_sha256: [u8; 32],
+        approve_pub_sha256: [u8; 32],
+    },
 }
 
 /// A managed launch's counts, as its audit entries record them.
@@ -712,6 +726,17 @@ impl AuditEvent {
                  pid={pid}",
                 part.unwrap_or("none"),
                 launch.as_deref().unwrap_or("none")
+            ),
+            AuditEvent::AppUnlockFailed { pid } => {
+                format!("envcloakd: audit: unlock failed reason=unlock_failed pid={pid}")
+            }
+            AuditEvent::UnlockerAdd {
+                pid,
+                request,
+                unlocker,
+                ..
+            } => format!(
+                "envcloakd: audit: unlocker added request={request} unlocker={unlocker} pid={pid}"
             ),
         })
     }
@@ -1216,6 +1241,31 @@ impl AuditEvent {
                     ..AuditRecord::new(AuditKind::ManagedLaunch, outcome)
                 }
             }
+            AuditEvent::AppUnlockFailed { pid } => AuditRecord {
+                subject: subject(*pid),
+                decision: decision("failed", Some("unlock_failed"), Some("app.unlock"), None),
+                ..AuditRecord::new(AuditKind::Unlock, "failed")
+            },
+            AuditEvent::UnlockerAdd {
+                subject,
+                request,
+                unlocker,
+                label,
+                unlock_pub_sha256,
+                approve_pub_sha256,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                grant_id: Some(unlocker.clone()),
+                subject: subject.clone(),
+                decision: decision("enrolled", None, Some("approve"), None),
+                argv_redacted: vec![
+                    label.clone(),
+                    hex(unlock_pub_sha256),
+                    hex(approve_pub_sha256),
+                ],
+                ..AuditRecord::new(AuditKind::UnlockerAdd, "enrolled")
+            },
         }
     }
 }

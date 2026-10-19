@@ -174,3 +174,39 @@ pub fn fail_point(site: &str) -> std::io::Result<()> {
         Ok(())
     }
 }
+
+/// A test build's app identity (`ENVCLOAK_TEST_APP_IDENTITY`), as
+/// `(team_id, signing_id)` for a peer with `pid`, so daemon integration
+/// tests can exercise app-role methods without a keychain signing harness.
+/// `None` in a build without the `testing` feature, which only tests
+/// enable, and `None` when `ENVCLOAK_TEST_APP_IDENTITY` is unset or names
+/// a different pid (`<pid>:<team_id>:<signing_id>` or
+/// `<team_id>:<signing_id>`).
+#[must_use]
+pub fn test_app_identity(pid: i32) -> Option<(String, String)> {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::app_identity(pid)
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// A test build's additive clock offset (`ENVCLOAK_TEST_CLOCK_FILE`), so
+/// daemon integration tests can expire pending requests and unlock challenges
+/// without sleeping. Always [`std::time::Duration::ZERO`] in a build without
+/// the `testing` feature.
+#[must_use]
+pub fn test_clock_offset() -> std::time::Duration {
+    #[cfg(feature = "testing")]
+    {
+        crate::testing::clock_offset()
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        std::time::Duration::ZERO
+    }
+}

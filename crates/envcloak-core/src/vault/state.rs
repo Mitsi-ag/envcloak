@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use rusqlite::Connection;
 
 use crate::crypto::{
-    Aad, Envelope, FieldTag, ItemClass, Keyring, Purpose, SubKey, TableTag, UnlockerId, VaultId,
-    keyed_hash,
+    Aad, Envelope, FieldTag, ItemClass, Keyring, Purpose, SeUnlockerEnvelope, SubKey, TableTag,
+    UnlockerId, UnlockerKind, VaultId, keyed_hash,
 };
 
 use super::error::{VaultError, VaultErrorKind};
@@ -160,6 +160,7 @@ pub(crate) struct State {
     pub project_keys: BTreeMap<[u8; 32], ProjectId>,
     pub policies: BTreeMap<PolicyId, PolicyRow>,
     pub unlockers: BTreeMap<UnlockerId, Envelope>,
+    pub se_unlockers: BTreeMap<UnlockerId, SeUnlockerEnvelope>,
     pub stamps: BTreeMap<RowKey, Stamp>,
 }
 
@@ -519,11 +520,35 @@ pub(crate) fn load(
 
     for u in &raw.unlockers {
         note_stamp(&mut st, &mut found, u.stamp());
+        if u.kind == i64::from(UnlockerKind::SecureEnclave as u8)
+            && ctx.schema_version >= RECORDS_V2_FROM
+        {
+            let se = SeUnlockerEnvelope::from_bytes(&u.envelope)
+                .ok()
+                .filter(|e| {
+                    Some(e.unlocker_id().0) == id16(&u.id)
+                        && u.vault_id[..] == ctx.vault_id.0[..]
+                        && e.vault_id() == ctx.vault_id
+                        && e.epoch() == ctx.epoch
+                        && u64::try_from(u.created_at).ok() == Some(e.record().created_secs)
+                        && !st.unlockers.contains_key(&e.unlocker_id())
+                        && !st.se_unlockers.contains_key(&e.unlocker_id())
+                });
+            match se {
+                Some(envelope) => {
+                    st.se_unlockers.insert(envelope.unlocker_id(), envelope);
+                }
+                None => found.note(TamperKind::RowInconsistent),
+            }
+            continue;
+        }
         let env = Envelope::from_bytes(&u.envelope).ok().filter(|e| {
             Some(e.unlocker_id().0) == id16(&u.id)
                 && u.vault_id[..] == ctx.vault_id.0[..]
                 && i64::from(e.kind() as u8) == u.kind
                 && e.epoch() == ctx.epoch
+                && !st.unlockers.contains_key(&e.unlocker_id())
+                && !st.se_unlockers.contains_key(&e.unlocker_id())
         });
         match env {
             Some(envelope) => {

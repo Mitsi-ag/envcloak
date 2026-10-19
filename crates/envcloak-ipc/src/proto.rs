@@ -22,9 +22,14 @@ use serde_json::value::RawValue;
 
 use envcloak_policy::{
     ApprovalOptions, Binding, EnvFileNames, EnvFileRef, EnvName, ManifestError, PendingDescriptor,
-    PlainName, Proposal,
+    PlainName, Proposal, UnlockerAddDescriptor,
 };
 
+pub use crate::app::{
+    AppUnlock, AppUnlockBegin, AppUnlockBeginOutput, AppUnlockBeginParams, AppUnlockParams,
+    AppUnlockerEnroll, AppUnlockerEnrollBegin, AppUnlockerEnrollBeginOutput,
+    AppUnlockerEnrollBeginParams, AppUnlockerEnrollOutput, AppUnlockerEnrollParams, SeEnvelopeView,
+};
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, BackupBegunView, BackupCommittedView, BackupListView,
@@ -410,7 +415,18 @@ pub struct PendingGet;
 impl Method for PendingGet {
     const NAME: &'static str = "pending.get";
     type Params = PendingGetParams;
-    type Output = PendingDescriptor;
+    type Output = PendingGetOutput;
+}
+
+/// The descriptor returned by [`PendingGet`]: either a run request's
+/// [`PendingDescriptor`] or a Secure Enclave unlocker enrolment's
+/// [`UnlockerAddDescriptor`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum PendingGetOutput {
+    UnlockerAdd(UnlockerAddDescriptor),
+    Run(PendingDescriptor),
 }
 
 /// A pending request's id, and the caller's claims.
@@ -1810,8 +1826,11 @@ pub const CLIENT_METHODS: [&str; 45] = [
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
 /// approval, policy, reveal, the paste sheet, devices and registry
 /// overrides. Any other `app.` name is an app method too.
-pub const APP_METHODS: [&str; 8] = [
+pub const APP_METHODS: [&str; 11] = [
+    "app.unlock.begin",
     "app.unlock",
+    "app.unlocker.enroll.begin",
+    "app.unlocker.enroll",
     "app.approve",
     "app.policy.set",
     "app.reveal",
@@ -1985,12 +2004,19 @@ pub enum ErrorKind {
     /// server (on Linux, the sealed copy of the `envcloak` beside it, made
     /// when it started, cannot be made or run); nothing is released.
     RunnerUnavailable,
+    /// An `app.unlock` whose sealed VMK does not open, does not match the
+    /// vault's sealed header, or answers an unlock request that is unknown,
+    /// used or more than 60 seconds old; audited.
+    UnlockFailed,
+    /// No enrolled Secure Enclave unlocker has the id `app.unlock.begin`
+    /// names.
+    NoUnlocker,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 50] = [
+    pub const ALL: [ErrorKind; 52] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -2040,6 +2066,8 @@ impl ErrorKind {
         ErrorKind::ManagedLaunchChanged,
         ErrorKind::CodeSelectingEnv,
         ErrorKind::RunnerUnavailable,
+        ErrorKind::UnlockFailed,
+        ErrorKind::NoUnlocker,
         ErrorKind::Internal,
     ];
 
@@ -2095,6 +2123,8 @@ impl ErrorKind {
             ErrorKind::ManagedLaunchChanged => -32040,
             ErrorKind::CodeSelectingEnv => -32041,
             ErrorKind::RunnerUnavailable => -32042,
+            ErrorKind::UnlockFailed => -32052,
+            ErrorKind::NoUnlocker => -32053,
             ErrorKind::Internal => -32099,
         }
     }
@@ -2151,6 +2181,8 @@ impl ErrorKind {
             ErrorKind::ManagedLaunchChanged => "managed_launch_changed",
             ErrorKind::CodeSelectingEnv => "code_selecting_env",
             ErrorKind::RunnerUnavailable => "runner_unavailable",
+            ErrorKind::UnlockFailed => "unlock_failed",
+            ErrorKind::NoUnlocker => "no_unlocker",
             ErrorKind::Internal => "internal",
         }
     }
@@ -2286,6 +2318,10 @@ impl ErrorKind {
                  sealed copy, which this system's policy may refuse); nothing was released, and \
                  the server is reported as manual"
             }
+            ErrorKind::UnlockFailed => {
+                "the Secure Enclave unlock could not be verified, or the unlock challenge expired"
+            }
+            ErrorKind::NoUnlocker => "no Secure Enclave unlocker has that id",
             ErrorKind::Internal => "the daemon failed",
         }
     }

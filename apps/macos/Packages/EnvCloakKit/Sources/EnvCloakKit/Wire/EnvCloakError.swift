@@ -72,6 +72,8 @@ public enum ErrorKind: String, CaseIterable, Sendable {
     case managedLaunchChanged = "managed_launch_changed"
     case codeSelectingEnv = "code_selecting_env"
     case runnerUnavailable = "runner_unavailable"
+    case unlockFailed = "unlock_failed"
+    case noUnlocker = "no_unlocker"
     case `internal` = "internal"
 
     public var code: Int64 {
@@ -125,6 +127,8 @@ public enum ErrorKind: String, CaseIterable, Sendable {
         case .managedLaunchChanged: -32040
         case .codeSelectingEnv: -32041
         case .runnerUnavailable: -32042
+        case .unlockFailed: -32052
+        case .noUnlocker: -32053
         case .internal: -32099
         }
     }

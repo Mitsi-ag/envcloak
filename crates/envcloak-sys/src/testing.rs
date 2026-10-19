@@ -1190,6 +1190,67 @@ pub(crate) fn fail_point(site: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Names a test build's app identity (`<team_id>:<signing_id>` or
+/// `<pid>:<team_id>:<signing_id>`, [`crate::test_app_identity`]).
+pub const APP_IDENTITY: &str = "ENVCLOAK_TEST_APP_IDENTITY";
+
+/// [`APP_IDENTITY`] for `pid`, when `team_id` is 10 ASCII uppercase
+/// letters or digits and `signing_id` is non-empty ASCII without control
+/// bytes.
+pub(crate) fn app_identity(pid: i32) -> Option<(String, String)> {
+    let raw = std::env::var_os(APP_IDENTITY)?;
+    let raw = raw.to_str()?;
+    let (team, signing) = match raw.split_once(':')? {
+        (first, rest) if first.bytes().all(|b| b.is_ascii_digit()) => {
+            if let Some((team, signing)) = rest.split_once(':') {
+                let wanted: i32 = first.parse().ok()?;
+                if wanted != pid {
+                    return None;
+                }
+                (team, signing)
+            } else {
+                (first, rest)
+            }
+        }
+        pair => pair,
+    };
+    if team.len() != 10
+        || !team
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    if signing.is_empty()
+        || !signing
+            .bytes()
+            .all(|b| b.is_ascii() && !b.is_ascii_control())
+    {
+        return None;
+    }
+    Some((team.to_owned(), signing.to_owned()))
+}
+
+/// Names a file holding an integer number of seconds to add to the daemon's
+/// clocks in a test build ([`crate::test_clock_offset`]).
+pub const CLOCK_FILE: &str = "ENVCLOAK_TEST_CLOCK_FILE";
+
+/// [`CLOCK_FILE`]'s offset in seconds, or [`std::time::Duration::ZERO`].
+pub(crate) fn clock_offset() -> std::time::Duration {
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(path) = PATH
+        .get_or_init(|| std::env::var_os(CLOCK_FILE).map(std::path::PathBuf::from))
+        .as_ref()
+    else {
+        return std::time::Duration::ZERO;
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::ZERO)
+}
+
 /// The memory a process holds now and the most it has held since it
 /// started, in KiB ([`process_memory`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

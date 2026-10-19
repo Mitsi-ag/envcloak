@@ -923,6 +923,98 @@ pub fn proposed_for(p: &PendingDescriptor, unticked: &[&str]) -> Option<String> 
     (!names.is_empty()).then(|| names.join(", "))
 }
 
+/// The first line of a canonical unlocker-enrolment statement
+/// (docs/IPC.md "Statement domains").
+pub const UNLOCKER_STATEMENT_DOMAIN: &[u8] = b"envcloak-unlocker-statement/1\n";
+
+/// The kind of a pending unlocker-enrolment request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnlockerRequestKind {
+    UnlockerAdd,
+}
+
+/// A pending `unlocker_add` request as an approval surface receives it
+/// (SPEC §10b, D3-08): request id, daemon nonce, vault id, label,
+/// SHA-256 fingerprints of both public keys, the app's verified Team ID
+/// and signing identifier, creation time and expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnlockerAddDescriptor {
+    pub kind: UnlockerRequestKind,
+    /// The request id: 8 Crockford base32 characters.
+    pub request: String,
+    /// The daemon nonce, 32 bytes as 64 hex characters.
+    pub nonce: String,
+    /// The vault id, 16 bytes as 32 hex characters.
+    pub vault_id: String,
+    /// The human-facing label for the unlocker.
+    pub label: String,
+    /// SHA-256 of the 65-byte SEC1 uncompressed `unlock` public key, as 64 hex characters.
+    pub unlock_pub_sha256: String,
+    /// SHA-256 of the 65-byte SEC1 uncompressed `approve` public key, as 64 hex characters.
+    pub approve_pub_sha256: String,
+    /// The app's verified Apple Developer Team ID.
+    pub team_id: String,
+    /// The app's verified code-signing identifier.
+    pub signing_id: String,
+    /// When the request was opened, Unix seconds.
+    pub created_secs: u64,
+    /// Seconds after `created_secs` at which it expires.
+    pub expires_in_secs: u64,
+}
+
+/// The canonical encoding of the unlocker-enrolment statement:
+/// [`UNLOCKER_STATEMENT_DOMAIN`], then every field of `d`,
+/// length-prefixed.
+pub fn canonical_unlocker_statement(d: &UnlockerAddDescriptor) -> Vec<u8> {
+    let mut e = Enc(Vec::with_capacity(256));
+    e.0.extend_from_slice(UNLOCKER_STATEMENT_DOMAIN);
+    e.str(&d.request)
+        .str(&d.nonce)
+        .str(&d.vault_id)
+        .str(&d.label)
+        .str(&d.unlock_pub_sha256)
+        .str(&d.approve_pub_sha256)
+        .str(&d.team_id)
+        .str(&d.signing_id)
+        .num(d.created_secs)
+        .num(d.expires_in_secs);
+    e.0
+}
+
+/// SHA-256 of [`canonical_unlocker_statement`].
+pub fn unlocker_statement_digest(d: &UnlockerAddDescriptor) -> [u8; 32] {
+    Sha256::digest(canonical_unlocker_statement(d)).into()
+}
+
+/// The unlocker-enrolment statement as a person reads it in a terminal.
+/// Every string from the request is escaped ([`escape_for_display`]).
+pub fn render_unlocker_statement(d: &UnlockerAddDescriptor) -> String {
+    let e = escape_for_display;
+    let mut t = String::with_capacity(512);
+    let _ = writeln!(t, "Unlocker enrolment request {}", e(&d.request));
+    let _ = writeln!(t, "  action: add Secure Enclave unlocker");
+    let _ = writeln!(t, "  label: {}", e(&d.label));
+    let _ = writeln!(t, "  vault id: {}", e(&d.vault_id));
+    let _ = writeln!(t, "  unlock public key sha256: {}", e(&d.unlock_pub_sha256));
+    let _ = writeln!(
+        t,
+        "  approve public key sha256: {}",
+        e(&d.approve_pub_sha256)
+    );
+    let _ = writeln!(
+        t,
+        "  app code identity: team_id={} signing_id={}",
+        e(&d.team_id),
+        e(&d.signing_id)
+    );
+    t.push_str(
+        "The passphrase you enter approves adding this Secure Enclave unlocker, and nothing else.\n",
+    );
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
