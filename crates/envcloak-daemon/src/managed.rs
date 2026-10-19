@@ -588,6 +588,30 @@ pub fn register(
             txn.put_policy(id, &PolicyRecord::ManagedServer(record.clone()))
         })
         .map_err(|e| write_error(&e))?;
+    let kept_launch_id = match &record.transport {
+        ManagedTransport::Stdio(l) => Some(l.launch_id),
+        ManagedTransport::Bridge { .. } => None,
+    };
+    let mut invalidated_standing = Vec::new();
+    for (_, old) in &replaced {
+        if let ManagedTransport::Stdio(old_l) = &old.transport
+            && kept_launch_id != Some(old_l.launch_id)
+        {
+            invalidated_standing.extend(s.standing().invalid_for_launch(&old_l.launch_id, None));
+        }
+    }
+    if !invalidated_standing.is_empty()
+        && let Ok((revoked, grants)) =
+            crate::standing::delete_records(&mut s, &invalidated_standing)
+        && revoked > 0
+    {
+        s.audit(AuditEvent::StandingRevoked {
+            pid: peer.pid,
+            revoked,
+            grants,
+            reason: Some("launch_removed"),
+        });
+    }
     let (launch, revision, launch_counts) = match &record.transport {
         ManagedTransport::Stdio(l) => (
             Some(launch_id_text(&l.launch_id)),
@@ -646,6 +670,21 @@ pub fn unregister(
     vault
         .transact(|txn| txn.delete_policy(id))
         .map_err(|e| write_error(&e))?;
+    let standing_ids = match &record.transport {
+        ManagedTransport::Stdio(l) => s.standing().invalid_for_launch(&l.launch_id, None),
+        ManagedTransport::Bridge { .. } => Vec::new(),
+    };
+    if !standing_ids.is_empty()
+        && let Ok((revoked, grants)) = crate::standing::delete_records(&mut s, &standing_ids)
+        && revoked > 0
+    {
+        s.audit(AuditEvent::StandingRevoked {
+            pid: peer.pid,
+            revoked,
+            grants,
+            reason: Some("launch_removed"),
+        });
+    }
     let launch = match &record.transport {
         ManagedTransport::Stdio(l) => Some(launch_id_text(&l.launch_id)),
         ManagedTransport::Bridge { .. } => None,
