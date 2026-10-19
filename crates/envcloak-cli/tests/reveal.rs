@@ -859,7 +859,7 @@ mod macos {
         let err1 = common::stderr(&out1);
         assert!(
             err1.contains(
-                "envcloak: warning: cleared from the clipboard; clipboard history tools may already hold the value"
+                "warning: cleared from the clipboard; clipboard history tools may already hold the value"
             ),
             "stderr missing clipboard warning: {err1}"
         );
@@ -902,7 +902,7 @@ mod macos {
         let err2 = common::stderr(&out2);
         assert!(
             err2.contains(
-                "envcloak: warning: the clipboard changed before it could be cleared; clipboard history tools may already hold the value"
+                "warning: the clipboard changed before it could be cleared; clipboard history tools may already hold the value"
             ),
             "stderr missing concurrent change warning: {err2}"
         );

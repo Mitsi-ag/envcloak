@@ -90,6 +90,7 @@ fn parse_wait(s: &str) -> Option<Duration> {
 
 fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
     let mut a = AddArgs::default();
+    let mut wait_raw: Option<String> = None;
     let mut it = args.iter();
     while let Some(&arg) = it.next() {
         let slot = match arg {
@@ -98,6 +99,7 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
             "--account" => &mut a.account,
             "--env" => &mut a.env,
             "--note" => &mut a.note,
+            "--wait" => &mut wait_raw,
             "--allow-short" if !a.allow_short => {
                 a.allow_short = true;
                 continue;
@@ -112,17 +114,6 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
             }
             "--ask" if !a.ask => {
                 a.ask = true;
-                continue;
-            }
-            "--wait" => {
-                if a.wait.is_some() {
-                    return Err("an option is given twice");
-                }
-                let d = it
-                    .next()
-                    .and_then(|v| parse_wait(v))
-                    .ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?;
-                a.wait = Some(d);
                 continue;
             }
             "--json" if !a.json => {
@@ -145,6 +136,12 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
             return Err("an option is given twice");
         }
         *slot = Some((*it.next().ok_or("an option needs a name after it")?).to_owned());
+    }
+    if let Some(v) = wait_raw {
+        a.wait = Some(
+            parse_wait(&v)
+                .ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?,
+        );
     }
     if usize::from(a.stdin) + usize::from(a.from_clipboard) + usize::from(a.ask) > 1 {
         return Err("--stdin, --from-clipboard and --ask cannot be combined");
@@ -291,12 +288,12 @@ fn read_clipboard_value() -> Result<envcloak_core::SecretBytes, Failure> {
     drop(pb);
     if cleared {
         eprintln!(
-            "envcloak: warning: cleared from the clipboard; clipboard history tools may already \
+            "warning: cleared from the clipboard; clipboard history tools may already \
              hold the value"
         );
     } else {
         eprintln!(
-            "envcloak: warning: the clipboard changed before it could be cleared; clipboard \
+            "warning: the clipboard changed before it could be cleared; clipboard \
              history tools may already hold the value"
         );
     }
