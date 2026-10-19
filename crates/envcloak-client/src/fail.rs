@@ -331,6 +331,15 @@ const REASON_TEXTS: &[(&str, &str)] = &[
          for a person's import, 2,000,000 others), so nothing more was compared and the run is \
          incomplete; run it again later",
     ),
+    (
+        "rolled_back",
+        "the keychain rollback anchor is ahead of the vault file, so the vault was rolled back \
+         and is open read-only",
+    ),
+    (
+        "keychain_anchor_missing",
+        "the vault's keychain rollback anchor was missing and has been written again",
+    ),
 ];
 
 /// Words for `reason` on an error of `kind`: [`reason_text`], except for

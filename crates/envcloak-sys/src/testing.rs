@@ -1231,6 +1231,9 @@ pub(crate) fn app_identity(pid: i32) -> Option<(String, String)> {
     Some((team.to_owned(), signing.to_owned()))
 }
 
+/// Names a file holding the 68-byte keychain rollback anchor in a test build.
+pub const ANCHOR_FILE: &str = "ENVCLOAK_TEST_ANCHOR_FILE";
+
 /// Names a file holding an integer number of seconds to add to the daemon's
 /// clocks in a test build ([`crate::test_clock_offset`]).
 pub const CLOCK_FILE: &str = "ENVCLOAK_TEST_CLOCK_FILE";

@@ -196,6 +196,41 @@ pub struct VaultView {
     pub busy: bool,
     /// Wrong passphrases since the daemon started.
     pub failed_unlocks: u32,
+    /// Where the vault's keychain rollback anchor stands (SPEC §5 "Integrity",
+    /// D3-12, M3-16).
+    #[serde(default)]
+    pub keychain_anchor: KeychainAnchorState,
+}
+
+/// How the keychain rollback anchor compares to the vault file (SPEC §5
+/// "Integrity", D3-12, M3-16).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainAnchorState {
+    /// The keychain anchor matches or was updated to the vault's head.
+    Matched,
+    /// The keychain anchor is ahead of the vault file (`rolled_back`).
+    Ahead,
+    /// The vault had an anchor before, found none at unlock, and re-created it.
+    Missing,
+    /// No keychain anchor has been written yet.
+    None,
+    /// Keychain rollback anchor is unavailable (Linux, or a build without the
+    /// helper's provisioning profile).
+    #[default]
+    Unavailable,
+}
+
+impl KeychainAnchorState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeychainAnchorState::Matched => "matched",
+            KeychainAnchorState::Ahead => "ahead",
+            KeychainAnchorState::Missing => "missing",
+            KeychainAnchorState::None => "none",
+            KeychainAnchorState::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -231,7 +266,7 @@ pub struct LockView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LockReason {
-    /// A client asked (`envcloak lock`).
+    /// A client asked (`envcloak lock` or `app.lock { reason: "user" }`).
     Request,
     /// No request for the idle limit.
     Idle,
@@ -241,6 +276,10 @@ pub enum LockReason {
     Signal,
     /// `vault.recover` closed the vault to put a backup's in its place.
     Restore,
+    /// The screen locked (`app.lock { reason: "screen_lock" }`, M3-16).
+    ScreenLock,
+    /// The graphical session resigned (`app.lock { reason: "session_resign" }`, M3-16).
+    SessionResign,
 }
 
 impl LockReason {
@@ -252,6 +291,8 @@ impl LockReason {
             LockReason::Sleep => "sleep",
             LockReason::Signal => "signal",
             LockReason::Restore => "restore",
+            LockReason::ScreenLock => "screen_lock",
+            LockReason::SessionResign => "session_resign",
         }
     }
 }

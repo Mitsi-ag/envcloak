@@ -5,7 +5,9 @@
 
 pub(crate) mod approve;
 pub(crate) mod asks;
+pub(crate) mod audit;
 pub(crate) mod enroll;
+pub(crate) mod lock;
 pub(crate) mod paste;
 pub(crate) mod pending;
 pub(crate) mod reveal;

@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::proto::Method;
 use crate::view::{
-    AddedView, ApprovedView, ClassificationView, LengthClass, MAX_LISTED_BINDINGS, RemovedView,
-    RotatedView, UnlockedView, View,
+    AddedView, ApprovedView, ClassificationView, LengthClass, LockedView, MAX_LISTED_BINDINGS,
+    RemovedView, RotatedView, UnlockedView, View,
 };
 
 /// `app.unlock.begin`: starts a Secure Enclave unlock (SPEC §5 step 2).
@@ -760,3 +760,118 @@ pub struct AppAskDeclinedView {
 }
 
 impl View for AppAskDeclinedView {}
+
+/// `app.lock`: locks the vault for a screen lock, a graphical session resign,
+/// or a user lock request from the app (`D3-11`, SPEC §5 "Lock", §10b; M3-16).
+/// Answered whatever an `app` peer's evidence is.
+#[derive(Debug)]
+pub struct AppLock;
+
+impl Method for AppLock {
+    const NAME: &'static str = "app.lock";
+    type Params = AppLockParams;
+    type Output = LockedView;
+}
+
+/// Parameters of [`AppLock`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppLockParams {
+    pub reason: AppLockReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Why [`AppLock`] asked to lock the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLockReason {
+    ScreenLock,
+    SessionResign,
+    User,
+}
+
+/// `app.audit.list`: lists decrypted audit entries for the Activity window,
+/// newest first, paginated by `before_seq` (M3-16).
+#[derive(Debug)]
+pub struct AppAuditList;
+
+impl Method for AppAuditList {
+    const NAME: &'static str = "app.audit.list";
+    type Params = AppAuditListParams;
+    type Output = AppAuditListView;
+}
+
+/// Parameters of [`AppAuditList`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAuditListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppAuditList`]. Metadata only; never a secret value.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAuditListView {
+    pub entries: Vec<AppAuditEntryView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_seq: Option<u64>,
+}
+
+impl View for AppAuditListView {}
+
+/// One audit entry returned by [`AppAuditList`] (design §5.4, §12.3; M3-16).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAuditEntryView {
+    pub seq: u64,
+    pub time_secs: u64,
+    pub kind: String,
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<AppAuditSubjectView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slugs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv_masked: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<String>,
+}
+
+impl View for AppAuditEntryView {}
+
+/// The subject recorded on an [`AppAuditEntryView`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppAuditSubjectView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SubjectKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub pid: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_pid: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_exe: Option<String>,
+}
+
+impl View for AppAuditSubjectView {}

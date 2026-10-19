@@ -1620,4 +1620,25 @@ impl Client {
             claims: claims.to_vec(),
         })
     }
+
+    /// `app.lock`: locks the vault with `reason` (`screen_lock`,
+    /// `session_resign` or `user`).
+    pub fn app_lock(
+        &mut self,
+        reason: crate::app::AppLockReason,
+        claims: &[String],
+    ) -> Result<LockedView, ClientError> {
+        self.call::<crate::app::AppLock>(&crate::app::AppLockParams {
+            reason,
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.audit.list`: lists decrypted audit entries for the Activity window.
+    pub fn app_audit_list(
+        &mut self,
+        p: &crate::app::AppAuditListParams,
+    ) -> Result<crate::app::AppAuditListView, ClientError> {
+        self.call::<crate::app::AppAuditList>(p)
+    }
 }
