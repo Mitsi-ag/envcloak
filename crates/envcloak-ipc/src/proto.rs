@@ -26,9 +26,11 @@ use envcloak_policy::{
 };
 
 pub use crate::app::{
-    AppUnlock, AppUnlockBegin, AppUnlockBeginOutput, AppUnlockBeginParams, AppUnlockParams,
-    AppUnlockerEnroll, AppUnlockerEnrollBegin, AppUnlockerEnrollBeginOutput,
-    AppUnlockerEnrollBeginParams, AppUnlockerEnrollOutput, AppUnlockerEnrollParams, SeEnvelopeView,
+    AppApprove, AppApproveParams, AppPendingGet, AppPendingGetParams, AppPendingList,
+    AppPendingListParams, AppPendingListView, AppPendingView, AppUnlock, AppUnlockBegin,
+    AppUnlockBeginOutput, AppUnlockBeginParams, AppUnlockParams, AppUnlockerEnroll,
+    AppUnlockerEnrollBegin, AppUnlockerEnrollBeginOutput, AppUnlockerEnrollBeginParams,
+    AppUnlockerEnrollOutput, AppUnlockerEnrollParams, RUN_STATEMENT_DOMAIN, SeEnvelopeView,
 };
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
@@ -1826,11 +1828,13 @@ pub const CLIENT_METHODS: [&str; 45] = [
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
 /// approval, policy, reveal, the paste sheet, devices and registry
 /// overrides. Any other `app.` name is an app method too.
-pub const APP_METHODS: [&str; 11] = [
+pub const APP_METHODS: [&str; 13] = [
     "app.unlock.begin",
     "app.unlock",
     "app.unlocker.enroll.begin",
     "app.unlocker.enroll",
+    "app.pending.list",
+    "app.pending.get",
     "app.approve",
     "app.policy.set",
     "app.reveal",
@@ -2004,6 +2008,10 @@ pub enum ErrorKind {
     /// server (on Linux, the sealed copy of the `envcloak` beside it, made
     /// when it started, cannot be made or run); nothing is released.
     RunnerUnavailable,
+    /// A signed approval (`app.approve`) or signed write whose 64-byte raw
+    /// P-256 signature does not verify against any enrolled Secure Enclave
+    /// unlocker's `approve` key; audited.
+    SignatureInvalid,
     /// An `app.unlock` whose sealed VMK does not open, does not match the
     /// vault's sealed header, or answers an unlock request that is unknown,
     /// used or more than 60 seconds old; audited.
@@ -2016,7 +2024,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 52] = [
+    pub const ALL: [ErrorKind; 53] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -2066,6 +2074,7 @@ impl ErrorKind {
         ErrorKind::ManagedLaunchChanged,
         ErrorKind::CodeSelectingEnv,
         ErrorKind::RunnerUnavailable,
+        ErrorKind::SignatureInvalid,
         ErrorKind::UnlockFailed,
         ErrorKind::NoUnlocker,
         ErrorKind::Internal,
@@ -2123,6 +2132,7 @@ impl ErrorKind {
             ErrorKind::ManagedLaunchChanged => -32040,
             ErrorKind::CodeSelectingEnv => -32041,
             ErrorKind::RunnerUnavailable => -32042,
+            ErrorKind::SignatureInvalid => -32051,
             ErrorKind::UnlockFailed => -32052,
             ErrorKind::NoUnlocker => -32053,
             ErrorKind::Internal => -32099,
@@ -2181,6 +2191,7 @@ impl ErrorKind {
             ErrorKind::ManagedLaunchChanged => "managed_launch_changed",
             ErrorKind::CodeSelectingEnv => "code_selecting_env",
             ErrorKind::RunnerUnavailable => "runner_unavailable",
+            ErrorKind::SignatureInvalid => "signature_invalid",
             ErrorKind::UnlockFailed => "unlock_failed",
             ErrorKind::NoUnlocker => "no_unlocker",
             ErrorKind::Internal => "internal",
@@ -2317,6 +2328,10 @@ impl ErrorKind {
                 "EnvCloak could not start its own runner for this server (on Linux it runs from a \
                  sealed copy, which this system's policy may refuse); nothing was released, and \
                  the server is reported as manual"
+            }
+            ErrorKind::SignatureInvalid => {
+                "the approval signature could not be verified against an enrolled Secure Enclave \
+                 unlocker"
             }
             ErrorKind::UnlockFailed => {
                 "the Secure Enclave unlock could not be verified, or the unlock challenge expired"

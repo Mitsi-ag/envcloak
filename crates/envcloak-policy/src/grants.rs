@@ -207,16 +207,33 @@ impl ApprovalOptions {
 pub enum ProofKind {
     /// The vault passphrase, checked against the envelope (SPEC §10b).
     Passphrase,
+    /// A P-256 ECDSA signature by the `approve` key of an enrolled Secure
+    /// Enclave unlocker (SPEC §10b, M3-09).
+    SecureEnclave { unlocker_id: UnlockerId },
 }
 
 /// A verified proof, and who gave it. The store refuses one from an
-/// approver that may not give a proof
-/// ([`SubjectEvidence::proof_refusal`]: an agent by any evidence, or no
-/// terminal session), whatever the daemon checked.
+/// approver that may not give a proof: for a passphrase proof,
+/// [`SubjectEvidence::proof_refusal`] (an agent by any evidence, or no
+/// terminal session); for a Secure Enclave signature from the verified app
+/// role, any agent ancestry, agent marker claim or cut chain.
 #[derive(Debug, Clone)]
 pub struct ApprovalProof {
     pub approver: SubjectEvidence,
     pub kind: ProofKind,
+}
+
+impl ApprovalProof {
+    fn is_refused(&self) -> bool {
+        match self.kind {
+            ProofKind::Passphrase => self.approver.proof_refusal().is_some(),
+            ProofKind::SecureEnclave { .. } => {
+                self.approver.nearest_agent().is_some()
+                    || self.approver.claims().claims_agent()
+                    || self.approver.cut()
+            }
+        }
+    }
 }
 
 /// A binding as a request asks for it: bound to the vault's item, with
@@ -930,6 +947,16 @@ impl GrantStore {
             .collect()
     }
 
+    /// Draws a fresh [`GrantId`] not held by any grant in this store.
+    pub fn fresh_grant_id(&self) -> GrantId {
+        loop {
+            let id = GrantId::generate();
+            if !self.grants.contains_key(&id) {
+                break id;
+            }
+        }
+    }
+
     /// Approves pending request `id` with a verified `proof`, the
     /// approver's `opts` and the `digest` of the statement the approver
     /// read, creating a grant at `now`.
@@ -955,11 +982,29 @@ impl GrantStore {
         now: &Now,
         items: &[ItemMeta],
     ) -> Result<GrantId, ApproveError> {
+        let grant_id = self.fresh_grant_id();
+        self.approve_with_id(id, grant_id, proof, opts, digest, now, items)
+    }
+
+    /// Like [`GrantStore::approve`], using the caller-supplied `grant_id`
+    /// so the daemon can durably write the `approved` audit entry before
+    /// committing the grant to the store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn approve_with_id(
+        &mut self,
+        id: &PendingId,
+        grant_id: GrantId,
+        proof: ApprovalProof,
+        opts: ApprovalOptions,
+        digest: [u8; 32],
+        now: &Now,
+        items: &[ItemMeta],
+    ) -> Result<GrantId, ApproveError> {
         self.expire(now);
         if self.pending(id, now).is_none() {
             return Err(ApproveError::NoSuchRequest);
         }
-        if proof.approver.proof_refusal().is_some() {
+        if proof.is_refused() {
             return Err(ApproveError::ProofRefused);
         }
         self.check_approval(id, &opts, digest, now, items)?;
@@ -969,11 +1014,10 @@ impl GrantStore {
         let kind = p.request.subject.kind();
         let r = p.request;
         let ttl = Duration::from_secs(opts.ttl_secs);
-        let id = loop {
-            let id = GrantId::generate();
-            if !self.grants.contains_key(&id) {
-                break id;
-            }
+        let id = if self.grants.contains_key(&grant_id) {
+            self.fresh_grant_id()
+        } else {
+            grant_id
         };
         let origin = ManagedRequest::origin(&r).map(str::to_owned);
         let grant = Grant {

@@ -43,8 +43,9 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::crypto::{
-    Envelope, FieldTag, Keyring, Purpose, SeUnlockerEnvelope, SeUnlockerRecord, TableTag,
-    UnlockerId, UnlockerKind, VaultId, Vmk, fill_random_or_panic, seal_se_unlocker,
+    Envelope, FieldTag, Keyring, P256_SIGNATURE_LEN, Purpose, SeEnrolledUnder, SeUnlockerEnvelope,
+    SeUnlockerRecord, TableTag, UnlockerId, UnlockerKind, VaultId, Vmk, fill_random_or_panic,
+    seal_se_unlocker, verify_p256_prehash,
 };
 use crate::secret::SecretBytes;
 
@@ -1138,6 +1139,26 @@ impl Vault {
             }
             _ => VaultError::from(e),
         })
+    }
+
+    /// Checks `signature` over the 32-byte statement `digest` against the
+    /// pinned `approve_pub` of every enrolled Secure Enclave unlocker whose
+    /// `enrolled_under` matches the caller's verified identity, returning the
+    /// matching unlocker's id.
+    pub fn verify_se_approval(
+        &self,
+        enrolled_under: &SeEnrolledUnder,
+        digest: &[u8; 32],
+        signature: &[u8; P256_SIGNATURE_LEN],
+    ) -> Option<UnlockerId> {
+        self.state
+            .se_unlockers
+            .values()
+            .find(|env| {
+                env.record().enrolled_under == *enrolled_under
+                    && verify_p256_prehash(&env.record().approve_pub, digest, signature).is_ok()
+            })
+            .map(SeUnlockerEnvelope::unlocker_id)
     }
 
     /// Seals the vault's VMK to `record.unlock_pub` and stores the new Secure

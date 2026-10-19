@@ -966,6 +966,22 @@ fn respond<'s>(
         proto::AppUnlockerEnroll::NAME => {
             answer::<proto::AppUnlockerEnroll>(id, &req, |p| crate::app::enroll::poll(shared, p))
         }
+        proto::AppPendingList::NAME => answer::<proto::AppPendingList>(id, &req, |p| {
+            crate::app::pending::list(shared, peer, p)
+        }),
+        proto::AppPendingGet::NAME => {
+            answer::<proto::AppPendingGet>(id, &req, |p| crate::app::pending::get(shared, peer, p))
+        }
+        proto::AppApprove::NAME => answer::<proto::AppApprove>(id, &req, |p| {
+            crate::app::approve::approve(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                p,
+            )
+        }),
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }
 }

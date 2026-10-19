@@ -1358,4 +1358,57 @@ impl Client {
             claims: claims.to_vec(),
         })
     }
+
+    /// `app.pending.list`: the pending run requests waiting for approval,
+    /// oldest first (at most 20).
+    pub fn app_pending_list(
+        &mut self,
+        claims: &[String],
+    ) -> Result<crate::app::AppPendingListView, ClientError> {
+        let list = self.call::<crate::app::AppPendingList>(&crate::app::AppPendingListParams {
+            claims: claims.to_vec(),
+        })?;
+        if list.well_formed() {
+            Ok(list)
+        } else {
+            Err(ClientError::Protocol)
+        }
+    }
+
+    /// `app.pending.get`: the full [`PendingDescriptor`] for pending run
+    /// request `request`.
+    pub fn app_pending_get(
+        &mut self,
+        request: &str,
+        claims: &[String],
+    ) -> Result<PendingDescriptor, ClientError> {
+        self.call::<crate::app::AppPendingGet>(&crate::app::AppPendingGetParams {
+            request: request.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
+
+    /// `app.approve`: approves pending run request `request` with a 64-byte
+    /// P-256 ECDSA signature over `digest`.
+    pub fn app_approve(
+        &mut self,
+        request: &str,
+        options: &ApprovalOptions,
+        digest: &[u8; 32],
+        signature: &str,
+        claims: &[String],
+    ) -> Result<ApprovedView, ClientError> {
+        use core::fmt::Write as _;
+        let hex = digest.iter().fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        self.call::<crate::app::AppApprove>(&crate::app::AppApproveParams {
+            request: request.to_owned(),
+            options: options.clone(),
+            digest: hex,
+            signature: signature.to_owned(),
+            claims: claims.to_vec(),
+        })
+    }
 }

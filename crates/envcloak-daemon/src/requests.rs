@@ -285,7 +285,7 @@ fn bind_error(e: &BindError) -> RpcError {
     }
 }
 
-fn approve_error(e: ApproveError) -> RpcError {
+pub(crate) fn approve_error(e: ApproveError) -> RpcError {
     match e {
         ApproveError::NoSuchRequest => RpcError::new(ErrorKind::NoSuchRequest),
         ApproveError::StatementMismatch => RpcError::new(ErrorKind::StatementMismatch),
@@ -1224,7 +1224,7 @@ pub fn pending_get(
 /// Audits an approval of request `id` that the live-key guard refused,
 /// with the items whose live bindings `opts` left unticked, and returns
 /// the refusal.
-fn live_refused(
+pub(crate) fn live_refused(
     s: &mut crate::state::State,
     peer: &PeerIdentity,
     approver: SubjectSummary,
@@ -1311,7 +1311,7 @@ pub fn pending_list(
 }
 
 /// What `envcloak pending` shows of one request.
-fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
+pub(crate) fn pending_view(p: &Pending, now: &envcloak_policy::Now) -> PendingView {
     let kind = p.request.subject.kind();
     let age = p.age(now);
     PendingView {

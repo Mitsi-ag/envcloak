@@ -26,7 +26,8 @@ use hpke::aead::{AesGcm256, ChaCha20Poly1305};
 use hpke::kdf::HkdfSha256;
 use hpke::kem::{DhP256HkdfSha256, X25519HkdfSha256};
 use hpke::{Deserializable as _, Kem as _, OpModeR, OpModeS, Serializable as _};
-use p256::ecdsa::VerifyingKey;
+use p256::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use secrecy::{ExposeSecret, SecretBox};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
@@ -39,6 +40,8 @@ use super::{CryptoError, CryptoErrorKind, fill_random};
 pub const SE_HPKE_INFO_PREFIX: &[u8] = b"envcloak/v1/unlocker/se";
 /// Length of an uncompressed SEC1 P-256 public key (`0x04 || X || Y`).
 pub const P256_PUBLIC_KEY_LEN: usize = 65;
+/// Length of a raw P-256 ECDSA signature (`r (32) || s (32)`).
+pub const P256_SIGNATURE_LEN: usize = 64;
 /// Length of the DHKEM(P-256, HKDF-SHA256) encapsulated key.
 pub const SE_HPKE_ENC_LEN: usize = 65;
 /// Length of the AES-256-GCM or ChaCha20-Poly1305 sealed 32-byte VMK (32 + 16).
@@ -508,6 +511,42 @@ pub fn derive_p256_keypair(ikm: &[u8; 32]) -> ([u8; 32], [u8; P256_PUBLIC_KEY_LE
     (sk_out, pk_out)
 }
 
+/// Verifies a 64-byte raw P-256 ECDSA signature (`r || s`, low-S normalized)
+/// over the 32-byte SHA-256 `digest` as a prehash using the 65-byte
+/// uncompressed SEC1 public key `pub_sec1` (SPEC §10b, §11; M3-09).
+pub fn verify_p256_prehash(
+    pub_sec1: &[u8; P256_PUBLIC_KEY_LEN],
+    digest: &[u8; 32],
+    sig_raw: &[u8; P256_SIGNATURE_LEN],
+) -> Result<(), CryptoError> {
+    let _ = check_p256_public_key(pub_sec1)?;
+    let vk = VerifyingKey::from_sec1_bytes(pub_sec1)
+        .map_err(|_| CryptoError::new(CryptoErrorKind::Unlock))?;
+    let sig = Signature::from_slice(sig_raw)
+        .map_err(|_| CryptoError::new(CryptoErrorKind::Unlock))?
+        .normalize_s();
+    vk.verify_prehash(digest, &sig)
+        .map_err(|_| CryptoError::new(CryptoErrorKind::Unlock))
+}
+
+/// Signs the 32-byte SHA-256 `digest` as a prehash with the raw 32-byte P-256
+/// private scalar `sk_raw`, returning the 64-byte raw signature (`r || s`,
+/// low-S normalized; used by software stand-in tests).
+pub fn sign_p256_prehash(
+    sk_raw: &[u8; 32],
+    digest: &[u8; 32],
+) -> Result<[u8; P256_SIGNATURE_LEN], CryptoError> {
+    let sk = SigningKey::from_bytes(sk_raw.into())
+        .map_err(|_| CryptoError::new(CryptoErrorKind::Seal))?;
+    let sig: Signature = sk
+        .sign_prehash(digest)
+        .map_err(|_| CryptoError::new(CryptoErrorKind::Seal))?;
+    let sig = sig.normalize_s();
+    let mut out = [0u8; P256_SIGNATURE_LEN];
+    out.copy_from_slice(sig.to_bytes().as_slice());
+    Ok(out)
+}
+
 fn put_str(out: &mut Vec<u8>, s: &str) {
     let len = u32::try_from(s.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&len.to_be_bytes());
@@ -652,5 +691,51 @@ mod tests {
         let (_, mut rec) = sample_record();
         rec.approve_pub = rec.unlock_pub;
         assert!(rec.check().is_err());
+    }
+
+    #[test]
+    fn p256_prehash_sign_and_verify_accepts_both_s_halves_and_rejects_bad_inputs() {
+        let (sk1, pk1) = derive_p256_keypair(&[0x31u8; 32]);
+        let (_, pk2) = derive_p256_keypair(&[0x32u8; 32]);
+        let digest: [u8; 32] = Sha256::digest(b"envcloak-statement/2\ntest-statement").into();
+        let other_digest: [u8; 32] =
+            Sha256::digest(b"envcloak-statement/2\nother-statement").into();
+        let double_hashed: [u8; 32] = Sha256::digest(digest).into();
+
+        let sig = sign_p256_prehash(&sk1, &digest).unwrap();
+        assert!(verify_p256_prehash(&pk1, &digest, &sig).is_ok());
+        assert!(verify_p256_prehash(&pk2, &digest, &sig).is_err());
+        assert!(verify_p256_prehash(&pk1, &other_digest, &sig).is_err());
+        assert!(verify_p256_prehash(&[0u8; 65], &digest, &sig).is_err());
+        assert!(verify_p256_prehash(&pk1, &digest, &[0u8; 64]).is_err());
+
+        // Double-hashing the digest fails verification against the one-hash digest.
+        let double_sig = sign_p256_prehash(&sk1, &double_hashed).unwrap();
+        assert!(verify_p256_prehash(&pk1, &digest, &double_sig).is_err());
+
+        // High-S representation (`s' = n - s` on P-256, as Apple Security / CryptoKit
+        // may emit) is normalized and accepted for the exact digest, while a flipped
+        // byte is rejected.
+        let p256_order: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2,
+            0xfc, 0x63, 0x25, 0x51,
+        ];
+        let mut high_s_sig = sig;
+        let mut borrow = 0u16;
+        for i in (0..32).rev() {
+            let diff = i32::from(p256_order[i]) - i32::from(sig[32 + i]) - i32::from(borrow);
+            if diff < 0 {
+                high_s_sig[32 + i] = (diff + 256) as u8;
+                borrow = 1;
+            } else {
+                high_s_sig[32 + i] = diff as u8;
+                borrow = 0;
+            }
+        }
+        assert!(verify_p256_prehash(&pk1, &digest, &high_s_sig).is_ok());
+        let mut flipped = sig;
+        flipped[63] ^= 1;
+        assert!(verify_p256_prehash(&pk1, &digest, &flipped).is_err());
     }
 }

@@ -1,7 +1,10 @@
-//! App-role admission and handlers (`app.unlock.*`, `app.unlocker.enroll.*`).
+//! App-role admission and handlers (`app.unlock.*`, `app.unlocker.enroll.*`,
+//! `app.pending.*`, `app.approve`).
 //! A code-identity verdict belongs only to the accepted connection.
 
+pub(crate) mod approve;
 pub(crate) mod enroll;
+pub(crate) mod pending;
 pub(crate) mod unlock;
 
 use std::os::fd::AsFd;

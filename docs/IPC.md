@@ -648,7 +648,7 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 <!-- reservations:error_kind -->
 | Token | Code | Task | Status | Use |
 |---|---|---|---|---|
-| `signature_invalid` | -32051 | M3-09 | reserved | a signed proof from the app whose P-256 signature does not verify with the `approve` key of a Secure Enclave unlocker enrolled in the vault (a key never enrolled, or removed, included); nothing is granted or written |
+| `signature_invalid` | -32051 | M3-09 | landed | a signed proof from the app whose P-256 signature does not verify with the `approve` key of a Secure Enclave unlocker enrolled in the vault (a key never enrolled, or removed, included); nothing is granted or written |
 | `unlock_failed` | -32052 | M3-08 | landed | an `app.unlock` whose sealed VMK does not open, does not match the vault's sealed header, or answers an unlock request that is unknown, used or more than 60 seconds old; audited |
 | `no_unlocker` | -32053 | M3-08 | landed | no enrolled Secure Enclave unlocker has the id `app.unlock.begin` names; M3-14 uses it again for an `app.unlocker.remove` that names no unlocker the app may remove (the Recovery Kit's is never one) |
 | `ask_closed` | -32054 | M3-14 | reserved | an ask that was declined, expired or answered already (`app.paste` for an ask, `app.asks.decline`) |
@@ -689,9 +689,9 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | `app.unlocker.enroll` | M3-08 | landed | that request's outcome: `pending`, `enrolled` with the unlocker's id, `denied` or `expired` |
 | `app.unlocker.add` | M3-14 | reserved | another Secure Enclave unlocker (as "Touch ID only" enrols, SPEC §12), signed by an enrolled `approve` key (`envcloak-write-statement/1`) |
 | `app.unlocker.remove` | M3-14 | reserved | removes the passphrase unlocker or a Secure Enclave unlocker under a signed `envcloak-write-statement/1` (SPEC §4.3, §5): never the Recovery Kit's (`no_unlocker`), and never the last daily unlocker (`last_unlocker`); a removed Secure Enclave unlocker's envelope and `approve` key leave the vault, so neither of its keys is taken again |
-| `app.pending.list` | M3-09 | reserved | the pending run requests, at most 20, oldest first, each with its statement domain; none to an `app` peer whose evidence names an agent (`proof_refused`, SPEC §10b) |
-| `app.pending.get` | M3-09 | reserved | one pending request's whole descriptor, for the approval window |
-| `app.approve` | M3-09 | reserved | a run approval: the statement's digest and its P-256 signature by an enrolled `approve` key, checked against the statement the daemon rebuilds from its own pending request |
+| `app.pending.list` | M3-09 | landed | the pending run requests, at most 20, oldest first, each with its statement domain; none to an `app` peer whose evidence names an agent (`proof_refused`, SPEC §10b) |
+| `app.pending.get` | M3-09 | landed | one pending request's whole descriptor, for the approval window |
+| `app.approve` | M3-09 | landed | a run approval: the statement's digest and its P-256 signature by an enrolled `approve` key, checked against the statement the daemon rebuilds from its own pending request |
 | `app.items.target` | M3-14 | reserved | the item a signed write names, with a nonce and a daemon key to seal a replacement value to |
 | `app.items.rotate` | M3-14 | reserved | replaces a value, sealed to that key, under a signed `envcloak-write-statement/1` |
 | `app.items.remove` | M3-14 | reserved | removes an item under a signed write statement, after an encrypted backup of the vault |

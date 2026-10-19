@@ -1,10 +1,11 @@
-//! App-role wire types and methods for Secure Enclave unlock and enrolment
-//! (SPEC §4.3, §5, §10b; M3 plan M3-08).
+//! App-role wire types and methods for Secure Enclave unlock, enrolment and
+//! signed approvals (SPEC §4.3, §5, §10b; M3 plan M3-08, M3-09).
 
+use envcloak_policy::{ApprovalOptions, PendingDescriptor, PendingId, SubjectKind};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::Method;
-use crate::view::{UnlockedView, View};
+use crate::view::{ApprovedView, MAX_LISTED_BINDINGS, UnlockedView, View};
 
 /// `app.unlock.begin`: starts a Secure Enclave unlock (SPEC §5 step 2).
 /// Returns the unlocker's envelope, a 32-byte random challenge and a fresh
@@ -169,3 +170,141 @@ pub enum AppUnlockerEnrollOutput {
 }
 
 impl View for AppUnlockerEnrollOutput {}
+
+/// The statement domain string `app.pending.list` names for a pending run
+/// request (`envcloak-statement/2`, without the trailing newline).
+pub const RUN_STATEMENT_DOMAIN: &str = "envcloak-statement/2";
+
+/// `app.pending.list`: the pending run requests waiting for approval, oldest
+/// first (at most 20), with [`PendingView`](crate::view::PendingView)'s row
+/// shape plus the statement domain (SPEC §10a, §10b; M3 plan M3-09).
+#[derive(Debug)]
+pub struct AppPendingList;
+
+impl Method for AppPendingList {
+    const NAME: &'static str = "app.pending.list";
+    type Params = AppPendingListParams;
+    type Output = AppPendingListView;
+}
+
+/// Parameters of [`AppPendingList`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPendingListParams {
+    /// Agent marker names in the caller's environment (`Claims::from_env`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// Answer to [`AppPendingList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPendingListView {
+    pub requests: Vec<AppPendingView>,
+}
+
+impl View for AppPendingListView {}
+
+impl AppPendingListView {
+    /// Whether every row has the canonical shape a daemon sends.
+    pub fn well_formed(&self) -> bool {
+        let mut seen: Vec<PendingId> = Vec::with_capacity(self.requests.len());
+        for r in &self.requests {
+            let Some(id) = PendingId::parse(&r.request) else {
+                return false;
+            };
+            if id.to_string() != r.request
+                || seen.contains(&id)
+                || r.statement_domain != RUN_STATEMENT_DOMAIN
+                || r.bindings.len() > MAX_LISTED_BINDINGS
+                || (r.more_bindings > 0 && r.bindings.len() < MAX_LISTED_BINDINGS)
+                || r.bindings
+                    .iter()
+                    .any(|b| envcloak_core::vault::Slug::new(b).is_err())
+            {
+                return false;
+            }
+            seen.push(id);
+        }
+        true
+    }
+}
+
+/// One pending run request row in [`AppPendingListView`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPendingView {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub request: String,
+    /// How long it has waited, in seconds of awake time.
+    pub age_secs: u64,
+    /// How long it may still wait before it expires.
+    pub expires_in_secs: u64,
+    /// The requester's kind.
+    pub kind: SubjectKind,
+    /// The agent's display name, when one is involved.
+    pub agent: Option<String>,
+    /// The project's canonical directory.
+    pub project: String,
+    /// The slugs of the items its first [`MAX_LISTED_BINDINGS`] bindings
+    /// name, in the request's order.
+    pub bindings: Vec<String>,
+    /// How many of its bindings are not in `bindings`.
+    pub more_bindings: u64,
+    /// The statement domain prefix without its trailing newline
+    /// (`"envcloak-statement/2"`).
+    pub statement_domain: String,
+}
+
+impl View for AppPendingView {}
+
+/// `app.pending.get`: the full [`PendingDescriptor`] of a pending run request
+/// for the app's approval window (SPEC §10b; M3 plan M3-09).
+#[derive(Debug)]
+pub struct AppPendingGet;
+
+impl Method for AppPendingGet {
+    const NAME: &'static str = "app.pending.get";
+    type Params = AppPendingGetParams;
+    type Output = PendingDescriptor;
+}
+
+/// Parameters of [`AppPendingGet`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppPendingGetParams {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub request: String,
+    /// Agent marker names in the caller's environment (`Claims::from_env`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `app.approve`: approves a pending run request with a P-256 ECDSA signature
+/// by the `approve` key of an enrolled Secure Enclave unlocker over the
+/// canonical statement digest as a prehash (SPEC §10b; M3 plan M3-09).
+#[derive(Debug)]
+pub struct AppApprove;
+
+impl Method for AppApprove {
+    const NAME: &'static str = "app.approve";
+    type Params = AppApproveParams;
+    type Output = ApprovedView;
+}
+
+/// Parameters of [`AppApprove`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppApproveParams {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub request: String,
+    pub options: ApprovalOptions,
+    /// SHA-256 of the canonical statement, 64 lowercase hex characters.
+    pub digest: String,
+    /// 64-byte raw P-256 ECDSA signature (`r || s`), 128 hex characters or
+    /// 88 standard base64 characters.
+    pub signature: String,
+    /// Agent marker names in the caller's environment (`Claims::from_env`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
