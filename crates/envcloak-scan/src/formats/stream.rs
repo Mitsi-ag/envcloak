@@ -83,7 +83,7 @@ impl<R: Read> Input<R> {
             if !string
                 && depth == 0
                 && (matches!(b, b',' | b']' | b'}' | b':')
-                    || (out.len() > 0 && b.is_ascii_whitespace()))
+                    || (!out.is_empty() && b.is_ascii_whitespace()))
             {
                 break;
             }
