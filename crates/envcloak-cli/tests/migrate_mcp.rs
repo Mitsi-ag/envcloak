@@ -372,10 +372,9 @@ fn gate39_claude_and_codex_migration_classes_receipts_standing_and_undo() {
     let openai_live = w.value(labels::OPENAI_API_KEY).to_owned();
     let github_tok = w.value(labels::GITHUB_TOKEN).to_owned();
     let bridge_hdr = w.value("CUSTOM_BRIDGE_HEADER").to_owned();
-    let bridge_env = w.value("CUSTOM_BRIDGE_ENV").to_owned();
 
-    // 1. Add a native server (bound + test key) and an HTTP bridge server (with BOTH
-    //    headers and env secret) via `claude mcp add-json`.
+    // 1. Add a native server (bound + test key) and an HTTP bridge server (with
+    //    secret headers) via `claude mcp add-json`.
     let claude_native_payload = json!({
         "command": native_bin.to_str().unwrap(),
         "args": ["--port", "9100"],
@@ -400,9 +399,6 @@ fn gate39_claude_and_codex_migration_classes_receipts_standing_and_undo() {
         "url": "https://mcp.example.com/v1/sse",
         "headers": {
             "Authorization": bridge_hdr,
-        },
-        "env": {
-            "EXTRA_BRIDGE_TOKEN": bridge_env,
         }
     });
     let out = w.host(
@@ -1359,9 +1355,12 @@ fn gate39_doc_derived_fixtures_for_cursor_gemini_copilot_kimi_opencode_and_share
         "expected ~/.claude/backups/ scrub note: {report}"
     );
 
-    // Remove the external `.cursor/mcp.env` file before sweeping `w.home` so we sweep all
-    // rewritten config files for every canary encoding.
-    std::fs::remove_file(&cursor_env_file).unwrap();
+    // Migrated `.cursor/mcp.env` must have been backed up and unlinked on apply (`F-02`),
+    // so sweeping `w.home` succeeds without any manual cleanup!
+    assert!(
+        !cursor_env_file.exists(),
+        "migrated envFile must be backed up and unlinked by apply"
+    );
     w.sweep();
 
     // Verify OpenCode `command` array and Gemini `${STRIPE_KEY}` interpolation preservation.
@@ -1378,5 +1377,496 @@ fn gate39_doc_derived_fixtures_for_cursor_gemini_copilot_kimi_opencode_and_share
     assert_eq!(
         gem_after["mcpServers"]["gem-interpolated"]["env"]["STRIPE_KEY"], "${STRIPE_KEY}",
         "existing interpolation must not be treated as a literal secret"
+    );
+
+    // Undo restores the unlinked `.cursor/mcp.env` byte-for-byte (`F-02`).
+    let backup_id = report["backup_id"].as_str().unwrap().to_owned();
+    let undo_out = w.run_terminal(&[
+        "agents",
+        "migrate-mcp",
+        "--undo",
+        &backup_id,
+        "--passphrase-fd",
+        "3",
+    ]);
+    assert!(
+        undo_out.status.success(),
+        "tier2 undo failed: {}\n{}",
+        stdout(&undo_out),
+        stderr(&undo_out)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&cursor_env_file).unwrap(),
+        format!("OPENAI_API_KEY={openai_live}\n"),
+        "undo must restore unlinked envFile byte-for-byte"
+    );
+}
+
+/// Regression tests for Round 1 security review findings (`F-01` through `F-09`):
+/// - `F-01`: HTTP servers with `env` secrets (`http_server_env_secrets`) or secrets/userinfo in
+///   `url` (`secret_in_url`) are reported manual and never written into plaintext manifests or `--url` argv.
+/// - `F-02`: `envFile` with `..` traversal or non-`Plain` (`export`) entry is reported manual;
+///   child file issues inside a directory source (`mcp-secrets` symlink) are preserved; quoted
+///   `Plain` entries in `envFile` are decoded before vault import and non-secret `envFile` entries
+///   are preserved in the stdio declaration while `envFile` is unlinked on disk.
+/// - `F-03`: `claude mcp` subprocess runs with a scrubbed environment and never echoes raw stderr
+///   canaries on failure, restoring `~/.claude.json` from snapshot if external tool fails.
+/// - `F-04`: Invalid TOML with a secret on the failing line reports only the line number (`invalid_toml (line N)`)
+///   and never echoes raw source lines.
+/// - `F-05`: Interpolated code-selecting env var (`NODE_OPTIONS: "${MY_OPTS}"`) is flagged
+///   `code_selecting_env`; mixed `${...}` + literal secret is flagged `mixed_interpolated_and_literal`;
+///   malformed `envcloak://` is flagged `invalid_envcloak_reference`.
+/// - `F-06`: Same `(agent, server)` name in user-scope and project-scope configs is disambiguated
+///   in `MigrationRegistry` and manifest filenames so both servers work and `--undo` unregisters both.
+/// - `F-07`: `--unrecorded` migration followed by `--undo` succeeds and restores config files.
+/// - `F-08`: Project-scoped stdio server with `cwd: None` and relative entry script resolves against
+///   project root; empty or relative non-interpreter `command` is flagged manual during planning.
+/// - `F-09`: Unknown `--agent` (`--agent bogus`) fails with exit code 2 (`USAGE`), and `--agent copilot`
+///   includes shared `.mcp.json`.
+#[test]
+fn gate39_round1_security_remediations_f01_through_f09() {
+    let w = MigrateWorld::new();
+    let stripe_test = w.value(labels::STRIPE_SECRET_KEY).to_owned();
+    let openai_live = w.value(labels::OPENAI_API_KEY).to_owned();
+    let github_tok = w.value(labels::GITHUB_TOKEN).to_owned();
+    let bridge_hdr = w.value("CUSTOM_BRIDGE_HEADER").to_owned();
+    let native_bin = w.compile_native_mcp_server("rem-mcp", 1, "STRIPE_KEY");
+
+    // --- F-09: unknown `--agent` fails with exit code 2 (USAGE) ---
+    let bad_agent = w.run_detached(&["agents", "migrate-mcp", "--agent", "bogus"]);
+    assert_eq!(bad_agent.status.code(), Some(2), "{}", stderr(&bad_agent));
+    let bad_claude_alias = w.run_detached(&["agents", "migrate-mcp", "--agent", "claude"]);
+    assert_eq!(
+        bad_claude_alias.status.code(),
+        Some(2),
+        "--agent claude must be rejected in favor of claude-code: {}",
+        stderr(&bad_claude_alias)
+    );
+
+    // --- F-01, F-02, F-04, F-05, F-08 manual refusals & zero-canary error reporting ---
+    // F-04: TOML syntax error on a line containing a canary secret must never echo the raw line,
+    // both via `rewrite_codex_toml` (which formats `invalid_toml (line N)`) and via `migrate-mcp`.
+    let broken_toml = format!(
+        "[mcp_servers.broken]\ncommand = \"npx\"\nenv = {{ OPENAI_API_KEY = \"{openai_live}\" \n"
+    );
+    let toml_err = envcloak_agents::migrate::codex::rewrite_codex_toml(
+        Path::new("/tmp/config.toml"),
+        &broken_toml,
+        &[],
+    )
+    .unwrap_err()
+    .to_string();
+    assert_no_canary(toml_err.as_bytes(), &w.cs);
+    assert!(
+        toml_err.contains("invalid TOML syntax at line 3"),
+        "expected line-only invalid_toml reason: {toml_err}"
+    );
+
+    std::fs::write(w.path(".codex/config.toml"), &broken_toml).unwrap();
+    age(&w.path(".codex/config.toml"), OLD);
+
+    // F-01, F-02, F-05, F-08 server entries across `.mcp.json`, `.cursor/mcp.json`, and `.gemini/settings.json`.
+    std::fs::create_dir_all(w.path(".cursor")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/nonexistent/secret.env", w.path(".cursor/dangling.env")).unwrap();
+
+    std::fs::create_dir_all(w.path(".gemini")).unwrap();
+    let export_env = w.path(".gemini/export.env");
+    std::fs::write(&export_env, "STRIPE_KEY=${OTHER_VAR}\n").unwrap();
+    age(&export_env, OLD);
+
+    let mcp_manual = json!({
+        "mcpServers": {
+            "http-env-sec": {
+                "url": "https://mcp.example.com/v1",
+                "headers": { "Authorization": bridge_hdr },
+                "env": { "STRIPE_KEY": stripe_test }
+            },
+            "http-url-sec": {
+                "url": format!("https://user:{github_tok}@mcp.example.com/v1")
+            },
+            "http-query-sec": {
+                "url": "https://mcp.example.com/v1?api_key=plain_query_token"
+            },
+            "interp-codesel": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "env": {
+                    "NODE_OPTIONS": "${INJECTED_NODE_OPTS}",
+                    "STRIPE_KEY": stripe_test
+                }
+            },
+            "mixed-interp": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "env": {
+                    "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+                    "STRIPE_KEY": stripe_test
+                }
+            },
+            "bad-ref": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "env": {
+                    "STRIPE_KEY": "envcloak://not a valid reference"
+                }
+            },
+            "empty-cmd": {
+                "command": "",
+                "args": [],
+                "env": { "STRIPE_KEY": stripe_test }
+            },
+            "rel-cmd": {
+                "command": "./relative-binary",
+                "args": [],
+                "env": { "STRIPE_KEY": stripe_test }
+            }
+        }
+    });
+    std::fs::write(w.path(".mcp.json"), mcp_manual.to_string()).unwrap();
+    age(&w.path(".mcp.json"), OLD);
+
+    // `.cursor/mcp.json` references a child symlink `dangling.env` (`F-02`: `scan_sources` emits
+    // a `ScanIssue` with path `.cursor/dangling.env`, which `agent_for_path` maps to `cursor`
+    // without suppressing inspection of `.cursor/mcp.json`).
+    let cursor_manual = json!({
+        "mcpServers": {
+            "envfile-symlink": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "envFile": "dangling.env"
+            }
+        }
+    });
+    std::fs::write(w.path(".cursor/mcp.json"), cursor_manual.to_string()).unwrap();
+    age(&w.path(".cursor/mcp.json"), OLD);
+
+    // `.gemini/settings.json` has an `export` line in `export.env` (`unsupported_env_file_entry`)
+    // and an `envFile` with `..` (`unread_env_file`).
+    let gemini_manual = json!({
+        "mcpServers": {
+            "envfile-export": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "envFile": "export.env"
+            },
+            "envfile-interp": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "envFile": "${HOME}/some.env"
+            }
+        }
+    });
+    std::fs::write(w.path(".gemini/settings.json"), gemini_manual.to_string()).unwrap();
+    age(&w.path(".gemini/settings.json"), OLD);
+
+    let dry_man = w.run_detached(&["agents", "migrate-mcp", "--dry-run", "--json"]);
+    assert!(
+        !dry_man.status.success(),
+        "dry-run with manual items must exit non-zero (incomplete)"
+    );
+    let plan: Value = serde_json::from_slice(&dry_man.stdout).unwrap();
+    assert_eq!(plan["complete"], false);
+    let items = plan["manual_items"].as_array().unwrap();
+    let reasons: Vec<&str> = items
+        .iter()
+        .map(|m| m["reason"].as_str().unwrap())
+        .collect();
+    for expected in [
+        "invalid_toml",
+        "http_server_env_secrets",
+        "secret_in_url",
+        "code_selecting_env",
+        "mixed_interpolated_and_literal",
+        "invalid_secret_ref",
+        "invalid_launch_declaration",
+        "unsupported_env_file_entry",
+        "unread_env_file",
+        "symlink",
+    ] {
+        assert!(
+            reasons.contains(&expected),
+            "missing manual reason `{expected}` in {reasons:?}"
+        );
+    }
+    assert!(
+        items
+            .iter()
+            .any(|m| m["agent"] == "cursor" && m["reason"] == "symlink"),
+        "expected child symlink envFile issue under .cursor/ to be mapped to cursor in {items:?}"
+    );
+
+    // Clean up manual fixtures before testing positive F-02, F-06, F-07, F-08, F-09 flows.
+    std::fs::remove_file(w.path(".codex/config.toml")).unwrap();
+    std::fs::remove_file(w.path(".cursor/dangling.env")).unwrap();
+    std::fs::remove_file(&export_env).unwrap();
+    std::fs::remove_file(w.path(".gemini/settings.json")).unwrap();
+
+    // --- F-09: `--agent copilot` includes shared `.mcp.json` ---
+    std::fs::write(
+        w.path(".mcp.json"),
+        json!({
+            "mcpServers": {
+                "shared-cop": {
+                    "command": native_bin.to_str().unwrap(),
+                    "args": [],
+                    "env": { "STRIPE_KEY": stripe_test }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    age(&w.path(".mcp.json"), OLD);
+    let cop_dry = w.run_detached(&[
+        "agents",
+        "migrate-mcp",
+        "--agent",
+        "copilot",
+        "--dry-run",
+        "--json",
+    ]);
+    assert!(cop_dry.status.success(), "{}", stderr(&cop_dry));
+    let cop_plan: Value = serde_json::from_slice(&cop_dry.stdout).unwrap();
+    assert_eq!(
+        cop_plan["rewrites"].as_array().unwrap().len(),
+        1,
+        "--agent copilot must include shared .mcp.json: {cop_plan}"
+    );
+    std::fs::remove_file(w.path(".mcp.json")).unwrap();
+
+    // --- F-02 (quoted envFile + non-secret), F-06 (user + project collision), F-07 (--unrecorded + --undo), F-08 (project-scoped relative script + cwd) ---
+    let proj_dir = w.home.root().join("my-proj");
+    std::fs::create_dir_all(proj_dir.join(".cursor")).unwrap();
+    let rel_script = proj_dir.join("rel_srv.py");
+    std::fs::write(
+        &rel_script,
+        concat!(
+            "import json, os, sys\n",
+            "for line in sys.stdin:\n",
+            "    msg = json.loads(line)\n",
+            "    val = os.environ.get('OPENAI_API_KEY', '')\n",
+            "    res = {\n",
+            "        'unquoted_len': len(val),\n",
+            "        'has_quotes': ('\"' in val),\n",
+            "        'mode': os.environ.get('MODE'),\n",
+            "        'cwd': os.path.realpath(os.getcwd()),\n",
+            "    }\n",
+            "    sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':msg.get('id'),'result':res}) + '\\n')\n",
+            "    sys.stdout.flush()\n",
+        ),
+    )
+    .unwrap();
+
+    // User-scope `~/.cursor/mcp.json` defines server `dup-srv` (native).
+    std::fs::write(
+        w.path(".cursor/mcp.json"),
+        json!({
+            "mcpServers": {
+                "dup-srv": {
+                    "command": native_bin.to_str().unwrap(),
+                    "args": [],
+                    "env": { "STRIPE_KEY": stripe_test }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    age(&w.path(".cursor/mcp.json"), OLD);
+
+    // Project-scope `<proj>/.cursor/mcp.json` ALSO defines server `dup-srv`, with:
+    // - `cwd: None` and relative entry script `"rel_srv.py"` (`F-08`)
+    // - `envFile: "quoted.env"` containing a quoted secret and a non-secret (`F-02`).
+    let proj_env_file = proj_dir.join(".cursor/quoted.env");
+    std::fs::write(
+        &proj_env_file,
+        format!("OPENAI_API_KEY=\"{openai_live}\"\nMODE=\"from_dotenv\"\n"),
+    )
+    .unwrap();
+    age(&proj_env_file, OLD);
+
+    let py = python3();
+    let proj_mcp_path = proj_dir.join(".cursor/mcp.json");
+    std::fs::write(
+        &proj_mcp_path,
+        json!({
+            "mcpServers": {
+                "dup-srv": {
+                    "command": py.to_str().unwrap(),
+                    "args": ["rel_srv.py"],
+                    "envFile": "quoted.env"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    age(&proj_mcp_path, OLD);
+
+    let user_cursor_before = std::fs::read(w.path(".cursor/mcp.json")).unwrap();
+    let proj_cursor_before = std::fs::read(&proj_mcp_path).unwrap();
+
+    // Apply from inside `proj_dir`.
+    let mut cmd = on_terminal_command(
+        &w.home,
+        &[
+            "agents",
+            "migrate-mcp",
+            "--yes",
+            "--passphrase-fd",
+            "3",
+            "--json",
+        ],
+        &[(3, &w.pass_file, true)],
+    );
+    cmd.current_dir(&proj_dir);
+    cmd.env("PATH", w.path_env());
+    let mig_out = finish_within(cmd, Duration::from_secs(60));
+    assert_no_canary(&mig_out.stdout, &w.cs);
+    assert_no_canary(&mig_out.stderr, &w.cs);
+    assert!(
+        mig_out.status.success(),
+        "migrate failed: {}\n{}",
+        stdout(&mig_out),
+        stderr(&mig_out)
+    );
+    assert!(
+        !proj_env_file.exists(),
+        "project envFile must be unlinked on apply"
+    );
+
+    let mig_rep: Value = serde_json::from_slice(&mig_out.stdout).unwrap();
+    let servers = mig_rep["servers"].as_array().unwrap();
+    assert_eq!(
+        servers.len(),
+        2,
+        "expected both colliding dup-srv entries: {mig_rep}"
+    );
+    // One server is `dup-srv` and the colliding one is disambiguated `cursor/dup-srv-<hash>` (`F-06`).
+    let proj_srv = servers
+        .iter()
+        .find(|s| s["config_path"].as_str().unwrap().contains("my-proj"))
+        .unwrap();
+    let proj_launch_id = proj_srv["launch_id"].as_str().unwrap().to_owned();
+    assert!(
+        proj_srv["server_key"]
+            .as_str()
+            .unwrap()
+            .starts_with("cursor/dup-srv-"),
+        "expected disambiguated server_key: {proj_srv}"
+    );
+
+    // Run the project-scoped relative-script server and verify:
+    // 1) Quoted dotenv secret was decoded without surrounding quotes (`F-02`).
+    // 2) Non-secret `MODE=from_dotenv` from `envFile` was preserved (`F-02`).
+    // 3) `cwd` defaulted to canonical `proj_dir` and `"rel_srv.py"` resolved against it (`F-08`).
+    let proj_canon = std::fs::canonicalize(&proj_dir).unwrap();
+    let (run_out, run_reply) = w.call_stdio_launch(&proj_launch_id, Some(&[]));
+    assert!(run_out.status.success(), "{}", stderr(&run_out));
+    assert_eq!(
+        run_reply["result"]["unquoted_len"].as_u64().unwrap() as usize,
+        openai_live.len(),
+        "quoted dotenv secret must be decoded without surrounding quotes"
+    );
+    assert_eq!(run_reply["result"]["has_quotes"], false);
+    assert_eq!(run_reply["result"]["mode"], "from_dotenv");
+    assert_eq!(
+        run_reply["result"]["cwd"].as_str().unwrap(),
+        proj_canon.to_str().unwrap()
+    );
+
+    // Undo with `--unrecorded` (`F-07`) and verify both configs and `quoted.env` are restored!
+    let backup_id = mig_rep["backup_id"].as_str().unwrap().to_owned();
+    let undo_out = w.run_terminal(&[
+        "agents",
+        "migrate-mcp",
+        "--undo",
+        &backup_id,
+        "--unrecorded",
+        "--passphrase-fd",
+        "3",
+    ]);
+    assert!(
+        undo_out.status.success(),
+        "unrecorded undo failed: {}\n{}",
+        stdout(&undo_out),
+        stderr(&undo_out)
+    );
+    assert_eq!(
+        std::fs::read(w.path(".cursor/mcp.json")).unwrap(),
+        user_cursor_before
+    );
+    assert_eq!(std::fs::read(&proj_mcp_path).unwrap(), proj_cursor_before);
+    assert!(
+        proj_env_file.exists(),
+        "unrecorded undo must restore deleted project envFile"
+    );
+    std::fs::remove_file(w.path(".cursor/mcp.json")).unwrap();
+    std::fs::remove_dir_all(&proj_dir).unwrap();
+
+    // --- F-03: `claude mcp` child env scrubbing, stderr suppression, and rollback on failure ---
+    let claude_json_path = w.path(".claude.json");
+    let claude_initial = json!({
+        "mcpServers": {
+            "f03-srv": {
+                "command": native_bin.to_str().unwrap(),
+                "args": [],
+                "env": { "STRIPE_KEY": stripe_test }
+            }
+        }
+    })
+    .to_string();
+    std::fs::write(&claude_json_path, &claude_initial).unwrap();
+    age(&claude_json_path, OLD);
+
+    // Replace `claude` in `w.bin_dir` with a script that checks `LEAKED_PARENT_SECRET` is absent,
+    // corrupts `~/.claude.json` on `remove`, prints a canary secret to stderr, and exits 42 on `add-json`.
+    let env_marker = w.home.root().join("claude_env_check.txt");
+    let fake_claude = w.bin.join("claude");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\nif [ -n \"$LEAKED_PARENT_SECRET\" ]; then\n  echo leaked > {:?}\nelse\n  echo clean > {:?}\nfi\nif [ \"$2\" = \"remove\" ]; then\n  echo '{{\"corrupted\":true}}' > {:?}\n  exit 0\nfi\necho \"fatal: {openai_live}\" >&2\nexit 42\n",
+            env_marker,
+            env_marker,
+            claude_json_path,
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut f03_cmd = on_terminal_command(
+        &w.home,
+        &["agents", "migrate-mcp", "--yes", "--passphrase-fd", "3"],
+        &[(3, &w.pass_file, true)],
+    );
+    f03_cmd.env("PATH", w.path_env());
+    f03_cmd.env("LEAKED_PARENT_SECRET", &github_tok);
+    let f03_out = finish_within(f03_cmd, Duration::from_secs(60));
+    assert!(!f03_out.status.success(), "expected fake claude failure");
+    // Must not echo the canary printed to fake claude's stderr!
+    assert_no_canary(&f03_out.stdout, &w.cs);
+    assert_no_canary(&f03_out.stderr, &w.cs);
+    assert!(
+        stderr(&f03_out).contains("exited with"),
+        "expected status-only detail: {}",
+        stderr(&f03_out)
+    );
+    // Parent secret env var must have been scrubbed via `env_clear()`.
+    assert_eq!(
+        std::fs::read_to_string(&env_marker).unwrap().trim(),
+        "clean",
+        "claude child process must run with scrubbed environment"
+    );
+    // `~/.claude.json` must be atomically rolled back to its pre-migration snapshot!
+    assert_eq!(
+        std::fs::read_to_string(&claude_json_path).unwrap(),
+        claude_initial,
+        "~/.claude.json must be rolled back from snapshot when claude mcp add-json fails"
     );
 }

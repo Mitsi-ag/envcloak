@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -6,6 +6,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use envcloak_client::fail::Failure;
 use envcloak_client::managed::{
@@ -13,7 +14,9 @@ use envcloak_client::managed::{
 };
 use envcloak_ipc::view::{LaunchReceiptView, UpdateStatementView};
 use envcloak_policy::managed::LaunchChanges;
-use envcloak_scan::{BackedUpFile, ModifyErrorKind, open_root, restore_over_left};
+use envcloak_scan::{
+    BackedUpFile, ModifyErrorKind, create_atomically, open_root, remove_checked, restore_over_left,
+};
 use envcloak_sys::InUse;
 
 use crate::coverage::Cache;
@@ -22,6 +25,7 @@ use crate::writer::{Journal, Stamp, StateFile};
 use super::{MigrateError, MigrateProof};
 
 const MIGRATIONS_FILE: &str = "agents/migrations.json";
+const EMPTY_SHA256_HEX: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MigrationRegistry {
@@ -51,6 +55,8 @@ pub struct BackupMigrationRecord {
     pub server_keys: Vec<String>,
     #[serde(default)]
     pub files: Vec<PathBuf>,
+    #[serde(default)]
+    pub deleted_files: Vec<PathBuf>,
 }
 
 impl MigrationRegistry {
@@ -233,6 +239,16 @@ pub fn update(
     })
 }
 
+struct RestoreTarget {
+    path: PathBuf,
+    root: envcloak_scan::ScanRoot,
+    rel: PathBuf,
+    file_idx: u32,
+    sha256_hex: String,
+    backed: BackedUpFile,
+    create_empty_first: bool,
+}
+
 pub fn undo(backup_id: &str, proof: &MigrateProof<'_>) -> Result<UndoReport, MigrateError> {
     let passphrase = proof
         .passphrase
@@ -250,22 +266,19 @@ pub fn undo(backup_id: &str, proof: &MigrateProof<'_>) -> Result<UndoReport, Mig
         )
         .map_err(|e| MigrateError::Client(Failure::from(e)))?;
 
+    let mut reg = MigrationRegistry::open(&proof.data_dir)?;
+    let deleted_set: BTreeSet<PathBuf> = reg
+        .backups
+        .get(backup_id)
+        .map(|b| b.deleted_files.iter().cloned().collect())
+        .unwrap_or_default();
+
     let mut targets = Vec::with_capacity(lease_view.statement.files.len());
     for f in &lease_view.statement.files {
         let path = PathBuf::from(&f.path);
-        let Some(after_hex) = &f.sha256_after else {
-            return Err(MigrateError::RestoreRefused {
-                path,
-                reason: "backup has no post-change digest recorded".to_string(),
-            });
-        };
         let sha256 = parse_hex32(&f.sha256).ok_or_else(|| MigrateError::RestoreRefused {
             path: path.clone(),
             reason: "invalid pre-change digest in backup".to_string(),
-        })?;
-        let sha256_after = parse_hex32(after_hex).ok_or_else(|| MigrateError::RestoreRefused {
-            path: path.clone(),
-            reason: "invalid post-change digest in backup".to_string(),
         })?;
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(MigrateError::RestoreRefused {
@@ -277,26 +290,110 @@ pub fn undo(backup_id: &str, proof: &MigrateProof<'_>) -> Result<UndoReport, Mig
             path: path.clone(),
             reason: "parent directory could not be opened".to_string(),
         })?;
-        let open_fd = envcloak_sys::open_beneath(root.dir(), name).map_err(|_| {
-            MigrateError::RestoreRefused {
-                path: path.clone(),
-                reason: "file is missing or unreadable on disk".to_string(),
+
+        let is_deleted = deleted_set.contains(&path);
+        match envcloak_sys::open_beneath(root.dir(), name) {
+            Ok(open_fd) => {
+                if matches!(envcloak_sys::open_elsewhere(&open_fd), InUse::Yes) {
+                    return Err(MigrateError::OpenElsewhere { path });
+                }
+                if is_deleted {
+                    if proof.unrecorded
+                        && f.sha256_after.is_none()
+                        && envcloak_scan::scrub::current_digest(&path) == Ok(sha256)
+                    {
+                        targets.push(RestoreTarget {
+                            path: path.clone(),
+                            root,
+                            rel: PathBuf::from(name),
+                            file_idx: f.file,
+                            sha256_hex: f.sha256.clone(),
+                            backed: BackedUpFile {
+                                size: f.size,
+                                sha256,
+                                sha256_after: sha256,
+                            },
+                            create_empty_first: false,
+                        });
+                    } else {
+                        return Err(MigrateError::RestoreRefused {
+                            path,
+                            reason: "file on disk was modified since migration".to_string(),
+                        });
+                    }
+                } else {
+                    let sha256_after = match &f.sha256_after {
+                        Some(after_hex) => {
+                            parse_hex32(after_hex).ok_or_else(|| MigrateError::RestoreRefused {
+                                path: path.clone(),
+                                reason: "invalid post-change digest in backup".to_string(),
+                            })?
+                        }
+                        None if proof.unrecorded => envcloak_scan::scrub::current_digest(&path)
+                            .map_err(|_| MigrateError::RestoreRefused {
+                                path: path.clone(),
+                                reason: "file is missing or unreadable on disk".to_string(),
+                            })?,
+                        None => {
+                            return Err(MigrateError::RestoreRefused {
+                                path,
+                                reason: "backup has no post-change digest recorded".to_string(),
+                            });
+                        }
+                    };
+                    targets.push(RestoreTarget {
+                        path: path.clone(),
+                        root,
+                        rel: PathBuf::from(name),
+                        file_idx: f.file,
+                        sha256_hex: f.sha256.clone(),
+                        backed: BackedUpFile {
+                            size: f.size,
+                            sha256,
+                            sha256_after,
+                        },
+                        create_empty_first: false,
+                    });
+                }
             }
-        })?;
-        if matches!(envcloak_sys::open_elsewhere(&open_fd), InUse::Yes) {
-            return Err(MigrateError::OpenElsewhere { path });
+            Err(_) => {
+                let recorded_empty = f.sha256_after.as_deref() == Some(EMPTY_SHA256_HEX);
+                if !is_deleted && !recorded_empty {
+                    return Err(MigrateError::RestoreRefused {
+                        path,
+                        reason: "file is missing or unreadable on disk".to_string(),
+                    });
+                }
+                if f.sha256_after.is_none() && !proof.unrecorded {
+                    return Err(MigrateError::RestoreRefused {
+                        path,
+                        reason: "backup has no post-change digest recorded".to_string(),
+                    });
+                }
+                if let Some(after_hex) = &f.sha256_after
+                    && after_hex != EMPTY_SHA256_HEX
+                {
+                    return Err(MigrateError::RestoreRefused {
+                        path,
+                        reason: "file is missing or unreadable on disk".to_string(),
+                    });
+                }
+                let empty_sha: [u8; 32] = Sha256::digest(b"").into();
+                targets.push(RestoreTarget {
+                    path: path.clone(),
+                    root,
+                    rel: PathBuf::from(name),
+                    file_idx: f.file,
+                    sha256_hex: f.sha256.clone(),
+                    backed: BackedUpFile {
+                        size: f.size,
+                        sha256,
+                        sha256_after: empty_sha,
+                    },
+                    create_empty_first: true,
+                });
+            }
         }
-        targets.push((
-            path.clone(),
-            root,
-            PathBuf::from(name),
-            f.file,
-            BackedUpFile {
-                size: f.size,
-                sha256,
-                sha256_after,
-            },
-        ));
     }
 
     let (mut state_file, mut state) =
@@ -307,38 +404,54 @@ pub fn undo(backup_id: &str, proof: &MigrateProof<'_>) -> Result<UndoReport, Mig
     let mut restored_files = Vec::new();
     let mut touched_mcp_json = false;
 
-    for (path, root, rel, file_idx, backed) in &targets {
+    for t in &targets {
+        let empty_stamp = if t.create_empty_first {
+            Some(create_atomically(&t.root, &t.rel, b"", 0o600).map_err(|e| {
+                MigrateError::RestoreRefused {
+                    path: t.path.clone(),
+                    reason: e.kind.message().to_string(),
+                }
+            })?)
+        } else {
+            None
+        };
         let lease_id = lease_view.lease.clone();
-        let new_stamp = restore_over_left(root, rel, backed, &mut |chunk_idx| {
+        let new_stamp = match restore_over_left(&t.root, &t.rel, &t.backed, &mut |chunk_idx| {
             let chunk_u32 = u32::try_from(chunk_idx).ok()?;
             client
-                .backup_v2_read(&lease_id, *file_idx, chunk_u32)
+                .backup_v2_read(&lease_id, t.file_idx, chunk_u32)
                 .ok()
                 .map(|c| c.data.into_inner())
-        })
-        .map_err(|e| {
-            let reason = match e.kind {
-                ModifyErrorKind::EditedSince => {
-                    "file on disk was modified since migration".to_string()
+        }) {
+            Ok(stamp) => stamp,
+            Err(e) => {
+                if let Some(es) = &empty_stamp {
+                    let _ = remove_checked(&t.root, &t.rel, es);
                 }
-                _ => e.kind.message().to_string(),
-            };
-            MigrateError::RestoreRefused {
-                path: path.clone(),
-                reason,
+                let reason = match e.kind {
+                    ModifyErrorKind::EditedSince => {
+                        "file on disk was modified since migration".to_string()
+                    }
+                    _ => e.kind.message().to_string(),
+                };
+                return Err(MigrateError::RestoreRefused {
+                    path: t.path.clone(),
+                    reason,
+                });
             }
-        })?;
+        };
 
-        let k = crate::writer::key(path);
+        let k = crate::writer::key(&t.path);
         let s = Stamp::from(new_stamp);
         state.written.insert(k.clone(), s);
         if let Some(rec) = state.files.get_mut(&k) {
             rec.stamp = Some(s);
+            rec.post_sha256 = t.sha256_hex.clone();
         }
-        if path.file_name() == Some(OsStr::new(".mcp.json")) {
+        if t.path.file_name() == Some(OsStr::new(".mcp.json")) {
             touched_mcp_json = true;
         }
-        restored_files.push(path.clone());
+        restored_files.push(t.path.clone());
     }
 
     state_file.save(&state).map_err(|r| MigrateError::Io {
@@ -350,28 +463,33 @@ pub fn undo(backup_id: &str, proof: &MigrateProof<'_>) -> Result<UndoReport, Mig
         invalidate_shared_mcp_cache(&proof.data_dir);
     }
 
-    let mut reg = MigrationRegistry::open(&proof.data_dir)?;
     let mut unregistered_servers = Vec::new();
-    if let Some(backup_rec) = reg.backups.remove(backup_id) {
+    if let Some(backup_rec) = reg.backups.get(backup_id).cloned() {
         for srv_key in &backup_rec.server_keys {
-            if let Some(srv_rec) = reg.servers.remove(srv_key) {
+            if let Some(srv_rec) = reg.servers.get(srv_key).cloned() {
+                client
+                    .unregister_managed(
+                        &srv_rec.policy_id,
+                        envcloak_scan::first_run::secret_copy(&passphrase),
+                        &proof.claims,
+                    )
+                    .map_err(|e| MigrateError::Client(Failure::from(e)))?;
                 if let Some(parent) = srv_rec.manifest.parent() {
                     let _ = fs::remove_file(parent.join("launch_id"));
                 }
-                let _ = client.unregister_managed(
-                    &srv_rec.policy_id,
-                    envcloak_scan::first_run::secret_copy(&passphrase),
-                    &proof.claims,
-                );
+                reg.servers.remove(srv_key);
             } else {
-                let _ = client.unregister_managed(
-                    srv_key,
-                    envcloak_scan::first_run::secret_copy(&passphrase),
-                    &proof.claims,
-                );
+                client
+                    .unregister_managed(
+                        srv_key,
+                        envcloak_scan::first_run::secret_copy(&passphrase),
+                        &proof.claims,
+                    )
+                    .map_err(|e| MigrateError::Client(Failure::from(e)))?;
             }
             unregistered_servers.push(srv_key.clone());
         }
+        reg.backups.remove(backup_id);
         reg.save(&proof.data_dir)?;
     }
 

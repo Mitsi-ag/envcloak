@@ -1,5 +1,4 @@
 use std::ffi::{OsStr, OsString};
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -58,7 +57,7 @@ pub fn apply_claude_user_scope(
     path_env: &OsStr,
     claude_bin: &Path,
     rewrites: &[(String, Value)],
-) -> Result<Vec<u8>, MigrateError> {
+) -> Result<(), MigrateError> {
     let effective = effective_path(path_env);
     let claude_json = loc.claude_json().to_path_buf();
     let custom_dir = (claude_json.parent() == Some(loc.claude_dir())).then(|| loc.claude_dir());
@@ -70,54 +69,52 @@ pub fn apply_claude_user_scope(
         })?;
 
         let mut rm_cmd = Command::new(claude_bin);
-        rm_cmd
-            .args(["mcp", "remove", "--scope", "user", server])
-            .env("HOME", loc.home())
-            .env("PATH", &effective);
-        if let Some(d) = custom_dir {
-            rm_cmd.env("CLAUDE_CONFIG_DIR", d);
-        } else {
-            rm_cmd.env_remove("CLAUDE_CONFIG_DIR");
-        }
+        configure_claude_env(&mut rm_cmd, loc.home(), &effective, custom_dir);
+        rm_cmd.args(["mcp", "remove", "--scope", "user", server]);
         let remove_out = rm_cmd.output().map_err(|e| MigrateError::Io {
             path: claude_bin.to_path_buf(),
             message: format!("failed to run `claude mcp remove`: {e}"),
         })?;
         if !remove_out.status.success() {
-            let stderr = String::from_utf8_lossy(&remove_out.stderr);
             return Err(MigrateError::ExternalToolFailed {
                 tool: "claude mcp remove".to_string(),
-                detail: stderr.trim().to_string(),
+                detail: format!("exited with {}", remove_out.status),
             });
         }
 
         let mut add_cmd = Command::new(claude_bin);
-        add_cmd
-            .args(["mcp", "add-json", "--scope", "user", server, &json_payload])
-            .env("HOME", loc.home())
-            .env("PATH", &effective);
-        if let Some(d) = custom_dir {
-            add_cmd.env("CLAUDE_CONFIG_DIR", d);
-        } else {
-            add_cmd.env_remove("CLAUDE_CONFIG_DIR");
-        }
+        configure_claude_env(&mut add_cmd, loc.home(), &effective, custom_dir);
+        add_cmd.args(["mcp", "add-json", "--scope", "user", server, &json_payload]);
         let add_out = add_cmd.output().map_err(|e| MigrateError::Io {
             path: claude_bin.to_path_buf(),
             message: format!("failed to run `claude mcp add-json`: {e}"),
         })?;
         if !add_out.status.success() {
-            let stderr = String::from_utf8_lossy(&add_out.stderr);
             return Err(MigrateError::ExternalToolFailed {
                 tool: "claude mcp add-json".to_string(),
-                detail: stderr.trim().to_string(),
+                detail: format!("exited with {}", add_out.status),
             });
         }
     }
 
-    fs::read(&claude_json).map_err(|e| MigrateError::Io {
-        path: claude_json,
-        message: e.to_string(),
-    })
+    Ok(())
+}
+
+fn configure_claude_env(
+    cmd: &mut Command,
+    home: &Path,
+    path_env: &OsStr,
+    custom_dir: Option<&Path>,
+) {
+    cmd.env_clear().env("HOME", home).env("PATH", path_env);
+    for var in ["LANG", "LC_ALL", "TMPDIR", "USER"] {
+        if let Some(val) = std::env::var_os(var) {
+            cmd.env(var, val);
+        }
+    }
+    if let Some(d) = custom_dir {
+        cmd.env("CLAUDE_CONFIG_DIR", d);
+    }
 }
 
 pub fn build_entry_value(command: &str, args: &[String]) -> Value {

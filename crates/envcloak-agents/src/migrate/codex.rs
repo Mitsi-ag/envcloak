@@ -39,7 +39,7 @@ pub fn rewrite_codex_toml(
         .parse::<DocumentMut>()
         .map_err(|e| MigrateError::InvalidConfig {
             path: path.to_path_buf(),
-            reason: e.to_string(),
+            reason: super::toml_err_reason(source, &e),
         })?;
 
     let mcp_item = doc

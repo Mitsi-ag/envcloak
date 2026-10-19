@@ -1450,9 +1450,8 @@ enum MigrateCmd {
 
 fn normalize_migrate_agent(raw: &str) -> Option<String> {
     match raw {
-        "claude" | "claude-code" => Some("claude-code".to_owned()),
-        "codex" | "cursor" | "gemini" | "copilot" | "kimi" | "opencode" | "goose" | "qwen"
-        | "vscode" => Some(raw.to_owned()),
+        "claude-code" | "codex" | "cursor" | "gemini" | "copilot" | "kimi" | "opencode"
+        | "goose" | "qwen" | "vscode" => Some(raw.to_owned()),
         _ => None,
     }
 }

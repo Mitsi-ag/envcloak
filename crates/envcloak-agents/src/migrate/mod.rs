@@ -33,16 +33,19 @@ use envcloak_ipc::proto::{
     ManagedServerDecl,
 };
 use envcloak_ipc::view::{ClassificationView, LaunchReceiptView};
+use envcloak_policy::Reference;
 use envcloak_policy::managed::{
-    CodeSelecting, DeclError, bridge_binding_name, check_declaration, is_code_selecting,
+    ArgvClass, CodeSelecting, DeclError, bridge_binding_name, check_declaration, classify_argv,
+    is_code_selecting, refuse_disguised,
 };
 use envcloak_scan::first_run::secret_copy;
 use envcloak_scan::source::{ConfigFormat, ConfigSource, SourceKind};
 use envcloak_scan::{
     FileStamp, MAX_DOTENV, MIN_AGE, ScanErrorKind, open_root, pause_point, read_plain,
-    replace_atomically, scan_config_sources,
+    remove_checked, replace_atomically, scan_config_sources,
 };
 use envcloak_sys::InUse;
+use zeroize::Zeroizing;
 
 use crate::detect::find_on_path;
 use crate::jsonedit::Doc;
@@ -298,13 +301,13 @@ pub enum PlannedRewriteKind {
         cwd: Option<String>,
         non_secret_env: Vec<(String, String)>,
         secrets: Vec<PlannedSecret>,
+        env_file: Option<PathBuf>,
     },
     HttpBridge {
         url: String,
         origin: String,
         host: String,
         headers: Vec<PlannedSecret>,
-        env_secrets: Vec<PlannedSecret>,
     },
 }
 
@@ -316,11 +319,25 @@ pub struct PlannedServerMigration {
     pub format: ConfigFormat,
     pub codex_needs_startup_timeout: bool,
     pub kind: PlannedRewriteKind,
+    pub key_override: Option<String>,
+    pub dir_slug_override: Option<String>,
 }
 
 impl PlannedServerMigration {
     pub fn key(&self) -> String {
-        format!("{}/{}", self.agent, self.server)
+        self.key_override
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", self.agent, self.server))
+    }
+
+    pub fn dir_slug(&self) -> String {
+        self.dir_slug_override.clone().unwrap_or_else(|| {
+            format!(
+                "{}-{}",
+                update::sanitize_segment(&self.agent),
+                update::sanitize_segment(&self.server)
+            )
+        })
     }
 
     pub fn transport_name(&self) -> &'static str {
@@ -331,11 +348,7 @@ impl PlannedServerMigration {
     }
 
     pub fn managed_dir(&self, data_dir: &Path) -> PathBuf {
-        data_dir.join("mcp").join(format!(
-            "{}-{}",
-            update::sanitize_segment(&self.agent),
-            update::sanitize_segment(&self.server)
-        ))
+        data_dir.join("mcp").join(self.dir_slug())
     }
 
     pub fn manifest_path(&self, data_dir: &Path) -> PathBuf {
@@ -347,15 +360,9 @@ impl PlannedServerMigration {
             PlannedRewriteKind::Stdio { secrets, .. } => {
                 secrets.iter().map(|s| s.name.clone()).collect()
             }
-            PlannedRewriteKind::HttpBridge {
-                headers,
-                env_secrets,
-                ..
-            } => headers
-                .iter()
-                .chain(env_secrets.iter())
-                .map(|s| s.name.clone())
-                .collect(),
+            PlannedRewriteKind::HttpBridge { headers, .. } => {
+                headers.iter().map(|s| s.name.clone()).collect()
+            }
         }
     }
 }
@@ -403,10 +410,14 @@ impl MigratePlan {
     }
 
     pub fn filter_agent(&mut self, agent: &str) {
-        self.rewrites.retain(|r| r.agent == agent);
+        let is_shared_mcp =
+            |p: &Path| agent == "copilot" && p.file_name() == Some(OsStr::new(".mcp.json"));
+        self.rewrites
+            .retain(|r| r.agent == agent || is_shared_mcp(&r.config_path));
         self.manual_items
-            .retain(|m| m.agent == agent || m.agent == "unknown");
-        self.unavailable_opt_ins.retain(|u| u.agent == agent);
+            .retain(|m| m.agent == agent || m.agent == "unknown" || is_shared_mcp(&m.path));
+        self.unavailable_opt_ins
+            .retain(|u| u.agent == agent || is_shared_mcp(&u.path));
         self.shared_mcp_json_touched = self
             .rewrites
             .iter()
@@ -427,6 +438,8 @@ pub struct ImportedSecretSummary {
 pub struct MigratedServerSummary {
     pub agent: String,
     pub server: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_key: Option<String>,
     pub config_path: PathBuf,
     pub manifest_path: PathBuf,
     pub transport: String,
@@ -496,10 +509,24 @@ pub fn plan_with_project(loc: &Locations, project: Option<&Path>) -> MigratePlan
     let mut issue_paths = BTreeSet::new();
     for issue in &scan_report.issues {
         let p = normalize_scan_path(loc, &issue.source.path);
-        let Some(agent) = agent_for_path(&sources, &p) else {
-            continue;
-        };
-        issue_paths.insert(p.clone());
+        let agent = agent_for_path(&sources, &p).unwrap_or("unknown");
+        let is_whole_file_issue = matches!(
+            issue.reason,
+            "invalid_json"
+                | "invalid_toml"
+                | "unsupported_format"
+                | "symlink"
+                | "hard_link"
+                | "too_large"
+                | "unreadable"
+        );
+        if is_whole_file_issue
+            && sources
+                .iter()
+                .any(|s| normalize_scan_path(loc, &s.path) == p)
+        {
+            issue_paths.insert(p.clone());
+        }
         let detail = match issue.reason {
             "unsupported_format" => format!(
                 "{} uses an unsupported format ({}) that cannot be rewritten preserving comments; \
@@ -567,36 +594,37 @@ pub fn plan_with_project(loc: &Locations, project: Option<&Path>) -> MigratePlan
         if src.source_kind != SourceKind::McpConfig {
             continue;
         }
-        if !visited_files.insert(src.path.clone()) {
+        let norm_src_path = normalize_scan_path(loc, &src.path);
+        if !visited_files.insert(norm_src_path.clone()) {
             continue;
         }
-        if issue_paths.contains(&src.path) {
+        if issue_paths.contains(&norm_src_path) {
             continue;
         }
         let Some(agent) = agent_for_label(&src.label) else {
             continue;
         };
-        if !src.path.exists() {
+        if src.path.symlink_metadata().is_err() {
             continue;
         }
         match src.format {
             ConfigFormat::Json => {
-                inspect_json_mcp_file(loc, agent, &src.path, &mut out);
+                inspect_json_mcp_file(loc, agent, &norm_src_path, &mut out);
             }
             ConfigFormat::Toml => {
-                inspect_toml_mcp_file(loc, agent, &src.path, &mut out);
+                inspect_toml_mcp_file(loc, agent, &norm_src_path, &mut out);
             }
             ConfigFormat::Yaml => {
                 push_manual_unique(
                     &mut out.manual_items,
                     ManualItem {
                         agent: agent.to_string(),
-                        path: src.path.clone(),
+                        path: norm_src_path.clone(),
                         server: None,
                         reason: "unsupported_format".to_string(),
                         detail: format!(
                             "{} uses YAML and must be migrated manually",
-                            src.path.display()
+                            norm_src_path.display()
                         ),
                     },
                 );
@@ -605,12 +633,93 @@ pub fn plan_with_project(loc: &Locations, project: Option<&Path>) -> MigratePlan
         }
     }
 
+    disambiguate_rewrites(loc, &mut out.rewrites);
+
     out.shared_mcp_json_touched = out
         .rewrites
         .iter()
         .any(|r| r.config_path.file_name() == Some(OsStr::new(".mcp.json")));
 
     out
+}
+
+pub(crate) fn short_disambiguator(config_path: &Path, server: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(config_path.to_string_lossy().as_bytes());
+    h.update(b"\0");
+    h.update(server.as_bytes());
+    let digest = h.finalize();
+    let mut hex = String::with_capacity(8);
+    for b in &digest[..4] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
+}
+
+fn disambiguate_rewrites(loc: &Locations, rewrites: &mut [PlannedServerMigration]) {
+    let mut key_counts: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for rw in rewrites.iter() {
+        *key_counts
+            .entry((rw.agent.clone(), rw.server.clone()))
+            .or_insert(0) += 1;
+    }
+    for rw in rewrites.iter_mut() {
+        if key_counts
+            .get(&(rw.agent.clone(), rw.server.clone()))
+            .copied()
+            .unwrap_or(0)
+            > 1
+            && project_root_for_config(loc, &rw.config_path).is_some()
+        {
+            let h = short_disambiguator(&rw.config_path, &rw.server);
+            rw.key_override = Some(format!("{}/{}-{}", rw.agent, rw.server, h));
+            rw.dir_slug_override = Some(format!(
+                "{}-{}-{}",
+                update::sanitize_segment(&rw.agent),
+                update::sanitize_segment(&rw.server),
+                h
+            ));
+        }
+    }
+
+    let mut seen_keys: BTreeSet<String> = BTreeSet::new();
+    for rw in rewrites.iter_mut() {
+        let k = rw.key();
+        if !seen_keys.insert(k) {
+            let h = short_disambiguator(&rw.config_path, &rw.server);
+            rw.key_override = Some(format!("{}/{}-{}", rw.agent, rw.server, h));
+            rw.dir_slug_override = Some(format!(
+                "{}-{}-{}",
+                update::sanitize_segment(&rw.agent),
+                update::sanitize_segment(&rw.server),
+                h
+            ));
+            seen_keys.insert(rw.key());
+        }
+    }
+
+    let mut slug_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for rw in rewrites.iter() {
+        *slug_counts.entry(rw.dir_slug()).or_insert(0) += 1;
+    }
+    let mut seen_slugs: BTreeSet<String> = BTreeSet::new();
+    for rw in rewrites.iter_mut() {
+        let slug = rw.dir_slug();
+        if slug_counts.get(&slug).copied().unwrap_or(0) > 1 {
+            let is_exact_sanitized = rw.server == update::sanitize_segment(&rw.server);
+            if !is_exact_sanitized || !seen_slugs.insert(slug.clone()) {
+                let h = short_disambiguator(&rw.config_path, &rw.server);
+                rw.dir_slug_override = Some(format!(
+                    "{}-{}-{}",
+                    update::sanitize_segment(&rw.agent),
+                    update::sanitize_segment(&rw.server),
+                    h
+                ));
+            }
+        }
+        seen_slugs.insert(rw.dir_slug());
+    }
 }
 
 fn push_manual_unique(list: &mut Vec<ManualItem>, item: ManualItem) {
@@ -633,9 +742,7 @@ fn push_opt_in_unique(list: &mut Vec<UnavailableOptIn>, item: UnavailableOptIn) 
 
 fn normalize_scan_path(loc: &Locations, p: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
-    if let Ok(rest) = p.strip_prefix("/private/tmp")
-        && loc.home().starts_with("/tmp")
-    {
+    if let Ok(rest) = p.strip_prefix("/private/tmp") {
         return Path::new("/tmp").join(rest);
     }
     #[cfg(target_os = "macos")]
@@ -670,6 +777,21 @@ fn agent_for_path(sources: &[ConfigSource], path: &Path) -> Option<&'static str>
             }
         }
     }
+    if let Some(parent) = path.parent() {
+        let canon_parent = fs::canonicalize(parent).ok();
+        for src in sources {
+            if matches!(
+                src.source_kind,
+                SourceKind::McpConfig | SourceKind::Credentials
+            ) && let Some(src_parent) = src.path.parent()
+                && (src_parent == parent
+                    || (canon_parent.is_some()
+                        && fs::canonicalize(src_parent).ok() == canon_parent))
+            {
+                return agent_for_label(&src.label);
+            }
+        }
+    }
     None
 }
 
@@ -699,8 +821,92 @@ fn agent_for_label(label: &str) -> Option<&'static str> {
     }
 }
 
+fn read_config_plain_zeroizing(
+    agent: &str,
+    path: &Path,
+    out: &mut MigratePlan,
+) -> Option<Zeroizing<String>> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return None;
+    };
+    let Ok(root) = open_root(parent) else {
+        push_manual_unique(
+            &mut out.manual_items,
+            ManualItem {
+                agent: agent.to_string(),
+                path: path.to_path_buf(),
+                server: None,
+                reason: "unreadable".to_string(),
+                detail: format!(
+                    "{} could not be opened safely; migrate manually",
+                    path.display()
+                ),
+            },
+        );
+        return None;
+    };
+    let limit = if name == OsStr::new(".claude.json") {
+        MAX_HOST_STATE
+    } else {
+        MAX_FILE.max(MAX_DOTENV)
+    };
+    let (bytes, stamp) = match read_plain(&root, Path::new(name), limit) {
+        Ok(pair) => pair,
+        Err(e) => {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: None,
+                    reason: e.kind.token().to_string(),
+                    detail: format!(
+                        "{} could not be read safely ({}); migrate manually",
+                        path.display(),
+                        e.kind.token()
+                    ),
+                },
+            );
+            return None;
+        }
+    };
+    let zbytes = Zeroizing::new(bytes);
+    if stamp.nlink > 1 {
+        push_manual_unique(
+            &mut out.manual_items,
+            ManualItem {
+                agent: agent.to_string(),
+                path: path.to_path_buf(),
+                server: None,
+                reason: "hard_link".to_string(),
+                detail: format!(
+                    "{} has multiple hard links and cannot be rewritten safely; migrate manually",
+                    path.display()
+                ),
+            },
+        );
+        return None;
+    }
+    match std::str::from_utf8(&zbytes) {
+        Ok(s) => Some(Zeroizing::new(s.to_string())),
+        Err(_) => {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: None,
+                    reason: "invalid_utf8".to_string(),
+                    detail: format!("{} is not valid UTF-8; migrate manually", path.display()),
+                },
+            );
+            None
+        }
+    }
+}
+
 fn inspect_json_mcp_file(loc: &Locations, agent: &str, path: &Path, out: &mut MigratePlan) {
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Some(raw) = read_config_plain_zeroizing(agent, path, out) else {
         return;
     };
     if Doc::parse(raw.as_bytes()).is_err() {
@@ -773,25 +979,35 @@ fn inspect_json_mcp_file(loc: &Locations, agent: &str, path: &Path, out: &mut Mi
         return;
     };
 
+    let mut unmigrated_env_files = BTreeSet::new();
     for (server_name, srv_val) in servers_obj {
         let Some(srv_obj) = srv_val.as_object() else {
             continue;
         };
+        let raw_srv = RawServer::from_json(srv_obj);
+        let rewrites_before = out.rewrites.len();
         inspect_raw_server(
             loc,
             agent,
             path,
             ConfigFormat::Json,
             server_name,
-            &RawServer::from_json(srv_obj),
+            &raw_srv,
             false,
             out,
         );
+        if out.rewrites.len() == rewrites_before
+            && let Some(ef) = &raw_srv.env_file
+        {
+            let ef_path = resolve_env_file_path(loc, path, ef);
+            unmigrated_env_files.insert(ef_path);
+        }
     }
+    reject_shared_env_file_rewrites(path, &unmigrated_env_files, out);
 }
 
 fn inspect_toml_mcp_file(loc: &Locations, agent: &str, path: &Path, out: &mut MigratePlan) {
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Some(raw) = read_config_plain_zeroizing(agent, path, out) else {
         return;
     };
     let Ok(doc) = raw.parse::<toml_edit::DocumentMut>() else {
@@ -813,22 +1029,82 @@ fn inspect_toml_mcp_file(loc: &Locations, agent: &str, path: &Path, out: &mut Mi
     else {
         return;
     };
+    let mut unmigrated_env_files = BTreeSet::new();
     for (server_name, srv_item) in mcp_table.iter() {
         let Some(srv_tbl) = srv_item.as_table_like() else {
             continue;
         };
         let needs_timeout = codex::needs_startup_timeout(&raw, server_name);
+        let raw_srv = RawServer::from_toml(srv_tbl);
+        let rewrites_before = out.rewrites.len();
         inspect_raw_server(
             loc,
             agent,
             path,
             ConfigFormat::Toml,
             server_name,
-            &RawServer::from_toml(srv_tbl),
+            &raw_srv,
             needs_timeout,
             out,
         );
+        if out.rewrites.len() == rewrites_before
+            && let Some(ef) = &raw_srv.env_file
+        {
+            let ef_path = resolve_env_file_path(loc, path, ef);
+            unmigrated_env_files.insert(ef_path);
+        }
     }
+    reject_shared_env_file_rewrites(path, &unmigrated_env_files, out);
+}
+
+fn resolve_env_file_path(loc: &Locations, config_path: &Path, ef: &str) -> PathBuf {
+    let raw_path = if Path::new(ef).is_absolute() {
+        PathBuf::from(ef)
+    } else {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(ef)
+    };
+    normalize_scan_path(loc, &raw_path)
+}
+
+fn reject_shared_env_file_rewrites(
+    config_path: &Path,
+    unmigrated_env_files: &BTreeSet<PathBuf>,
+    out: &mut MigratePlan,
+) {
+    if unmigrated_env_files.is_empty() {
+        return;
+    }
+    let mut kept = Vec::with_capacity(out.rewrites.len());
+    for rw in out.rewrites.drain(..) {
+        if rw.config_path == config_path
+            && let PlannedRewriteKind::Stdio {
+                env_file: Some(ef_path),
+                ..
+            } = &rw.kind
+            && unmigrated_env_files.contains(ef_path)
+        {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: rw.agent,
+                    path: rw.config_path,
+                    server: Some(rw.server),
+                    reason: "shared_env_file".to_string(),
+                    detail: format!(
+                        "envFile {} is also referenced by an unmigrated server and cannot be \
+                         removed automatically; migrate manually",
+                        ef_path.display()
+                    ),
+                },
+            );
+        } else {
+            kept.push(rw);
+        }
+    }
+    out.rewrites = kept;
 }
 
 #[derive(Default)]
@@ -841,6 +1117,7 @@ struct RawServer {
     headers: Vec<(String, String)>,
     env_file: Option<String>,
     opt_ins: Vec<String>,
+    code_selecting_var: Option<String>,
     has_template_or_ref: bool,
     has_manual_ref: bool,
 }
@@ -984,7 +1261,17 @@ impl RawServer {
     }
 
     fn record_env(&mut self, k: &str, v: &str) {
-        if v.starts_with("envcloak://") || contains_interpolation(v) {
+        if is_code_selecting(k) && self.code_selecting_var.is_none() {
+            self.code_selecting_var = Some(k.to_string());
+        }
+        if let Some(rest) = v.strip_prefix("envcloak://") {
+            self.has_template_or_ref = true;
+            if Reference::parse(rest).is_err() {
+                self.has_manual_ref = true;
+            }
+            return;
+        }
+        if contains_interpolation(v) {
             self.has_template_or_ref = true;
             if malformed_interpolation(v) {
                 self.has_manual_ref = true;
@@ -995,7 +1282,14 @@ impl RawServer {
     }
 
     fn record_header(&mut self, k: &str, v: &str) {
-        if v.starts_with("envcloak://") || contains_interpolation(v) {
+        if let Some(rest) = v.strip_prefix("envcloak://") {
+            self.has_template_or_ref = true;
+            if Reference::parse(rest).is_err() {
+                self.has_manual_ref = true;
+            }
+            return;
+        }
+        if contains_interpolation(v) {
             self.has_template_or_ref = true;
             if malformed_interpolation(v) {
                 self.has_manual_ref = true;
@@ -1011,15 +1305,19 @@ fn contains_interpolation(v: &str) -> bool {
 }
 
 fn malformed_interpolation(v: &str) -> bool {
-    let Some(start) = v.find("${") else {
-        return false;
-    };
-    let tail = &v[start + 2..];
-    let Some(end) = tail.find('}') else {
-        return true;
-    };
-    let inner = &tail[..end];
-    inner.is_empty() || inner.contains('{')
+    let mut rest = v;
+    while let Some(start) = rest.find("${") {
+        let tail = &rest[start + 2..];
+        let Some(end) = tail.find('}') else {
+            return true;
+        };
+        let inner = &tail[..end];
+        if inner.is_empty() || inner.contains('{') {
+            return true;
+        }
+        rest = &tail[end + 1..];
+    }
+    false
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1076,7 +1374,7 @@ fn inspect_raw_server(
         return;
     }
 
-    if let Some((code_var, _)) = raw.env.iter().find(|(k, _)| is_code_selecting(k)) {
+    if let Some(code_var) = &raw.code_selecting_var {
         push_manual_unique(
             &mut out.manual_items,
             ManualItem {
@@ -1096,7 +1394,7 @@ fn inspect_raw_server(
 
     if let Some(cmd) = &raw.command
         && let Some(code_reason) =
-            check_argv_code_selecting(loc, cmd, &raw.args, raw.cwd.as_deref())
+            check_argv_code_selecting(loc, path, cmd, &raw.args, raw.cwd.as_deref(), false)
     {
         push_manual_unique(
             &mut out.manual_items,
@@ -1116,8 +1414,17 @@ fn inspect_raw_server(
     }
 
     let mut env_file_secrets = Vec::new();
+    let mut env_file_non_secrets = Vec::new();
+    let mut resolved_env_file_path = None;
     if let Some(ef) = &raw.env_file {
-        if ef.starts_with("envcloak://") || contains_interpolation(ef) {
+        let has_parent_dir = Path::new(ef)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+        if ef.trim().is_empty()
+            || ef.starts_with("envcloak://")
+            || contains_interpolation(ef)
+            || has_parent_dir
+        {
             push_manual_unique(
                 &mut out.manual_items,
                 ManualItem {
@@ -1126,54 +1433,213 @@ fn inspect_raw_server(
                     server: Some(server_name.to_string()),
                     reason: "unread_env_file".to_string(),
                     detail: format!(
-                        "server `{agent}/{server_name}` in {} references an interpolated envFile \
-                         `{ef}` that must be migrated manually",
+                        "server `{agent}/{server_name}` in {} references envFile `{ef}` that \
+                         cannot be resolved safely; migrate manually",
                         path.display()
                     ),
                 },
             );
             return;
         }
-        let ef_path = if Path::new(ef).is_absolute() {
-            PathBuf::from(ef)
-        } else {
-            path.parent().unwrap_or_else(|| Path::new(".")).join(ef)
+        let ef_path = resolve_env_file_path(loc, path, ef);
+        let Some((ef_parent, ef_name)) = ef_path.parent().zip(ef_path.file_name()) else {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "unread_env_file".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} references invalid envFile path \
+                         `{}`; migrate manually",
+                        path.display(),
+                        ef_path.display()
+                    ),
+                },
+            );
+            return;
         };
-        if let (Some(ef_parent), Some(ef_name)) = (ef_path.parent(), ef_path.file_name())
-            && let Ok(ef_root) = open_root(ef_parent)
-            && let Ok((ef_bytes, _)) = read_plain(&ef_root, Path::new(ef_name), MAX_DOTENV)
-            && let Ok(entries) = envcloak_scan::parse_dotenv(&SecretBytes::copy_from(&ef_bytes))
-        {
-            for entry in entries {
-                if is_code_selecting(entry.name.as_str()) {
-                    push_manual_unique(
-                        &mut out.manual_items,
-                        ManualItem {
-                            agent: agent.to_string(),
-                            path: path.to_path_buf(),
-                            server: Some(server_name.to_string()),
-                            reason: "code_selecting_env".to_string(),
-                            detail: format!(
-                                "server `{agent}/{server_name}` envFile {} sets code-selecting \
-                                 variable `{}`",
-                                ef_path.display(),
-                                entry.name.as_str()
-                            ),
-                        },
-                    );
-                    return;
-                }
-                if entry.kind == envcloak_scan::EntryKind::Plain && !entry.value.is_empty() {
-                    env_file_secrets.push(PlannedSecret {
-                        name: entry.name.as_str().to_string(),
-                        value: entry.value,
-                    });
-                }
+        let Ok(ef_root) = open_root(ef_parent) else {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "unread_env_file".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} references envFile `{}` whose \
+                         directory could not be opened safely; migrate manually",
+                        path.display(),
+                        ef_path.display()
+                    ),
+                },
+            );
+            return;
+        };
+        let Ok((ef_bytes_raw, ef_stamp)) = read_plain(&ef_root, Path::new(ef_name), MAX_DOTENV)
+        else {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "unread_env_file".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} references envFile `{}` which could \
+                         not be read safely; migrate manually",
+                        path.display(),
+                        ef_path.display()
+                    ),
+                },
+            );
+            return;
+        };
+        let ef_bytes = Zeroizing::new(ef_bytes_raw);
+        if ef_stamp.nlink > 1 {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "unread_env_file".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} references hard-linked envFile `{}` \
+                         which cannot be migrated safely; migrate manually",
+                        path.display(),
+                        ef_path.display()
+                    ),
+                },
+            );
+            return;
+        }
+        let Ok(entries) = envcloak_scan::parse_dotenv(&SecretBytes::copy_from(&ef_bytes)) else {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "unread_env_file".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} references envFile `{}` with invalid \
+                         dotenv syntax; migrate manually",
+                        path.display(),
+                        ef_path.display()
+                    ),
+                },
+            );
+            return;
+        };
+        for entry in entries {
+            if is_code_selecting(entry.name.as_str()) {
+                push_manual_unique(
+                    &mut out.manual_items,
+                    ManualItem {
+                        agent: agent.to_string(),
+                        path: path.to_path_buf(),
+                        server: Some(server_name.to_string()),
+                        reason: "code_selecting_env".to_string(),
+                        detail: format!(
+                            "server `{agent}/{server_name}` envFile {} sets code-selecting \
+                             variable `{}`",
+                            ef_path.display(),
+                            entry.name.as_str()
+                        ),
+                    },
+                );
+                return;
+            }
+            if entry.kind != envcloak_scan::EntryKind::Plain {
+                push_manual_unique(
+                    &mut out.manual_items,
+                    ManualItem {
+                        agent: agent.to_string(),
+                        path: path.to_path_buf(),
+                        server: Some(server_name.to_string()),
+                        reason: "unsupported_env_file_entry".to_string(),
+                        detail: format!(
+                            "server `{agent}/{server_name}` envFile {} contains a non-literal \
+                             entry for `{}` that must be migrated manually",
+                            ef_path.display(),
+                            entry.name.as_str()
+                        ),
+                    },
+                );
+                return;
+            }
+            let Some(decoded_val) =
+                decode_dotenv_plain_span(&ef_bytes[entry.span.clone()], &entry.value)
+            else {
+                push_manual_unique(
+                    &mut out.manual_items,
+                    ManualItem {
+                        agent: agent.to_string(),
+                        path: path.to_path_buf(),
+                        server: Some(server_name.to_string()),
+                        reason: "unread_env_file".to_string(),
+                        detail: format!(
+                            "server `{agent}/{server_name}` envFile {} contains non-UTF-8 data \
+                             for `{}`; migrate manually",
+                            ef_path.display(),
+                            entry.name.as_str()
+                        ),
+                    },
+                );
+                return;
+            };
+            if is_secret_env_pair(entry.name.as_str(), &decoded_val) {
+                env_file_secrets.push(PlannedSecret {
+                    name: entry.name.as_str().to_string(),
+                    value: entry.value,
+                });
+            } else {
+                env_file_non_secrets
+                    .push((entry.name.as_str().to_string(), decoded_val.to_string()));
             }
         }
+        resolved_env_file_path = Some(ef_path);
     }
 
     if let Some(url_str) = &raw.url {
+        if url_contains_secret_or_userinfo(url_str) {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "secret_in_url".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} embeds credentials or a secret in \
+                         `url` and cannot be migrated automatically; move the secret to a request \
+                         header",
+                        path.display()
+                    ),
+                },
+            );
+            return;
+        }
+        if raw.has_manual_ref {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "invalid_secret_ref".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} has a malformed interpolation or \
+                         secret reference; migrate manually",
+                        path.display()
+                    ),
+                },
+            );
+            return;
+        }
         let mut headers = Vec::new();
         for (h_name, h_val) in &raw.headers {
             if !h_val.is_empty() {
@@ -1183,17 +1649,44 @@ fn inspect_raw_server(
                 });
             }
         }
-        let mut env_secrets = Vec::new();
-        for (e_name, e_val) in &raw.env {
-            if is_secret_env_pair(e_name, e_val) {
-                env_secrets.push(PlannedSecret {
-                    name: e_name.clone(),
-                    value: SecretBytes::copy_from(e_val.as_bytes()),
-                });
-            }
+        if raw.has_template_or_ref && !headers.is_empty() {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "mixed_interpolated_and_literal".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} mixes interpolated or `envcloak://` \
+                         references with literal headers; migrate manually",
+                        path.display()
+                    ),
+                },
+            );
+            return;
         }
-        env_secrets.extend(env_file_secrets);
-        if headers.is_empty() && env_secrets.is_empty() {
+        let has_http_env_secrets = raw.env.iter().any(|(k, v)| is_secret_env_pair(k, v))
+            || !env_file_secrets.is_empty()
+            || raw.env_file.is_some();
+        if has_http_env_secrets {
+            push_manual_unique(
+                &mut out.manual_items,
+                ManualItem {
+                    agent: agent.to_string(),
+                    path: path.to_path_buf(),
+                    server: Some(server_name.to_string()),
+                    reason: "http_server_env_secrets".to_string(),
+                    detail: format!(
+                        "server `{agent}/{server_name}` in {} is an HTTP server with `env` or \
+                         `envFile` bindings that `mcp-bridge --url` does not use; migrate manually",
+                        path.display()
+                    ),
+                },
+            );
+            return;
+        }
+        if headers.is_empty() {
             return;
         }
         let (origin, host) = match parse_bridge_origin(url_str) {
@@ -1227,9 +1720,28 @@ fn inspect_raw_server(
                 origin,
                 host,
                 headers,
-                env_secrets,
             },
+            key_override: None,
+            dir_slug_override: None,
         });
+        return;
+    }
+
+    if raw.has_manual_ref {
+        push_manual_unique(
+            &mut out.manual_items,
+            ManualItem {
+                agent: agent.to_string(),
+                path: path.to_path_buf(),
+                server: Some(server_name.to_string()),
+                reason: "invalid_secret_ref".to_string(),
+                detail: format!(
+                    "server `{agent}/{server_name}` in {} has a malformed interpolation or secret \
+                     reference; migrate manually",
+                    path.display()
+                ),
+            },
+        );
         return;
     }
 
@@ -1239,7 +1751,9 @@ fn inspect_raw_server(
 
     let mut secrets = Vec::new();
     let mut non_secret_env = Vec::new();
+    let mut inline_names = BTreeSet::new();
     for (k, v) in &raw.env {
+        inline_names.insert(k.clone());
         if is_secret_env_pair(k, v) {
             secrets.push(PlannedSecret {
                 name: k.clone(),
@@ -1249,9 +1763,56 @@ fn inspect_raw_server(
             non_secret_env.push((k.clone(), v.clone()));
         }
     }
-    secrets.extend(env_file_secrets);
+    for (k, v) in env_file_non_secrets {
+        if !inline_names.contains(&k) {
+            non_secret_env.push((k, v));
+        }
+    }
+    for s in env_file_secrets {
+        if !inline_names.contains(&s.name) {
+            secrets.push(s);
+        }
+    }
+
+    if raw.has_template_or_ref && !secrets.is_empty() {
+        push_manual_unique(
+            &mut out.manual_items,
+            ManualItem {
+                agent: agent.to_string(),
+                path: path.to_path_buf(),
+                server: Some(server_name.to_string()),
+                reason: "mixed_interpolated_and_literal".to_string(),
+                detail: format!(
+                    "server `{agent}/{server_name}` in {} mixes interpolated or `envcloak://` \
+                     references with literal secrets; migrate manually",
+                    path.display()
+                ),
+            },
+        );
+        return;
+    }
 
     if secrets.is_empty() {
+        return;
+    }
+
+    if let Some(decl_reason) =
+        check_argv_code_selecting(loc, path, cmd, &raw.args, raw.cwd.as_deref(), true)
+    {
+        push_manual_unique(
+            &mut out.manual_items,
+            ManualItem {
+                agent: agent.to_string(),
+                path: path.to_path_buf(),
+                server: Some(server_name.to_string()),
+                reason: "invalid_launch_declaration".to_string(),
+                detail: format!(
+                    "server `{agent}/{server_name}` in {} has a launch declaration that cannot \
+                     be registered automatically ({decl_reason}); migrate manually",
+                    path.display()
+                ),
+            },
+        );
         return;
     }
 
@@ -1270,8 +1831,165 @@ fn inspect_raw_server(
             cwd: raw.cwd.clone(),
             non_secret_env,
             secrets,
+            env_file: resolved_env_file_path,
         },
+        key_override: None,
+        dir_slug_override: None,
     });
+}
+
+fn decode_dotenv_plain_span(raw_span: &[u8], expected: &SecretBytes) -> Option<Zeroizing<String>> {
+    let eq = raw_span.iter().position(|&b| b == b'=')?;
+    let mut pos = eq + 1;
+    let had_blank_after_eq = matches!(raw_span.get(pos), Some(b' ' | b'\t'));
+    while matches!(raw_span.get(pos), Some(b' ' | b'\t')) {
+        pos += 1;
+    }
+    let val_slice = &raw_span[pos..];
+    let mut decoded: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(expected.len()));
+    match val_slice.first().copied() {
+        Some(q @ (b'\'' | b'`')) => {
+            let mut i = 1;
+            let mut closed = false;
+            while i < val_slice.len() {
+                if val_slice[i] == q {
+                    closed = true;
+                    break;
+                }
+                if val_slice[i] == b'\r' && val_slice.get(i + 1) == Some(&b'\n') {
+                    decoded.push(b'\n');
+                    i += 2;
+                } else {
+                    decoded.push(val_slice[i]);
+                    i += 1;
+                }
+            }
+            if !closed {
+                return None;
+            }
+        }
+        Some(b'"') => {
+            let mut i = 1;
+            let mut closed = false;
+            while i < val_slice.len() {
+                match val_slice[i] {
+                    b'"' => {
+                        closed = true;
+                        break;
+                    }
+                    b'\\' => {
+                        i += 1;
+                        let escaped = *val_slice.get(i)?;
+                        match escaped {
+                            b'n' => decoded.push(b'\n'),
+                            b'r' => decoded.push(b'\r'),
+                            b't' => decoded.push(b'\t'),
+                            b'\\' | b'"' | b'\'' => decoded.push(escaped),
+                            b'\r' if val_slice.get(i + 1) == Some(&b'\n') => {
+                                decoded.push(b'\\');
+                                decoded.push(b'\n');
+                                i += 1;
+                            }
+                            other => {
+                                decoded.push(b'\\');
+                                decoded.push(other);
+                            }
+                        }
+                        i += 1;
+                    }
+                    b'\r' if val_slice.get(i + 1) == Some(&b'\n') => {
+                        decoded.push(b'\n');
+                        i += 2;
+                    }
+                    c => {
+                        decoded.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            if !closed {
+                return None;
+            }
+        }
+        _ => {
+            let eol = val_slice
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(val_slice.len());
+            let mut end = (0..eol)
+                .find(|&i| {
+                    val_slice[i] == b'#'
+                        && ((i == 0 && had_blank_after_eq)
+                            || (i > 0 && matches!(val_slice[i - 1], b' ' | b'\t')))
+                })
+                .unwrap_or(eol);
+            while end > 0 && matches!(val_slice[end - 1], b' ' | b'\t') {
+                end -= 1;
+            }
+            if end == eol && end > 0 && val_slice[end - 1] == b'\r' {
+                end -= 1;
+                while end > 0 && matches!(val_slice[end - 1], b' ' | b'\t') {
+                    end -= 1;
+                }
+            }
+            decoded.extend_from_slice(&val_slice[..end]);
+        }
+    }
+    if !expected.ct_eq(&decoded) {
+        return None;
+    }
+    let s = std::str::from_utf8(&decoded).ok()?.to_string();
+    Some(Zeroizing::new(s))
+}
+
+fn url_contains_secret_or_userinfo(url_str: &str) -> bool {
+    if arg_contains_secret_literal(url_str) {
+        return true;
+    }
+    let rest = match url_str.split_once("://") {
+        Some((_, r)) => r,
+        None => url_str,
+    };
+    let split_at = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..split_at];
+    if authority.contains('@') {
+        return true;
+    }
+    let tail = &rest[split_at..];
+    for seg in tail.split(['/', '?', '&', ';', '#']) {
+        if seg.is_empty() {
+            continue;
+        }
+        if arg_contains_secret_literal(seg) {
+            return true;
+        }
+        if let Some((k, v)) = seg.split_once('=') {
+            if arg_contains_secret_literal(v) {
+                return true;
+            }
+            if !v.is_empty() && !v.starts_with("${") && !v.starts_with("envcloak://") {
+                let lower_k = k.to_ascii_lowercase();
+                if is_secret_env_pair(k, v)
+                    || matches!(
+                        lower_k.as_str(),
+                        "key"
+                            | "api_key"
+                            | "apikey"
+                            | "token"
+                            | "access_token"
+                            | "auth"
+                            | "secret"
+                            | "password"
+                            | "sig"
+                            | "signature"
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn is_already_migrated(command: Option<&str>, args: &[String]) -> bool {
@@ -1325,39 +2043,33 @@ fn is_secret_env_pair(name: &str, value: &str) -> bool {
 
 fn check_argv_code_selecting(
     loc: &Locations,
+    config_path: &Path,
     cmd: &str,
     args: &[String],
     cwd: Option<&str>,
+    strict_all_errors: bool,
 ) -> Option<&'static str> {
     let sys_path = std::env::var_os("PATH").unwrap_or_default();
-    let exe = if Path::new(cmd).is_absolute() {
-        PathBuf::from(cmd)
-    } else if let Some(found) = find_on_path(cmd, &sys_path) {
-        found
-    } else {
-        let base = Path::new(cmd)
-            .file_name()
-            .unwrap_or_else(|| OsStr::new(cmd));
-        PathBuf::from("/usr/bin").join(base)
-    };
-    let base_dir = cwd
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| loc.home().to_path_buf());
+    let base_dir =
+        project_root_for_config(loc, config_path).unwrap_or_else(|| loc.home().to_path_buf());
+    let mut raw_argv = Vec::with_capacity(1 + args.len());
+    raw_argv.push(cmd.to_string());
+    raw_argv.extend(args.iter().cloned());
 
-    let mut test_argv = Vec::with_capacity(1 + args.len());
-    test_argv.push(exe.to_string_lossy().into_owned());
-    for a in args {
-        if !a.starts_with('-') && !Path::new(a).is_absolute() {
-            test_argv.push(base_dir.join(a).to_string_lossy().into_owned());
-        } else {
-            test_argv.push(a.clone());
-        }
-    }
+    let resolved_argv = resolve_stdio_argv(&sys_path, &base_dir, &raw_argv, cwd);
+    let Some(first) = resolved_argv.first() else {
+        return strict_all_errors.then_some("empty_argv");
+    };
+
+    let resolved_cwd = match cwd {
+        Some(c) if Path::new(c).is_absolute() => Some(c.to_string()),
+        Some(c) => Some(base_dir.join(c).to_string_lossy().into_owned()),
+        None => Some(base_dir.to_string_lossy().into_owned()),
+    };
 
     let decl = envcloak_core::vault::LaunchDecl {
-        argv: test_argv,
-        cwd: Some(base_dir.to_string_lossy().into_owned()),
+        argv: resolved_argv.clone(),
+        cwd: resolved_cwd,
         env: Vec::new(),
         path_env: None,
     };
@@ -1369,17 +2081,26 @@ fn check_argv_code_selecting(
         }
         Err(DeclError::Wrapper) => Some("wrapper_program"),
         Err(DeclError::Disguised) => Some("disguised_launcher"),
-        _ => {
-            if let Ok(canon) = fs::canonicalize(&exe)
+        Err(other) => strict_all_errors.then(|| other.word()),
+        Ok(()) => {
+            let exe_path = Path::new(first);
+            if let Ok(canon) = fs::canonicalize(exe_path)
                 && matches!(
-                    envcloak_policy::managed::refuse_disguised(
-                        &decl.argv,
-                        &canon.to_string_lossy()
-                    ),
+                    refuse_disguised(&decl.argv, &canon.to_string_lossy()),
                     Err(DeclError::Disguised)
                 )
             {
                 return Some("disguised_launcher");
+            }
+            if strict_all_errors {
+                if !exe_path.is_absolute() || !exe_path.is_file() {
+                    return Some("executable_not_found");
+                }
+                if let Ok(ArgvClass::Interpreter { entry }) = classify_argv(&decl.argv)
+                    && !Path::new(&decl.argv[entry]).is_file()
+                {
+                    return Some("no_entry_file");
+                }
             }
             None
         }
@@ -1493,8 +2214,40 @@ pub fn apply(
         .map(secret_copy)
         .ok_or(MigrateError::MissingPassphrase)?;
 
-    let claude_cli = if plan
-        .rewrites
+    let mut rewrites = plan.rewrites.clone();
+    let existing_reg = MigrationRegistry::open(&proof.data_dir)?;
+    for rw in &mut rewrites {
+        let key_conflict = existing_reg
+            .servers
+            .get(&rw.key())
+            .is_some_and(|rec| rec.config_path != rw.config_path || rec.server != rw.server);
+        if key_conflict {
+            let h = short_disambiguator(&rw.config_path, &rw.server);
+            rw.key_override = Some(format!("{}/{}-{}", rw.agent, rw.server, h));
+            rw.dir_slug_override = Some(format!(
+                "{}-{}-{}",
+                update::sanitize_segment(&rw.agent),
+                update::sanitize_segment(&rw.server),
+                h
+            ));
+        }
+        let target_manifest = rw.manifest_path(&proof.data_dir);
+        let dir_conflict = existing_reg.servers.values().any(|rec| {
+            rec.manifest == target_manifest
+                && (rec.config_path != rw.config_path || rec.server != rw.server)
+        });
+        if dir_conflict {
+            let h = short_disambiguator(&rw.config_path, &rw.server);
+            rw.dir_slug_override = Some(format!(
+                "{}-{}-{}",
+                update::sanitize_segment(&rw.agent),
+                update::sanitize_segment(&rw.server),
+                h
+            ));
+        }
+    }
+
+    let claude_cli = if rewrites
         .iter()
         .any(|r| r.config_path == proof.loc.claude_json())
     {
@@ -1512,8 +2265,9 @@ pub fn apply(
     let now = SystemTime::now();
     let mut file_order: Vec<PathBuf> = Vec::new();
     let mut file_snapshots: BTreeMap<PathBuf, FileSnapshot> = BTreeMap::new();
+    let mut deleted_env_files: BTreeSet<PathBuf> = BTreeSet::new();
 
-    for rw in &plan.rewrites {
+    for rw in &rewrites {
         if !file_snapshots.contains_key(&rw.config_path) {
             let snap = preflight_config_file(
                 &rw.config_path,
@@ -1526,28 +2280,35 @@ pub fn apply(
             file_snapshots.insert(rw.config_path.clone(), snap);
         }
     }
+    for rw in &rewrites {
+        if let PlannedRewriteKind::Stdio {
+            env_file: Some(ef_path),
+            ..
+        } = &rw.kind
+        {
+            if !file_snapshots.contains_key(ef_path) {
+                let snap =
+                    preflight_config_file(ef_path, &rw.agent, &state, now, proof.enforce_min_age)?;
+                file_order.push(ef_path.clone());
+                file_snapshots.insert(ef_path.clone(), snap);
+            }
+            deleted_env_files.insert(ef_path.clone());
+        }
+    }
 
     let mut client = (proof.connect)().map_err(MigrateError::Client)?;
 
-    let mut imported_by_server: BTreeMap<String, BTreeMap<String, ImportedSecretSummary>> =
+    let mut imported_by_rewrite: BTreeMap<usize, BTreeMap<String, ImportedSecretSummary>> =
         BTreeMap::new();
     let mut imported_list: Vec<ImportedSecretSummary> = Vec::new();
 
-    for rw in &plan.rewrites {
+    for (rw_idx, rw) in rewrites.iter().enumerate() {
         let srv_key = rw.key();
         let secrets_to_import: Vec<&PlannedSecret> = match &rw.kind {
             PlannedRewriteKind::Stdio { secrets, .. } => secrets.iter().collect(),
-            PlannedRewriteKind::HttpBridge {
-                headers,
-                env_secrets,
-                ..
-            } => headers.iter().chain(env_secrets.iter()).collect(),
+            PlannedRewriteKind::HttpBridge { headers, .. } => headers.iter().collect(),
         };
-        let label = format!(
-            "mcp-{}-{}",
-            update::sanitize_segment(&rw.agent),
-            update::sanitize_segment(&rw.server)
-        );
+        let label = format!("mcp-{}", rw.dir_slug());
         let file_display = rw.config_path.display().to_string();
 
         let entries: Vec<ImportEntry> = secrets_to_import
@@ -1638,7 +2399,7 @@ pub fn apply(
             srv_map.insert(s.name.clone(), summary.clone());
             imported_list.push(summary);
         }
-        imported_by_server.insert(srv_key, srv_map);
+        imported_by_rewrite.insert(rw_idx, srv_map);
     }
 
     let envcloak_cmd = proof.envcloak_bin.to_string_lossy().into_owned();
@@ -1651,13 +2412,13 @@ pub fn apply(
     let mut migrated_summaries: Vec<MigratedServerSummary> = Vec::new();
     let mut receipts: Vec<LaunchReceiptView> = Vec::new();
 
-    for rw in &plan.rewrites {
+    for (rw_idx, rw) in rewrites.iter().enumerate() {
         let srv_key = rw.key();
         let managed_dir = rw.managed_dir(&proof.data_dir);
         let manifest_path = rw.manifest_path(&proof.data_dir);
         let srv_imports =
-            imported_by_server
-                .get(&srv_key)
+            imported_by_rewrite
+                .get(&rw_idx)
                 .ok_or_else(|| MigrateError::ServerNotFound {
                     agent: rw.agent.clone(),
                     server: rw.server.clone(),
@@ -1671,11 +2432,19 @@ pub fn apply(
                 cwd,
                 non_secret_env,
                 secrets,
+                ..
             } => {
+                let base_dir = project_root_for_config(proof.loc, &rw.config_path)
+                    .unwrap_or_else(|| proof.project_dir.clone());
                 let resolved_argv =
-                    resolve_stdio_argv(&proof.path_env, &proof.project_dir, argv, cwd.as_deref());
-                let resolved_cwd =
-                    resolve_stdio_cwd(&proof.project_dir, cwd.as_deref(), &managed_dir);
+                    resolve_stdio_argv(&proof.path_env, &base_dir, argv, cwd.as_deref());
+                let resolved_cwd = resolve_stdio_cwd(
+                    proof.loc,
+                    &rw.config_path,
+                    &proof.project_dir,
+                    cwd.as_deref(),
+                    &managed_dir,
+                );
                 let decl = ManagedServerDecl::Stdio {
                     launch: LaunchDeclParams {
                         argv: resolved_argv,
@@ -1757,10 +2526,12 @@ pub fn apply(
         let codex_startup_timeout_set =
             rw.agent == "codex" && consent.startup_timeout && rw.codex_needs_startup_timeout;
 
+        let default_key = format!("{}/{}", rw.agent, rw.server);
         receipts.push(registered.receipt.clone());
         migrated_summaries.push(MigratedServerSummary {
             agent: rw.agent.clone(),
             server: rw.server.clone(),
+            server_key: (srv_key != default_key).then_some(srv_key),
             config_path: rw.config_path.clone(),
             manifest_path,
             transport: rw.transport_name().to_string(),
@@ -1827,7 +2598,10 @@ pub fn apply(
     let mut policy_ids = Vec::new();
     let mut server_keys = Vec::new();
     for s in &migrated_summaries {
-        let key = format!("{}/{}", s.agent, s.server);
+        let key = s
+            .server_key
+            .clone()
+            .unwrap_or_else(|| format!("{}/{}", s.agent, s.server));
         policy_ids.push(s.policy_id.clone());
         server_keys.push(key.clone());
         reg.servers.insert(
@@ -1849,6 +2623,7 @@ pub fn apply(
             policy_ids,
             server_keys,
             files: file_order.clone(),
+            deleted_files: deleted_env_files.iter().cloned().collect(),
         },
     );
     reg.save(&proof.data_dir)?;
@@ -1858,6 +2633,19 @@ pub fn apply(
     let mut touched_mcp_json = false;
     for (file_idx, path) in file_order.iter().enumerate() {
         let snap = &file_snapshots[path];
+        let file_u32 = u32::try_from(file_idx).unwrap_or(0);
+        if deleted_env_files.contains(path) {
+            remove_checked(&snap.root, &snap.rel, &snap.stamp)
+                .map_err(|_| MigrateError::Changed { path: path.clone() })?;
+            let empty_digest: [u8; 32] = Sha256::digest(b"").into();
+            client
+                .backup_v2_record_result(&begun.id, file_u32, &empty_digest)
+                .map_err(|e| MigrateError::Client(Failure::from(e)))?;
+            let k = crate::writer::key(path);
+            state.written.remove(&k);
+            continue;
+        }
+
         let servers_for_file: Vec<&MigratedServerSummary> = migrated_summaries
             .iter()
             .filter(|s| &s.config_path == path)
@@ -1870,7 +2658,19 @@ pub fn apply(
                     tool: "claude".to_string(),
                     detail: "claude CLI missing".to_string(),
                 })?;
-            let rewrites: Vec<(String, Value)> = servers_for_file
+            let (cur_bytes, cur_stamp) = read_plain(&snap.root, &snap.rel, MAX_HOST_STATE)
+                .map_err(|_| MigrateError::Changed { path: path.clone() })?;
+            if cur_stamp != snap.stamp || cur_bytes != snap.bytes {
+                return Err(MigrateError::Changed { path: path.clone() });
+            }
+            if let Some(name) = path.file_name() {
+                let open_fd = envcloak_sys::open_beneath(snap.root.dir(), name)
+                    .map_err(|_| MigrateError::Changed { path: path.clone() })?;
+                if matches!(envcloak_sys::open_elsewhere(&open_fd), InUse::Yes) {
+                    return Err(MigrateError::OpenElsewhere { path: path.clone() });
+                }
+            }
+            let claude_rewrites: Vec<(String, Value)> = servers_for_file
                 .iter()
                 .map(|s| {
                     (
@@ -1879,16 +2679,31 @@ pub fn apply(
                     )
                 })
                 .collect();
-            let _ =
-                claude::apply_claude_user_scope(proof.loc, &proof.path_env, claude_bin, &rewrites)?;
-            let (reread_bytes, post_stamp) = read_plain(&snap.root, &snap.rel, MAX_HOST_STATE)
-                .map_err(|_| MigrateError::Io {
-                    path: path.clone(),
-                    message: "failed to re-read ~/.claude.json after `claude mcp` update"
-                        .to_string(),
-                })?;
-            verify_structural_reread(path, &reread_bytes)?;
-            (reread_bytes, post_stamp)
+            let claude_res = (|| -> Result<(Vec<u8>, FileStamp), MigrateError> {
+                claude::apply_claude_user_scope(
+                    proof.loc,
+                    &proof.path_env,
+                    claude_bin,
+                    &claude_rewrites,
+                )?;
+                let (reread_bytes, post_stamp) = read_plain(&snap.root, &snap.rel, MAX_HOST_STATE)
+                    .map_err(|_| MigrateError::Io {
+                        path: path.clone(),
+                        message: "failed to re-read ~/.claude.json after `claude mcp` update"
+                            .to_string(),
+                    })?;
+                verify_structural_reread(path, &reread_bytes)?;
+                Ok((reread_bytes, post_stamp))
+            })();
+            match claude_res {
+                Ok(pair) => pair,
+                Err(err) => {
+                    if let Ok((_, bad_stamp)) = read_plain(&snap.root, &snap.rel, MAX_HOST_STATE) {
+                        let _ = replace_atomically(&snap.root, &snap.rel, &snap.bytes, &bad_stamp);
+                    }
+                    return Err(err);
+                }
+            }
         } else {
             let source_str =
                 std::str::from_utf8(&snap.bytes).map_err(|e| MigrateError::InvalidConfig {
@@ -1906,7 +2721,6 @@ pub fn apply(
         };
 
         let digest: [u8; 32] = Sha256::digest(&after_bytes).into();
-        let file_u32 = u32::try_from(file_idx).unwrap_or(0);
         client
             .backup_v2_record_result(&begun.id, file_u32, &digest)
             .map_err(|e| MigrateError::Client(Failure::from(e)))?;
@@ -1954,10 +2768,13 @@ pub fn apply(
     ];
     for s in &migrated_summaries {
         if s.standing_eligible {
+            let key = s
+                .server_key
+                .clone()
+                .unwrap_or_else(|| format!("{}/{}", s.agent, s.server));
             next_steps.push(format!(
-                "`{}/{}` is `bound` and binds only `test`-classified items: once a request appears \
-                 in `envcloak pending`, you may approve it with `envcloak approve <id> --standing`.",
-                s.agent, s.server
+                "`{key}` is `bound` and binds only `test`-classified items: once a request appears \
+                 in `envcloak pending`, you may approve it with `envcloak approve <id> --standing`."
             ));
         }
     }
@@ -2116,11 +2933,7 @@ fn write_managed_manifest(
         })?;
     let _ = fs::set_permissions(managed_dir, fs::Permissions::from_mode(0o700));
 
-    let proj_name = format!(
-        "mcp-{}-{}",
-        update::sanitize_segment(&rw.agent),
-        update::sanitize_segment(&rw.server)
-    );
+    let proj_name = format!("mcp-{}", rw.dir_slug());
     let mut content = format!(
         "[project]\nname = {}\n\n[env]\n",
         serde_json::to_string(&proj_name).unwrap_or_default()
@@ -2138,10 +2951,7 @@ fn write_managed_manifest(
             }
         }
         PlannedRewriteKind::HttpBridge {
-            origin,
-            headers,
-            env_secrets,
-            ..
+            origin, headers, ..
         } => {
             for h in headers {
                 if let Some(imp) = imports.get(&h.name)
@@ -2152,18 +2962,6 @@ fn write_managed_manifest(
                         format_toml_key(&binding_name),
                         serde_json::to_string(&imp.reference).unwrap_or_default()
                     ));
-                }
-            }
-            if !env_secrets.is_empty() {
-                content.push_str("\n[env.extra]\n");
-                for s in env_secrets {
-                    if let Some(imp) = imports.get(&s.name) {
-                        content.push_str(&format!(
-                            "{} = {}\n",
-                            format_toml_key(&s.name),
-                            serde_json::to_string(&imp.reference).unwrap_or_default()
-                        ));
-                    }
                 }
             }
         }
@@ -2264,6 +3062,33 @@ fn format_toml_key(k: &str) -> String {
     }
 }
 
+fn project_root_for_config(loc: &Locations, config_path: &Path) -> Option<PathBuf> {
+    if config_path.file_name() == Some(OsStr::new(".mcp.json")) {
+        return config_path.parent().map(Path::to_path_buf);
+    }
+    if config_path.file_name() == Some(OsStr::new("opencode.json"))
+        && let Some(parent) = config_path.parent()
+        && parent.file_name() != Some(OsStr::new("opencode"))
+    {
+        return Some(parent.to_path_buf());
+    }
+    let parent = config_path.parent()?;
+    let dir_name = parent.file_name()?;
+    if dir_name == OsStr::new(".vscode") || dir_name == OsStr::new(".github") {
+        return parent.parent().map(Path::to_path_buf);
+    }
+    if dir_name == OsStr::new(".cursor")
+        || dir_name == OsStr::new(".gemini")
+        || dir_name == OsStr::new(".codex")
+    {
+        let grandparent = parent.parent()?;
+        if grandparent != loc.home() && parent != loc.codex_home() {
+            return Some(grandparent.to_path_buf());
+        }
+    }
+    None
+}
+
 fn resolve_stdio_argv(
     path_env: &OsStr,
     project_dir: &Path,
@@ -2276,41 +3101,88 @@ fn resolve_stdio_argv(
     let mut out = Vec::with_capacity(argv.len());
     if Path::new(first).is_absolute() {
         out.push(first.clone());
-    } else if !path_env.is_empty()
-        && let Some(found) = find_on_path(first, path_env)
-    {
-        out.push(found.to_string_lossy().into_owned());
-    } else if let Some(sys_path) = std::env::var_os("PATH")
-        && let Some(found) = find_on_path(first, &sys_path)
-    {
-        out.push(found.to_string_lossy().into_owned());
+    } else if !first.contains('/') {
+        if !path_env.is_empty()
+            && let Some(found) = find_on_path(first, path_env)
+        {
+            out.push(found.to_string_lossy().into_owned());
+        } else if let Some(sys_path) = std::env::var_os("PATH")
+            && let Some(found) = find_on_path(first, &sys_path)
+        {
+            out.push(found.to_string_lossy().into_owned());
+        } else {
+            out.push(first.clone());
+        }
     } else {
         out.push(first.clone());
     }
+
+    out.extend(rest.iter().cloned());
 
     let base_dir = cwd
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| project_dir.to_path_buf());
 
-    for arg in rest {
-        if !arg.starts_with('-') && !Path::new(arg).is_absolute() {
-            let candidate = base_dir.join(arg);
-            if candidate.exists() {
-                out.push(candidate.to_string_lossy().into_owned());
-                continue;
+    if matches!(classify_argv(&out), Err(DeclError::NotAbsolute)) {
+        let exe_base = out[0]
+            .rsplit('/')
+            .next()
+            .unwrap_or(&out[0])
+            .to_ascii_lowercase();
+        let is_deno_or_bun = exe_base == "deno"
+            || exe_base == "bun"
+            || exe_base
+                .strip_prefix("deno")
+                .or_else(|| exe_base.strip_prefix("bun"))
+                .is_some_and(|s| {
+                    s.strip_prefix('-')
+                        .unwrap_or(s)
+                        .starts_with(|c: char| c.is_ascii_digit())
+                });
+        let mut idx = 1;
+        if is_deno_or_bun && out.get(1).map(String::as_str) == Some("run") {
+            idx = 2;
+        }
+        while let Some(a) = out.get(idx) {
+            if a == "--" {
+                idx += 1;
+                break;
+            }
+            if !a.starts_with('-') || a == "-" {
+                break;
+            }
+            idx += 1;
+        }
+        if let Some(entry_arg) = out.get(idx).cloned()
+            && !entry_arg.starts_with('-')
+            && !Path::new(&entry_arg).is_absolute()
+        {
+            let candidate = base_dir.join(&entry_arg);
+            if candidate.is_file() {
+                out[idx] = candidate.to_string_lossy().into_owned();
             }
         }
-        out.push(arg.clone());
     }
     out
 }
 
-fn resolve_stdio_cwd(project_dir: &Path, cwd: Option<&str>, managed_dir: &Path) -> Option<String> {
+fn resolve_stdio_cwd(
+    loc: &Locations,
+    config_path: &Path,
+    project_dir: &Path,
+    cwd: Option<&str>,
+    managed_dir: &Path,
+) -> Option<String> {
+    let proj_root = project_root_for_config(loc, config_path);
+    let base_dir = proj_root.as_deref().unwrap_or(project_dir);
     match cwd {
         Some(c) if Path::new(c).is_absolute() => Some(c.to_string()),
-        Some(c) => Some(project_dir.join(c).to_string_lossy().into_owned()),
-        None => Some(managed_dir.to_string_lossy().into_owned()),
+        Some(c) => Some(base_dir.join(c).to_string_lossy().into_owned()),
+        None => match proj_root {
+            Some(p) => Some(p.to_string_lossy().into_owned()),
+            None => Some(managed_dir.to_string_lossy().into_owned()),
+        },
     }
 }
 
@@ -2361,6 +3233,16 @@ fn rewrite_file_contents(
     }
 }
 
+pub(crate) fn toml_err_reason(source: &str, err: &toml_edit::TomlError) -> String {
+    if let Some(span) = err.span() {
+        let prefix = &source.as_bytes()[..span.start.min(source.len())];
+        let line = prefix.iter().filter(|&&b| b == b'\n').count() + 1;
+        format!("invalid TOML syntax at line {line}")
+    } else {
+        "invalid TOML syntax".to_string()
+    }
+}
+
 fn verify_structural_reread(path: &Path, bytes: &[u8]) -> Result<(), MigrateError> {
     if path.extension() == Some(OsStr::new("toml")) {
         let s = std::str::from_utf8(bytes).map_err(|e| MigrateError::InvalidConfig {
@@ -2370,7 +3252,7 @@ fn verify_structural_reread(path: &Path, bytes: &[u8]) -> Result<(), MigrateErro
         s.parse::<toml_edit::DocumentMut>()
             .map_err(|e| MigrateError::InvalidConfig {
                 path: path.to_path_buf(),
-                reason: e.to_string(),
+                reason: toml_err_reason(s, &e),
             })?;
     } else {
         Doc::parse(bytes).map_err(|e| MigrateError::InvalidConfig {
