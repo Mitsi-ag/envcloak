@@ -21,26 +21,33 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
 use envcloak_policy::{
-    ApprovalOptions, Binding, EnvFileNames, EnvFileRef, EnvName, ManifestError, PendingDescriptor,
-    PlainName, Proposal, UnlockerAddDescriptor,
+    ApprovalOptions, AskStateOutcome, Binding, EnvFileNames, EnvFileRef, EnvName, ManifestError,
+    PendingDescriptor, PlainName, Proposal, UnlockerAddDescriptor,
 };
 
 pub use crate::app::{
-    AppApprove, AppApproveParams, AppPendingGet, AppPendingGetParams, AppPendingList,
-    AppPendingListParams, AppPendingListView, AppPendingView, AppUnlock, AppUnlockBegin,
-    AppUnlockBeginOutput, AppUnlockBeginParams, AppUnlockParams, AppUnlockerEnroll,
-    AppUnlockerEnrollBegin, AppUnlockerEnrollBeginOutput, AppUnlockerEnrollBeginParams,
-    AppUnlockerEnrollOutput, AppUnlockerEnrollParams, RUN_STATEMENT_DOMAIN, SeEnvelopeView,
+    AppApprove, AppApproveParams, AppAskDeclinedView, AppAsksDecline, AppAsksDeclineParams,
+    AppAsksList, AppAsksListParams, AppAsksListView, AppItemsRemove, AppItemsRemoveParams,
+    AppItemsRotate, AppItemsRotateParams, AppItemsTarget, AppItemsTargetOutput,
+    AppItemsTargetParams, AppPaste, AppPasteBegin, AppPasteBeginOutput, AppPasteBeginParams,
+    AppPasteInspect, AppPasteInspectOutput, AppPasteInspectParams, AppPasteParams, AppPendingGet,
+    AppPendingGetParams, AppPendingList, AppPendingListParams, AppPendingListView, AppPendingView,
+    AppReveal, AppRevealBegin, AppRevealBeginParams, AppRevealOutput, AppRevealParams, AppUnlock,
+    AppUnlockBegin, AppUnlockBeginOutput, AppUnlockBeginParams, AppUnlockParams, AppUnlockerAdd,
+    AppUnlockerAddParams, AppUnlockerAddedView, AppUnlockerEnroll, AppUnlockerEnrollBegin,
+    AppUnlockerEnrollBeginOutput, AppUnlockerEnrollBeginParams, AppUnlockerEnrollOutput,
+    AppUnlockerEnrollParams, AppUnlockerRemove, AppUnlockerRemoveParams, AppUnlockerRemovedView,
+    RUN_STATEMENT_DOMAIN, SeEnvelopeView,
 };
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
-    AddedView, ApprovedView, AuditVerifyView, BackupBegunView, BackupCommittedView, BackupListView,
-    BackupPutView, BackupResultView, BackupView, CheckView, ClassificationView, CreatedView,
-    DecisionView, DeniedView, ExposureSourceView, FileBackupCreatorView, FileBackupView,
-    GrantsView, ImportPlanView, ItemView, ItemsView, LockedView, MarkedView, PendingListView,
-    PendingStateView, ReclassifiedView, RecoveredView, RecoveryConfirmedView, RemovedView,
-    RestoreFileView, RestoreLeaseView, RevokedView, RotatedView, ScanMatchView, StatusView,
-    TargetView, UnlockedView, VerifyView,
+    AddedView, ApprovedView, AskOpenedView, AuditVerifyView, BackupBegunView, BackupCommittedView,
+    BackupListView, BackupPutView, BackupResultView, BackupView, CheckView, ClassificationView,
+    CreatedView, DecisionView, DeniedView, ExposureSourceView, FileBackupCreatorView,
+    FileBackupView, GrantsView, ImportPlanView, ItemView, ItemsView, LockedView, MarkedView,
+    PendingListView, PendingStateView, ReclassifiedView, RecoveredView, RecoveryConfirmedView,
+    RemovedView, RestoreFileView, RestoreLeaseView, RevealRequestedView, RevokedView, RotatedView,
+    ScanMatchView, StatusView, TargetView, UnlockedView, VerifyView,
 };
 use crate::view::{
     ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
@@ -1777,7 +1784,7 @@ impl core::fmt::Debug for ManagedUpdateParams {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 45] = [
+pub const CLIENT_METHODS: [&str; 48] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1823,22 +1830,35 @@ pub const CLIENT_METHODS: [&str; 45] = [
     ManagedUpdatePlan::NAME,
     ManagedUpdate::NAME,
     ProjectsList::NAME,
+    ItemsAsk::NAME,
+    ItemsAskState::NAME,
+    RevealRequest::NAME,
 ];
 
 /// The `app`-role methods (SPEC §4.3): Secure Enclave unlock, signed
 /// approval, policy, reveal, the paste sheet, devices and registry
 /// overrides. Any other `app.` name is an app method too.
-pub const APP_METHODS: [&str; 13] = [
+pub const APP_METHODS: [&str; 23] = [
     "app.unlock.begin",
     "app.unlock",
     "app.unlocker.enroll.begin",
     "app.unlocker.enroll",
+    "app.unlocker.add",
+    "app.unlocker.remove",
     "app.pending.list",
     "app.pending.get",
     "app.approve",
-    "app.policy.set",
+    "app.items.target",
+    "app.items.rotate",
+    "app.items.remove",
+    "app.reveal.begin",
     "app.reveal",
+    "app.paste.begin",
+    "app.paste.inspect",
     "app.paste",
+    "app.asks.list",
+    "app.asks.decline",
+    "app.policy.set",
     "app.device.add",
     "app.device.remove",
     "app.registry.override",
@@ -2019,12 +2039,18 @@ pub enum ErrorKind {
     /// No enrolled Secure Enclave unlocker has the id `app.unlock.begin`
     /// names.
     NoUnlocker,
+    /// An ask was already answered, declined or expired (`app.paste`,
+    /// `app.asks.decline`).
+    AskClosed,
+    /// An `app.unlocker.remove` that would leave the vault without a daily
+    /// unlocker (passphrase or Secure Enclave).
+    LastUnlocker,
     Internal,
 }
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 53] = [
+    pub const ALL: [ErrorKind; 55] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -2077,6 +2103,8 @@ impl ErrorKind {
         ErrorKind::SignatureInvalid,
         ErrorKind::UnlockFailed,
         ErrorKind::NoUnlocker,
+        ErrorKind::AskClosed,
+        ErrorKind::LastUnlocker,
         ErrorKind::Internal,
     ];
 
@@ -2135,6 +2163,8 @@ impl ErrorKind {
             ErrorKind::SignatureInvalid => -32051,
             ErrorKind::UnlockFailed => -32052,
             ErrorKind::NoUnlocker => -32053,
+            ErrorKind::AskClosed => -32054,
+            ErrorKind::LastUnlocker => -32055,
             ErrorKind::Internal => -32099,
         }
     }
@@ -2194,6 +2224,8 @@ impl ErrorKind {
             ErrorKind::SignatureInvalid => "signature_invalid",
             ErrorKind::UnlockFailed => "unlock_failed",
             ErrorKind::NoUnlocker => "no_unlocker",
+            ErrorKind::AskClosed => "ask_closed",
+            ErrorKind::LastUnlocker => "last_unlocker",
             ErrorKind::Internal => "internal",
         }
     }
@@ -2337,6 +2369,13 @@ impl ErrorKind {
                 "the Secure Enclave unlock could not be verified, or the unlock challenge expired"
             }
             ErrorKind::NoUnlocker => "no Secure Enclave unlocker has that id",
+            ErrorKind::AskClosed => {
+                "that ask is no longer open (it was answered, declined or expired)"
+            }
+            ErrorKind::LastUnlocker => {
+                "cannot remove the last daily unlocker; the vault must keep at least the \
+                 passphrase or one Secure Enclave unlocker"
+            }
             ErrorKind::Internal => "the daemon failed",
         }
     }
@@ -2779,4 +2818,77 @@ impl core::fmt::Debug for ProjectsListParams {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("ProjectsListParams { .. }")
     }
+}
+
+/// `items.ask`: files a request for the app's paste sheet with the
+/// requester's evidence, under the pending caps (SPEC §6.3; M3-14). Takes
+/// no value and makes no grant.
+#[derive(Debug)]
+pub struct ItemsAsk;
+
+impl Method for ItemsAsk {
+    const NAME: &'static str = "items.ask";
+    type Params = AskParams;
+    type Output = AskOpenedView;
+}
+
+/// Parameters of [`ItemsAsk`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+/// `items.ask_state`: how an ask stands (`pending`, `added` with `slug`,
+/// `declined`, `expired` or `unknown`), told only to the requester's own
+/// process tree (M3-14).
+#[derive(Debug)]
+pub struct ItemsAskState;
+
+impl Method for ItemsAskState {
+    const NAME: &'static str = "items.ask_state";
+    type Params = AskStateParams;
+    type Output = AskStateOutcome;
+}
+
+/// Parameters of [`ItemsAskState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskStateParams {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub ask: String,
+}
+
+/// `reveal.request`: files a reveal request for the app from a terminal
+/// subject (SPEC §6.7; M3-14). Refused (`proof_refused`, audited) to an
+/// agent, unknown or terminal-less subject before anything is filed.
+#[derive(Debug)]
+pub struct RevealRequest;
+
+impl Method for RevealRequest {
+    const NAME: &'static str = "reveal.request";
+    type Params = RevealRequestParams;
+    type Output = RevealRequestedView;
+}
+
+/// Parameters of [`RevealRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealRequestParams {
+    pub slug: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
 }

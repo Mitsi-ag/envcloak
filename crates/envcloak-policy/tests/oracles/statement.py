@@ -118,12 +118,85 @@ def encode_unlocker(d):
     return bytes(out)
 
 
+def encode_write(s):
+    out = bytearray(b"envcloak-write-statement/1\n")
+    out += text(s["target"]) + text(s["nonce"]) + text(s["vault_id"])
+    a = s["action"]
+    kind = a["kind"]
+    out += text(kind)
+    if kind == "rotate":
+        for k in ("item", "slug", "field", "field_name", "classification"):
+            out += text(a[k])
+        out += num(a["prior_count"]) + num(a["grants"]) + text(a["new_value_sha256"])
+    elif kind == "remove":
+        out += text(a["item"]) + text(a["slug"]) + num(a["grants"])
+    elif kind == "unlocker_add":
+        for k in (
+            "label",
+            "unlock_pub_sha256",
+            "approve_pub_sha256",
+            "team_id",
+            "signing_id",
+        ):
+            out += text(a[k])
+    elif kind == "unlocker_remove":
+        u = a["unlocker"]
+        ukind = u["kind"]
+        out += text(ukind)
+        if ukind == "secure_enclave":
+            for k in (
+                "unlocker_id",
+                "label",
+                "unlock_pub_sha256",
+                "approve_pub_sha256",
+            ):
+                out += text(u[k])
+        elif ukind != "passphrase":
+            raise ValueError("unknown unlocker kind %r" % (ukind,))
+    else:
+        raise ValueError("unknown write action %r" % (kind,))
+    return bytes(out)
+
+
+def encode_reveal(d):
+    out = bytearray(b"envcloak-reveal-statement/1\n")
+    for k in (
+        "request",
+        "nonce",
+        "vault_id",
+        "item",
+        "slug",
+        "field",
+        "field_name",
+        "classification",
+    ):
+        out += text(d[k])
+    req = d.get("requester")
+    if req is None:
+        out += flag(False)
+    else:
+        out += flag(True)
+        out += text(req["kind"])
+        out += optional(req.get("label"))
+        root = req["root"]
+        out += num(req["caller_pid"]) + num(root["pid"]) + num(root["start_time"])
+        out += optional(root.get("exe"))
+    out += num(d["created_secs"]) + num(d["expires_in_secs"])
+    return bytes(out)
+
+
 def main():
     cases = json.load(sys.stdin)
     out = []
     for c in cases:
         if "unlocker_add" in c:
             out.append({"unlocker": encode_unlocker(c["unlocker_add"]).hex()})
+            continue
+        if "write" in c:
+            out.append({"write": encode_write(c["write"]).hex()})
+            continue
+        if "reveal" in c:
+            out.append({"reveal": encode_reveal(c["reveal"]).hex()})
             continue
         d, o = c["descriptor"], c["options"]
         out.append(

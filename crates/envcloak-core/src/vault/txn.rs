@@ -1026,6 +1026,38 @@ impl<'v> Txn<'v> {
         Ok(())
     }
 
+    /// Removes a daily unlocker (the passphrase unlocker or a Secure Enclave
+    /// unlocker; SPEC §5, M3-14). The Recovery Kit unlocker is never a daily
+    /// unlocker and is refused with [`VaultErrorKind::UnknownUnlocker`];
+    /// removing the last daily unlocker (or the last Secure Enclave unlocker)
+    /// is refused with [`VaultErrorKind::LastUnlocker`].
+    pub fn remove_daily_unlocker(&mut self, id: UnlockerId) -> Result<(), VaultError> {
+        let is_se = self.state.se_unlockers.contains_key(&id);
+        let is_daily = match self.state.unlockers.get(&id) {
+            Some(env) => env.kind() == UnlockerKind::Passphrase,
+            None => is_se,
+        };
+        if !is_daily {
+            return Err(VaultErrorKind::UnknownUnlocker.into());
+        }
+        let daily_count = self
+            .state
+            .unlockers
+            .values()
+            .filter(|e| e.kind() == UnlockerKind::Passphrase)
+            .count()
+            + self.state.se_unlockers.len();
+        let se_remaining = self
+            .state
+            .se_unlockers
+            .len()
+            .saturating_sub(usize::from(is_se));
+        if daily_count <= 1 || se_remaining == 0 {
+            return Err(VaultErrorKind::LastUnlocker.into());
+        }
+        self.remove_unlocker(id)
+    }
+
     /// Saves the audit log's head in the header (T10).
     pub fn set_audit_head(&mut self, head: AuditHead) {
         self.state.header.audit_head = Some(head);

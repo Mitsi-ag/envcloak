@@ -481,6 +481,8 @@ fn tick(shared: &Shared) {
     let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
     s.grants().sweep(&now, &requests::alive);
+    s.prune_app_stages(now.awake);
+    s.sweep_expired_asks(&now);
     s.backups().sweep(now.awake);
     s.audit_tick(Reading::now(&shared.clocks));
 }
@@ -945,6 +947,15 @@ fn respond<'s>(
             })
         }),
         BackupList::NAME => answer::<BackupList>(id, &req, |p| backups::list(shared, p)),
+        proto::ItemsAsk::NAME => {
+            answer::<proto::ItemsAsk>(id, &req, |p| crate::app::asks::ask(shared, peer, p))
+        }
+        proto::ItemsAskState::NAME => answer::<proto::ItemsAskState>(id, &req, |p| {
+            crate::app::asks::ask_state(shared, peer, p)
+        }),
+        proto::RevealRequest::NAME => answer::<proto::RevealRequest>(id, &req, |p| {
+            crate::app::reveal::request(shared, peer, p)
+        }),
         proto::AppUnlockBegin::NAME => {
             answer::<proto::AppUnlockBegin>(id, &req, |p| crate::app::unlock::begin(shared, p))
         }
@@ -966,6 +977,26 @@ fn respond<'s>(
         proto::AppUnlockerEnroll::NAME => {
             answer::<proto::AppUnlockerEnroll>(id, &req, |p| crate::app::enroll::poll(shared, p))
         }
+        proto::AppUnlockerAdd::NAME => answer::<proto::AppUnlockerAdd>(id, &req, |p| {
+            crate::app::enroll::add(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                p,
+            )
+        }),
+        proto::AppUnlockerRemove::NAME => answer::<proto::AppUnlockerRemove>(id, &req, |p| {
+            crate::app::enroll::remove(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                p,
+            )
+        }),
         proto::AppPendingList::NAME => answer::<proto::AppPendingList>(id, &req, |p| {
             crate::app::pending::list(shared, peer, p)
         }),
@@ -981,6 +1012,58 @@ fn respond<'s>(
                     .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
                 p,
             )
+        }),
+        proto::AppItemsTarget::NAME => answer::<proto::AppItemsTarget>(id, &req, |p| {
+            crate::app::writes::target(shared, peer, p)
+        }),
+        proto::AppItemsRotate::NAME => answer::<proto::AppItemsRotate>(id, &req, |p| {
+            crate::app::writes::rotate(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                p,
+            )
+        }),
+        proto::AppItemsRemove::NAME => answer::<proto::AppItemsRemove>(id, &req, |p| {
+            crate::app::writes::remove(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                p,
+            )
+        }),
+        proto::AppRevealBegin::NAME => answer::<proto::AppRevealBegin>(id, &req, |p| {
+            crate::app::reveal::begin(shared, peer, p)
+        }),
+        proto::AppReveal::NAME => framed::<proto::AppReveal>(id, &req, |p| {
+            crate::app::reveal::reveal(
+                shared,
+                peer,
+                enrolled_under
+                    .as_ref()
+                    .ok_or(RpcError::new(ErrorKind::RoleDenied))?,
+                id,
+                p,
+            )
+        }),
+        proto::AppPasteBegin::NAME => {
+            answer::<proto::AppPasteBegin>(id, &req, |p| crate::app::paste::begin(shared, peer, p))
+        }
+        proto::AppPasteInspect::NAME => answer::<proto::AppPasteInspect>(id, &req, |p| {
+            crate::app::paste::inspect(shared, peer, p)
+        }),
+        proto::AppPaste::NAME => {
+            answer::<proto::AppPaste>(id, &req, |p| crate::app::paste::paste(shared, peer, p))
+        }
+        proto::AppAsksList::NAME => {
+            answer::<proto::AppAsksList>(id, &req, |p| crate::app::asks::list(shared, peer, p))
+        }
+        proto::AppAsksDecline::NAME => answer::<proto::AppAsksDecline>(id, &req, |p| {
+            crate::app::asks::decline(shared, peer, p)
         }),
         _ => proto::error_frame(Some(id), &RpcError::new(ErrorKind::MethodNotFound)).ok(),
     }

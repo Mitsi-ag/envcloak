@@ -85,6 +85,10 @@ pub const UNRECOGNIZED_VERSION: &str = "unrecognized";
 /// of [`REASONS`].
 pub const UNKNOWN_REASON: &str = "unknown";
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 /// `status`: the daemon, its vault, its lock, and its grants and proofs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusView {
@@ -93,6 +97,9 @@ pub struct StatusView {
     pub lock: LockView,
     pub approvals: ApprovalsView,
     pub audit: AuditStatusView,
+    /// How many asks and reveal requests wait for the app (`status.app_requests`, M3-14).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub app_requests: u32,
 }
 
 impl StatusView {
@@ -2059,3 +2066,25 @@ project_debug!(
     RefUnsetView
 );
 views!(ProjectsView, RefUnsetView);
+
+/// `items.ask`'s answer (`{ ask }`, M3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskOpenedView {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub ask: String,
+}
+
+/// `reveal.request`'s answer (`{ request }`, M3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealRequestedView {
+    /// 8 Crockford base32 characters (`PendingId`).
+    pub request: String,
+}
+
+views!(
+    AskOpenedView,
+    RevealRequestedView,
+    envcloak_policy::AskStateOutcome
+);

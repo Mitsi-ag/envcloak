@@ -118,6 +118,22 @@ const SE_UNLOCK_TTL: Duration = Duration::from_secs(60);
 /// Maximum concurrent in-flight `app.unlock.begin` challenges.
 const MAX_SE_UNLOCK_CHALLENGES: usize = 64;
 
+/// How long an `app.items.target` write target stays valid on the awake clock.
+pub(crate) const WRITE_TARGET_TTL: Duration = Duration::from_secs(60);
+
+/// Maximum concurrent in-flight `app.items.target` targets.
+const MAX_WRITE_TARGETS: usize = 64;
+
+/// How long an `app.paste` stage stays valid on the awake clock.
+pub(crate) const PASTE_STAGE_TTL: Duration = Duration::from_secs(120);
+
+/// Maximum concurrent in-flight `app.paste` stages.
+const MAX_PASTE_STAGES: usize = 64;
+
+/// Maximum remembered single-use nonces for `app.unlocker.add` and
+/// `app.unlocker.remove`.
+const MAX_USED_WRITE_NONCES: usize = 256;
+
 /// A single-use challenge and daemon ephemeral X25519 key for `app.unlock`
 /// (SPEC §5 "Unlock flow" step 2).
 #[derive(Debug)]
@@ -125,6 +141,36 @@ struct SeUnlockChallenge {
     request_id: envcloak_policy::PendingId,
     challenge: [u8; envcloak_core::crypto::SE_CHALLENGE_LEN],
     ephemeral: envcloak_core::crypto::SeEphemeralKey,
+    opened_awake: Duration,
+}
+
+/// A single-use target and daemon ephemeral X25519 key for `app.items.rotate`
+/// and `app.items.remove` (M3-14).
+#[derive(Debug)]
+pub(crate) struct WriteTarget {
+    pub(crate) target: envcloak_policy::PendingId,
+    pub(crate) nonce: [u8; 32],
+    pub(crate) ephemeral: envcloak_core::crypto::SeEphemeralKey,
+    pub(crate) vault_id: envcloak_core::crypto::VaultId,
+    pub(crate) item: envcloak_core::vault::ItemId,
+    pub(crate) slug: envcloak_core::vault::Slug,
+    pub(crate) field: Option<(
+        envcloak_core::vault::FieldId,
+        envcloak_core::vault::FieldName,
+    )>,
+    pub(crate) classification: envcloak_core::vault::Classification,
+    pub(crate) prior_count: u8,
+    pub(crate) grants: u64,
+    pub(crate) opened_awake: Duration,
+}
+
+/// A single-use sealed paste stage for `app.paste.begin`, `app.paste.inspect`
+/// and `app.paste` (M3-14).
+#[derive(Debug)]
+struct PasteStage {
+    stage: envcloak_policy::PendingId,
+    ephemeral: Option<envcloak_core::crypto::SeEphemeralKey>,
+    staged_secret: Option<SecretBytes>,
     opened_awake: Duration,
 }
 
@@ -154,6 +200,13 @@ pub struct State {
     backups: crate::backups::Registry,
     /// Single-use Secure Enclave unlock challenges (`app.unlock.begin`).
     se_challenges: Vec<SeUnlockChallenge>,
+    /// Single-use item write targets (`app.items.target`).
+    write_targets: Vec<WriteTarget>,
+    /// Single-use paste stages (`app.paste.begin`, `app.paste.inspect`).
+    paste_stages: Vec<PasteStage>,
+    /// Single-use nonces consumed by `app.unlocker.add` and
+    /// `app.unlocker.remove`.
+    used_write_nonces: Vec<[u8; 32]>,
 }
 
 impl State {
@@ -176,6 +229,9 @@ impl State {
             crowded: Crowded::default(),
             backups: crate::backups::Registry::default(),
             se_challenges: Vec::new(),
+            write_targets: Vec::new(),
+            paste_stages: Vec::new(),
+            used_write_nonces: Vec::new(),
         }
     }
 
@@ -318,6 +374,9 @@ impl State {
         self.grants.on_lock();
         self.backups.on_lock();
         self.se_challenges.clear();
+        self.write_targets.clear();
+        self.paste_stages.clear();
+        self.used_write_nonces.clear();
         let recorded = matches!(self.slot, Slot::Unlocked(_))
             || (matches!(self.slot, Slot::Busy) && reason != LockReason::Idle);
         if recorded {
@@ -414,6 +473,176 @@ impl State {
     fn prune_se_challenges(&mut self, awake: Duration) {
         self.se_challenges
             .retain(|c| awake.saturating_sub(c.opened_awake) < SE_UNLOCK_TTL);
+    }
+
+    /// Drops expired `app.items.target` targets and `app.paste` stages on the
+    /// awake clock, wiping any staged secrets.
+    pub(crate) fn prune_app_stages(&mut self, awake: Duration) {
+        self.write_targets
+            .retain(|t| awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL);
+        self.paste_stages
+            .retain(|s| awake.saturating_sub(s.opened_awake) < PASTE_STAGE_TTL);
+    }
+
+    /// Drains expired asks and writes an `Ask { outcome: "expired" }` audit
+    /// entry for each.
+    pub(crate) fn sweep_expired_asks(&mut self, now: &Now) {
+        let expired = self.grants.take_expired_asks(now);
+        for ask in expired {
+            let pid = ask.request.subject.caller().pid;
+            let root = ask.request.subject.root();
+            let subject = envcloak_core::audit::SubjectSummary {
+                pid,
+                uid: None,
+                kind: Some(
+                    match ask.request.subject.kind() {
+                        envcloak_policy::SubjectKind::Agent => "agent",
+                        envcloak_policy::SubjectKind::Terminal => "terminal",
+                        envcloak_policy::SubjectKind::Unknown => "unknown",
+                    }
+                    .to_owned(),
+                ),
+                agent: ask.request.subject.label().map(|l| l.name.clone()),
+                root_pid: Some(root.pid),
+                root_exe: root
+                    .exe
+                    .as_ref()
+                    .map(|x| x.path.to_string_lossy().into_owned()),
+            };
+            self.audit(AuditEvent::Ask {
+                pid,
+                subject,
+                ask: ask.id.to_string(),
+                outcome: "expired",
+                item: None,
+            });
+        }
+    }
+
+    /// Allocates a fresh `PendingId` not currently in use by `write_targets`.
+    pub(crate) fn fresh_write_target_id(&self) -> envcloak_policy::PendingId {
+        loop {
+            let id = envcloak_policy::PendingId::generate();
+            if !self.write_targets.iter().any(|t| t.target == id) {
+                break id;
+            }
+        }
+    }
+
+    /// Stores a new `WriteTarget`, evicting the oldest if at cap.
+    pub(crate) fn open_write_target(&mut self, target: WriteTarget, awake: Duration) {
+        self.prune_app_stages(awake);
+        if self.write_targets.len() >= MAX_WRITE_TARGETS {
+            self.write_targets.remove(0);
+        }
+        self.write_targets.push(target);
+    }
+
+    /// Consumes a single-use `WriteTarget` if still live on the awake clock.
+    pub(crate) fn take_write_target(
+        &mut self,
+        id: envcloak_policy::PendingId,
+        awake: Duration,
+    ) -> Option<WriteTarget> {
+        let found = self
+            .write_targets
+            .iter()
+            .position(|t| t.target == id)
+            .map(|idx| self.write_targets.remove(idx));
+        self.prune_app_stages(awake);
+        found.filter(|t| awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL)
+    }
+
+    /// Opens a 2-minute paste stage (`app.paste.begin`).
+    pub(crate) fn open_paste_stage(
+        &mut self,
+        awake: Duration,
+    ) -> Result<(envcloak_policy::PendingId, [u8; 32]), RpcError> {
+        self.prune_app_stages(awake);
+        let stage = loop {
+            let id = envcloak_policy::PendingId::generate();
+            if !self.paste_stages.iter().any(|s| s.stage == id) {
+                break id;
+            }
+        };
+        let ephemeral = envcloak_core::crypto::SeEphemeralKey::generate()
+            .map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        let daemon_eph_pub = *ephemeral.public_key();
+        if self.paste_stages.len() >= MAX_PASTE_STAGES {
+            self.paste_stages.remove(0);
+        }
+        self.paste_stages.push(PasteStage {
+            stage,
+            ephemeral: Some(ephemeral),
+            staged_secret: None,
+            opened_awake: awake,
+        });
+        Ok((stage, daemon_eph_pub))
+    }
+
+    /// Takes the single-use `SeEphemeralKey` for `app.paste.inspect`.
+    pub(crate) fn take_paste_ephemeral(
+        &mut self,
+        id: envcloak_policy::PendingId,
+        awake: Duration,
+    ) -> Option<envcloak_core::crypto::SeEphemeralKey> {
+        self.prune_app_stages(awake);
+        let stage = self.paste_stages.iter_mut().find(|s| s.stage == id)?;
+        stage.ephemeral.take()
+    }
+
+    /// Stores the inspected `SecretBytes` in the paste stage for up to 2
+    /// minutes on the awake clock.
+    pub(crate) fn store_paste_secret(
+        &mut self,
+        id: envcloak_policy::PendingId,
+        secret: SecretBytes,
+        awake: Duration,
+    ) -> bool {
+        self.prune_app_stages(awake);
+        let Some(stage) = self.paste_stages.iter_mut().find(|s| s.stage == id) else {
+            return false;
+        };
+        stage.staged_secret = Some(secret);
+        stage.opened_awake = awake;
+        true
+    }
+
+    /// Removes and wipes a paste stage.
+    pub(crate) fn remove_paste_stage(&mut self, id: envcloak_policy::PendingId) {
+        if let Some(idx) = self.paste_stages.iter().position(|s| s.stage == id) {
+            self.paste_stages.remove(idx);
+        }
+    }
+
+    /// Consumes the staged secret for `app.paste`.
+    pub(crate) fn take_paste_secret(
+        &mut self,
+        id: envcloak_policy::PendingId,
+        awake: Duration,
+    ) -> Option<SecretBytes> {
+        let found = self
+            .paste_stages
+            .iter()
+            .position(|s| s.stage == id)
+            .map(|idx| self.paste_stages.remove(idx));
+        self.prune_app_stages(awake);
+        found
+            .filter(|s| awake.saturating_sub(s.opened_awake) < PASTE_STAGE_TTL)
+            .and_then(|mut s| s.staged_secret.take())
+    }
+
+    /// Records a single-use nonce for `app.unlocker.add` or
+    /// `app.unlocker.remove`. Returns `false` if the nonce was already used.
+    pub(crate) fn record_write_nonce(&mut self, nonce: [u8; 32]) -> bool {
+        if self.used_write_nonces.contains(&nonce) {
+            return false;
+        }
+        if self.used_write_nonces.len() >= MAX_USED_WRITE_NONCES {
+            self.used_write_nonces.remove(0);
+        }
+        self.used_write_nonces.push(nonce);
+        true
     }
 
     fn se_unlock_failed(&mut self, pid: i32) -> RpcError {
@@ -613,9 +842,52 @@ impl State {
         Ok(env)
     }
 
+    /// Removes a daily unlocker (the passphrase unlocker or a Secure Enclave
+    /// unlocker) in one transaction with its durable `unlocker_remove` audit
+    /// append (gate 33).
+    pub fn remove_daily_unlocker(
+        &mut self,
+        unlocker_id: envcloak_core::crypto::UnlockerId,
+        e: AuditEvent,
+    ) -> Result<(), RpcError> {
+        self.unlocked()?;
+        self.audit_open();
+        let Slot::Unlocked(vault) = &mut self.slot else {
+            return Err(RpcError::new(ErrorKind::VaultLocked));
+        };
+        let audit = &mut self.audit;
+        let mut audit_failed = false;
+        let result = vault.transact(|t| {
+            t.remove_daily_unlocker(unlocker_id)?;
+            if !Self::write_delivery(audit, e.clone()) {
+                audit_failed = true;
+                return Err(VaultErrorKind::Io(std::io::ErrorKind::Interrupted).into());
+            }
+            Ok(())
+        });
+        if let Err(err) = result {
+            if audit_failed {
+                return Err(RpcError::new(ErrorKind::AuditFailed));
+            }
+            return Err(match err.kind() {
+                VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
+                    RpcError::new(ErrorKind::VaultTampered)
+                }
+                VaultErrorKind::UnknownUnlocker => RpcError::new(ErrorKind::NoUnlocker),
+                VaultErrorKind::LastUnlocker => RpcError::new(ErrorKind::LastUnlocker),
+                k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
+            });
+        }
+        self.anchor_if_due(None);
+        Ok(())
+    }
+
     /// An unlocked vault: the grant store starts empty at its epochs.
     fn start_grants(&mut self, v: &Vault) {
         self.grants.on_lock();
+        self.write_targets.clear();
+        self.paste_stages.clear();
+        self.used_write_nonces.clear();
         let policy_epoch = v.header().map(|h| h.policy_epoch).unwrap_or(0);
         self.grants.set_epochs(v.epoch(), policy_epoch);
     }
@@ -759,6 +1031,11 @@ impl State {
                 idle_remaining_secs: unlocked.then(|| self.timer.idle_remaining(now).as_secs()),
             },
             approvals: self.approvals(at),
+            app_requests: if unlocked {
+                u32::try_from(self.grants.app_requests_count(at)).unwrap_or(u32::MAX)
+            } else {
+                0
+            },
         }
     }
 

@@ -156,15 +156,17 @@ public struct StatusView: Sendable, WireDecodable, CustomStringConvertible, Cust
     public let `lock`: LockView
     public let `approvals`: ApprovalsView
     public let `audit`: AuditStatusView
+    public let `app_requests`: UInt32
     public var description: String { "[StatusView]" }
     public var debugDescription: String { description }
     init(wire: WireReader) throws {
-        let o = try wire.object(["daemon", "vault", "lock", "approvals", "audit"])
+        let o = try wire.object(["daemon", "vault", "lock", "approvals", "audit", "app_requests"])
         self.`daemon` = try o.decode("daemon")
         self.`vault` = try o.decode("vault")
         self.`lock` = try o.decode("lock")
         self.`approvals` = try o.decode("approvals")
         self.`audit` = try o.decode("audit")
+        self.`app_requests` = try o.optional("app_requests") ?? 0
     }
 }
 
