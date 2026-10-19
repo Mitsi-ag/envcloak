@@ -117,9 +117,9 @@ const HELP: &str = "usage:
   envcloak scrub [--path <path>]... [--yes] [--json]
   envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak doctor [--json] [--path <path>]... [--git-history]
+  envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak agents migrate-mcp
-  envcloak mcp-bridge
   envcloak standing
   envcloak login
   envcloak signin
@@ -209,7 +209,6 @@ fn main() -> ExitCode {
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
-        "mcp-bridge" => cmd::mcp_bridge::run(&[]),
         "standing" => cmd::standing::run(&[]),
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
