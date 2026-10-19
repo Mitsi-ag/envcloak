@@ -139,8 +139,7 @@ fn parse(args: &[&str]) -> Result<AddArgs, &'static str> {
     }
     if let Some(v) = wait_raw {
         a.wait = Some(
-            parse_wait(&v)
-                .ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?,
+            parse_wait(&v).ok_or("--wait needs a duration from 1s to 10m, such as 30s or 5m")?,
         );
     }
     if usize::from(a.stdin) + usize::from(a.from_clipboard) + usize::from(a.ask) > 1 {
