@@ -21,9 +21,11 @@ IDENTITIES = json.loads((FIXTURES / "identities.json").read_text())
 EXCEPTIONS = ["allow-jit", "allow-unsigned-executable-memory", "allow-dyld-environment-variables",
               "disable-library-validation", "disable-executable-page-protection", "debugger"]
 METHODS = ["app.unlock.begin", "app.unlock", "app.unlocker.enroll.begin", "app.unlocker.enroll",
-           "app.pending.list", "app.pending.get", "app.approve", "app.reveal", "app.paste",
-           "app.policy.set", "app.device.add", "app.device.remove", "app.registry.override",
-           "app.future"]
+           "app.unlocker.add", "app.unlocker.remove", "app.pending.list", "app.pending.get",
+           "app.approve", "app.items.target", "app.items.rotate", "app.items.remove",
+           "app.reveal.begin", "app.reveal", "app.paste.begin", "app.paste.inspect", "app.paste",
+           "app.asks.list", "app.asks.decline", "app.policy.set", "app.device.add",
+           "app.device.remove", "app.registry.override", "app.future"]
 
 
 def read_exact(pipe, count):

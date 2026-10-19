@@ -35,6 +35,7 @@ use zeroize::{Zeroize, Zeroizing};
 use super::envelope::UnlockerKind;
 use super::keys::{UnlockerId, VaultId, Vmk};
 use super::{CryptoError, CryptoErrorKind, fill_random};
+use crate::SecretBytes;
 
 /// The HPKE `info` prefix for a Secure Enclave VMK envelope (SPEC §5).
 pub const SE_HPKE_INFO_PREFIX: &[u8] = b"envcloak/v1/unlocker/se";
@@ -371,6 +372,20 @@ pub fn se_reseal_aad(request_id: &str, challenge: &[u8; SE_CHALLENGE_LEN]) -> Ve
     aad
 }
 
+/// Builds the associated data for the daemon-to-app HPKE reveal seal:
+/// `request_id || challenge || app_eph_pub` (SPEC §6.3; M3-14).
+pub fn se_reveal_aad(
+    request_id: &str,
+    challenge: &[u8; SE_CHALLENGE_LEN],
+    app_eph_pub: &[u8; X25519_PUBLIC_KEY_LEN],
+) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(request_id.len() + SE_CHALLENGE_LEN + X25519_PUBLIC_KEY_LEN);
+    aad.extend_from_slice(request_id.as_bytes());
+    aad.extend_from_slice(challenge);
+    aad.extend_from_slice(app_eph_pub);
+    aad
+}
+
 /// Generates a fresh 32-byte random challenge for `app.unlock.begin`.
 pub fn generate_se_challenge() -> Result<[u8; SE_CHALLENGE_LEN], CryptoError> {
     let mut challenge = [0u8; SE_CHALLENGE_LEN];
@@ -470,6 +485,83 @@ impl SeEphemeralKey {
         pt.zeroize();
         Ok(Vmk(vmk))
     }
+
+    /// Opens an HPKE-sealed secret value (`DHKEM(X25519, HKDF-SHA256)`,
+    /// `HKDF-SHA256`, `ChaCha20-Poly1305`, empty `info`, associated data `aad`)
+    /// into [`SecretBytes`], zeroizing intermediate buffers (SPEC §4.4, §6.7;
+    /// M3-14).
+    pub fn open_secret(&self, aad: &[u8], sealed: &[u8]) -> Result<SecretBytes, CryptoError> {
+        let open_err = || CryptoError::new(CryptoErrorKind::Open);
+        if sealed.len() <= SE_SEALED_SECRET_OVERHEAD {
+            return Err(CryptoError::new(CryptoErrorKind::Malformed));
+        }
+        let enc = <X25519HkdfSha256 as hpke::Kem>::EncappedKey::from_bytes(
+            &sealed[..X25519_PUBLIC_KEY_LEN],
+        )
+        .map_err(|_| open_err())?;
+        let ct = &sealed[X25519_PUBLIC_KEY_LEN..];
+        let mut pt = hpke::single_shot_open::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+            &OpModeR::Base,
+            &self.sk,
+            &enc,
+            b"",
+            ct,
+            aad,
+        )
+        .map_err(|_| open_err())?;
+        let out = SecretBytes::copy_from(&pt);
+        pt.zeroize();
+        Ok(out)
+    }
+}
+
+/// Byte overhead of an HPKE-sealed secret (`enc(32)` + 16-byte Poly1305 tag).
+pub const SE_SEALED_SECRET_OVERHEAD: usize = X25519_PUBLIC_KEY_LEN + 16;
+
+/// Seals `secret` to `recipient_pub` with HPKE base mode
+/// (`DHKEM(X25519, HKDF-SHA256)`, `HKDF-SHA256`, `ChaCha20-Poly1305`, empty
+/// `info`, associated data `aad`), returning `enc(32) || ciphertext(len + 16)`
+/// (SPEC §4.4, §6.7; M3-14).
+#[allow(clippy::disallowed_methods)] // Seals a secret value to an ephemeral X25519 public key.
+pub fn seal_secret_to_x25519(
+    recipient_pub: &[u8; X25519_PUBLIC_KEY_LEN],
+    aad: &[u8],
+    secret: &SecretBytes,
+) -> Result<Vec<u8>, CryptoError> {
+    if recipient_pub.iter().all(|&b| b == 0) {
+        return Err(CryptoError::new(CryptoErrorKind::EnvelopeFormat));
+    }
+    let pk = <X25519HkdfSha256 as hpke::Kem>::PublicKey::from_bytes(recipient_pub)
+        .map_err(|_| CryptoError::new(CryptoErrorKind::EnvelopeFormat))?;
+    let (enc, ct) = hpke::single_shot_seal::<ChaCha20Poly1305, HkdfSha256, X25519HkdfSha256>(
+        &OpModeS::Base,
+        &pk,
+        b"",
+        secret.expose_secret(),
+        aad,
+    )
+    .map_err(|_| CryptoError::new(CryptoErrorKind::Seal))?;
+    let mut out = Vec::with_capacity(X25519_PUBLIC_KEY_LEN + ct.len());
+    out.extend_from_slice(enc.to_bytes().as_slice());
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Opens an HPKE-sealed secret value using a raw 32-byte X25519 private key.
+pub fn open_secret_from_x25519(
+    sk_raw: &[u8; 32],
+    aad: &[u8],
+    sealed: &[u8],
+) -> Result<SecretBytes, CryptoError> {
+    let key = SeEphemeralKey::from_raw_private(sk_raw)?;
+    key.open_secret(aad, sealed)
+}
+
+/// Computes the SHA-256 digest of `secret` for `envcloak-write-statement/1`
+/// (`new_value_sha256`, SPEC §4.3; M3-14).
+#[allow(clippy::disallowed_methods)] // Hashes secret bytes to bind replacement ciphertext to the signed statement.
+pub fn secret_sha256(secret: &SecretBytes) -> [u8; 32] {
+    Sha256::digest(secret.expose_secret()).into()
 }
 
 /// Seals `vmk` to `daemon_eph_pub` with HPKE base mode
@@ -737,5 +829,22 @@ mod tests {
         let mut flipped = sig;
         flipped[63] ^= 1;
         assert!(verify_p256_prehash(&pk1, &digest, &flipped).is_err());
+    }
+
+    #[test]
+    fn seal_and_open_secret_to_x25519_binds_aad_and_rejects_tampering() {
+        let eph = SeEphemeralKey::generate().unwrap();
+        let secret = SecretBytes::copy_from(b"sk_test_synthetic_secret_value_0123456789");
+        let aad = b"TARGET01\x11\x22\x33\x44";
+        let sealed = seal_secret_to_x25519(eph.public_key(), aad, &secret).unwrap();
+        assert_eq!(sealed.len(), SE_SEALED_SECRET_OVERHEAD + secret.len());
+        let opened = eph.open_secret(aad, &sealed).unwrap();
+        assert_eq!(secret_sha256(&opened), secret_sha256(&secret));
+        assert!(eph.open_secret(b"WRONG_AAD", &sealed).is_err());
+        assert!(
+            eph.open_secret(aad, &sealed[..SE_SEALED_SECRET_OVERHEAD])
+                .is_err()
+        );
+        assert!(seal_secret_to_x25519(&[0u8; 32], aad, &secret).is_err());
     }
 }

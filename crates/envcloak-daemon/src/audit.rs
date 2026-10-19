@@ -407,7 +407,7 @@ pub enum AuditEvent {
     /// expired challenge or sealed VMK).
     AppUnlockFailed { pid: i32 },
     /// A Secure Enclave unlocker was enrolled (`approve` for an
-    /// `unlocker_add` request).
+    /// `unlocker_add` request, or `app.unlocker.add`).
     UnlockerAdd {
         pid: i32,
         subject: SubjectSummary,
@@ -416,6 +416,35 @@ pub enum AuditEvent {
         label: String,
         unlock_pub_sha256: [u8; 32],
         approve_pub_sha256: [u8; 32],
+    },
+    /// A passphrase or Secure Enclave unlocker was removed
+    /// (`app.unlocker.remove`).
+    UnlockerRemove {
+        pid: i32,
+        subject: SubjectSummary,
+        unlocker: String,
+        kind: &'static str,
+        label: Option<String>,
+        unlock_pub_sha256: Option<[u8; 32]>,
+        approve_pub_sha256: Option<[u8; 32]>,
+    },
+    /// An app reveal (`app.reveal`), written durably before the sealed
+    /// value is released.
+    RevealedApp {
+        pid: i32,
+        subject: SubjectSummary,
+        request: String,
+        item: ItemId,
+        slug: Slug,
+    },
+    /// An ask filed (`items.ask`) or resolved (`added`, `declined`,
+    /// `expired`).
+    Ask {
+        pid: i32,
+        subject: SubjectSummary,
+        ask: String,
+        outcome: &'static str,
+        item: Option<(ItemId, Slug)>,
     },
     /// A standing approval was created, or updated in place on Linux
     /// self-update (`approve` with `options.standing`).
@@ -774,6 +803,20 @@ impl AuditEvent {
             } => format!(
                 "envcloakd: audit: unlocker added request={request} unlocker={unlocker} pid={pid}"
             ),
+            AuditEvent::UnlockerRemove {
+                pid,
+                unlocker,
+                kind,
+                ..
+            } => format!(
+                "envcloakd: audit: unlocker removed kind={kind} unlocker={unlocker} pid={pid}"
+            ),
+            AuditEvent::RevealedApp {
+                pid, request, item, ..
+            } => format!("envcloakd: audit: revealed app request={request} id={item} pid={pid}"),
+            AuditEvent::Ask {
+                pid, ask, outcome, ..
+            } => format!("envcloakd: audit: ask outcome={outcome} ask={ask} pid={pid}"),
             AuditEvent::StandingCreated {
                 pid,
                 standing,
@@ -1332,6 +1375,59 @@ impl AuditEvent {
                     hex(approve_pub_sha256),
                 ],
                 ..AuditRecord::new(AuditKind::UnlockerAdd, "enrolled")
+            },
+            AuditEvent::UnlockerRemove {
+                subject,
+                unlocker,
+                kind,
+                label,
+                unlock_pub_sha256,
+                approve_pub_sha256,
+                ..
+            } => {
+                let mut argv_redacted = Vec::new();
+                if let Some(l) = label {
+                    argv_redacted.push(l.clone());
+                }
+                if let Some(u) = unlock_pub_sha256 {
+                    argv_redacted.push(hex(u));
+                }
+                if let Some(a) = approve_pub_sha256 {
+                    argv_redacted.push(hex(a));
+                }
+                AuditRecord {
+                    grant_id: Some(unlocker.clone()),
+                    subject: subject.clone(),
+                    decision: decision("removed", Some(kind), Some("app.unlocker.remove"), None),
+                    argv_redacted,
+                    ..AuditRecord::new(AuditKind::UnlockerRemove, "removed")
+                }
+            }
+            AuditEvent::RevealedApp {
+                subject,
+                request,
+                item,
+                slug,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision("revealed", None, Some("app.reveal"), None),
+                ..AuditRecord::new(AuditKind::RevealApp, "revealed")
+            },
+            AuditEvent::Ask {
+                subject,
+                ask,
+                outcome,
+                item,
+                ..
+            } => AuditRecord {
+                request_id: Some(ask.clone()),
+                subject: subject.clone(),
+                items: item.iter().cloned().collect(),
+                decision: decision(outcome, None, Some("items.ask"), None),
+                ..AuditRecord::new(AuditKind::Ask, outcome)
             },
             AuditEvent::StandingCreated {
                 subject,

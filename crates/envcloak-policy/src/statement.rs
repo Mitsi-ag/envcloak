@@ -1094,6 +1094,330 @@ pub fn render_unlocker_statement(d: &UnlockerAddDescriptor) -> String {
     t
 }
 
+/// The first line of a canonical signed write statement
+/// (docs/IPC.md "Statement domains").
+pub const WRITE_STATEMENT_DOMAIN: &[u8] = b"envcloak-write-statement/1\n";
+
+/// A signed write statement for `app.items.rotate`, `app.items.remove`,
+/// `app.unlocker.add`, or `app.unlocker.remove` (SPEC §4.3, §5, §10b; M3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteStatement {
+    /// The write target id (8 Crockford base32 characters) or `"unlocker_add"`
+    /// / `"unlocker_remove"`.
+    pub target: String,
+    /// The 32-byte nonce, as 64 lower-case hex characters.
+    pub nonce: String,
+    /// The vault id, 16 bytes as 32 lower-case hex characters.
+    pub vault_id: String,
+    /// The action this signed write statement authorizes.
+    pub action: WriteAction,
+}
+
+/// Which signed write action [`WriteStatement`] authorizes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WriteAction {
+    /// `app.items.rotate`: replaces one field's value on a secret item.
+    Rotate {
+        item: String,
+        slug: String,
+        field: String,
+        field_name: String,
+        classification: String,
+        prior_count: u8,
+        grants: u64,
+        /// Lower-case hex SHA-256 of the replacement plaintext bytes.
+        new_value_sha256: String,
+    },
+    /// `app.items.remove`: removes a secret item after an encrypted vault backup.
+    Remove {
+        item: String,
+        slug: String,
+        grants: u64,
+    },
+    /// `app.unlocker.add`: adds a Secure Enclave unlocker signed by an enrolled
+    /// `approve` key.
+    UnlockerAdd {
+        label: String,
+        unlock_pub_sha256: String,
+        approve_pub_sha256: String,
+        team_id: String,
+        signing_id: String,
+    },
+    /// `app.unlocker.remove`: removes a daily unlocker (the passphrase unlocker
+    /// or a Secure Enclave unlocker).
+    UnlockerRemove { unlocker: UnlockerTarget },
+}
+
+/// Which daily unlocker an `app.unlocker.remove` statement removes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UnlockerTarget {
+    Passphrase,
+    SecureEnclave {
+        unlocker_id: String,
+        label: String,
+        unlock_pub_sha256: String,
+        approve_pub_sha256: String,
+    },
+}
+
+/// The canonical encoding of a signed write statement:
+/// [`WRITE_STATEMENT_DOMAIN`], then `target`, `nonce`, `vault_id`, and the
+/// action's fields, each length-prefixed.
+pub fn canonical_write_statement(s: &WriteStatement) -> Vec<u8> {
+    let mut e = Enc(Vec::with_capacity(256));
+    e.0.extend_from_slice(WRITE_STATEMENT_DOMAIN);
+    e.str(&s.target).str(&s.nonce).str(&s.vault_id);
+    match &s.action {
+        WriteAction::Rotate {
+            item,
+            slug,
+            field,
+            field_name,
+            classification,
+            prior_count,
+            grants,
+            new_value_sha256,
+        } => {
+            e.str("rotate")
+                .str(item)
+                .str(slug)
+                .str(field)
+                .str(field_name)
+                .str(classification)
+                .num(u64::from(*prior_count))
+                .num(*grants)
+                .str(new_value_sha256);
+        }
+        WriteAction::Remove { item, slug, grants } => {
+            e.str("remove").str(item).str(slug).num(*grants);
+        }
+        WriteAction::UnlockerAdd {
+            label,
+            unlock_pub_sha256,
+            approve_pub_sha256,
+            team_id,
+            signing_id,
+        } => {
+            e.str("unlocker_add")
+                .str(label)
+                .str(unlock_pub_sha256)
+                .str(approve_pub_sha256)
+                .str(team_id)
+                .str(signing_id);
+        }
+        WriteAction::UnlockerRemove { unlocker } => {
+            e.str("unlocker_remove");
+            match unlocker {
+                UnlockerTarget::Passphrase => {
+                    e.str("passphrase");
+                }
+                UnlockerTarget::SecureEnclave {
+                    unlocker_id,
+                    label,
+                    unlock_pub_sha256,
+                    approve_pub_sha256,
+                } => {
+                    e.str("secure_enclave")
+                        .str(unlocker_id)
+                        .str(label)
+                        .str(unlock_pub_sha256)
+                        .str(approve_pub_sha256);
+                }
+            }
+        }
+    }
+    e.0
+}
+
+/// SHA-256 of [`canonical_write_statement`].
+pub fn write_statement_digest(s: &WriteStatement) -> [u8; 32] {
+    Sha256::digest(canonical_write_statement(s)).into()
+}
+
+/// The signed write statement as a person reads it. Every string is escaped
+/// with [`escape_for_display`].
+pub fn render_write_statement(s: &WriteStatement) -> String {
+    let e = escape_for_display;
+    let mut t = String::with_capacity(512);
+    let _ = writeln!(t, "Write approval {}", e(&s.target));
+    let _ = writeln!(t, "  vault id: {}", e(&s.vault_id));
+    match &s.action {
+        WriteAction::Rotate {
+            item,
+            slug,
+            field,
+            field_name,
+            classification,
+            prior_count,
+            grants,
+            new_value_sha256,
+        } => {
+            let _ = writeln!(t, "  action: rotate item {} ({})", e(slug), e(item));
+            let _ = writeln!(t, "  field: {} ({})", e(field_name), e(field));
+            let _ = writeln!(t, "  classification: {}", e(classification));
+            let _ = writeln!(t, "  prior values kept: {prior_count}");
+            let _ = writeln!(t, "  grants binding item: {grants}");
+            let _ = writeln!(t, "  replacement value sha256: {}", e(new_value_sha256));
+        }
+        WriteAction::Remove { item, slug, grants } => {
+            let _ = writeln!(t, "  action: remove item {} ({})", e(slug), e(item));
+            let _ = writeln!(t, "  grants binding item: {grants}");
+        }
+        WriteAction::UnlockerAdd {
+            label,
+            unlock_pub_sha256,
+            approve_pub_sha256,
+            team_id,
+            signing_id,
+        } => {
+            let _ = writeln!(t, "  action: add Secure Enclave unlocker");
+            let _ = writeln!(t, "  label: {}", e(label));
+            let _ = writeln!(t, "  unlock public key sha256: {}", e(unlock_pub_sha256));
+            let _ = writeln!(t, "  approve public key sha256: {}", e(approve_pub_sha256));
+            let _ = writeln!(
+                t,
+                "  app code identity: team_id={} signing_id={}",
+                e(team_id),
+                e(signing_id)
+            );
+        }
+        WriteAction::UnlockerRemove { unlocker } => match unlocker {
+            UnlockerTarget::Passphrase => {
+                let _ = writeln!(t, "  action: remove passphrase unlocker");
+            }
+            UnlockerTarget::SecureEnclave {
+                unlocker_id,
+                label,
+                unlock_pub_sha256,
+                approve_pub_sha256,
+            } => {
+                let _ = writeln!(
+                    t,
+                    "  action: remove Secure Enclave unlocker {} ({})",
+                    e(label),
+                    e(unlocker_id)
+                );
+                let _ = writeln!(t, "  unlock public key sha256: {}", e(unlock_pub_sha256));
+                let _ = writeln!(t, "  approve public key sha256: {}", e(approve_pub_sha256));
+            }
+        },
+    }
+    t.push_str("Your signature approves this write, and nothing else.\n");
+    t
+}
+
+/// The first line of a canonical signed reveal statement
+/// (docs/IPC.md "Statement domains").
+pub const REVEAL_STATEMENT_DOMAIN: &[u8] = b"envcloak-reveal-statement/1\n";
+
+/// A pending reveal request as an approval surface receives it
+/// (`app.reveal.begin`, `app.reveal`; SPEC §6.7, M3-14).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevealDescriptor {
+    /// The reveal request id: 8 Crockford base32 characters.
+    pub request: String,
+    /// The 32-byte daemon nonce, as 64 lower-case hex characters.
+    pub nonce: String,
+    /// The 32-byte app ephemeral X25519 public key, as 64 lower-case hex
+    /// characters (empty on `app.reveal.begin` before `app.reveal` supplies the
+    /// recipient key).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_eph_pub: String,
+    /// The vault id, 16 bytes as 32 lower-case hex characters.
+    pub vault_id: String,
+    /// The item id: 26 Crockford base32 characters.
+    pub item: String,
+    /// The item's slug.
+    pub slug: String,
+    /// The field id: 26 Crockford base32 characters.
+    pub field: String,
+    /// The field's name.
+    pub field_name: String,
+    /// `test`, `live`, or `unknown`.
+    pub classification: String,
+    /// Present when the reveal was requested by a CLI caller via
+    /// `reveal.request`; `None` when initiated directly in the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester: Option<SubjectSummary>,
+    /// When the request was opened, Unix seconds.
+    pub created_secs: u64,
+    /// Seconds after `created_secs` at which it expires.
+    pub expires_in_secs: u64,
+}
+
+/// The canonical encoding of a signed reveal statement:
+/// [`REVEAL_STATEMENT_DOMAIN`], then every field of `d`, length-prefixed.
+pub fn canonical_reveal_statement(d: &RevealDescriptor) -> Vec<u8> {
+    let mut e = Enc(Vec::with_capacity(256));
+    e.0.extend_from_slice(REVEAL_STATEMENT_DOMAIN);
+    e.str(&d.request)
+        .str(&d.nonce)
+        .str(&d.app_eph_pub)
+        .str(&d.vault_id)
+        .str(&d.item)
+        .str(&d.slug)
+        .str(&d.field)
+        .str(&d.field_name)
+        .str(&d.classification);
+    match &d.requester {
+        None => {
+            e.flag(false);
+        }
+        Some(s) => {
+            e.flag(true)
+                .str(kind_word(s.kind))
+                .str(s.label.as_deref().unwrap_or(""))
+                .flag(s.label.is_some())
+                .signed(i64::from(s.caller_pid))
+                .signed(i64::from(s.root.pid))
+                .num(s.root.start_time)
+                .str(s.root.exe.as_deref().unwrap_or(""))
+                .flag(s.root.exe.is_some());
+        }
+    }
+    e.num(d.created_secs).num(d.expires_in_secs);
+    e.0
+}
+
+/// SHA-256 of [`canonical_reveal_statement`].
+pub fn reveal_statement_digest(d: &RevealDescriptor) -> [u8; 32] {
+    Sha256::digest(canonical_reveal_statement(d)).into()
+}
+
+/// The signed reveal statement as a person reads it. Every string is escaped
+/// with [`escape_for_display`].
+pub fn render_reveal_statement(d: &RevealDescriptor) -> String {
+    let e = escape_for_display;
+    let mut t = String::with_capacity(512);
+    let _ = writeln!(t, "Reveal request {}", e(&d.request));
+    let _ = writeln!(t, "  vault id: {}", e(&d.vault_id));
+    let _ = writeln!(
+        t,
+        "  item: {}#{} ({}, {} key)",
+        e(&d.slug),
+        e(&d.field_name),
+        e(&d.item),
+        e(&d.classification)
+    );
+    if let Some(s) = &d.requester {
+        let _ = writeln!(
+            t,
+            "  requested by: {} (caller pid {}, root pid {})",
+            kind_word(s.kind),
+            s.caller_pid,
+            s.root.pid
+        );
+    } else {
+        let _ = writeln!(t, "  requested by: EnvCloak app");
+    }
+    t.push_str("Your signature reveals this secret value once, and nothing else.\n");
+    t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

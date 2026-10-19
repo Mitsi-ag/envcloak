@@ -658,8 +658,8 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | `signature_invalid` | -32051 | M3-09 | landed | a signed proof from the app whose P-256 signature does not verify with the `approve` key of a Secure Enclave unlocker enrolled in the vault (a key never enrolled, or removed, included); nothing is granted or written |
 | `unlock_failed` | -32052 | M3-08 | landed | an `app.unlock` whose sealed VMK does not open, does not match the vault's sealed header, or answers an unlock request that is unknown, used or more than 60 seconds old; audited |
 | `no_unlocker` | -32053 | M3-08 | landed | no enrolled Secure Enclave unlocker has the id `app.unlock.begin` names; M3-14 uses it again for an `app.unlocker.remove` that names no unlocker the app may remove (the Recovery Kit's is never one) |
-| `ask_closed` | -32054 | M3-14 | reserved | an ask that was declined, expired or answered already (`app.paste` for an ask, `app.asks.decline`) |
-| `last_unlocker` | -32055 | M3-14 | reserved | an `app.unlocker.remove` that would leave the vault without a daily unlocker (the passphrase or a Secure Enclave unlocker; SPEC §5); nothing is removed |
+| `ask_closed` | -32054 | M3-14 | landed | an ask that was declined, expired or answered already (`app.paste` for an ask, `app.asks.decline`) |
+| `last_unlocker` | -32055 | M3-14 | landed | an `app.unlocker.remove` that would leave the vault without a daily unlocker (the passphrase or a Secure Enclave unlocker; SPEC §5); nothing is removed |
 | `statement_mismatch` | -32018 | M3-14 | reuse | a signed write, reveal or unlocker statement whose digest is not the one the daemon rebuilds from its own record (the target's nonce, the item, the grants it names); M3-09's `app.approve` uses it as `approve` does |
 | `proof_refused` | -32019 | M3-08 | reuse | every `app.` request but `app.lock` from an `app` peer whose evidence names an agent or whose chain is cut at the walk's depth limit, before anything else is done (`app.unlock.begin` sends no envelope; SPEC §10b); M3-09 and M3-14 use it again for the app methods they add, and M3-14 for `reveal.request` |
 <!-- /reservations -->
@@ -680,9 +680,9 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | Method | Task | Status | Use |
 |---|---|---|---|
 | `projects.list` | M3-04 | landed | the vault's project index, newest first and paged within a frame: each project's display path, manifest hash, bindings and last use. Metadata, as `items.list` is, so any client, an agent included, can list project paths (plan D3-17 and Q3-04) |
-| `items.ask` | M3-14 | reserved | `envcloak add --ask`: files a request for the app's paste sheet with the requester's evidence, under the pending caps; takes no value and makes no grant |
-| `items.ask_state` | M3-14 | reserved | an ask's state (`pending`, `added` with the new slug, `declined`, `expired` or `unknown`), told only to the requester's own tree, as `pending.state` |
-| `reveal.request` | M3-14 | reserved | `envcloak reveal` on macOS: files a reveal for the app; refused (`proof_refused`) to an agent, unknown or terminal-less subject before anything is filed (SPEC §6.7) |
+| `items.ask` | M3-14 | landed | `envcloak add --ask`: files a request for the app's paste sheet with the requester's evidence, under the pending caps; takes no value and makes no grant |
+| `items.ask_state` | M3-14 | landed | an ask's state (`pending`, `added` with the new slug, `declined`, `expired` or `unknown`), told only to the requester's own tree, as `pending.state` |
+| `reveal.request` | M3-14 | landed | `envcloak reveal` on macOS: files a reveal for the app; refused (`proof_refused`) to an agent, unknown or terminal-less subject before anything is filed (SPEC §6.7) |
 <!-- /reservations -->
 
 **App-role methods** (SPEC §4.3):
@@ -694,21 +694,21 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | `app.unlock` | M3-08 | landed | the VMK, HPKE-sealed to that key with the request id and the challenge as its associated data: the one VMK crossing of an unlock (SPEC §4.4) |
 | `app.unlocker.enroll.begin` | M3-08 | landed | opens a pending `unlocker_add` request with the new unlocker's two public keys and label, which the person approves with `envcloak approve` and the passphrase (plan D3-08) |
 | `app.unlocker.enroll` | M3-08 | landed | that request's outcome: `pending`, `enrolled` with the unlocker's id, `denied` or `expired` |
-| `app.unlocker.add` | M3-14 | reserved | another Secure Enclave unlocker (as "Touch ID only" enrols, SPEC §12), signed by an enrolled `approve` key (`envcloak-write-statement/1`) |
-| `app.unlocker.remove` | M3-14 | reserved | removes the passphrase unlocker or a Secure Enclave unlocker under a signed `envcloak-write-statement/1` (SPEC §4.3, §5): never the Recovery Kit's (`no_unlocker`), and never the last daily unlocker (`last_unlocker`); a removed Secure Enclave unlocker's envelope and `approve` key leave the vault, so neither of its keys is taken again |
+| `app.unlocker.add` | M3-14 | landed | another Secure Enclave unlocker (as "Touch ID only" enrols, SPEC §12), signed by an enrolled `approve` key (`envcloak-write-statement/1`) |
+| `app.unlocker.remove` | M3-14 | landed | removes the passphrase unlocker or a Secure Enclave unlocker under a signed `envcloak-write-statement/1` (SPEC §4.3, §5): never the Recovery Kit's (`no_unlocker`), and never the last daily unlocker (`last_unlocker`); a removed Secure Enclave unlocker's envelope and `approve` key leave the vault, so neither of its keys is taken again |
 | `app.pending.list` | M3-09 | landed | the pending run requests, at most 20, oldest first, each with its statement domain; none to an `app` peer whose evidence names an agent (`proof_refused`, SPEC §10b) |
 | `app.pending.get` | M3-09 | landed | one pending request's whole descriptor, for the approval window |
 | `app.approve` | M3-09 | landed | a run approval: the statement's digest and its P-256 signature by an enrolled `approve` key, checked against the statement the daemon rebuilds from its own pending request |
-| `app.items.target` | M3-14 | reserved | the item a signed write names, with a nonce and a daemon key to seal a replacement value to |
-| `app.items.rotate` | M3-14 | reserved | replaces a value, sealed to that key, under a signed `envcloak-write-statement/1` |
-| `app.items.remove` | M3-14 | reserved | removes an item under a signed write statement, after an encrypted backup of the vault |
-| `app.reveal.begin` | M3-14 | reserved | starts a reveal, from the app or for a CLI's `reveal.request`: request id, nonce and descriptor |
-| `app.reveal` | M3-14 | reserved | the value HPKE-sealed to the app's ephemeral key after a signed `envcloak-reveal-statement/1`, its audit entry durable before release |
-| `app.paste.begin` | M3-14 | reserved | a paste stage and a daemon key to seal the pasted value to |
-| `app.paste.inspect` | M3-14 | reserved | what the pasted value looks like (provider, class, length class, suggested slug and variable); the value stays staged in daemon memory for 2 minutes, then is wiped |
-| `app.paste` | M3-14 | reserved | saves the staged value as a new item, or as the answer to an ask |
-| `app.asks.list` | M3-14 | reserved | the asks the CLI filed, with each requester's evidence |
-| `app.asks.decline` | M3-14 | reserved | declines an ask |
+| `app.items.target` | M3-14 | landed | the item a signed write names, with a nonce and a daemon key to seal a replacement value to |
+| `app.items.rotate` | M3-14 | landed | replaces a value, sealed to that key, under a signed `envcloak-write-statement/1` |
+| `app.items.remove` | M3-14 | landed | removes an item under a signed write statement, after an encrypted backup of the vault |
+| `app.reveal.begin` | M3-14 | landed | starts a reveal, from the app or for a CLI's `reveal.request`: request id, nonce and descriptor |
+| `app.reveal` | M3-14 | landed | the value HPKE-sealed to the app's ephemeral key after a signed `envcloak-reveal-statement/1`, its audit entry durable before release |
+| `app.paste.begin` | M3-14 | landed | a paste stage and a daemon key to seal the pasted value to |
+| `app.paste.inspect` | M3-14 | landed | what the pasted value looks like (provider, class, length class, suggested slug and variable); the value stays staged in daemon memory for 2 minutes, then is wiped |
+| `app.paste` | M3-14 | landed | saves the staged value as a new item, or as the answer to an ask |
+| `app.asks.list` | M3-14 | landed | the asks the CLI filed, with each requester's evidence |
+| `app.asks.decline` | M3-14 | landed | declines an ask |
 | `app.audit.list` | M3-16 | reserved | audit entries, paged within a frame: metadata with masked command lines; in the app role so that no client, an agent included, can page through the person's command history, and refused to an `app` peer whose evidence names an agent (SPEC §10b) |
 | `app.lock` | M3-16 | reserved | locks with a reason, `screen_lock` or `session_resign` (the two `status` rows below), audited and kept in `status.lock` (plan D3-11), and answered whatever the peer's evidence, since locking only tightens; the app's own Lock command calls M1's `lock`, whose reason is `request` |
 | `app.device.add` | M5 | reserved | pairs a device (SPEC §9) |
@@ -725,7 +725,7 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | `items.list` | `last_used_secs` | M3-05 | reserved | landed in code: optional last-use timestamp in each long item view, for the Keys table; same metadata as `items.show`. Kept reserved here because the field table has no code reader; `check-reservations.py` rejects landed field rows until a reader exists |
 | `items.show` | `last_used_secs` | M3-05 | reserved | landed in code: optional top-level last-use timestamp, matching the long inventory and the existing `detail.last_used_secs`; the field table has no code reader, so its status follows the `items.list` exception above |
 | `status` | `vault.keychain_anchor` | M3-16 | reserved | the keychain anchor: `matched`, `ahead` (the file was rolled back), `missing`, `none`, or `unavailable` (a build without the helper's profile, and Linux) |
-| `status` | `app_requests` | M3-14 | reserved | how many asks and reveal requests wait for the app |
+| `status` | `app_requests` | M3-14 | reserved | landed in code: how many asks and reveal requests wait for the app; kept reserved here because the field table has no code reader |
 | `status` | `lock.reason=screen_lock` | M3-16 | reserved | the vault locked because the screen locked (`app.lock`) |
 | `status` | `lock.reason=session_resign` | M3-16 | reserved | the vault locked because the login session was switched away from (`app.lock`) |
 <!-- /reservations -->
@@ -746,6 +746,6 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 | Domain | Task | Status | Use |
 |---|---|---|---|
 | `envcloak-unlocker-statement/1` | M3-08 | landed | adding a Secure Enclave unlocker, approved in a terminal with the passphrase: its label, the SHA-256 fingerprints of both its public keys and the Team ID and signing identifier the daemon verified for the app (plan D3-08) |
-| `envcloak-write-statement/1` | M3-14 | reserved | signed in the app: replacing or removing an item, adding or removing a Secure Enclave unlocker, removing the passphrase unlocker |
-| `envcloak-reveal-statement/1` | M3-14 | reserved | a reveal in the app, signed (SPEC §6.7) |
+| `envcloak-write-statement/1` | M3-14 | landed | signed in the app: replacing or removing an item, adding or removing a Secure Enclave unlocker, removing the passphrase unlocker |
+| `envcloak-reveal-statement/1` | M3-14 | landed | a reveal in the app, signed (SPEC §6.7) |
 <!-- /reservations -->

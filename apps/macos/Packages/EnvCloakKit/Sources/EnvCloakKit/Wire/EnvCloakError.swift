@@ -79,6 +79,8 @@ public enum ErrorKind: String, CaseIterable, Sendable {
     case signatureInvalid = "signature_invalid"
     case unlockFailed = "unlock_failed"
     case noUnlocker = "no_unlocker"
+    case askClosed = "ask_closed"
+    case lastUnlocker = "last_unlocker"
     case `internal` = "internal"
 
     public var code: Int64 {
@@ -139,6 +141,8 @@ public enum ErrorKind: String, CaseIterable, Sendable {
         case .signatureInvalid: -32051
         case .unlockFailed: -32052
         case .noUnlocker: -32053
+        case .askClosed: -32054
+        case .lastUnlocker: -32055
         case .internal: -32099
         }
     }

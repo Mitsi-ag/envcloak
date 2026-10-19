@@ -1093,3 +1093,184 @@ fn unlocker_statement_encoding_and_rendering_and_oracle() {
         );
     }
 }
+
+#[test]
+fn write_and_reveal_statement_encoding_and_rendering_and_oracle() {
+    use envcloak_policy::{
+        ProcessSummary, REVEAL_STATEMENT_DOMAIN, RevealDescriptor, SubjectKind, SubjectSummary,
+        UnlockerTarget, WRITE_STATEMENT_DOMAIN, WriteAction, WriteStatement,
+        canonical_reveal_statement, canonical_write_statement, render_reveal_statement,
+        render_write_statement, reveal_statement_digest, write_statement_digest,
+    };
+
+    let rotate_base = WriteStatement {
+        target: "4KQ7M2XD".to_owned(),
+        nonce: "aa".repeat(32),
+        vault_id: "bb".repeat(16),
+        action: WriteAction::Rotate {
+            item: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            slug: "stripe/live\u{202e}".to_owned(),
+            field: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+            field_name: "value".to_owned(),
+            classification: "live".to_owned(),
+            prior_count: 2,
+            grants: 3,
+            new_value_sha256: "cc".repeat(32),
+        },
+    };
+    let remove_base = WriteStatement {
+        target: "8NW3R5TF".to_owned(),
+        nonce: "dd".repeat(32),
+        vault_id: "bb".repeat(16),
+        action: WriteAction::Remove {
+            item: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+            slug: "stripe/live".to_owned(),
+            grants: 1,
+        },
+    };
+    let add_unlocker = WriteStatement {
+        target: "unlocker_add".to_owned(),
+        nonce: "ee".repeat(32),
+        vault_id: "bb".repeat(16),
+        action: WriteAction::UnlockerAdd {
+            label: "Touch ID 2\u{202e}".to_owned(),
+            unlock_pub_sha256: "11".repeat(32),
+            approve_pub_sha256: "22".repeat(32),
+            team_id: "TEAMID1234".to_owned(),
+            signing_id: "ai.envcloak.app".to_owned(),
+        },
+    };
+    let rm_passphrase = WriteStatement {
+        target: "unlocker_remove".to_owned(),
+        nonce: "ff".repeat(32),
+        vault_id: "bb".repeat(16),
+        action: WriteAction::UnlockerRemove {
+            unlocker: UnlockerTarget::Passphrase,
+        },
+    };
+    let rm_se = WriteStatement {
+        target: "unlocker_remove".to_owned(),
+        nonce: "99".repeat(32),
+        vault_id: "bb".repeat(16),
+        action: WriteAction::UnlockerRemove {
+            unlocker: UnlockerTarget::SecureEnclave {
+                unlocker_id: "01ARZ3NDEKTSV4RRFFQ69G5FAY".to_owned(),
+                label: "Mac Studio SE".to_owned(),
+                unlock_pub_sha256: "11".repeat(32),
+                approve_pub_sha256: "22".repeat(32),
+            },
+        },
+    };
+
+    assert!(canonical_write_statement(&rotate_base).starts_with(WRITE_STATEMENT_DOMAIN));
+    assert_eq!(WRITE_STATEMENT_DOMAIN, b"envcloak-write-statement/1\n");
+
+    let rotate_digest = write_statement_digest(&rotate_base);
+    let mut swapped_ct = rotate_base.clone();
+    if let WriteAction::Rotate {
+        new_value_sha256, ..
+    } = &mut swapped_ct.action
+    {
+        *new_value_sha256 = "cd".repeat(32);
+    }
+    assert_ne!(write_statement_digest(&swapped_ct), rotate_digest);
+
+    let reveal_app = RevealDescriptor {
+        request: "7HM9P2QA".to_owned(),
+        nonce: "55".repeat(32),
+        app_eph_pub: "66".repeat(32),
+        vault_id: "bb".repeat(16),
+        item: "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
+        slug: "openai/dev\u{202e}".to_owned(),
+        field: "01ARZ3NDEKTSV4RRFFQ69G5FAW".to_owned(),
+        field_name: "value".to_owned(),
+        classification: "test".to_owned(),
+        requester: None,
+        created_secs: 1_800_000_000,
+        expires_in_secs: 60,
+    };
+    let reveal_cli = RevealDescriptor {
+        requester: Some(SubjectSummary {
+            kind: SubjectKind::Terminal,
+            label: None,
+            caller_pid: 4242,
+            root: ProcessSummary {
+                pid: 4000,
+                start_time: 1_799_999_000,
+                exe: Some("/bin/zsh".to_owned()),
+            },
+        }),
+        expires_in_secs: 600,
+        ..reveal_app.clone()
+    };
+    let mut reveal_swapped_eph = reveal_app.clone();
+    reveal_swapped_eph.app_eph_pub = "77".repeat(32);
+
+    assert!(canonical_reveal_statement(&reveal_app).starts_with(REVEAL_STATEMENT_DOMAIN));
+    assert_eq!(REVEAL_STATEMENT_DOMAIN, b"envcloak-reveal-statement/1\n");
+    assert_ne!(
+        reveal_statement_digest(&reveal_app),
+        reveal_statement_digest(&reveal_cli)
+    );
+    assert_ne!(
+        reveal_statement_digest(&reveal_app),
+        reveal_statement_digest(&reveal_swapped_eph)
+    );
+
+    let write_cases = vec![
+        rotate_base.clone(),
+        swapped_ct,
+        remove_base,
+        add_unlocker,
+        rm_passphrase,
+        rm_se,
+    ];
+    let reveal_cases = vec![reveal_app.clone(), reveal_cli.clone(), reveal_swapped_eph];
+
+    let mut payload = Vec::new();
+    for w in &write_cases {
+        payload.push(serde_json::json!({"write": w}));
+    }
+    for r in &reveal_cases {
+        payload.push(serde_json::json!({"reveal": r}));
+    }
+    let input = serde_json::to_vec(&payload).unwrap();
+    let oracle =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracles/statement.py");
+    let mut child = std::process::Command::new("python3")
+        .arg("-I")
+        .arg(&oracle)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 is needed on PATH");
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(&input).unwrap();
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let got: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(got.len(), write_cases.len() + reveal_cases.len());
+    for (w, g) in write_cases.iter().zip(&got[..write_cases.len()]) {
+        assert_eq!(hex(&canonical_write_statement(w)), g["write"], "{w:?}");
+    }
+    for (r, g) in reveal_cases.iter().zip(&got[write_cases.len()..]) {
+        assert_eq!(hex(&canonical_reveal_statement(r)), g["reveal"], "{r:?}");
+    }
+
+    for rendered in [
+        render_write_statement(&rotate_base),
+        render_reveal_statement(&reveal_app),
+        render_reveal_statement(&reveal_cli),
+    ] {
+        for c in rendered.chars() {
+            assert!(
+                c == '\n' || (!c.is_control() && c != '\u{202e}'),
+                "raw {c:?} in rendered statement"
+            );
+        }
+    }
+}

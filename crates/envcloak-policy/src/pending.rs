@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use envcloak_core::crypto::{SeEnrolledUnder, UnlockerId, VaultId};
-use envcloak_core::vault::{Classification, ItemMeta};
+use envcloak_core::vault::{Classification, FieldId, FieldName, ItemId, ItemMeta, Slug};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -50,8 +50,8 @@ use crate::evidence::{ProcessInstance, SubjectEvidence};
 use crate::grants::{AccessRequest, Now};
 use crate::ids;
 use crate::statement::{
-    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, SubjectSummary,
-    UnlockerAddDescriptor, UnlockerRequestKind, proposals,
+    BindingSummary, PendingDescriptor, ProcessSummary, ProjectSummary, RevealDescriptor,
+    SubjectSummary, UnlockerAddDescriptor, UnlockerRequestKind, proposals,
 };
 
 /// How long a pending request waits for an approval.
@@ -603,5 +603,322 @@ impl UnlockerOutcomes {
 
     pub(crate) fn clear(&mut self) {
         self.ended.clear();
+    }
+}
+
+/// How long an app-initiated reveal challenge (`app.reveal.begin` with a
+/// slug) waits for a signature.
+pub const APP_REVEAL_TTL: Duration = Duration::from_secs(60);
+
+/// Converts `subject` to the statement [`SubjectSummary`] descriptor.
+pub fn subject_descriptor(subject: &SubjectEvidence) -> SubjectSummary {
+    let root = subject.root();
+    let kind = subject.kind();
+    let label = match kind {
+        SubjectKind::Agent => subject.label().map(|l| l.name.clone()),
+        SubjectKind::Terminal | SubjectKind::Unknown => None,
+    };
+    SubjectSummary {
+        kind,
+        label,
+        caller_pid: subject.caller().pid,
+        root: ProcessSummary {
+            pid: root.pid,
+            start_time: root.start_time.raw(),
+            exe: root
+                .exe
+                .as_ref()
+                .map(|e| e.path.to_string_lossy().into_owned()),
+        },
+    }
+}
+
+/// A request for the app's paste sheet (`items.ask`, M3-14). Takes no value
+/// and never creates a grant.
+#[derive(Debug, Clone)]
+pub struct AskRequest {
+    pub subject: SubjectEvidence,
+    pub provider: Option<String>,
+    pub project_dir: Option<String>,
+    pub account: Option<String>,
+    pub env_hint: Option<String>,
+    pub note: Option<String>,
+}
+
+impl AskRequest {
+    /// The ask's identity for deduplication under the same root.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let root = self.subject.root();
+        let mut h = Sha256::new();
+        let str = |h: &mut Sha256, s: &[u8]| {
+            h.update(u32::try_from(s.len()).unwrap_or(u32::MAX).to_be_bytes());
+            h.update(s);
+        };
+        let opt = |h: &mut Sha256, s: Option<&str>| match s {
+            None => h.update([0u8]),
+            Some(v) => {
+                h.update([1u8]);
+                h.update(u32::try_from(v.len()).unwrap_or(u32::MAX).to_be_bytes());
+                h.update(v.as_bytes());
+            }
+        };
+        str(&mut h, b"items.ask");
+        str(&mut h, &root.pid.to_be_bytes());
+        str(&mut h, &root.start_time.raw().to_be_bytes());
+        opt(&mut h, self.provider.as_deref());
+        opt(&mut h, self.project_dir.as_deref());
+        opt(&mut h, self.account.as_deref());
+        opt(&mut h, self.env_hint.as_deref());
+        opt(&mut h, self.note.as_deref());
+        h.finalize().into()
+    }
+}
+
+/// An ask summary as `app.asks.list` returns it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AskSummary {
+    pub ask: String,
+    pub created_secs: u64,
+    pub expires_in_secs: u64,
+    pub requester: SubjectSummary,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// A pending ask waiting for the user in the app (`items.ask`).
+#[derive(Debug, Clone)]
+pub struct PendingAsk {
+    pub id: PendingId,
+    pub request: AskRequest,
+    pub summary: AskSummary,
+    pub fingerprint: [u8; 32],
+    pub opened: Duration,
+}
+
+impl PendingAsk {
+    pub(crate) fn open(
+        id: PendingId,
+        request: AskRequest,
+        fingerprint: [u8; 32],
+        now: &Now,
+    ) -> Self {
+        let created_secs = now
+            .wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let summary = AskSummary {
+            ask: id.to_string(),
+            created_secs,
+            expires_in_secs: PENDING_TTL.as_secs(),
+            requester: subject_descriptor(&request.subject),
+            provider: request.provider.clone(),
+            project_dir: request.project_dir.clone(),
+            account: request.account.clone(),
+            env_hint: request.env_hint.clone(),
+            note: request.note.clone(),
+        };
+        PendingAsk {
+            id,
+            request,
+            summary,
+            fingerprint,
+            opened: now.awake,
+        }
+    }
+
+    pub fn expired(&self, now: &Now) -> bool {
+        now.awake.saturating_sub(self.opened) >= PENDING_TTL
+    }
+}
+
+/// How an ask stands, as `items.ask_state` answers it to the requester's
+/// own process tree (`Unknown` to any other tree or unknown id).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AskStateOutcome {
+    Pending,
+    Added { slug: String },
+    Declined,
+    Expired,
+    Unknown,
+}
+
+/// Error returned when an ask was already answered, declined, expired, or
+/// does not exist (`ask_closed`, -32054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AskClosed;
+
+#[derive(Debug, Clone)]
+struct EndedAsk {
+    root: ProcessInstance,
+    outcome: AskStateOutcome,
+    at: Duration,
+}
+
+/// Outcomes of asks that ended, remembered for [`OUTCOME_TTL`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AskOutcomes {
+    ended: BTreeMap<PendingId, EndedAsk>,
+}
+
+impl AskOutcomes {
+    pub(crate) fn record(
+        &mut self,
+        id: PendingId,
+        root: ProcessInstance,
+        outcome: AskStateOutcome,
+        now: &Now,
+    ) {
+        self.expire(now);
+        if self.ended.len() >= MAX_OUTCOMES && !self.ended.contains_key(&id) {
+            let oldest = self
+                .ended
+                .iter()
+                .min_by_key(|(_, e)| e.at)
+                .map(|(id, _)| *id);
+            if let Some(oldest) = oldest {
+                self.ended.remove(&oldest);
+            }
+        }
+        self.ended.insert(
+            id,
+            EndedAsk {
+                root,
+                outcome,
+                at: now.awake,
+            },
+        );
+    }
+
+    pub(crate) fn expire(&mut self, now: &Now) {
+        self.ended
+            .retain(|_, e| now.awake.saturating_sub(e.at) < OUTCOME_TTL);
+    }
+
+    pub(crate) fn get(&self, id: &PendingId) -> Option<(&ProcessInstance, &AskStateOutcome)> {
+        self.ended.get(id).map(|e| (&e.root, &e.outcome))
+    }
+
+    pub(crate) fn contains(&self, id: &PendingId) -> bool {
+        self.ended.contains_key(id)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ended.clear();
+    }
+}
+
+/// Specification for opening a pending reveal request (`reveal.request` or
+/// `app.reveal.begin`).
+#[derive(Debug, Clone)]
+pub struct RevealRequestSpec {
+    pub requester: Option<SubjectEvidence>,
+    pub vault_id: VaultId,
+    pub item: ItemId,
+    pub slug: Slug,
+    pub field: FieldId,
+    pub field_name: FieldName,
+    pub classification: Classification,
+}
+
+impl RevealRequestSpec {
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut h = Sha256::new();
+        let mut str = |s: &[u8]| {
+            h.update(u32::try_from(s.len()).unwrap_or(u32::MAX).to_be_bytes());
+            h.update(s);
+        };
+        str(b"reveal");
+        if let Some(sub) = &self.requester {
+            let root = sub.root();
+            str(&[1u8]);
+            str(&root.pid.to_be_bytes());
+            str(&root.start_time.raw().to_be_bytes());
+        } else {
+            str(&[0u8]);
+        }
+        str(&self.vault_id.0);
+        str(self.item.as_bytes());
+        str(self.field.as_bytes());
+        h.finalize().into()
+    }
+}
+
+/// A pending reveal request waiting for a signed `envcloak-reveal-statement/1`
+/// in the app (`reveal.request`, `app.reveal.begin`, `app.reveal`).
+#[derive(Debug, Clone)]
+pub struct PendingReveal {
+    pub id: PendingId,
+    pub nonce: [u8; 32],
+    pub spec: RevealRequestSpec,
+    pub descriptor: RevealDescriptor,
+    pub fingerprint: [u8; 32],
+    pub opened: Duration,
+    pub ttl: Duration,
+}
+
+impl PendingReveal {
+    pub(crate) fn open(
+        id: PendingId,
+        spec: RevealRequestSpec,
+        fingerprint: [u8; 32],
+        ttl: Duration,
+        now: &Now,
+    ) -> Self {
+        let nonce: [u8; 32] = ids::random();
+        let created_secs = now
+            .wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let descriptor = RevealDescriptor {
+            request: id.to_string(),
+            nonce: hex(&nonce),
+            app_eph_pub: String::new(),
+            vault_id: hex(&spec.vault_id.0),
+            item: spec.item.to_string(),
+            slug: spec.slug.as_str().to_owned(),
+            field: spec.field.to_string(),
+            field_name: spec.field_name.as_str().to_owned(),
+            classification: classification_word(spec.classification).to_owned(),
+            requester: spec.requester.as_ref().map(subject_descriptor),
+            created_secs,
+            expires_in_secs: ttl.as_secs(),
+        };
+        PendingReveal {
+            id,
+            nonce,
+            spec,
+            descriptor,
+            fingerprint,
+            opened: now.awake,
+            ttl,
+        }
+    }
+
+    /// Rebuilds the [`RevealDescriptor`] against the vault's current `items`,
+    /// returning `None` if the item or field was removed or changed.
+    pub fn current(&self, items: &[ItemMeta]) -> Option<RevealDescriptor> {
+        let m = items.iter().find(|m| m.id == self.spec.item)?;
+        let f = m.fields.iter().find(|f| f.id == self.spec.field)?;
+        let mut d = self.descriptor.clone();
+        d.slug = m.slug.as_str().to_owned();
+        d.field_name = f.name.as_str().to_owned();
+        d.classification = classification_word(m.details.classification).to_owned();
+        Some(d)
+    }
+
+    pub fn expired(&self, now: &Now) -> bool {
+        now.awake.saturating_sub(self.opened) >= self.ttl
     }
 }

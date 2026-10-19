@@ -92,8 +92,9 @@ use crate::ids;
 use crate::manifest::{BindingSource, Mode};
 use crate::names::EnvName;
 use crate::pending::{
-    Busy, Outcomes, Pending, PendingId, PendingState, PendingUnlockerAdd, PollLimiter,
-    UnlockerAddRequest, UnlockerEnrollOutcome, UnlockerOutcomes,
+    APP_REVEAL_TTL, AskClosed, AskOutcomes, AskRequest, AskStateOutcome, Busy, Outcomes,
+    PENDING_TTL, Pending, PendingAsk, PendingId, PendingReveal, PendingState, PendingUnlockerAdd,
+    PollLimiter, RevealRequestSpec, UnlockerAddRequest, UnlockerEnrollOutcome, UnlockerOutcomes,
 };
 use crate::project::ProjectIdentity;
 use crate::statement::{
@@ -111,6 +112,9 @@ pub const MAX_AGENT_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const MAX_TERMINAL_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Grants held at once.
 pub const MAX_GRANTS: usize = 256;
+/// Maximum concurrent app-originated reveal stages (`app.reveal.begin` with
+/// `slug`, `requester == None`).
+pub const MAX_APP_REVEAL_STAGES: usize = 64;
 
 /// One reading of the clocks a decision needs: the wall clock (UTC), time
 /// awake, and time including sleep.
@@ -603,9 +607,13 @@ pub struct GrantStore {
     grants: BTreeMap<GrantId, Grant>,
     pending: BTreeMap<PendingId, Pending>,
     pending_unlockers: BTreeMap<PendingId, PendingUnlockerAdd>,
+    pending_asks: BTreeMap<PendingId, PendingAsk>,
+    pending_reveals: BTreeMap<PendingId, PendingReveal>,
     /// How requests that left `pending` ended, for their waiters.
     ended: Outcomes,
     ended_unlockers: UnlockerOutcomes,
+    ended_asks: AskOutcomes,
+    expired_asks: Vec<PendingAsk>,
     polls: PollLimiter,
     flood: FloodControl,
     vault_epoch: u32,
@@ -713,8 +721,12 @@ impl GrantStore {
             grants: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_unlockers: BTreeMap::new(),
+            pending_asks: BTreeMap::new(),
+            pending_reveals: BTreeMap::new(),
             ended: Outcomes::default(),
             ended_unlockers: UnlockerOutcomes::default(),
+            ended_asks: AskOutcomes::default(),
+            expired_asks: Vec::new(),
             polls: PollLimiter::default(),
             flood: FloodControl::new(),
             vault_epoch: 0,
@@ -770,8 +782,23 @@ impl GrantStore {
                     .record(id, UnlockerEnrollOutcome::Expired, now);
             }
         }
+        let expired_asks: Vec<PendingId> = self
+            .pending_asks
+            .values()
+            .filter(|p| p.expired(now))
+            .map(|p| p.id)
+            .collect();
+        for id in expired_asks {
+            if let Some(p) = self.pending_asks.remove(&id) {
+                self.ended_asks
+                    .record(id, p.request.subject.root(), AskStateOutcome::Expired, now);
+                self.expired_asks.push(p);
+            }
+        }
+        self.pending_reveals.retain(|_, p| !p.expired(now));
         self.ended.expire(now);
         self.ended_unlockers.expire(now);
+        self.ended_asks.expire(now);
         self.flood.expire(now);
     }
 
@@ -785,10 +812,27 @@ impl GrantStore {
                 .values()
                 .filter(|p| p.request.subject.root() == *root)
                 .count()
+            + self
+                .pending_asks
+                .values()
+                .filter(|p| p.request.subject.root() == *root)
+                .count()
+            + self
+                .pending_reveals
+                .values()
+                .filter(|p| p.spec.requester.as_ref().is_some_and(|s| s.root() == *root))
+                .count()
     }
 
     fn pending_total(&self) -> usize {
-        self.pending.len() + self.pending_unlockers.len()
+        self.pending.len()
+            + self.pending_unlockers.len()
+            + self.pending_asks.len()
+            + self
+                .pending_reveals
+                .values()
+                .filter(|p| p.spec.requester.is_some())
+                .count()
     }
 
     fn fresh_pending_id(&self) -> PendingId {
@@ -796,8 +840,11 @@ impl GrantStore {
             let id = PendingId::generate();
             if !self.pending.contains_key(&id)
                 && !self.pending_unlockers.contains_key(&id)
+                && !self.pending_asks.contains_key(&id)
+                && !self.pending_reveals.contains_key(&id)
                 && !self.ended.contains(&id)
                 && !self.ended_unlockers.contains(&id)
+                && !self.ended_asks.contains(&id)
             {
                 break id;
             }
@@ -1431,6 +1478,7 @@ impl GrantStore {
         });
         self.pending
             .retain(|_, p| !p.request.bindings.iter().any(|b| b.binding.item == item));
+        self.pending_reveals.retain(|_, p| p.spec.item != item);
         before - self.grants.len()
     }
 
@@ -1444,6 +1492,212 @@ impl GrantStore {
             .count()
     }
 
+    /// Opens a pending `items.ask` request under the pending caps (SPEC §10a,
+    /// M3-14). An identical request already pending returns the existing id.
+    pub fn open_ask(&mut self, r: AskRequest, now: &Now) -> Result<PendingId, PendingCap> {
+        self.expire(now);
+        let fp = r.fingerprint();
+        if let Some(p) = self.pending_asks.values().find(|p| p.fingerprint == fp) {
+            return Ok(p.id);
+        }
+        let root = r.subject.root();
+        if self.pending_per_root(&root) >= MAX_PENDING_PER_ROOT {
+            return Err(PendingCap::PerRoot);
+        }
+        if self.pending_total() >= MAX_PENDING {
+            return Err(PendingCap::Total);
+        }
+        let id = self.fresh_pending_id();
+        self.pending_asks
+            .insert(id, PendingAsk::open(id, r, fp, now));
+        Ok(id)
+    }
+
+    /// The pending ask `id`, unless it expired.
+    pub fn pending_ask(&self, id: &PendingId, now: &Now) -> Option<&PendingAsk> {
+        self.pending_asks.get(id).filter(|p| !p.expired(now))
+    }
+
+    /// The pending asks, unexpired, oldest first.
+    pub fn pending_asks_all(&self, now: &Now) -> impl Iterator<Item = &PendingAsk> {
+        let mut all: Vec<&PendingAsk> = self
+            .pending_asks
+            .values()
+            .filter(|p| !p.expired(now))
+            .collect();
+        all.sort_by_key(|p| (p.opened, p.id));
+        all.into_iter()
+    }
+
+    /// Resolves pending ask `id` as answered by `app.paste` with `slug`,
+    /// without creating any grant.
+    ///
+    /// # Errors
+    /// [`AskClosed`] when the ask is not open (unknown, already resolved,
+    /// declined, or expired).
+    pub fn resolve_ask_added(
+        &mut self,
+        id: &PendingId,
+        slug: &Slug,
+        now: &Now,
+    ) -> Result<PendingAsk, AskClosed> {
+        self.expire(now);
+        let p = self.pending_asks.remove(id).ok_or(AskClosed)?;
+        self.ended_asks.record(
+            *id,
+            p.request.subject.root(),
+            AskStateOutcome::Added {
+                slug: slug.as_str().to_owned(),
+            },
+            now,
+        );
+        Ok(p)
+    }
+
+    /// Declines pending ask `id` (`app.asks.decline`).
+    ///
+    /// # Errors
+    /// [`AskClosed`] when the ask is not open.
+    pub fn decline_ask(&mut self, id: &PendingId, now: &Now) -> Result<PendingAsk, AskClosed> {
+        self.expire(now);
+        let p = self.pending_asks.remove(id).ok_or(AskClosed)?;
+        self.ended_asks.record(
+            *id,
+            p.request.subject.root(),
+            AskStateOutcome::Declined,
+            now,
+        );
+        Ok(p)
+    }
+
+    /// How ask `id` stands, for `caller` at `now` (`items.ask_state`):
+    /// [`AskStateOutcome::Pending`] while it waits, or how it ended while
+    /// that is remembered, only when `caller`'s verified chain holds the
+    /// requester's root instance; [`AskStateOutcome::Unknown`] to anyone
+    /// else and for an unknown id. Never creates a grant.
+    ///
+    /// # Errors
+    /// [`Busy`] when the caller's root is over its poll limit.
+    pub fn poll_ask(
+        &mut self,
+        id: &PendingId,
+        caller: &SubjectEvidence,
+        now: &Now,
+    ) -> Result<AskStateOutcome, Busy> {
+        self.expire(now);
+        let root = caller.root();
+        let live = self
+            .pending
+            .values()
+            .filter(|p| p.request.subject.root() == root)
+            .count()
+            + self
+                .pending_asks
+                .values()
+                .filter(|p| p.request.subject.root() == root)
+                .count();
+        self.polls.take(&root, live, now.awake)?;
+        let state = if let Some(p) = self.pending_asks.get(id) {
+            caller
+                .descends_from(&p.request.subject.root())
+                .then_some(AskStateOutcome::Pending)
+        } else {
+            self.ended_asks
+                .get(id)
+                .and_then(|(root, state)| caller.descends_from(root).then(|| state.clone()))
+        };
+        Ok(state.unwrap_or(AskStateOutcome::Unknown))
+    }
+
+    /// Drains asks that expired since the last call, so the daemon can
+    /// write their `expired` audit entries.
+    pub fn take_expired_asks(&mut self, now: &Now) -> Vec<PendingAsk> {
+        self.expire(now);
+        std::mem::take(&mut self.expired_asks)
+    }
+
+    /// Opens a client-originated `reveal.request` under the pending caps
+    /// (10-minute awake TTL). An identical request already pending returns
+    /// the existing id.
+    pub fn open_reveal_request(
+        &mut self,
+        spec: RevealRequestSpec,
+        now: &Now,
+    ) -> Result<PendingId, PendingCap> {
+        self.expire(now);
+        let fp = spec.fingerprint();
+        if let Some(p) = self.pending_reveals.values().find(|p| p.fingerprint == fp) {
+            return Ok(p.id);
+        }
+        if let Some(sub) = &spec.requester {
+            let root = sub.root();
+            if self.pending_per_root(&root) >= MAX_PENDING_PER_ROOT {
+                return Err(PendingCap::PerRoot);
+            }
+        }
+        if self.pending_total() >= MAX_PENDING {
+            return Err(PendingCap::Total);
+        }
+        let id = self.fresh_pending_id();
+        self.pending_reveals
+            .insert(id, PendingReveal::open(id, spec, fp, PENDING_TTL, now));
+        Ok(id)
+    }
+
+    /// Opens an app-originated `app.reveal.begin` request (60-second awake
+    /// TTL), evicting the oldest app-originated reveal stage if at cap.
+    pub fn open_app_reveal(&mut self, spec: RevealRequestSpec, now: &Now) -> PendingId {
+        self.expire(now);
+        while self
+            .pending_reveals
+            .values()
+            .filter(|p| p.spec.requester.is_none())
+            .count()
+            >= MAX_APP_REVEAL_STAGES
+        {
+            let Some(oldest) = self
+                .pending_reveals
+                .values()
+                .filter(|p| p.spec.requester.is_none())
+                .min_by_key(|p| (p.opened, p.id))
+                .map(|p| p.id)
+            else {
+                break;
+            };
+            self.pending_reveals.remove(&oldest);
+        }
+        let fp = spec.fingerprint();
+        let id = self.fresh_pending_id();
+        self.pending_reveals
+            .insert(id, PendingReveal::open(id, spec, fp, APP_REVEAL_TTL, now));
+        id
+    }
+
+    /// The pending reveal request `id`, unless it expired.
+    pub fn pending_reveal(&self, id: &PendingId, now: &Now) -> Option<&PendingReveal> {
+        self.pending_reveals.get(id).filter(|p| !p.expired(now))
+    }
+
+    /// Removes and returns the pending reveal request `id`, unless it
+    /// expired.
+    pub fn take_pending_reveal(&mut self, id: &PendingId, now: &Now) -> Option<PendingReveal> {
+        self.expire(now);
+        self.pending_reveals.remove(id)
+    }
+
+    /// How many asks and reveal requests wait for the app (`status.app_requests`).
+    pub fn app_requests_count(&self, now: &Now) -> usize {
+        self.pending_asks
+            .values()
+            .filter(|p| !p.expired(now))
+            .count()
+            + self
+                .pending_reveals
+                .values()
+                .filter(|p| !p.expired(now) && p.spec.requester.is_some())
+                .count()
+    }
+
     /// The vault locked: every grant and pending request ends, and the
     /// outcomes remembered go with them (a waiter is told `unknown`, asks
     /// `run.request` again and is told the vault is locked). Denials and
@@ -1452,8 +1706,12 @@ impl GrantStore {
         self.grants.clear();
         self.pending.clear();
         self.pending_unlockers.clear();
+        self.pending_asks.clear();
+        self.pending_reveals.clear();
         self.ended.clear();
         self.ended_unlockers.clear();
+        self.ended_asks.clear();
+        self.expired_asks.clear();
         self.polls.clear();
     }
 
