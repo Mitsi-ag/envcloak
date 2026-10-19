@@ -236,6 +236,7 @@ mod macos {
         pb: *mut c_void,
         max_len: usize,
     ) -> Result<Zeroizing<Vec<u8>>, PasteboardError> {
+        let _pool = AutoreleasePool::new();
         let cf_type = CFString::new(UTF8_PLAIN_TEXT_TYPE);
         // SAFETY: `-[NSPasteboard stringForType:]` takes `(id, SEL, NSString *)`
         // and returns a nullable `NSString *`.
@@ -316,6 +317,12 @@ mod macos {
             msg(pb, sel(c"releaseGlobally"));
         }
     }
+
+    #[cfg(feature = "testing")]
+    pub(super) fn with_pool<R>(f: impl FnOnce() -> R) -> R {
+        let _pool = AutoreleasePool::new();
+        f()
+    }
 }
 
 /// An isolated named `NSPasteboard` for tests on macOS, released on drop.
@@ -337,8 +344,10 @@ impl TestPasteboard {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let name = format!("ai.envcloak.test.{}.{id}", std::process::id());
-        let pb = macos::open_pasteboard(Some(&name)).expect("open test pasteboard");
-        let _ = macos::clear_contents(pb);
+        macos::with_pool(|| {
+            let pb = macos::open_pasteboard(Some(&name)).expect("open test pasteboard");
+            let _ = macos::clear_contents(pb);
+        });
         Self { name }
     }
 
@@ -353,11 +362,13 @@ impl TestPasteboard {
     /// # Panics
     /// Panics if the pasteboard write fails.
     pub fn set_string(&self, text: &str) {
-        let pb = macos::open_pasteboard(Some(&self.name)).expect("open test pasteboard");
-        assert!(
-            macos::set_utf8_string(pb, text),
-            "setString:forType: on test pasteboard failed"
-        );
+        macos::with_pool(|| {
+            let pb = macos::open_pasteboard(Some(&self.name)).expect("open test pasteboard");
+            assert!(
+                macos::set_utf8_string(pb, text),
+                "setString:forType: on test pasteboard failed"
+            );
+        });
     }
 
     /// Reads the current UTF-8 plain-text string on the pasteboard, or `None`
@@ -367,12 +378,14 @@ impl TestPasteboard {
     /// Panics if the pasteboard cannot be opened.
     #[must_use]
     pub fn read_string(&self) -> Option<String> {
-        let pb = macos::open_pasteboard(Some(&self.name)).expect("open test pasteboard");
-        match macos::read_utf8_bytes(pb, 64 * 1024) {
-            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
-            Err(PasteboardError::Empty) => None,
-            Err(e) => panic!("unexpected pasteboard read error: {e:?}"),
-        }
+        macos::with_pool(|| {
+            let pb = macos::open_pasteboard(Some(&self.name)).expect("open test pasteboard");
+            match macos::read_utf8_bytes(pb, 64 * 1024) {
+                Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+                Err(PasteboardError::Empty) => None,
+                Err(e) => panic!("unexpected pasteboard read error: {e:?}"),
+            }
+        })
     }
 
     /// Current `changeCount` of this test pasteboard.
@@ -381,8 +394,10 @@ impl TestPasteboard {
     /// Panics if the pasteboard cannot be opened.
     #[must_use]
     pub fn change_count(&self) -> isize {
-        let pb = macos::open_pasteboard(Some(&self.name)).expect("open test pasteboard");
-        macos::change_count(pb)
+        macos::with_pool(|| {
+            let pb = macos::open_pasteboard(Some(&self.name)).expect("open test pasteboard");
+            macos::change_count(pb)
+        })
     }
 }
 

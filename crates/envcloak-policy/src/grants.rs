@@ -1453,16 +1453,7 @@ impl GrantStore {
     ) -> Result<PendingState, Busy> {
         self.expire(now);
         let root = caller.root();
-        let live = self
-            .pending
-            .values()
-            .filter(|p| p.request.subject.root() == root)
-            .count()
-            + self
-                .pending_reveals
-                .values()
-                .filter(|p| p.spec.requester.as_ref().is_some_and(|s| s.root() == root))
-                .count();
+        let live = self.pending_per_root(&root);
         self.polls.take(&root, live, now.awake)?;
         let state = if let Some(p) = self.pending.get(id) {
             caller
@@ -1619,16 +1610,7 @@ impl GrantStore {
     ) -> Result<AskStateOutcome, Busy> {
         self.expire(now);
         let root = caller.root();
-        let live = self
-            .pending
-            .values()
-            .filter(|p| p.request.subject.root() == root)
-            .count()
-            + self
-                .pending_asks
-                .values()
-                .filter(|p| p.request.subject.root() == root)
-                .count();
+        let live = self.pending_per_root(&root);
         self.polls.take(&root, live, now.awake)?;
         let state = if let Some(p) = self.pending_asks.get(id) {
             caller
