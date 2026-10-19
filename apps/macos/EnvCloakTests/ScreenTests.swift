@@ -27,6 +27,7 @@ import XCTest
     #endif
 
     private func host<V: View>(_ view: V) -> NSWindow {
+        Darwin.signal(SIGPIPE, SIG_IGN)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 740), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: view.frame(width: 1180, height: 740))
@@ -535,7 +536,6 @@ import XCTest
             "any claude_code\\u{202e}\\u{1b}[31m session in this project, including one started by another program, gets these keys without asking",
             in: window
         )
-        window.close()
 
         // Verify > 2 KB argv truncation and "Show full command" control (M3-12).
         let baseDescriptor = try XCTUnwrap(model.descriptor)
@@ -557,10 +557,8 @@ import XCTest
             standing: baseDescriptor.standing
         )
         model.applyDescriptor(longDescriptor)
-        let truncatedWindow = host(ApprovalWindowView(model: model))
-        await assertVisible("Show full command", in: truncatedWindow)
-        XCTAssertTrue(labels(truncatedWindow).contains { $0.contains("more bytes)") })
-        truncatedWindow.close()
+        await assertVisible("Show full command", in: window)
+        XCTAssertTrue(labels(window).contains { $0.contains("more bytes)") })
     }
 
     func testUnlockAndEnrolScreensRenderStatesAndSSHRefusal() async {
@@ -572,43 +570,34 @@ import XCTest
         await session.poll()
 
         // Default unenrolled state.
-        let unenrolledWindow = host(UnlockView(session: session))
-        await assertVisible("Unlock with Touch ID", in: unenrolledWindow)
-        await assertVisible("Add Touch ID", in: unenrolledWindow)
-        await assertVisible("Touch ID, or your login password when Touch ID is not available", in: unenrolledWindow)
-        unenrolledWindow.close()
+        let window = host(UnlockView(session: session))
+        await assertVisible("Unlock with Touch ID", in: window)
+        await assertVisible("Add Touch ID", in: window)
+        await assertVisible("Touch ID, or your login password when Touch ID is not available", in: window)
 
         // Clamshell closed state.
         session.clamshellClosed = true
-        let clamshellWindow = host(UnlockView(session: session))
-        await assertVisible("Touch ID is not available with the lid closed. Use your password.", in: clamshellWindow)
-        await assertVisible("Unlock with password", in: clamshellWindow)
-        clamshellWindow.close()
+        await assertVisible("Touch ID is not available with the lid closed. Use your password.", in: window)
+        await assertVisible("Unlock with password", in: window)
         session.clamshellClosed = false
 
         // SSH session refusal state.
         session.sshSession = true
-        let sshWindow = host(UnlockView(session: session))
-        await assertVisible("Touch ID cannot be used over SSH. Approve in a terminal with envcloak approve <id>.", in: sshWindow)
-        sshWindow.close()
+        await assertVisible("Touch ID cannot be used over SSH. Approve in a terminal with envcloak approve <id>.", in: window)
         session.sshSession = false
 
         // Pending enrolment instructions state.
         await client.setEnrollState("pending")
         session.enrolmentPendingId = DaemonText("ENROL123")
         session.enrolmentCommand = "envcloak approve ENROL123"
-        let pendingEnrolWindow = host(EnrolView(session: session))
-        await assertVisible("Approve this once in Terminal with your passphrase: envcloak approve ENROL123", in: pendingEnrolWindow)
-        await assertVisible("envcloak approve ENROL123", in: pendingEnrolWindow)
-        pendingEnrolWindow.close()
+        await assertVisible("Approve this once in Terminal with your passphrase: envcloak approve ENROL123", in: window)
+        await assertVisible("envcloak approve ENROL123", in: window)
 
         // Completed enrolment state.
         await client.setEnrollState("enrolled")
         session.enrolmentPendingId = nil
         session.enrolmentCompleted = true
-        let completedEnrolWindow = host(EnrolView(session: session))
-        await assertVisible("Touch ID added", in: completedEnrolWindow)
-        completedEnrolWindow.close()
+        await assertVisible("Touch ID added", in: window)
     }
 
     func testFirstRunScanScreenRendersWaitingAndFixtureReportAndSweepsClean() async throws {
