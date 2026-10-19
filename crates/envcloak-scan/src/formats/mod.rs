@@ -6,6 +6,8 @@ use std::io::Read;
 
 mod bitwarden;
 mod doppler;
+mod entry;
+use entry::valid_name;
 mod infisical;
 mod onepassword_csv;
 mod stream;
@@ -36,9 +38,9 @@ impl Kind {
         Self::Dotenv,
     ];
     pub fn parse(text: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|k| k.token() == text)
+        Self::ALL.into_iter().find(|k| k.as_str() == text)
     }
-    pub fn token(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::BitwardenJson => "bitwarden-json",
             Self::OnePasswordCsv => "1password-csv",
@@ -72,18 +74,6 @@ pub struct Entry {
     pub record: u32,
     pub name: SecretBytes,
     pub value: SecretBytes,
-}
-impl Entry {
-    /// Safe environment metadata for the shared importer. Values and labels
-    /// shaped like credentials never become report names.
-    #[allow(clippy::disallowed_methods)]
-    pub fn env_name(&self) -> Option<String> {
-        let text = std::str::from_utf8(secrecy::ExposeSecret::expose_secret(&self.name)).ok()?;
-        if !valid_name(&self.name) || envcloak_policy::value_shaped(text) {
-            return None;
-        }
-        Some(text.to_owned())
-    }
 }
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FormatReport {
@@ -131,12 +121,6 @@ impl Batch {
         });
         Ok(())
     }
-}
-#[allow(clippy::disallowed_methods)] // Inspect a candidate name, never print it.
-fn valid_name(name: &SecretBytes) -> bool {
-    std::str::from_utf8(secrecy::ExposeSecret::expose_secret(name))
-        .ok()
-        .is_some_and(|s| envcloak_policy::EnvName::new(s).is_ok())
 }
 fn text(node: Node) -> Result<SecretBytes, FormatError> {
     if let Node::Text(t) = node {

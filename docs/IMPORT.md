@@ -18,6 +18,81 @@ envcloak import --machine --yes --delete-plaintext --json
 
 The project is the directory of the nearest `envcloak.toml` at or above the working directory, or the working directory when there is none. `init` reads that directory's env files; `import --scan` reads every directory below the one named, and each directory holding env files is a project. Every command takes `--json`.
 
+## Named exports (M2-23)
+
+```sh
+envcloak import --from doppler-json /path/to/export.json --dry-run --json
+envcloak import --from doppler-json /path/to/export.json --yes
+```
+
+Choose the format explicitly. Without `--yes`, the command plans only. Named
+exports use machine scope with `source: export`; they create no manifest,
+project adoption, ignore file or backup. The daemon applies the same provider,
+guessability and keyed-hash deduplication rules as dotenv imports. An existing
+item is reused, including one imported from a project's dotenv file. Owning
+accounts remain `unknown` until M4.
+
+| Kind | Supported input and selected fields |
+| --- | --- |
+| `bitwarden-json` | Plaintext Password Manager JSON, `items` plus optional `folders`, `collections` and boolean `encrypted: false`. Login `login.password` and Text/Hidden custom fields on types 1 to 4. Custom names must already be valid environment names; no normalization. |
+| `1password-csv` | Login and Password CSV with the exact nine-column header below; only `Password` is imported. |
+| `doppler-json` | Flat string map from `doppler secrets download --no-file --format json`. |
+| `infisical-json` | Array of CLI `SingleEnvironmentVariable` records, the v0.43.139 schema: `key`, `value`, `workspace`, `type`, `_id`, `secretPath`, `tags`, `comment`, `Etag`, `skipMultilineEncoding`. String metadata, null or typed tag arrays, boolean flag. Values decode once. |
+| `aws-credentials` | A named AWS shared credentials/config file, using the existing keys-only INI parser. No credential process or SSO execution. |
+| `dotenv` | A named dotenv file, including Vercel `env pull`, Infisical's default dotenv and Doppler `--format env`. Existing dotenv grammar applies. |
+
+The CSV header is `Title,Url,Username,Password,OTPAuth,Favorite,Archived,Tags,Notes`.
+Cells may be quoted; a quote inside a quoted cell is doubled. One leading UTF-8
+BOM, CRLF or LF record separators, and embedded newlines are accepted. Credential
+spaces, backslashes and embedded CRLF are preserved. Other headers, invalid
+UTF-8, NUL, bare record-separator CR and malformed quoting are refused.
+
+These are documented-format profiles, not verified output from installed vendor
+builds. The CSV header comes from a historical vendor-published audit input,
+not a current exporter capture. Schema recognition cannot verify an export's
+origin, version, freshness or upstream completeness. 1Password CSV itself omits
+custom fields and many item types. Bitwarden exports can omit organization-owned
+items, trash and Sends. Its encrypted exports and Secrets Manager exports are
+separate unsupported shapes. 1PUX remains outside M2 (D-21).
+
+Bitwarden history, notes, URLs, native card/identity data, passkeys, TOTP and linked
+fields never supply a password fallback. Non-login records, unsupported custom
+field types, passkeys and TOTP are counted as unsupported where present; custom
+names needing mapping are counted as manual. CSV OTPAuth is counted as unsupported.
+The report covers only the supplied file's supported fields, not every credential
+in the vendor account. Empty and rejected candidates get the daemon's normal
+skip reason. Unsupported/manual/skipped entries make the exit status nonzero,
+including when other entries committed successfully.
+
+Parsing streams through a 4 KiB wiping input buffer, with at most 16 MiB input,
+256 KiB per JSON subtree or decoded CSV row, 64 KiB per decoded field, 10,000
+records, 1,024 selected entries and 256 KiB selected values. AWS and dotenv reuse
+their 1 MiB parsers. JSON depth is at most 64 per subtree. Excluded metadata also
+consumes the record and input budgets. A batch is retained in wiping storage and
+published only after the complete file validates. Both full IPC envelopes must
+fit the 1 MiB frame limit before planning; oversized inputs refuse as a whole.
+No plaintext spill files or automatic multi-transaction batching are used.
+The adapter also caps repeated outbound metadata at 256 KiB and claims at 64;
+a cap failure discards the whole batch.
+
+The file is opened through a held directory without following child symlinks or
+blocking on special files; its descriptor identity is checked after reading.
+The held values are the ones reviewed and committed. The daemon recomputes the
+plan at commit and refuses a changed plan. A lost commit reply reports failure;
+it is not evidence that the vault transaction did not happen.
+
+The report separates records, candidates, accepted/imported entries and distinct
+items. It always reminds you that the named file is plaintext. **EnvCloak never
+removes or rewrites a named export.** After verifying the import, delete the file
+yourself. `--delete-plaintext`, `--machine` and `--scan` cannot be combined with
+`--from`.
+
+Format evidence: [Bitwarden documented shapes](https://bitwarden.com/help/condition-bitwarden-import/),
+[1Password export limits](https://support.1password.com/export/),
+[historical CSV header evidence, section 5.2](https://bucket.agilebits.com/security/SecfaultSecurity_Report_1Password_8_for_Mac_Security_Assessment_v1.1.pdf),
+[Doppler download](https://docs.doppler.com/reference/secrets-download),
+[Infisical pinned model](https://github.com/Infisical/cli/blob/f728c428b689611a431c2fa627cf81da46f07102/packages/models/cli.go).
+
 ## Machine-wide first run (M2-16)
 
 `import` accepts multiple roots, including repeated `--scan`, and `--machine` adds HOME. Roots and physical sources are deduplicated. Without `--yes` it plans only: no vault import, manifest, ignore file, backup or source change. `--dry-run` and `--yes` conflict; `--delete-plaintext` requires `--yes`.

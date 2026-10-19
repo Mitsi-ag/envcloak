@@ -47,6 +47,6 @@ crates/envcloak-scan/tests/transcript_oracle.rs # hashes synthetic candidate val
 crates/envcloak-client/src/tty.rs           # writes a passphrase-proven reveal to an already opened /dev/tty only, never stdout or stderr
 crates/envcloak-scan/tests/scrub_oracle.rs    # generated previews sent only to the independent Python checker pipe
 
-crates/envcloak-scan/src/formats/mod.rs # validate export names in wiping buffers
+crates/envcloak-scan/src/formats/entry.rs # validate export names in wiping buffers
 crates/envcloak-scan/src/formats/stream.rs # decode bounded wiping export records
 crates/envcloak-scan/src/formats/bitwarden.rs # validate numeric export type tags

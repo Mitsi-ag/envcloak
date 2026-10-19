@@ -9,10 +9,10 @@ fn independent_csv_and_infisical_corpora_match_in_both_orders_and_all_chunks() {
     let home = tempfile::tempdir_in("/tmp").unwrap();
     let output = Command::new("python3")
         .args(["-I", "-B"])
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/oracles/vendor_exports.py"
-        ))
+        .arg(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/oracles/vendor_exports.py"),
+        )
         .env_clear()
         .env("PATH", "/usr/bin:/bin:/opt/homebrew/bin")
         .env("HOME", home.path())

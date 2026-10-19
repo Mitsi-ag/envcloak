@@ -580,6 +580,10 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e --test m2_story --no-run
+      - name: Vendor export parser and dedupe gates
+        run: |
+          cargo test --locked -p envcloak-scan --test vendor_formats --test vendor_oracle --test vendor_fuzz --no-fail-fast -- --test-threads 3
+          cargo test --locked -p envcloak --test vendor_import --no-fail-fast -- --test-threads 3
       - name: Scrub transaction and independent planner gates
         run: |
           cargo test --locked -p envcloakd --no-run

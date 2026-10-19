@@ -57,9 +57,10 @@ use envcloak_scan::{
 };
 
 use super::require_unlocked;
+mod export;
 mod first_run;
 
-const USAGE: &str = "envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json]";
+const USAGE: &str = "envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json] | envcloak import --from <kind> <file> [--dry-run | --yes] [--json]";
 
 /// An env file read for an import or a deletion.
 pub(crate) struct ReadFile {
@@ -813,6 +814,7 @@ fn too_large(e: envcloak_ipc::ClientError) -> Failure {
 /// The parsed command line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ImportArgs {
+    from: Option<(envcloak_scan::formats::Kind, PathBuf)>,
     dirs: Vec<PathBuf>,
     machine: bool,
     dry_run: bool,
@@ -826,6 +828,14 @@ fn parse(args: &[&str]) -> Option<ImportArgs> {
     let mut it = args.iter().peekable();
     while let Some(&arg) = it.next() {
         match arg {
+            "--from" if a.from.is_none() => {
+                let kind = envcloak_scan::formats::Kind::parse(it.next()?)?;
+                let file = it.next()?;
+                if file.is_empty() || file.starts_with("--") {
+                    return None;
+                }
+                a.from = Some((kind, PathBuf::from(file)));
+            }
             "--scan" => {
                 let before = a.dirs.len();
                 while it.peek().is_some_and(|s| !s.starts_with("--")) {
@@ -847,7 +857,12 @@ fn parse(args: &[&str]) -> Option<ImportArgs> {
             _ => return None,
         }
     }
-    ((!a.dirs.is_empty() || a.machine) && !(a.dry_run && a.yes) && (!a.delete || a.yes))
+    ((if a.from.is_some() {
+        a.dirs.is_empty() && !a.machine && !a.delete
+    } else {
+        !a.dirs.is_empty() || a.machine
+    }) && !(a.dry_run && a.yes)
+        && (!a.delete || a.yes))
         .then_some(a)
 }
 
@@ -859,7 +874,12 @@ pub fn run(args: &[&str]) -> ExitCode {
     let Some(a) = parse(args) else {
         return usage(USAGE);
     };
-    first_run::run(&a).unwrap_or_else(|f| f.report(FAILURE))
+    if let Some((kind, path)) = &a.from {
+        export::run(*kind, path, &a)
+    } else {
+        first_run::run(&a)
+    }
+    .unwrap_or_else(|f| f.report(FAILURE))
 }
 
 #[cfg(test)]

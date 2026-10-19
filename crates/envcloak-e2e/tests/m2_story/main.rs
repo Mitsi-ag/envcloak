@@ -24,6 +24,7 @@ mod reveal;
 mod scanners;
 mod scrub;
 mod skeleton;
+mod vendor_exports;
 
 /// The story runs with the network CI says (`ENVCLOAK_TEST_NETWORK`):
 /// loopback only in the `gates` and `agents-e2e` jobs, so the hosts reach
