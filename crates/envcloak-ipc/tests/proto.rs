@@ -867,3 +867,37 @@ fn reveal_wire_contract_is_strict_and_debug_is_value_free() {
     wire["unrecognized"] = serde_json::Value::Bool(true);
     assert!(serde_json::from_slice::<RevealOutput>(&serde_json::to_vec(&wire).unwrap()).is_err());
 }
+
+#[test]
+fn claimed_markers_reads_claims_only_and_refuses_duplicate_keys() {
+    let parse = |raw: &str| -> Result<Vec<String>, RpcError> {
+        let mut wire = (raw.len() as u32).to_be_bytes().to_vec();
+        wire.extend_from_slice(raw.as_bytes());
+        let frame = Frame::read_from(&mut wire.as_slice()).unwrap();
+        let req = IncomingRequest::parse(&frame).unwrap();
+        req.claimed_markers()
+    };
+    assert_eq!(
+        parse(r#"{"jsonrpc":"2.0","id":1,"method":"app.unlock"}"#).unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        parse(
+            r#"{"jsonrpc":"2.0","id":1,"method":"app.unlock","params":{"passphrase":"secret","claims":["CURSOR_TRACE_ID"]}}"#
+        )
+        .unwrap(),
+        vec!["CURSOR_TRACE_ID".to_owned()]
+    );
+    assert_eq!(
+        parse(
+            r#"{"jsonrpc":"2.0","id":1,"method":"app.unlock","params":{"claims":["CURSOR_TRACE_ID"],"claims":[]}}"#
+        )
+        .unwrap_err(),
+        RpcError::new(ErrorKind::InvalidParams)
+    );
+    assert_eq!(
+        parse(r#"{"jsonrpc":"2.0","id":1,"method":"app.unlock","params":[["CURSOR_TRACE_ID"]]}"#)
+            .unwrap_err(),
+        RpcError::new(ErrorKind::InvalidParams)
+    );
+}

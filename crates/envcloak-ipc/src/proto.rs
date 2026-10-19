@@ -2574,12 +2574,37 @@ impl<'a> IncomingRequest<'a> {
     /// Only the evidence-tightening claims projection. App handlers still
     /// decode their complete parameters with deny_unknown_fields afterwards.
     pub fn claimed_markers(&self) -> Result<Vec<String>, RpcError> {
-        let object: serde_json::Map<String, serde_json::Value> = self.params()?;
-        match object.get("claims") {
-            None => Ok(Vec::new()),
-            Some(value) => serde_json::from_value(value.clone())
-                .map_err(|_| RpcError::new(ErrorKind::InvalidParams)),
+        struct ClaimsOnly(Vec<String>);
+        impl<'de> Deserialize<'de> for ClaimsOnly {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Visitor;
+                impl<'de> serde::de::Visitor<'de> for Visitor {
+                    type Value = ClaimsOnly;
+                    fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                        f.write_str("a parameter object")
+                    }
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let mut claims: Option<Vec<String>> = None;
+                        while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                            if key == "claims" {
+                                if claims.is_some() {
+                                    return Err(serde::de::Error::duplicate_field("claims"));
+                                }
+                                claims = Some(map.next_value()?);
+                            } else {
+                                let _ = map.next_value::<IgnoredAny>()?;
+                            }
+                        }
+                        Ok(ClaimsOnly(claims.unwrap_or_default()))
+                    }
+                }
+                d.deserialize_map(Visitor)
+            }
         }
+        self.params::<ClaimsOnly>().map(|c| c.0)
     }
 
     /// Parses a request frame. On failure, the error to answer with and
