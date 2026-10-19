@@ -577,3 +577,26 @@ fn provider_config_paths_stay_in_the_catalog() {
             .is_some_and(|v| v.ct_eq(b"fixture-provider-value"))
     }));
 }
+
+#[test]
+fn fixture_catalog_yields_a_migration_plan() {
+    let home = fixture_home();
+    std::fs::write(
+        home.path().join(".claude.json"),
+        br#"{"mcpServers":{"fixture-stdio":{"command":"/usr/bin/true","args":["--stdio"],"env":{"API_TOKEN":"fixture-catalog-secret-value"}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".codex/config.toml"),
+        "model = \"m\"\n[mcp_servers.codex_http]\nurl = \"https://api.example.com/mcp\"\n[mcp_servers.codex_http.http_headers]\nAuthorization = \"Bearer fixture-codex-header-secret\"\n",
+    )
+    .unwrap();
+    let plan = envcloak_agents::migrate::plan(&catalog(home.path()));
+    assert_eq!(plan.rewrites.len(), 2, "{:?}", plan.rewrites);
+    assert!(plan.rewrites.iter().any(|r| r.agent == "claude-code"
+        && r.server == "fixture-stdio"
+        && r.secret_names() == vec!["API_TOKEN"]));
+    assert!(plan.rewrites.iter().any(|r| r.agent == "codex"
+        && r.server == "codex_http"
+        && r.secret_names() == vec!["Authorization"]));
+}

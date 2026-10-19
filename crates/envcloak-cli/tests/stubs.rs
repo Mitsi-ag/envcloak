@@ -23,7 +23,6 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 /// Each registered command or option (the words that select it) and how
 /// its refusal names it.
 const STUBS: &[(&[&str], &str)] = &[
-    (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["login"], "`envcloak login`"),
     (&["signin"], "`envcloak signin`"),
 ];
@@ -157,12 +156,13 @@ fn every_stub_refuses_an_argument_that_is_not_utf8() {
         assert_eq!(stderr(&out), want, "{what}");
     }
     // Elsewhere the argument is the usage error it was, `agents status`
-    // (landed by M2-09), its `--probe` (landed by M2-28) and `standing`
-    // (landed by M2-15) included.
+    // (landed by M2-09), its `--probe` (landed by M2-28), `agents migrate-mcp`
+    // (landed by M2-20) and `standing` (landed by M2-15) included.
     for words in [
         &["run", "--"][..],
         &["agents", "status"],
         &["agents", "status", "--probe"],
+        &["agents", "migrate-mcp"],
         &["standing"],
     ] {
         let mut cmd = cli_command(&home, words, &[]);
@@ -218,21 +218,22 @@ fn every_stub_exits_125_and_echoes_nothing() {
 
 /// A subcommand that no task adds is a usage error, as any unknown
 /// command is, and is not echoed either. `items` has its one subcommand
-/// since M2-13 (`reclassify`), and `standing` has its subcommands since
-/// M2-15; their usage names them, with no stub left.
+/// since M2-13 (`reclassify`), `standing` has its subcommands since
+/// M2-15, and `agents` has all of its subcommands since M2-20; their
+/// usage names them, with no stub left.
 #[test]
 fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
     let cs = canaries(fresh_seed());
     let home = TestHome::new();
     let mut cases = vec![
-        (vec!["agents"], true),
-        (vec!["agents", "--json"], true),
+        (vec!["agents"], false),
+        (vec!["agents", "--json"], false),
         (vec!["items"], false),
         (vec!["items", "list"], false),
         (vec!["standing"], false),
     ];
     for c in &cs {
-        cases.push((vec!["agents", c.as_str()], true));
+        cases.push((vec!["agents", c.as_str()], false));
         cases.push((vec!["items", c.as_str()], false));
         cases.push((vec!["standing", c.as_str()], false));
     }
@@ -284,14 +285,15 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
             "{what} is listed as available: {help}"
         );
     }
-    // The check sees the commands this build has, those M2-03, M2-06 and
-    // M2-15 landed among them.
+    // The check sees the commands this build has, those M2-03, M2-06,
+    // M2-15 and M2-20 landed among them.
     assert!(lists(available, &["run"]));
     assert!(lists(available, &["pending"]));
     assert!(lists(available, &["mcp"]));
     assert!(lists(available, &["standing", "ls"]));
     assert!(lists(available, &["standing", "rm"]));
     assert!(lists(available, &["standing", "confirm"]));
+    assert!(lists(available, &["agents", "migrate-mcp"]));
     assert!(lists(available, &["mcp-bridge"]));
     let run = available
         .lines()

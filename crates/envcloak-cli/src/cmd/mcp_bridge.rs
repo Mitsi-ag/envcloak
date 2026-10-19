@@ -75,7 +75,7 @@ fn check_value_like_args(args: &[&str]) -> Result<(), ExitCode> {
                     names.extend(v.split(['/', ':', '?', '&', '=']));
                 }
             }
-            "--header-ref" => {
+            "--header-ref" | "--header" => {
                 if let Some(v) = it.next() {
                     names.extend(v.split(['=', '#']));
                 }
@@ -174,7 +174,7 @@ fn parse(args: &[&str]) -> Result<Mode, &'static str> {
                 );
                 i += 2;
             }
-            "--header-ref" => {
+            "--header-ref" | "--header" => {
                 let Some(&r) = args.get(i + 1) else {
                     return Err("--header-ref needs <Header>=<slug>[#<field>]");
                 };

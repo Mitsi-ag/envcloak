@@ -115,6 +115,9 @@ const HELP: &str = "usage:
   envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
   envcloak agents status [--json]
   envcloak agents status --probe [--agent ID]... [--json]
+  envcloak agents migrate-mcp [--agent ID] [--dry-run] [--yes] [--consent-startup-timeout] [--passphrase-fd N] [--json]
+  envcloak agents migrate-mcp --update <agent>/<server> [--cwd DIR] [--env NAME=VALUE]... [--unset-env NAME]... [--path-env PATH] [--passphrase-fd N] [--json] [-- <argv>...]
+  envcloak agents migrate-mcp --undo <id> [--passphrase-fd N] [--json]
   envcloak hook --host ID --event NAME
   envcloak reveal <slug>[#field]
   envcloak scrub [--path <path>]... [--yes] [--json]
@@ -122,7 +125,6 @@ const HELP: &str = "usage:
   envcloak doctor [--json] [--path <path>]... [--git-history] [--report]
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak agents migrate-mcp
   envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
@@ -206,14 +208,13 @@ fn main() -> ExitCode {
 }
 
 /// The refusal of an M2 or M2b command this build does not have, chosen
-/// by the words that select it (the first, and for `agents` the second);
-/// `None` for any other command line. No other argument is read.
+/// by the words that select it; `None` for any other command line. No
+/// other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
         "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
-        "agents" if word(1)? == "migrate-mcp" => cmd::agents::run(&["migrate-mcp"]),
         _ => return None,
     })
 }
