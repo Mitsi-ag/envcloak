@@ -79,7 +79,7 @@ struct Change: OptionSet {
             case .idle: "Locked after \(Self.durationWords(status.lock.idle_limit_secs)) idle"
             case .sleep: "Locked when this Mac slept"
             case .screenLock: "Locked when the screen locked"
-            case .sessionResign: "Locked when the user session became inactive"
+            case .sessionResign: "Locked when the user session switched"
             case .request: "Locked by request"
             case .signal: "Locked when the background process stopped"
             case .restore: "Locked after restoring the vault"

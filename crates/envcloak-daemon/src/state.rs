@@ -1560,8 +1560,13 @@ impl State {
     }
 
     /// Immediately saves the current audit head in the unlocked vault's header
-    /// and syncs the keychain rollback anchor (SPEC §5 "Integrity", D3-12).
+    /// and syncs the keychain rollback anchor when the keychain anchor store is
+    /// available (SPEC §5 "Integrity", D3-12).
     pub fn anchor_now(&mut self) {
+        if !self.anchor_store.is_available() {
+            self.keychain_anchor = KeychainAnchorState::Unavailable;
+            return;
+        }
         let saved = match &mut self.slot {
             Slot::Unlocked(v) if v.integrity() == Integrity::Ok => {
                 if let Some(head) = self.audit.head() {

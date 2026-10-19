@@ -266,7 +266,7 @@ fn is_kind(e: &ClientError, kind: ErrorKind) -> bool {
 /// `answered` this wait, nothing listening there. A connection that ends
 /// or fails inside an answer ([`FrameError::Truncated`]), a timeout, a
 /// socket or daemon that failed a check, and a malformed answer are not.
-fn not_taken(e: &ClientError, answered: bool) -> bool {
+pub(crate) fn not_taken(e: &ClientError, answered: bool) -> bool {
     use std::io::ErrorKind as Io;
     match e {
         ClientError::Frame(
