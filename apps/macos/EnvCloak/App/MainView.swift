@@ -11,6 +11,8 @@ struct MainView: View {
     @State private var selectedKey: DaemonText?
     @State private var inspector = false
     @State private var query = ""
+    @State private var showPalette = false
+    @State private var paletteSheetAction: InspectorAction?
     private var scope: DaemonText? { session.projects.scope }
     private var scopeBinding: Binding<DaemonText?> { Binding(get: { scope }, set: { session.setScope($0) }) }
     @State private var grouping = KeyGrouping.none
@@ -64,26 +66,38 @@ struct MainView: View {
                 }
             }.navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 300)
         } detail: {
-            VStack(spacing: 0) {
-                if let notice = session.notice {
-                    HStack { Text(notice); Spacer(); Button("Dismiss") { session.notice = nil } }.padding(12)
-                        .background(ECToken.raised.color).accessibilityIdentifier("session.notice")
-                }
-                if session.state == .readOnly {
-                    ReadOnlyBanner()
-                    ContentUnavailableView("Metadata unavailable", systemImage: "exclamationmark.triangle", description: Text("This build cannot read keys or projects from a vault that failed its integrity check. Recover from a backup to continue."))
-                } else if session.state.canReadMetadata {
-                    if session.state == .upgradeReadOnly {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(session.state.title)
-                            Text(session.state.detail)
-                        }.padding(12).foregroundStyle(ECToken.warning.color)
-                            .accessibilityIdentifier("upgrade-read-only.banner")
+            ZStack(alignment: .top) {
+                VStack(spacing: 0) {
+                    if let notice = session.notice {
+                        HStack { Text(notice); Spacer(); Button("Dismiss") { session.notice = nil } }.padding(12)
+                            .background(ECToken.raised.color).accessibilityIdentifier("session.notice")
                     }
-                    detail
+                    if session.state == .readOnly {
+                        ReadOnlyBanner()
+                        ContentUnavailableView("Metadata unavailable", systemImage: "exclamationmark.triangle", description: Text("This build cannot read keys or projects from a vault that failed its integrity check. Recover from a backup to continue."))
+                    } else if session.state.canReadMetadata {
+                        if session.state == .upgradeReadOnly {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(session.state.title)
+                                Text(session.state.detail)
+                            }.padding(12).foregroundStyle(ECToken.warning.color)
+                                .accessibilityIdentifier("upgrade-read-only.banner")
+                        }
+                        detail
+                    }
+                    else { ConnectionView(session: session) }
+                }.frame(minWidth: 420).background(ECToken.background.color)
+
+                if showPalette {
+                    CommandPalette(
+                        session: session,
+                        selectedKey: currentSelectedKeyItem,
+                        onEffect: { handlePaletteEffect($0) },
+                        onClose: { showPalette = false }
+                    )
+                    .padding(.top, 20)
                 }
-                else { ConnectionView(session: session) }
-            }.frame(minWidth: 420).background(ECToken.background.color)
+            }
         }
         .navigationTitle(windowTitle)
         .navigationSubtitle(windowSubtitle)
@@ -125,27 +139,94 @@ struct MainView: View {
         .sheet(isPresented: $paste, onDismiss: {
             if let next = pendingBinding { pendingBinding = nil; binding = next }
         }) {
-            PasteSheet(session: session) { item in
+            PasteSheet(session: session, useInProject: { item in
                 pendingBinding = BindingSelection(project: scope, key: item)
                 paste = false
-            }
+            }, ask: session.activeAsk)
         }
         .sheet(item: $binding) { BindingSheet(session: session, selection: $0) }
+        .sheet(item: $paletteSheetAction) { action in
+            if let item = currentSelectedKeyItem {
+                if session.enrolledTouchID {
+                    switch action {
+                    case .reveal:
+                        RevealSheet(session: session, item: item, field: item.fields.first?.name)
+                    case .replace:
+                        ReplaceSheet(session: session, item: item, field: item.fields.first?.name)
+                    case .remove:
+                        RemoveSheet(session: session, item: item)
+                    }
+                } else {
+                    InspectorActionSheet(action: action, item: item, field: item.fields.first?.name)
+                }
+            }
+        }
         .frame(minWidth: 900, minHeight: 560)
         .onGeometryChange(for: Bool.self) { $0.size.width < 980 } action: { columns = $0 ? .detailOnly : .all }
         .onChange(of: selectedKey) { _, key in if key != nil { inspector = true } }
         .onChange(of: session.state) { _, state in if !state.canReadMetadata { selectedKey = nil } }
         .focusedSceneValue(\.workspaceNavigation, WorkspaceNavigation(
             navigate: { route = $0 }, search: { searchFocused = true },
+            togglePalette: { showPalette.toggle() },
             addFolder: { addFolder() }, addKey: { paste = true }, lock: { Task { await session.lock() } },
             group: { grouping = $0 }, ready: session.state == .ready, canLock: session.state.canLock))
         .onAppear {
             session.onOpenApprovalWindow = { [openWindow] in
                 openWindow(id: WindowID.approval)
             }
+            session.onOpenPasteWindow = { [openWindow] in
+                openWindow(id: WindowID.paste)
+            }
+            session.onOpenMainWindow = { [openWindow] in
+                openWindow(id: WindowID.main)
+            }
         }
         .onDisappear { session.bindings.clear() }
         .task { await session.run() }
+    }
+
+    private var currentSelectedKeyItem: ItemView? {
+        guard let slug = selectedKey else { return nil }
+        return session.items.selectedItem?.slug == slug
+            ? session.items.selectedItem
+            : session.items.rows.first(where: { $0.slug == slug })
+    }
+
+    private func handlePaletteEffect(_ effect: PaletteEffect) {
+        switch effect {
+        case .navigate(let target):
+            if case .key(let slug) = target {
+                selectedKey = slug
+                route = .keys(.all)
+            } else {
+                route = target
+            }
+        case .openSheet(let sheet):
+            switch sheet {
+            case .addKey:
+                session.activeAsk = nil
+                paste = true
+            case .addBinding:
+                binding = BindingSelection(project: scope, key: currentSelectedKeyItem)
+            case .inspectKey:
+                paletteSheetAction = .reveal
+            case .swapKey:
+                paletteSheetAction = .replace
+            case .deleteKey:
+                paletteSheetAction = .remove
+            case .reviewRequests:
+                session.openApprovalWindow()
+                openWindow(id: WindowID.approval)
+            case .welcome:
+                openWindow(id: WindowID.welcome)
+            }
+        case .copyReference(let reference):
+            ClipboardWriter().copyReference(reference)
+        case .lock:
+            Task { await session.lock() }
+        case .revoke(let id):
+            Task { await session.revoke(id) }
+        }
     }
 
     private var windowTitle: String {
@@ -189,6 +270,14 @@ struct MainView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     DevelopmentBanner()
                     EnrolView(session: session)
+                    Toggle(
+                        "Show EnvCloak in the menu bar",
+                        isOn: Binding(
+                            get: { session.showMenuBarExtra },
+                            set: { session.setShowMenuBarExtra($0) }
+                        )
+                    )
+                    .accessibilityIdentifier("settings.menuBar")
                     Text("Unlock in Terminal with envcloak unlock. Touch ID, Recovery Kit settings and agent integrations arrive in later builds.")
                     Text("Policies and the idle limit cannot be edited in this build.")
                     Spacer()
@@ -209,6 +298,7 @@ struct MainView: View {
 struct WorkspaceNavigation {
     let navigate: (Route) -> Void
     let search: () -> Void
+    let togglePalette: () -> Void
     let addFolder: () -> Void
     let addKey: () -> Void
     let lock: () -> Void
@@ -233,6 +323,8 @@ struct WorkspaceCommands: Commands {
             Button("Activity") { navigation?.navigate(.activity) }.keyboardShortcut("4")
             Button("Agents") { navigation?.navigate(.agents) }.keyboardShortcut("5")
             Button("Settings") { navigation?.navigate(.settings) }.keyboardShortcut(",")
+            Divider()
+            Button("Command Palette…") { navigation?.togglePalette() }.keyboardShortcut("k")
         }
         CommandGroup(after: .newItem) {
             Button("Add key") { navigation?.addKey() }.keyboardShortcut("n").disabled(navigation?.ready != true)
@@ -249,3 +341,4 @@ struct WorkspaceCommands: Commands {
         }
     }
 }
+

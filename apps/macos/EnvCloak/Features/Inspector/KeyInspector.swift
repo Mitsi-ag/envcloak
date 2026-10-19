@@ -95,8 +95,20 @@ struct KeyInspector: View {
             }.onChange(of: item.fields.map(\.name), initial: true) { _, fields in
                 if !fields.contains(selectedField ?? DaemonText("")) { selectedField = fields.count == 1 ? fields.first : nil }
             }.sheet(item: $action) { action in
-                InspectorActionSheet(action: action, item: item, field: selectedField)
+                if session.enrolledTouchID {
+                    switch action {
+                    case .reveal:
+                        RevealSheet(session: session, item: item, field: selectedField)
+                    case .replace:
+                        ReplaceSheet(session: session, item: item, field: selectedField)
+                    case .remove:
+                        RemoveSheet(session: session, item: item)
+                    }
+                } else {
+                    InspectorActionSheet(action: action, item: item, field: selectedField)
+                }
             }
+
 
         } else {
             ContentUnavailableView("No selection", systemImage: "sidebar.right", description: Text("Select a key, binding or entry to see its details."))

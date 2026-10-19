@@ -4,6 +4,8 @@ enum WindowID {
     static let about = "about"
     static let welcome = "welcome"
     static let approval = "approval"
+    static let paste = "paste"
 }
+
 
 

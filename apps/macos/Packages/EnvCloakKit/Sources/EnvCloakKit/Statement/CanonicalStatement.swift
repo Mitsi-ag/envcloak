@@ -27,9 +27,61 @@ public struct RenderedArgv: Equatable, Sendable {
     }
 }
 
+public enum UnlockerTarget: Equatable, Sendable {
+    case passphrase
+    case secureEnclave(
+        unlocker_id: String,
+        label: String,
+        unlock_pub_sha256: String,
+        approve_pub_sha256: String
+    )
+}
+
+public enum WriteAction: Equatable, Sendable {
+    case rotate(
+        item: String,
+        slug: String,
+        field: String,
+        field_name: String,
+        classification: String,
+        prior_count: UInt8,
+        grants: UInt64,
+        new_value_sha256: String
+    )
+    case remove(
+        item: String,
+        slug: String,
+        grants: UInt64
+    )
+    case unlockerAdd(
+        label: String,
+        unlock_pub_sha256: String,
+        approve_pub_sha256: String,
+        team_id: String,
+        signing_id: String
+    )
+    case unlockerRemove(unlocker: UnlockerTarget)
+}
+
+public struct WriteStatement: Equatable, Sendable {
+    public let target: String
+    public let nonce: String
+    public let vault_id: String
+    public let action: WriteAction
+
+    public init(target: String, nonce: String, vault_id: String, action: WriteAction) {
+        self.target = target
+        self.nonce = nonce
+        self.vault_id = vault_id
+        self.action = action
+    }
+}
+
 public enum CanonicalStatement {
     public static let domain = Data("envcloak-statement/2\n".utf8)
     public static let domainV1 = Data("envcloak-statement/1\n".utf8)
+    public static let writeDomain = Data("envcloak-write-statement/1\n".utf8)
+    public static let revealDomain = Data("envcloak-reveal-statement/1\n".utf8)
     public static let renderLimit = 2048
     public static let hidden = "[not shown: looks like a key or token]"
     public static let valueRun = 24
@@ -183,6 +235,95 @@ public enum CanonicalStatement {
 
     public static func digestV1Hex(_ descriptor: PendingDescriptor, options: ApprovalOptions) -> String {
         HexCoding.encode(Data(SHA256.hash(data: encodeV1(descriptor, options: options))))
+    }
+
+    public static func encodeWrite(_ statement: WriteStatement) -> Data {
+        var e = Encoder(domain: writeDomain)
+        e.str(statement.target)
+        e.str(statement.nonce)
+        e.str(statement.vault_id)
+        switch statement.action {
+        case let .rotate(item, slug, field, field_name, classification, prior_count, grants, new_value_sha256):
+            e.str("rotate")
+            e.str(item)
+            e.str(slug)
+            e.str(field)
+            e.str(field_name)
+            e.str(classification)
+            e.num(UInt64(prior_count))
+            e.num(grants)
+            e.str(new_value_sha256)
+        case let .remove(item, slug, grants):
+            e.str("remove")
+            e.str(item)
+            e.str(slug)
+            e.num(grants)
+        case let .unlockerAdd(label, unlock_pub_sha256, approve_pub_sha256, team_id, signing_id):
+            e.str("unlocker_add")
+            e.str(label)
+            e.str(unlock_pub_sha256)
+            e.str(approve_pub_sha256)
+            e.str(team_id)
+            e.str(signing_id)
+        case let .unlockerRemove(unlocker):
+            e.str("unlocker_remove")
+            switch unlocker {
+            case .passphrase:
+                e.str("passphrase")
+            case let .secureEnclave(unlocker_id, label, unlock_pub_sha256, approve_pub_sha256):
+                e.str("secure_enclave")
+                e.str(unlocker_id)
+                e.str(label)
+                e.str(unlock_pub_sha256)
+                e.str(approve_pub_sha256)
+            }
+        }
+        return e.data
+    }
+
+    public static func writeDigest(_ statement: WriteStatement) -> Data {
+        Data(SHA256.hash(data: encodeWrite(statement)))
+    }
+
+    public static func writeDigestHex(_ statement: WriteStatement) -> String {
+        HexCoding.encode(writeDigest(statement))
+    }
+
+    public static func encodeReveal(_ descriptor: RevealDescriptor) -> Data {
+        var e = Encoder(domain: revealDomain)
+        e.str(descriptor.request.raw)
+        e.str(descriptor.nonce.raw)
+        e.str(descriptor.app_eph_pub.raw)
+        e.str(descriptor.vault_id.raw)
+        e.str(descriptor.item.raw)
+        e.str(descriptor.slug.raw)
+        e.str(descriptor.field.raw)
+        e.str(descriptor.field_name.raw)
+        e.str(descriptor.classification.raw)
+        if let req = descriptor.requester {
+            e.flag(true)
+            e.str(req.kind.rawValue)
+            e.str(req.label?.raw ?? "")
+            e.flag(req.label != nil)
+            e.signed(req.caller_pid)
+            e.signed(req.root.pid)
+            e.num(req.root.start_time)
+            e.str(req.root.exe?.raw ?? "")
+            e.flag(req.root.exe != nil)
+        } else {
+            e.flag(false)
+        }
+        e.num(descriptor.created_secs)
+        e.num(descriptor.expires_in_secs)
+        return e.data
+    }
+
+    public static func revealDigest(_ descriptor: RevealDescriptor) -> Data {
+        Data(SHA256.hash(data: encodeReveal(descriptor)))
+    }
+
+    public static func revealDigestHex(_ descriptor: RevealDescriptor) -> String {
+        HexCoding.encode(revealDigest(descriptor))
     }
 
     public static func liveGuarded(_ kind: SubjectKind) -> Bool {

@@ -15,6 +15,12 @@ struct ApprovalsView: View {
         return session.grants.pending.filter { $0.project == canonical || $0.project == scope }
     }
 
+    var filteredAsks: [AskSummary] {
+        guard let scope else { return session.grants.asks }
+        let canonical = session.projects.canonicalDirectory(scope)
+        return session.grants.asks.filter { $0.project_dir == nil || $0.project_dir == canonical || $0.project_dir == scope }
+    }
+
     var filteredGrants: [GrantView] {
         let canonical = scope.map { session.projects.canonicalDirectory($0) }
         return session.grants.rows.filter { grant in
@@ -41,7 +47,7 @@ struct ApprovalsView: View {
                         Text("Waiting requests could not be refreshed. Try again.")
                             .foregroundStyle(ECToken.danger.color)
                             .accessibilityIdentifier("approvals.pending.error")
-                    } else if filteredPending.isEmpty {
+                    } else if filteredPending.isEmpty && filteredAsks.isEmpty {
                         Text("Nothing waiting. Requests from Claude Code, Codex and other agents appear here.")
                             .foregroundStyle(ECToken.secondary.color)
                             .accessibilityIdentifier("approvals.waiting.empty")
@@ -49,8 +55,12 @@ struct ApprovalsView: View {
                         ForEach(filteredPending, id: \.request) { item in
                             waitingRow(item)
                         }
+                        ForEach(filteredAsks, id: \.ask) { ask in
+                            askRow(ask)
+                        }
                     }
                 }
+
 
                 VStack(alignment: .leading, spacing: 8) {
                     Text("In force")
@@ -165,6 +175,41 @@ struct ApprovalsView: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("approvals.waiting." + item.request.escaped)
     }
+
+    private func askRow(_ ask: AskSummary) -> some View {
+        let caller = ask.requester.label?.escaped ?? ask.requester.kind.rawValue.capitalized
+        let providerText = ask.provider?.escaped ?? "a service"
+        let projectText = ask.project_dir.map { MetadataRequest.basename($0) } ?? "No project"
+        let remaining = session.grants.remainingAsk(ask)
+        return HStack(spacing: 12) {
+            Image(systemName: Self.subjectSymbol(ask.requester.kind))
+                .foregroundStyle(ECToken.secondary.color)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("\(caller) asks you to add a key for \(providerText)")
+                    .font(.headline)
+                    .foregroundStyle(ECToken.text.color)
+                Text(projectText)
+                    .font(.subheadline)
+                    .foregroundStyle(ECToken.secondary.color)
+            }
+            Spacer()
+            Text(Self.remainingWords(remaining))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(ECToken.secondary.color)
+            Button("Add key…") {
+                session.activeAsk = ask
+                openWindow(id: WindowID.paste)
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("approvals.ask.add." + ask.ask.escaped)
+        }
+        .padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("approvals.ask." + ask.ask.escaped)
+    }
+
 
     private func grantRow(_ grant: GrantView) -> some View {
         let who = grant.label?.escaped ?? grant.kind.rawValue.capitalized
