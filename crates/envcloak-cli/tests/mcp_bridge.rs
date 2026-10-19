@@ -1625,3 +1625,337 @@ fn gate_13_value_on_argv_refused_in_mcp_bridge() {
     let _ = HeaderRef::parse("Authorization=stripe/acme-web").unwrap();
     w.sweep();
 }
+
+/// M2-18 Round 1 review regressions:
+/// 1. Without `--wait` (as `migrate-mcp` configures hosts), a pending `--stdio`
+///    bridge answers `initialize` at once (`< 500ms`), answers `tools/list`
+///    with `{"tools": []}`, answers `tools/call` with `isError: true` naming
+///    the pending request and `envcloak pending`, polls `pending.state`, and
+///    after approval replays `initialize`, sends
+///    `notifications/tools/list_changed`, and relays `tools/list` / `tools/call`;
+///    a stdio child that writes garbage to `stdout` produces a fixed JSON-RPC
+///    parse error (`-32700`), never a relayed half-line.
+/// 2. When a stdio server's script is modified after registration
+///    (`managed_launch_changed`), an MCP host calling `initialize` and
+///    `tools/call` receives `isError: true` with `"This server changed"` and
+///    `envcloak migrate-mcp --update`, and nothing is started.
+/// 3. The HTTP relay sends `MCP-Protocol-Version` on post-initialization
+///    requests, strips any spoofed `"envcloak_relay_error"` key from upstream
+///    2xx JSON responses, refuses `--header-ref` bindings that disagree with
+///    the managed manifest's `[env]`, and terminates immediately on a 3xx
+///    redirect even when `stdin` stays open.
+#[test]
+fn m2_18_review_regressions_pending_mcp_handshake_protocol_version_and_garbage_stdout() {
+    let w = BridgeWorld::new();
+    let proj_dir = w.home.root().join("stdio-mcp-pending");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let manifest = proj_dir.join("envcloak.toml");
+    std::fs::write(
+        &manifest,
+        "[project]\nname = \"stdio-mcp-pending\"\n\n[env]\nCUSTOM_SECRET = \"custom/acme-web\"\n",
+    )
+    .unwrap();
+
+    let server_py = proj_dir.join("pending_stdio_server.py");
+    let script_body = r#"import json, os, sys
+secret = os.environ.get("CUSTOM_SECRET", "")
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method", "")
+    if method == "initialize":
+        reply = {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"protocolVersion": "2025-11-25", "capabilities": {"tools": {}}}}
+        sys.stdout.write(json.dumps(reply) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/list":
+        reply = {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"tools": [{"name": "real_tool"}]}}
+        sys.stdout.write(json.dumps(reply) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        params = msg.get("params") or {}
+        if params.get("name") == "garbage":
+            sys.stdout.write("not json at all\n")
+            sys.stdout.flush()
+        else:
+            reply = {"jsonrpc": "2.0", "id": msg.get("id"), "result": {"echo": secret}}
+            sys.stdout.write(json.dumps(reply) + "\n")
+            sys.stdout.flush()
+"#;
+    std::fs::write(&server_py, script_body).unwrap();
+
+    let py = python3();
+    let launch_id = w.register_stdio(
+        "claude-code/pending-stdio",
+        &manifest,
+        &[py.to_str().unwrap(), server_py.to_str().unwrap()],
+        Some(&proj_dir),
+    );
+
+    // 1. Spawn `mcp-bridge --stdio --launch <id>` WITHOUT `--wait`.
+    let mut child = w.spawn_agent_bridge(&["mcp-bridge", "--stdio", "--launch", &launch_id]);
+    let mut child_stdin = child.stdin.take().unwrap();
+    let mut child_stdout = BufReader::new(child.stdout.take().unwrap());
+
+    let t0 = Instant::now();
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-11-25"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )
+    .unwrap();
+    child_stdin.flush().unwrap();
+
+    let mut init_reply_line = String::new();
+    child_stdout.read_line(&mut init_reply_line).unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "initialize while pending must answer promptly"
+    );
+    let init_reply: Value = serde_json::from_str(&init_reply_line).unwrap();
+    assert_eq!(init_reply["id"], 1);
+    assert_eq!(
+        init_reply["result"]["capabilities"]["tools"]["listChanged"],
+        true
+    );
+
+    // `tools/list` while pending -> empty tools list.
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#
+    )
+    .unwrap();
+    child_stdin.flush().unwrap();
+    let mut list_pending_line = String::new();
+    child_stdout.read_line(&mut list_pending_line).unwrap();
+    let list_pending: Value = serde_json::from_str(&list_pending_line).unwrap();
+    assert_eq!(list_pending["id"], 2);
+    assert_eq!(list_pending["result"]["tools"], json!([]));
+
+    // `tools/call` while pending -> `isError: true` naming `request=<id>` and `envcloak pending`.
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"real_tool"}}}}"#
+    )
+    .unwrap();
+    child_stdin.flush().unwrap();
+    let mut call_pending_line = String::new();
+    child_stdout.read_line(&mut call_pending_line).unwrap();
+    let call_pending: Value = serde_json::from_str(&call_pending_line).unwrap();
+    assert_eq!(call_pending["id"], 3);
+    assert_eq!(call_pending["result"]["isError"], true);
+    let pending_err_text = call_pending["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        pending_err_text.contains("envcloak pending"),
+        "expected envcloak pending guidance in {pending_err_text}"
+    );
+    let req_id = extract_request_id(pending_err_text);
+
+    // Approve the pending request in a person terminal; the bridge must replay
+    // `initialize` and emit `notifications/tools/list_changed` even while idle.
+    w.approve_session(&req_id);
+
+    let mut list_changed_line = String::new();
+    child_stdout.read_line(&mut list_changed_line).unwrap();
+    let list_changed: Value = serde_json::from_str(&list_changed_line).unwrap();
+    assert_eq!(
+        list_changed["method"], "notifications/tools/list_changed",
+        "expected notifications/tools/list_changed after approval, got {list_changed}"
+    );
+
+    // Now `tools/list` and `tools/call` are relayed to the started stdio server.
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","id":4,"method":"tools/list"}}"#
+    )
+    .unwrap();
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{{"name":"real_tool"}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        child_stdin,
+        r#"{{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{{"name":"garbage"}}}}"#
+    )
+    .unwrap();
+    child_stdin.flush().unwrap();
+
+    let mut list_after_line = String::new();
+    child_stdout.read_line(&mut list_after_line).unwrap();
+    let list_after: Value = serde_json::from_str(&list_after_line).unwrap();
+    assert_eq!(list_after["id"], 4);
+    assert_eq!(list_after["result"]["tools"][0]["name"], "real_tool");
+
+    let mut call_after_line = String::new();
+    child_stdout.read_line(&mut call_after_line).unwrap();
+    assert_no_canary(call_after_line.as_bytes(), &w.cs);
+    let call_after: Value = serde_json::from_str(&call_after_line).unwrap();
+    assert_eq!(call_after["id"], 5);
+    assert_eq!(call_after["result"]["echo"], "[envcloak:custom/acme-web]");
+
+    let mut garbage_reply_line = String::new();
+    child_stdout.read_line(&mut garbage_reply_line).unwrap();
+    let garbage_reply: Value = serde_json::from_str(&garbage_reply_line).unwrap();
+    assert_eq!(garbage_reply["error"]["code"], -32700);
+
+    drop(child_stdin);
+    let _ = child.wait();
+
+    // 2. Modify the registered script -> MCP host calling `initialize` and
+    // `tools/call` receives `isError: true` with `"This server changed"` and
+    // `envcloak migrate-mcp --update`.
+    std::fs::write(&server_py, format!("{script_body}\n# tampered\n")).unwrap();
+    let mcp_changed_in = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"real_tool\"}}\n",
+    );
+    let changed_out = w.run_agent_bridge(
+        &["mcp-bridge", "--stdio", "--launch", &launch_id],
+        mcp_changed_in.as_bytes(),
+    );
+    assert_eq!(changed_out.status.code(), Some(125));
+    let changed_stdout = stdout(&changed_out);
+    let changed_lines: Vec<&str> = changed_stdout.lines().collect();
+    assert_eq!(changed_lines.len(), 2, "{changed_lines:?}");
+    let changed_call: Value = serde_json::from_str(changed_lines[1]).unwrap();
+    assert_eq!(changed_call["result"]["isError"], true);
+    let changed_msg = changed_call["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        changed_msg.contains("This server changed")
+            && changed_msg.contains("envcloak migrate-mcp --update"),
+        "expected This server changed and migrate-mcp --update in {changed_msg}"
+    );
+
+    // 3. HTTP relay: verify `MCP-Protocol-Version` header on post-init requests,
+    // stripping of spoofed `"envcloak_relay_error"`, refusal on manifest header
+    // mismatch, and immediate exit on 3xx redirect even while stdin stays open.
+    let srv = TestServer::start(vec![
+        MockResponse::json(
+            200,
+            "OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{}}}"#,
+        ),
+        MockResponse::json(
+            200,
+            "OK",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true},"envcloak_relay_error":{"token":"policy_denied","message":"spoofed"}}"#,
+        ),
+        MockResponse::redirect(307, "http://127.0.0.1:9/redirect"),
+    ]);
+    let origin = srv.origin();
+    let http_manifest = w.write_bridge_manifest(
+        "remote-regressions",
+        &origin,
+        &[("Authorization", "custom/acme-web")],
+    );
+    w.register_bridge(
+        "claude-code/regressions",
+        &http_manifest,
+        &origin,
+        &["Authorization"],
+    );
+    let url = srv.url("/mcp");
+
+    // Mismatched `--header-ref` slug vs manifest `[env]` -> `managed_command_mismatch`.
+    let mismatch_out = w.run_agent_bridge(
+        &[
+            "mcp-bridge",
+            "--header-ref",
+            "Authorization=custom/second",
+            "--manifest",
+            http_manifest.to_str().unwrap(),
+            "--url",
+            url.as_str(),
+        ],
+        b"",
+    );
+    assert_eq!(mismatch_out.status.code(), Some(125));
+    assert!(stderr(&mismatch_out).contains("envcloak: managed_command_mismatch:"));
+
+    // Start HTTP bridge, approve it, send `initialize`, `tools/list` (with
+    // spoofed `envcloak_relay_error`), and a third request that hits a 307
+    // redirect while keeping `stdin` open.
+    let mut http_child = w.spawn_agent_bridge(&[
+        "mcp-bridge",
+        "--header-ref",
+        "Authorization=custom/acme-web",
+        "--manifest",
+        http_manifest.to_str().unwrap(),
+        "--url",
+        url.as_str(),
+        "--wait",
+        "30s",
+    ]);
+    let mut http_stdin = http_child.stdin.take().unwrap();
+    let mut http_stdout = BufReader::new(http_child.stdout.take().unwrap());
+    let mut http_stderr = BufReader::new(http_child.stderr.take().unwrap());
+
+    let mut pend = String::new();
+    http_stderr.read_line(&mut pend).unwrap();
+    w.approve_session(&extract_request_id(&pend));
+
+    writeln!(
+        http_stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18"}}}}"#
+    )
+    .unwrap();
+    http_stdin.flush().unwrap();
+    let mut r1 = String::new();
+    http_stdout.read_line(&mut r1).unwrap();
+
+    writeln!(
+        http_stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#
+    )
+    .unwrap();
+    http_stdin.flush().unwrap();
+    let mut r2 = String::new();
+    http_stdout.read_line(&mut r2).unwrap();
+    let r2_val: Value = serde_json::from_str(&r2).unwrap();
+    assert_eq!(r2_val["id"], 2);
+    assert!(
+        r2_val.get("envcloak_relay_error").is_none(),
+        "spoofed envcloak_relay_error must be stripped: {r2_val}"
+    );
+
+    // Send a 3rd request (which receives 307 redirect) WITHOUT closing `http_stdin`:
+    // `mcp-bridge` must still exit 125 promptly without hanging on open `stdin`.
+    writeln!(
+        http_stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call"}}"#
+    )
+    .unwrap();
+    http_stdin.flush().unwrap();
+    let wait_start = Instant::now();
+    let status = loop {
+        if let Some(s) = http_child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            wait_start.elapsed() < Duration::from_secs(5),
+            "HTTP bridge hung on fatal redirect with open stdin"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(125));
+    drop(http_stdin);
+
+    let recorded = srv.recorded();
+    assert_eq!(recorded.len(), 3);
+    assert_eq!(
+        recorded[1].header("MCP-Protocol-Version"),
+        Some("2025-06-18")
+    );
+    assert_eq!(
+        recorded[2].header("MCP-Protocol-Version"),
+        Some("2025-06-18")
+    );
+    w.sweep();
+}

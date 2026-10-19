@@ -11,18 +11,20 @@
 //! and forwards MCP JSON-RPC messages between its own standard streams and
 //! the relay.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use envcloak_client::claims::claims;
 use envcloak_client::fail::Failure;
 use envcloak_core::vault::{FieldName, Slug};
 use envcloak_ipc::proto::{BridgeDecl, RunRequestParams};
-use envcloak_policy::load_project;
 use envcloak_policy::managed::{bridge_binding_name, bridge_headers};
+use envcloak_policy::{escape_for_display, load_project};
 use serde_json::{Value, json};
 
-use super::handoff::{StartedPipes, WaitBudget, request_pipes};
+use super::handoff::{BridgeSession, WaitBudget, connect_bridge};
+use crate::rpc::{self, PARSE_ERROR, PARSE_MESSAGE};
+use crate::stdio::{Line, LineReader};
 
 /// Maximum URL length accepted on `--url`.
 pub const MAX_URL_LEN: usize = 2048;
@@ -263,30 +265,26 @@ pub fn run_http(config: &HttpBridgeConfig) -> Result<(), Failure> {
         ));
     };
 
-    // Preserve BindingSource::Env when the manifest's [env] already binds the
-    // exact same `<HEADER>_O<16hex> = "<slug>[#<field>]"`; otherwise pass the
-    // explicit `--header-ref` bindings in `refs` so the daemon resolves them.
-    let explicit_refs: Vec<String> = expected_bindings
-        .iter()
-        .zip(&config.headers)
-        .map(|((_, binding_name), h)| format!("{binding_name}={}", h.reference()))
-        .collect();
-    let refs = match load_project(&config.manifest) {
-        Ok(proj)
-            if proj.manifest.env.len() == expected_bindings.len()
-                && expected_bindings.iter().zip(&config.headers).all(
-                    |((_, binding_name), h)| {
-                        proj.manifest.env.iter().any(|b| {
-                            b.env_name.as_str() == binding_name
-                                && b.reference.to_string() == h.reference()
-                        })
-                    },
-                ) =>
-        {
-            Vec::new()
+    // Verify that the managed manifest's `[env]` bindings match the requested
+    // `--header-ref` arguments rather than overriding the manifest via `refs`.
+    if let Ok(proj) = load_project(&config.manifest) {
+        let matches_manifest = proj.manifest.env.len() == expected_bindings.len()
+            && expected_bindings
+                .iter()
+                .zip(&config.headers)
+                .all(|((_, binding_name), h)| {
+                    proj.manifest.env.iter().any(|b| {
+                        b.env_name.as_str() == binding_name
+                            && b.reference.to_string() == h.reference()
+                    })
+                });
+        if !matches_manifest {
+            return Err(Failure::new(
+                "managed_command_mismatch",
+                "the requested --header-ref bindings do not match the managed manifest",
+            ));
         }
-        _ => explicit_refs,
-    };
+    }
 
     let manifest_str = config.manifest.to_string_lossy().into_owned();
     let mut argv = vec![
@@ -304,7 +302,7 @@ pub fn run_http(config: &HttpBridgeConfig) -> Result<(), Failure> {
     let params = RunRequestParams {
         manifest: manifest_str,
         profile: None,
-        refs,
+        refs: Vec::new(),
         env_file: None,
         argv,
         claims: claims(),
@@ -316,17 +314,21 @@ pub fn run_http(config: &HttpBridgeConfig) -> Result<(), Failure> {
         fds: Vec::new(),
     };
 
-    let pipes = request_pipes(&params, false, config.wait)?;
-    pump_http(&config.url, pipes)
+    let session = connect_bridge(&params, false, config.wait)?;
+    pump_http(&config.url, session)
 }
 
-fn pump_http(url: &BridgeUrl, pipes: StartedPipes) -> Result<(), Failure> {
-    let StartedPipes {
-        mut to_child,
-        from_child,
-        from_errors: _,
-        lifeline,
-    } = pipes;
+fn pump_http(url: &BridgeUrl, session: BridgeSession) -> Result<(), Failure> {
+    let BridgeSession {
+        pipes,
+        stdin_rx,
+        queued_stdin,
+        replayed_initialize,
+        saw_initialized_notification,
+    } = session;
+    let mut to_child = pipes.to_child;
+    let from_child = pipes.from_child;
+    let lifeline = pipes.lifeline;
 
     // Send the full target URL to the relay and read its startup readiness
     // line before forwarding MCP traffic.
@@ -338,22 +340,24 @@ fn pump_http(url: &BridgeUrl, pipes: StartedPipes) -> Result<(), Failure> {
         .and_then(|()| to_child.flush())
         .map_err(|_| relay_failed("the relay closed before accepting the target URL"))?;
 
-    let mut reader = BufReader::new(from_child);
-    let mut first_line = String::new();
-    let n = reader
-        .read_line(&mut first_line)
-        .map_err(|_| relay_failed("the relay closed before reporting readiness"))?;
-    if n == 0 {
-        return Err(relay_failed("the relay exited before reporting readiness"));
-    }
-    if let Ok(v) = serde_json::from_str::<Value>(first_line.trim()) {
+    let mut reader = LineReader::new(from_child);
+    let first_bytes = match reader.next_line() {
+        Ok(Line::Message(b)) => b,
+        Ok(Line::Oversized) => {
+            return Err(relay_failed("the relay handshake exceeded the line cap"));
+        }
+        Ok(Line::End) | Err(_) => {
+            return Err(relay_failed("the relay closed before reporting readiness"));
+        }
+    };
+    if let Ok(v) = serde_json::from_slice::<Value>(&first_bytes) {
         if v.get("ok").and_then(Value::as_bool) == Some(false) {
             let kind = v.get("token").and_then(Value::as_str).unwrap_or("");
-            let msg = v
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("the relay refused the bridged session")
-                .to_owned();
+            let msg = escape_for_display(
+                v.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the relay refused the bridged session"),
+            );
             return Err(match kind {
                 "policy_denied" => Failure::new("policy_denied", msg),
                 "value_too_short" => Failure::new("value_too_short", msg),
@@ -363,16 +367,74 @@ fn pump_http(url: &BridgeUrl, pipes: StartedPipes) -> Result<(), Failure> {
         }
     }
 
-    // Pump stdin -> relay in a background thread.
+    // If `initialize` was answered locally while pending, replay it to the
+    // started relay, absorb the upstream `initialize` reply, send
+    // `notifications/initialized` if seen, and emit
+    // `notifications/tools/list_changed` to stdout.
+    if let Some(mut init_line) = replayed_initialize {
+        init_line.push(b'\n');
+        let _ = to_child.write_all(&init_line);
+        let _ = to_child.flush();
+        if let Ok(Line::Message(init_reply)) = reader.next_line() {
+            if let Some(f) = parse_relay_error_line(&init_reply) {
+                return Err(f);
+            }
+        }
+        if saw_initialized_notification {
+            let _ = to_child
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+            let _ = to_child.flush();
+        }
+        let mut out = std::io::stdout().lock();
+        let _ = out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n");
+        let _ = out.flush();
+    }
+
+    for mut queued in queued_stdin {
+        queued.push(b'\n');
+        let _ = to_child.write_all(&queued);
+        let _ = to_child.flush();
+    }
+
+    // Pump stdin -> relay line by line (`MAX_LINE = 1 MiB`) in a background
+    // thread.
     std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if to_child.write_all(&buf[..n]).is_err() || to_child.flush().is_err() {
-                        break;
+        match stdin_rx {
+            Some(rx) => {
+                while let Ok(item) = rx.recv() {
+                    match item {
+                        Ok(Line::Message(mut bytes)) => {
+                            bytes.push(b'\n');
+                            if to_child.write_all(&bytes).is_err() || to_child.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Line::Oversized) => {
+                            let mut out = std::io::stdout().lock();
+                            let _ = out.write_all(&rpc::error(None, PARSE_ERROR, PARSE_MESSAGE));
+                            let _ = out.flush();
+                        }
+                        Ok(Line::End) | Err(_) => break,
+                    }
+                }
+            }
+            None => {
+                let mut stdin_reader = LineReader::new(std::io::stdin());
+                loop {
+                    match stdin_reader.next_line() {
+                        Ok(Line::Message(mut bytes)) => {
+                            bytes.push(b'\n');
+                            if to_child.write_all(&bytes).is_err() || to_child.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Line::Oversized) => {
+                            let mut out = std::io::stdout().lock();
+                            let _ = out.write_all(&rpc::error(None, PARSE_ERROR, PARSE_MESSAGE));
+                            let _ = out.flush();
+                        }
+                        Ok(Line::End) | Err(_) => break,
                     }
                 }
             }
@@ -381,28 +443,35 @@ fn pump_http(url: &BridgeUrl, pipes: StartedPipes) -> Result<(), Failure> {
     });
 
     // Read lines from relay -> stdout, intercepting any internal relay error
-    // frame `{"envcloak_relay_error": ...}` so it is reported on stderr.
-    let mut stdout = std::io::stdout().lock();
-    let mut line = String::new();
+    // frame `{"envcloak_relay_error": ...}` and breaking immediately so
+    // `mcp-bridge` exits 125 without hanging on an open `stdin`.
     let mut fatal: Option<Failure> = None;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {
-                if let Some(f) = parse_relay_error_line(&line) {
+        match reader.next_line() {
+            Ok(Line::Message(mut bytes)) => {
+                if let Some(f) = parse_relay_error_line(&bytes) {
                     fatal = Some(f);
-                    continue;
+                    break;
                 }
-                if stdout.write_all(line.as_bytes()).is_err() || stdout.flush().is_err() {
+                bytes.push(b'\n');
+                let mut stdout = std::io::stdout().lock();
+                if stdout.write_all(&bytes).is_err() || stdout.flush().is_err() {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Ok(Line::Oversized) => {
+                let mut stdout = std::io::stdout().lock();
+                if stdout
+                    .write_all(&rpc::error(None, PARSE_ERROR, PARSE_MESSAGE))
+                    .is_err()
+                    || stdout.flush().is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Line::End) | Err(_) => break,
         }
     }
-    drop(stdout);
     drop(reader);
     drop(lifeline);
 
@@ -412,15 +481,19 @@ fn pump_http(url: &BridgeUrl, pipes: StartedPipes) -> Result<(), Failure> {
     Ok(())
 }
 
-fn parse_relay_error_line(line: &str) -> Option<Failure> {
-    let v: Value = serde_json::from_str(line.trim()).ok()?;
-    let err = v.get("envcloak_relay_error")?;
+fn parse_relay_error_line(line: &[u8]) -> Option<Failure> {
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let obj = v.as_object()?;
+    if obj.len() != 1 {
+        return None;
+    }
+    let err = obj.get("envcloak_relay_error")?;
     let kind = err.get("token").and_then(Value::as_str).unwrap_or("");
-    let msg = err
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("the HTTP relay refused the request")
-        .to_owned();
+    let msg = escape_for_display(
+        err.get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("the HTTP relay refused the request"),
+    );
     Some(match kind {
         "policy_denied" => Failure::new("policy_denied", msg),
         "managed_command_mismatch" => Failure::new("managed_command_mismatch", msg),

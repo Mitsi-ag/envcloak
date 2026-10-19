@@ -406,25 +406,37 @@ pub fn serve_with_agent<R: Read, W: Write>(
         ));
     }
     let mut session_id: Option<String> = None;
-    let mut fatal: Option<Failure> = None;
+    let mut protocol_version: Option<String> = None;
 
     if let Some(line) = first_line {
-        if let Err(f) =
-            handle_client_line(prepared, agent, target_url, &mut session_id, &line, output)
-        {
+        if let Err(f) = handle_client_line(
+            prepared,
+            agent,
+            target_url,
+            &mut session_id,
+            &mut protocol_version,
+            &line,
+            output,
+        ) {
             write_relay_error(output, &f);
-            fatal = Some(f);
+            return Err(f);
         }
     }
 
     loop {
         match input.next_line() {
             Ok(Line::Message(line)) => {
-                if let Err(f) =
-                    handle_client_line(prepared, agent, target_url, &mut session_id, &line, output)
-                {
+                if let Err(f) = handle_client_line(
+                    prepared,
+                    agent,
+                    target_url,
+                    &mut session_id,
+                    &mut protocol_version,
+                    &line,
+                    output,
+                ) {
                     write_relay_error(output, &f);
-                    fatal = Some(f);
+                    return Err(f);
                 }
             }
             Ok(Line::Oversized) => {
@@ -440,9 +452,6 @@ pub fn serve_with_agent<R: Read, W: Write>(
         }
     }
 
-    if let Some(f) = fatal {
-        return Err(f);
-    }
     Ok(())
 }
 
@@ -451,16 +460,28 @@ fn handle_client_line<W: Write>(
     agent: &ureq::Agent,
     target_url: &str,
     session_id: &mut Option<String>,
+    protocol_version: &mut Option<String>,
     line: &[u8],
     output: &mut W,
 ) -> Result<(), Failure> {
+    let mut init_req_version: Option<String> = None;
     let req_id = match rpc::parse(line) {
         Incoming::Invalid { id, code, message } => {
             let _ = output.write_all(&rpc::error(id.as_ref(), code, message));
             let _ = output.flush();
             return Ok(());
         }
-        Incoming::Request { id, .. } => Some(id),
+        Incoming::Request { id, method, params } => {
+            if method == "initialize" {
+                init_req_version = params
+                    .as_ref()
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(Value::as_str)
+                    .filter(|s| is_valid_protocol_version(s))
+                    .map(ToOwned::to_owned);
+            }
+            Some(id)
+        }
         Incoming::Notification { .. } | Incoming::Response => None,
     };
 
@@ -470,6 +491,9 @@ fn handle_client_line<W: Write>(
         .header("Accept", "application/json, text/event-stream");
     if let Some(sid) = session_id.as_deref() {
         req = req.header("Mcp-Session-Id", sid);
+    }
+    if let Some(ver) = protocol_version.as_deref() {
+        req = req.header("MCP-Protocol-Version", ver);
     }
     for h in &prepared.headers {
         #[allow(clippy::disallowed_methods)]
@@ -544,6 +568,13 @@ fn handle_client_line<W: Write>(
                         continue;
                     }
                     let redacted = redact_json_line(&prepared.redactor, ev.data.as_bytes());
+                    if protocol_version.is_none() {
+                        if let Some(v) =
+                            extract_protocol_version(&redacted).or_else(|| init_req_version.clone())
+                        {
+                            *protocol_version = Some(v);
+                        }
+                    }
                     let _ = output.write_all(&redacted);
                     let _ = output.flush();
                 }
@@ -582,6 +613,13 @@ fn handle_client_line<W: Write>(
             })?;
         if !body.iter().all(u8::is_ascii_whitespace) {
             let redacted = redact_json_line(&prepared.redactor, &body);
+            if protocol_version.is_none() {
+                if let Some(v) =
+                    extract_protocol_version(&redacted).or_else(|| init_req_version.clone())
+                {
+                    *protocol_version = Some(v);
+                }
+            }
             let _ = output.write_all(&redacted);
             let _ = output.flush();
         }
@@ -594,6 +632,9 @@ fn handle_client_line<W: Write>(
         read_bounded(response.into_body().into_reader(), MAX_ERROR_BODY_BYTES).unwrap_or_default();
     let redacted_text = redact_text(&prepared.redactor, &err_body);
     if let Ok(mut v) = serde_json::from_str::<Value>(redacted_text.trim()) {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("envcloak_relay_error");
+        }
         if v.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
             && (v.get("error").is_some() || v.get("result").is_some())
         {
@@ -629,6 +670,19 @@ fn handle_client_line<W: Write>(
     Ok(())
 }
 
+fn is_valid_protocol_version(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.bytes().all(|b| (0x21..=0x7E).contains(&b))
+}
+
+fn extract_protocol_version(line: &[u8]) -> Option<String> {
+    let v: Value = serde_json::from_slice(line).ok()?;
+    let ver = v
+        .get("result")
+        .and_then(|r| r.get("protocolVersion"))
+        .and_then(Value::as_str)?;
+    is_valid_protocol_version(ver).then(|| ver.to_owned())
+}
+
 /// Redacts `raw` through both the bound-secret [`Redactor`] and the provider
 /// registry's [`envcloak_providers::Registry::mask_keys`], returning a single
 /// newline-terminated JSON line.
@@ -637,6 +691,9 @@ pub fn redact_json_line(redactor: &Redactor, raw: &[u8]) -> Vec<u8> {
     let first_pass = redact_text(redactor, raw);
     let single_line = match serde_json::from_str::<Value>(first_pass.trim()) {
         Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.remove("envcloak_relay_error");
+            }
             if let Some(id_val) = v.get("id") {
                 if !id_val.is_null() && Id::from_value(id_val).is_none() {
                     if let Some(obj) = v.as_object_mut() {

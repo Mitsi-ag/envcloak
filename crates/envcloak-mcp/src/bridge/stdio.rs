@@ -8,15 +8,18 @@
 //! pumps its own standard input and output to and from the daemon-started
 //! runner (`envcloak run --launch <id>`) while holding the lifeline open.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use envcloak_client::claims::claims;
 use envcloak_client::fail::Failure;
 use envcloak_ipc::proto::RunRequestParams;
+use serde_json::Value;
 
-use super::handoff::{StartedPipes, WaitBudget, request_pipes};
+use super::handoff::{BridgeSession, WaitBudget, connect_bridge};
+use crate::rpc::{self, Id, PARSE_ERROR, PARSE_MESSAGE};
+use crate::stdio::{Line, LineReader};
 
 /// Configuration for `envcloak mcp-bridge --stdio --launch <id>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,29 +52,88 @@ pub fn run_stdio(config: &StdioBridgeConfig) -> Result<(), Failure> {
         bridge: None,
         fds: Vec::new(),
     };
-    let pipes = request_pipes(&params, true, config.wait)?;
-    pump_stdio(pipes)
+    let session = connect_bridge(&params, true, config.wait)?;
+    pump_stdio(session)
 }
 
-fn pump_stdio(pipes: StartedPipes) -> Result<(), Failure> {
-    let StartedPipes {
-        mut to_child,
-        mut from_child,
-        from_errors,
-        lifeline,
-    } = pipes;
+fn pump_stdio(session: BridgeSession) -> Result<(), Failure> {
+    let BridgeSession {
+        pipes,
+        stdin_rx,
+        queued_stdin,
+        replayed_initialize,
+        saw_initialized_notification: _,
+    } = session;
+    let mut to_child = pipes.to_child;
+    let from_child = pipes.from_child;
+    let from_errors = pipes.from_errors;
+    let lifeline = pipes.lifeline;
 
-    // Forward stdin -> runner in a background thread; when stdin reaches EOF,
-    // dropping `to_child` closes the runner's stdin.
+    let mut child_reader = LineReader::new(from_child);
+
+    // If `initialize` was answered locally while pending, replay it to the
+    // started child server, absorb the child's `initialize` response, send
+    // `notifications/initialized`, and notify the host with
+    // `notifications/tools/list_changed`.
+    if let Some(mut init_line) = replayed_initialize {
+        init_line.push(b'\n');
+        let _ = to_child.write_all(&init_line);
+        let _ = to_child.flush();
+        let _ = child_reader.next_line();
+        let _ =
+            to_child.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n");
+        let _ = to_child.flush();
+        let mut out = std::io::stdout().lock();
+        let _ = out
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n");
+        let _ = out.flush();
+    }
+
+    for mut queued in queued_stdin {
+        queued.push(b'\n');
+        let _ = to_child.write_all(&queued);
+        let _ = to_child.flush();
+    }
+
+    // Forward stdin -> runner line by line (`MAX_LINE = 1 MiB`) in a background
+    // thread; when stdin reaches EOF, dropping `to_child` closes the runner's
+    // stdin.
     std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 16 * 1024];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if to_child.write_all(&buf[..n]).is_err() || to_child.flush().is_err() {
-                        break;
+        match stdin_rx {
+            Some(rx) => {
+                while let Ok(item) = rx.recv() {
+                    match item {
+                        Ok(Line::Message(mut bytes)) => {
+                            bytes.push(b'\n');
+                            if to_child.write_all(&bytes).is_err() || to_child.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Line::Oversized) => {
+                            let mut out = std::io::stdout().lock();
+                            let _ = out.write_all(&rpc::error(None, PARSE_ERROR, PARSE_MESSAGE));
+                            let _ = out.flush();
+                        }
+                        Ok(Line::End) | Err(_) => break,
+                    }
+                }
+            }
+            None => {
+                let mut reader = LineReader::new(std::io::stdin());
+                loop {
+                    match reader.next_line() {
+                        Ok(Line::Message(mut bytes)) => {
+                            bytes.push(b'\n');
+                            if to_child.write_all(&bytes).is_err() || to_child.flush().is_err() {
+                                break;
+                            }
+                        }
+                        Ok(Line::Oversized) => {
+                            let mut out = std::io::stdout().lock();
+                            let _ = out.write_all(&rpc::error(None, PARSE_ERROR, PARSE_MESSAGE));
+                            let _ = out.flush();
+                        }
+                        Ok(Line::End) | Err(_) => break,
                     }
                 }
             }
@@ -101,25 +163,34 @@ fn pump_stdio(pipes: StartedPipes) -> Result<(), Failure> {
         })
     });
 
-    // Forward runner stdout -> our stdout on the main thread.
-    let mut stdout = std::io::stdout().lock();
-    let mut buf = [0u8; 16 * 1024];
+    // Forward runner stdout -> our stdout line by line on the main thread,
+    // validating that each line is a single JSON-RPC 2.0 object within 1 MiB.
     let mut wrote_stdout = false;
     loop {
-        match from_child.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
+        match child_reader.next_line() {
+            Ok(Line::Message(bytes)) => {
                 wrote_stdout = true;
-                if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+                let out_line = sanitize_stdio_child_line(&bytes);
+                let mut out = std::io::stdout().lock();
+                if out.write_all(&out_line).is_err() || out.flush().is_err() {
                     break;
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Ok(Line::Oversized) => {
+                wrote_stdout = true;
+                let mut out = std::io::stdout().lock();
+                if out
+                    .write_all(&rpc::error(None, PARSE_ERROR, PARSE_MESSAGE))
+                    .is_err()
+                    || out.flush().is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Line::End) | Err(_) => break,
         }
     }
-    drop(stdout);
-    drop(from_child);
+    drop(child_reader);
     drop(lifeline);
 
     if let Some(h) = err_handle {
@@ -130,6 +201,35 @@ fn pump_stdio(pipes: StartedPipes) -> Result<(), Failure> {
         return Err(Failure::new("run_failed", ""));
     }
     Ok(())
+}
+
+/// Validates that `bytes` from a stdio child server is a valid UTF-8 JSON-RPC
+/// 2.0 object, sanitizing any unsafe `"id"`, or returns a fixed protocol
+/// parse error line if the child wrote garbage or a half-line.
+fn sanitize_stdio_child_line(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut v) = serde_json::from_slice::<Value>(bytes) else {
+        return rpc::error(None, PARSE_ERROR, PARSE_MESSAGE);
+    };
+    let Some(obj) = v.as_object_mut() else {
+        return rpc::error(None, PARSE_ERROR, PARSE_MESSAGE);
+    };
+    if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || (!obj.contains_key("result")
+            && !obj.contains_key("error")
+            && !obj.contains_key("method"))
+    {
+        return rpc::error(None, PARSE_ERROR, PARSE_MESSAGE);
+    }
+    if let Some(id_val) = obj.get("id") {
+        if !id_val.is_null() && Id::from_value(id_val).is_none() {
+            obj.insert("id".to_owned(), Value::Null);
+        }
+    }
+    let Ok(mut out) = serde_json::to_vec(&v) else {
+        return rpc::error(None, PARSE_ERROR, PARSE_MESSAGE);
+    };
+    out.push(b'\n');
+    out
 }
 
 fn is_runner_failure_line(line: &[u8]) -> bool {
