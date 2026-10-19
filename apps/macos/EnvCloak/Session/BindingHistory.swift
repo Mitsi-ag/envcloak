@@ -5,6 +5,7 @@ import Foundation
 /// belong to the receipt's wiping storage and expire with this session.
 @MainActor final class BindingHistory {
     private let runner: CLIRunner?
+    var applyOverride: (@MainActor (BindingEdit) async -> Bool)?
     private var records: [(UUID, BindingEdit, UndoReceipt)] = []
     private var busy = false
     private var epoch = 0
@@ -12,6 +13,12 @@ import Foundation
     func clear() { epoch += 1; records = [] }
 
     func apply(_ edit: BindingEdit, session: VaultSession, manager: UndoManager?) async -> Bool {
+        if let applyOverride {
+            guard !busy, session.state == .ready, edit.cliArguments != nil else {
+                session.notice = "The binding could not be edited. Check its variable, key and project."; return false
+            }
+            return await applyOverride(edit)
+        }
         guard !busy, session.state == .ready, let runner, let args = edit.cliArguments else {
             session.notice = "The binding could not be edited. Check its variable, key and project."; return false
         }

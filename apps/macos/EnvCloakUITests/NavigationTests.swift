@@ -35,10 +35,13 @@ final class NavigationTests: XCTestCase {
         XCTAssertTrue(window.staticTexts["No grants in force"].waitForExistence(timeout: 10))
         // The Python fixture independently checks grants.list after this test.
         app.typeKey("3", modifierFlags: .command)
-        let approvals = window.descendants(matching: .any)["sidebar.Approvals"].firstMatch
-        XCTAssertTrue(approvals.waitForExistence(timeout: 10))
-        XCTAssertTrue(approvals.staticTexts["Arrives with Touch ID approvals"].exists)
-        assertElementLabel("Approvals. Arrives with Touch ID approvals", identifier: "feature.unavailable", in: window)
+        let waitingEmpty = window.descendants(matching: .any)["approvals.waiting.empty"].firstMatch
+        XCTAssertTrue(waitingEmpty.waitForExistence(timeout: 10), window.debugDescription)
+        app.typeKey("4", modifierFlags: .command)
+        let activity = window.descendants(matching: .any)["sidebar.Activity"].firstMatch
+        XCTAssertTrue(activity.waitForExistence(timeout: 10))
+        XCTAssertTrue(activity.staticTexts["Arrives with Touch ID approvals"].exists)
+        assertElementLabel("Activity. Arrives with Touch ID approvals", identifier: "feature.unavailable", in: window)
     }
 
     @MainActor private func assertElementLabel(_ text: String, identifier: String, in window: XCUIElement,

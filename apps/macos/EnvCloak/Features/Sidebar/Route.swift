@@ -20,7 +20,7 @@ enum Route: Hashable {
     }
     var unavailableMessage: String? {
         switch self {
-        case .approvals, .activity, .agents: "Arrives with Touch ID approvals"
+        case .activity, .agents: "Arrives with Touch ID approvals"
         case .later(.spend), .later(.dashboard): "Spend arrives in M4"
         case .later(.devices): "Devices arrive in M5"
         default: nil

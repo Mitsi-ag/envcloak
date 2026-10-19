@@ -266,7 +266,7 @@ pub struct ApprovalProof {
 }
 
 impl ApprovalProof {
-    fn is_refused(&self) -> bool {
+    pub fn is_refused(&self) -> bool {
         match self.kind {
             ProofKind::Passphrase => self.approver.proof_refusal().is_some(),
             ProofKind::SecureEnclave { .. } => {

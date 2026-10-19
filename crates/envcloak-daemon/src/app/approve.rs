@@ -11,8 +11,11 @@ use envcloak_sys::PeerIdentity;
 use crate::audit::AuditEvent;
 use crate::clock::now_of;
 use crate::lock::Reading;
-use crate::requests::{self, approve_error, digest_of, live_refused, subject_summary};
+use crate::requests::{
+    self, approve_error, digest_of, live_refused, refresh_pending_standing, subject_summary,
+};
 use crate::server::{Shared, locked, refuse_if_traced};
+use envcloak_core::audit::ProjectSummary;
 
 use super::decode_fixed_bytes;
 
@@ -43,9 +46,45 @@ pub(crate) fn approve(
         return Err(RpcError::new(ErrorKind::ProofRefused));
     }
 
+    let home = crate::standing::home_dir();
     let mut s = locked(&shared.state);
     let now = now_of(&shared.clocks);
     let items = s.unlocked()?.items().to_vec();
+    refresh_pending_standing(shared, &mut s, &id, &now, &items);
+
+    if p.options.standing.is_some() {
+        let pending_req = s
+            .grants()
+            .pending(&id, &now)
+            .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?
+            .request
+            .clone();
+        if !s
+            .grants()
+            .unticked_items(&id, &p.options, &now, &items)
+            .is_empty()
+        {
+            let who = subject_summary(peer, &approver);
+            return Err(live_refused(
+                &mut s, peer, who, &id, &p.options, &now, &items,
+            ));
+        }
+        if s.epoch_state() == crate::policy_epoch::EpochState::Unverified {
+            return Err(RpcError::new(ErrorKind::PolicyEpochUnverified));
+        }
+        let _ = s
+            .standing()
+            .build_record(
+                &pending_req,
+                &p.options,
+                None,
+                &shared.catalog,
+                home.as_deref(),
+                now.wall,
+                &items,
+            )
+            .map_err(crate::standing::standing_error)?;
+    }
 
     match s
         .grants()
@@ -72,6 +111,50 @@ pub(crate) fn approve(
         return Err(RpcError::new(ErrorKind::SignatureInvalid));
     };
 
+    let who = subject_summary(peer, &approver);
+    let proof = ApprovalProof {
+        approver,
+        kind: ProofKind::SecureEnclave { unlocker_id },
+    };
+    let pending_req = s
+        .grants()
+        .pending(&id, &now)
+        .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?
+        .request
+        .clone();
+    let standing_created = if let Some(standing_ttl) = p.options.standing {
+        if s.epoch_state() == crate::policy_epoch::EpochState::Unverified {
+            return Err(RpcError::new(ErrorKind::PolicyEpochUnverified));
+        }
+        let appended = s
+            .standing()
+            .self_update_target(
+                &pending_req,
+                &shared.catalog,
+                home.as_deref(),
+                now.wall,
+                &items,
+            )
+            .is_some();
+        let record = s
+            .standing()
+            .build_record(
+                &pending_req,
+                &p.options,
+                Some(&proof),
+                &shared.catalog,
+                home.as_deref(),
+                now.wall,
+                &items,
+            )
+            .map_err(crate::standing::standing_error)?;
+        let standing_id = record.id.to_string();
+        crate::standing::put_record(&mut s, record)?;
+        Some((standing_id, standing_ttl.as_secs(), appended))
+    } else {
+        None
+    };
+
     let grant_id = s.grants().fresh_grant_id();
     let ttl = p.options.ttl_secs;
     let uses = match p.options.uses {
@@ -89,11 +172,6 @@ pub(crate) fn approve(
         return Err(RpcError::new(ErrorKind::AuditFailed));
     }
 
-    let who = subject_summary(peer, &approver);
-    let proof = ApprovalProof {
-        approver,
-        kind: ProofKind::SecureEnclave { unlocker_id },
-    };
     let opts = p.options.clone();
     let grant = match s
         .grants()
@@ -106,10 +184,38 @@ pub(crate) fn approve(
         Err(e) => return Err(approve_error(e)),
     };
     s.touch(Reading::now(&shared.clocks));
+    if let Some((ref standing_id, standing_secs, appended)) = standing_created {
+        s.audit(AuditEvent::StandingCreated {
+            pid: peer.pid,
+            subject: who,
+            standing: standing_id.clone(),
+            grant: grant.to_string(),
+            project: ProjectSummary {
+                dir: pending_req
+                    .project
+                    .canonical_dir
+                    .to_string_lossy()
+                    .into_owned(),
+                manifest_sha256: pending_req.manifest_sha256,
+                approved_sha256: None,
+            },
+            items: pending_req
+                .bindings
+                .iter()
+                .map(|b| (b.binding.item, b.slug.clone()))
+                .collect(),
+            ttl_secs: standing_secs,
+            appended,
+        });
+    }
+    let (standing, standing_expires_in_secs) = match standing_created {
+        Some((id, secs, _)) => (Some(id), Some(secs)),
+        None => (None, None),
+    };
     Ok(ApprovedView {
         grant: grant.to_string(),
         expires_in_secs: ttl,
-        standing: None,
-        standing_expires_in_secs: None,
+        standing,
+        standing_expires_in_secs,
     })
 }

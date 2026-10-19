@@ -45,6 +45,48 @@ final class MethodTests: XCTestCase {
         XCTAssertEqual(add["account"] as? String, "account")
         XCTAssertEqual(add["env_hint"] as? String, "VARIABLE")
         XCTAssertEqual(add["allow_short"] as? Bool, true)
+
+        let enrollBegin = try params(AppUnlockerEnrollBegin(unlock_pub: "04aa", approve_pub: "04bb", label: "Touch ID", claims: ["ui"]))
+        XCTAssertEqual(enrollBegin["unlock_pub"] as? String, "04aa")
+        XCTAssertEqual(enrollBegin["approve_pub"] as? String, "04bb")
+        XCTAssertEqual(enrollBegin["label"] as? String, "Touch ID")
+        XCTAssertEqual(enrollBegin["claims"] as? [String], ["ui"])
+
+        let enrollPoll = try params(AppUnlockerEnroll(request: "REQ12345"))
+        XCTAssertEqual(enrollPoll["request"] as? String, "REQ12345")
+
+        XCTAssertTrue(try params(AppUnlockBegin()).isEmpty)
+        let unlockBeginWithId = try params(AppUnlockBegin(unlocker_id: "00112233445566778899aabbccddeeff"))
+        XCTAssertEqual(unlockBeginWithId["unlocker_id"] as? String, "00112233445566778899aabbccddeeff")
+
+        let unlockFinish = try params(AppUnlock(request_id: "REQ12345", sealed: "deadbeef"))
+        XCTAssertEqual(unlockFinish["request_id"] as? String, "REQ12345")
+        XCTAssertEqual(unlockFinish["sealed"] as? String, "deadbeef")
+
+        XCTAssertTrue(try params(AppPendingList()).isEmpty)
+        XCTAssertEqual(try params(AppPendingGet(request: "REQ12345"))["request"] as? String, "REQ12345")
+
+        let approveParams = try params(
+            AppApprove(
+                request: "REQ12345",
+                options: ApprovalOptions(uses: .session, ttl_secs: 3600, live: ["STRIPE_KEY"], standing: 86400),
+                digest: String(repeating: "ab", count: 32),
+                signature: String(repeating: "cd", count: 64)
+            )
+        )
+        XCTAssertEqual(approveParams["request"] as? String, "REQ12345")
+        XCTAssertEqual(approveParams["digest"] as? String, String(repeating: "ab", count: 32))
+        XCTAssertEqual(approveParams["signature"] as? String, String(repeating: "cd", count: 64))
+        let optsDict = approveParams["options"] as? [String: Any]
+        XCTAssertEqual(optsDict?["uses"] as? String, "session")
+        XCTAssertEqual((optsDict?["ttl_secs"] as? NSNumber)?.uint64Value, 3600)
+        XCTAssertEqual(optsDict?["live"] as? [String], ["STRIPE_KEY"])
+        XCTAssertEqual((optsDict?["standing"] as? NSNumber)?.uint64Value, 86400)
+
+        XCTAssertTrue(try params(StandingList()).isEmpty)
+        let standingRevoke = try params(StandingRevoke(id: "01JSTAND", all: false))
+        XCTAssertEqual(standingRevoke["id"] as? String, "01JSTAND")
+        XCTAssertEqual(standingRevoke["all"] as? Bool, false)
     }
 
     func testStatusSanitizesBothUntrustedStringsAndRejectsNestedExtras() throws {

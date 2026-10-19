@@ -1232,7 +1232,7 @@ fn request_id(p: &RequestParams) -> Result<PendingId, RpcError> {
 
 /// Updates the pending request's [`StandingSummary`] so a Linux self-update's
 /// `appends_to` target matches what `StandingStore::build_record` will do.
-fn refresh_pending_standing(
+pub(crate) fn refresh_pending_standing(
     shared: &Shared,
     s: &mut crate::state::State,
     id: &PendingId,

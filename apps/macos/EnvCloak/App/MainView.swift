@@ -16,6 +16,7 @@ struct MainView: View {
     @State private var grouping = KeyGrouping.none
     @State private var columns = NavigationSplitViewVisibility.all
     @FocusState private var searchFocused: Bool
+    @Environment(\.openWindow) private var openWindow
     init(session: VaultSession, initialRoute: Route = .projects) {
         self.session = session
         _route = State(initialValue: initialRoute)
@@ -40,7 +41,18 @@ struct MainView: View {
                             }
                         }.tag(Route.keys(filter)).padding(.leading, 12)
                     }
-                    unavailableRow(.approvals, icon: "tray")
+                    HStack {
+                        Label("Approvals", systemImage: session.pendingCount > 0 ? "tray.full" : "tray")
+                        if session.pendingCount > 0 {
+                            Spacer()
+                            Text("\(session.pendingCount)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(ECToken.secondary.color)
+                        }
+                    }
+                    .tag(Route.approvals)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("sidebar.Approvals")
                     unavailableRow(.activity, icon: "clock.arrow.circlepath")
                     unavailableRow(.agents, icon: "terminal")
                     Label("Settings", systemImage: "gearshape").tag(Route.settings)
@@ -83,6 +95,14 @@ struct MainView: View {
         .searchFocused($searchFocused)
         .toolbar {
             ToolbarItemGroup {
+                if session.pendingCount > 0 {
+                    Button("Review \(session.pendingCount) \(session.pendingCount == 1 ? "request" : "requests")") {
+                        session.openApprovalWindow()
+                        openWindow(id: WindowID.approval)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("toolbar.review")
+                }
                 Button { paste = true } label: { Label("Add key", systemImage: "plus") }.accessibilityIdentifier("key.add").disabled(session.state != .ready)
                 Button { addFolder() } label: { Label("Add project folder…", systemImage: "folder.badge.plus") }
                     .help("Add project folder…").disabled(session.state != .ready)
@@ -119,6 +139,11 @@ struct MainView: View {
             navigate: { route = $0 }, search: { searchFocused = true },
             addFolder: { addFolder() }, addKey: { paste = true }, lock: { Task { await session.lock() } },
             group: { grouping = $0 }, ready: session.state == .ready, canLock: session.state.canLock))
+        .onAppear {
+            session.onOpenApprovalWindow = { [openWindow] in
+                openWindow(id: WindowID.approval)
+            }
+        }
         .onDisappear { session.bindings.clear() }
         .task { await session.run() }
     }
@@ -137,6 +162,7 @@ struct MainView: View {
             guard let project = session.projects.opened, project.directory == directory else { return "Not checked" }
             return "\(project.check.bindings.count) bindings across profiles"
         case .keys: return scope.map(MetadataRequest.basename) ?? "All projects"
+        case .approvals: return "\(session.pendingCount) waiting, \(session.grants.rows.count) in force"
         default: return ""
         }
     }
@@ -158,9 +184,11 @@ struct MainView: View {
             case .project(let dir): ProjectDetail(session: session, directory: dir, selectedKey: $selectedKey, bind: { binding = $0 })
             case .keys(let filter): KeysView(session: session, filter: filter, query: query, scope: scope, grouping: $grouping, selectedKey: $selectedKey)
             case .key(let slug): KeyInspector(session: session, slug: slug, route: $route, bind: { binding = $0 })
+            case .approvals: ApprovalsView(session: session, scope: scope)
             case .settings:
                 VStack(alignment: .leading, spacing: 16) {
                     DevelopmentBanner()
+                    EnrolView(session: session)
                     Text("Unlock in Terminal with envcloak unlock. Touch ID, Recovery Kit settings and agent integrations arrive in later builds.")
                     Text("Policies and the idle limit cannot be edited in this build.")
                     Spacer()

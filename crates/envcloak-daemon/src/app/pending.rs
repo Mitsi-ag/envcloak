@@ -80,6 +80,7 @@ pub(crate) fn get(
         return Err(RpcError::new(ErrorKind::NoSuchRequest));
     }
     let items = s.unlocked()?.items().to_vec();
+    requests::refresh_pending_standing(shared, &mut s, &id, &now, &items);
     s.grants()
         .pending_descriptor(&id, &now, &items)
         .ok_or(RpcError::new(ErrorKind::NoSuchRequest))

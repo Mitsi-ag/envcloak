@@ -1,4 +1,5 @@
 import AppKit
+import EnvCloakKitTestSupport
 import SwiftUI
 import XCTest
 @testable import EnvCloak
@@ -26,6 +27,7 @@ import XCTest
     #endif
 
     private func host<V: View>(_ view: V) -> NSWindow {
+        Darwin.signal(SIGPIPE, SIG_IGN)
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1180, height: 740), styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: view.frame(width: 1180, height: 740))
@@ -453,15 +455,14 @@ import XCTest
         await session.openProject(DaemonText("/tmp/project"))
         let window = host(MainView(session: session, initialRoute: .settings))
         await assertVisible("project\\u{202e}\\u{1b}[31m", in: window)
-        for title in ["Approvals", "Activity", "Agents"] {
+        for title in ["Activity", "Agents"] {
             await assertScoped("Arrives with Touch ID approvals", identifier: "sidebar." + title, in: window)
         }
         await assertVisible("Spend · M4", in: window)
         await assertVisible("Devices · M5", in: window)
         window.close()
         for (route, expected) in [
-            (Route.approvals, "Approvals. Arrives with Touch ID approvals"),
-            (.activity, "Activity. Arrives with Touch ID approvals"),
+            (Route.activity, "Activity. Arrives with Touch ID approvals"),
             (.agents, "Agents. Arrives with Touch ID approvals"),
             (.later(.spend), "Spend. Spend arrives in M4"),
             (.later(.devices), "Devices. Devices arrive in M5"),
@@ -472,10 +473,131 @@ import XCTest
             await assertElementLabel(expected, identifier: "feature.unavailable", in: detail)
             detail.close()
         }
+        let approvals = host(MainView(session: session, initialRoute: .approvals))
+        await assertVisible("Nothing waiting. Requests from Claude Code, Codex and other agents appear here.", in: approvals)
+        XCTAssertTrue(identified("feature.unavailable", in: approvals, accessibilityOnly: true).isEmpty)
+        approvals.close()
         let exposed = host(MainView(session: session, initialRoute: .keys(.exposed)))
         await assertVisible("No exposed keys.", in: exposed)
         XCTAssertTrue(identified("feature.unavailable", in: exposed, accessibilityOnly: true).isEmpty)
         exposed.close()
+    }
+
+    func testApprovalsScreenRendersWaitingGrantsStandingAndEscapesHostileText() async {
+        let client = ScriptedClient()
+        await client.hostileMetadata()
+        await client.configure(grants: 2, pending: 1)
+        await client.setStandingCount(1)
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        let window = host(ApprovalsView(session: session, scope: nil))
+        await assertVisible("claude_code\\u{202e}\\u{1b}[31m wants to run", in: window)
+        await assertVisible("STRIPE_SECRET_KEY, OPENAI_API_KEY", in: window)
+        await assertVisible("Review", in: window)
+        await assertVisible("Fixture grant\\u{202e}\\u{1b}[31m", in: window)
+        await assertVisible("Revoke all", in: window)
+        await assertVisible(
+            "any claude_code\\u{202e}\\u{1b}[31m session in this project, including one started by another program, gets these keys without asking",
+            in: window
+        )
+        XCTAssertFalse(labels(window).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+        window.close()
+    }
+
+    func testApprovalWindowScreenRendersV2StatementControlsTruncationStandingWarningAndEscapesHostileArgv() async throws {
+        let client = ScriptedClient()
+        await client.hostileMetadata()
+        await client.configure(pending: 1)
+        let signer = SoftwareApprovalSigner()
+        let session = VaultSession(client: client, approvalSigner: signer)
+        await session.poll()
+
+        let model = ApprovalWindowModel(session: session)
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        model.completeGuardPeriodForTesting()
+
+        let window = host(ApprovalWindowView(model: model))
+        await assertVisible("claude_code\\u{202e}\\u{1b}[31m wants to run", in: window)
+        await assertVisible("npm test\\u{202e}\\u{1b}[31m", in: window)
+        await assertVisible("in project\\u{202e}\\u{1b}[31m with 2 keys", in: window)
+        await assertVisible("Test key available: stripe/acme-test.", in: window)
+        await assertVisible("Use test key instead", in: window)
+        await assertVisible("Already granted in this project. This approval includes them too.", in: window)
+        await assertVisible("ALREADY_COVERED", in: window)
+        await assertVisible("Tick each live key to approve, or use its test key.", in: window)
+        assertDisabled("Approve with Touch ID", in: window)
+        XCTAssertFalse(labels(window).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+
+        // Selecting a standing duration displays the exact spec warning copy (M3-J2).
+        model.durationChoice = .standingDays7
+        model.completeGuardPeriodForTesting()
+        await assertVisible(
+            "any claude_code\\u{202e}\\u{1b}[31m session in this project, including one started by another program, gets these keys without asking",
+            in: window
+        )
+
+        // Verify > 2 KB argv truncation and "Show full command" control (M3-12).
+        let baseDescriptor = try XCTUnwrap(model.descriptor)
+        let longDescriptor = PendingDescriptor(
+            request: baseDescriptor.request,
+            nonce: baseDescriptor.nonce,
+            created_secs: baseDescriptor.created_secs,
+            expires_in_secs: baseDescriptor.expires_in_secs,
+            subject: baseDescriptor.subject,
+            project: baseDescriptor.project,
+            bindings: baseDescriptor.bindings,
+            proposals: baseDescriptor.proposals,
+            mode: baseDescriptor.mode,
+            argv: [
+                DaemonText("node"),
+                DaemonText(String(repeating: "x", count: 2500)),
+            ],
+            managed: baseDescriptor.managed,
+            standing: baseDescriptor.standing
+        )
+        model.applyDescriptor(longDescriptor)
+        await assertVisible("Show full command", in: window)
+        XCTAssertTrue(labels(window).contains { $0.contains("more bytes)") })
+    }
+
+    func testUnlockAndEnrolScreensRenderStatesAndSSHRefusal() async {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(vault: "locked")
+        let session = VaultSession(client: client)
+        session.enrolledTouchID = false
+        await session.poll()
+
+        // Default unenrolled state.
+        let window = host(UnlockView(session: session))
+        await assertVisible("Unlock with Touch ID", in: window)
+        await assertVisible("Add Touch ID", in: window)
+        await assertVisible("Touch ID, or your login password when Touch ID is not available", in: window)
+
+        // Clamshell closed state.
+        session.clamshellClosed = true
+        await assertVisible("Touch ID is not available with the lid closed. Use your password.", in: window)
+        await assertVisible("Unlock with password", in: window)
+        session.clamshellClosed = false
+
+        // SSH session refusal state.
+        session.sshSession = true
+        await assertVisible("Touch ID cannot be used over SSH. Approve in a terminal with envcloak approve <id>.", in: window)
+        session.sshSession = false
+
+        // Pending enrolment instructions state.
+        await client.setEnrollState("pending")
+        session.enrolmentPendingId = DaemonText("ENROL123")
+        session.enrolmentCommand = "envcloak approve ENROL123"
+        await assertVisible("Approve this once in Terminal with your passphrase: envcloak approve ENROL123", in: window)
+        await assertVisible("envcloak approve ENROL123", in: window)
+
+        // Completed enrolment state.
+        await client.setEnrollState("enrolled")
+        session.enrolmentPendingId = nil
+        session.enrolmentCompleted = true
+        await assertVisible("Touch ID added", in: window)
     }
 
     func testFirstRunScanScreenRendersWaitingAndFixtureReportAndSweepsClean() async throws {
