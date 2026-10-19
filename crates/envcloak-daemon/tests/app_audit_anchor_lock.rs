@@ -716,16 +716,26 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
     drop(c);
     drop(d_no_anchor);
 
-    // Start the daemon with `ENVCLOAK_TEST_ANCHOR_FILE`.
+    // Start the daemon with `ENVCLOAK_TEST_ANCHOR_FILE`. Because `seed_vault_with_kit`
+    // wrote items offline (`write_counter > 1`) with no keychain anchor yet,
+    // the first unlock detects `KeychainAnchorState::Missing` (`F-M3-16-01`),
+    // re-creates the anchor file, and after lock+unlock reports `Matched`.
     let d = start_daemon(&home, Some(&app_id), Some(&anchor_file));
     let mut c = client(&home);
+    c.unlock(passphrase(&cs), &[]).unwrap();
+    assert_eq!(
+        c.status().unwrap().vault.keychain_anchor,
+        KeychainAnchorState::Missing
+    );
+    let a0 = read_anchor_file(&anchor_file);
+    assert_eq!(a0.vault_id, vault_id);
+    c.lock().unwrap();
     c.unlock(passphrase(&cs), &[]).unwrap();
     assert_eq!(
         c.status().unwrap().vault.keychain_anchor,
         KeychainAnchorState::Matched
     );
     let a0 = read_anchor_file(&anchor_file);
-    assert_eq!(a0.vault_id, vault_id);
 
     // Enroll a Secure Enclave unlocker so we can test both `app.items.remove`
     // and `app.unlock` rollback detection.
@@ -733,6 +743,15 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
     let se_unlocker_id = enroll_se_over_socket(&mut c, &cs, &unlock_pub, &approve_pub, "Touch ID");
     let a_after_enroll = read_anchor_file(&anchor_file);
     assert!(a_after_enroll.write_counter > a0.write_counter);
+    assert!(a_after_enroll.audit_seq > a0.audit_seq);
+
+    // Verify `grants.revoke` immediately advances the keychain anchor's `audit_seq` (`F-M3-16-03`).
+    c.grants_revoke(None).unwrap();
+    let a_after_revoke = read_anchor_file(&anchor_file);
+    assert!(
+        a_after_revoke.audit_seq > a_after_enroll.audit_seq,
+        "grants.revoke must immediately advance the keychain anchor audit_seq"
+    );
 
     // Add a temporary item and verify the anchor advances.
     c.items_add(&AddParams {
@@ -749,7 +768,7 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
     })
     .unwrap();
     let a_after_add = read_anchor_file(&anchor_file);
-    assert!(a_after_add.write_counter > a_after_enroll.write_counter);
+    assert!(a_after_add.write_counter > a_after_revoke.write_counter);
 
     // Snapshot `vault.db` (and its WAL files) before `items.remove`, then
     // remove `temp/cli-item`. Drop the daemon without calling `lock` so that
@@ -763,6 +782,10 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
     assert!(
         a_after_cli_remove.write_counter > a_after_add.write_counter,
         "items.remove must update the keychain rollback anchor immediately"
+    );
+    assert!(
+        a_after_cli_remove.audit_seq > a_after_add.audit_seq,
+        "items.remove must immediately anchor its Removed audit_seq"
     );
     drop(c);
     drop(d);
@@ -789,11 +812,13 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
             ..AppAuditListParams::default()
         })
         .unwrap();
-    assert_eq!(mismatch_page.entries.len(), 1);
-    assert_eq!(mismatch_page.entries[0].outcome, "tampered");
-    assert_eq!(
-        mismatch_page.entries[0].reason.as_deref(),
-        Some("rolled_back")
+    assert!(
+        mismatch_page
+            .entries
+            .iter()
+            .any(|e| e.outcome == "tampered" && e.reason.as_deref() == Some("rolled_back")),
+        "expected tampered/rolled_back entry, got {:?}",
+        mismatch_page.entries
     );
 
     // Grants (`run.request`) and writes (`items.add`) are refused with
@@ -870,7 +895,8 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
         recreated_page.entries
     );
 
-    // Also verify `app.items.rotate` updates the anchor.
+    // Also verify `app.items.rotate` updates the anchor, while preserving
+    // `KeychainAnchorState::Missing` until the next lock/unlock cycle (`F-M3-16-01`).
     let a_before_rotate = read_anchor_file(&anchor_file);
     let t_rot = c.app_items_target(SLUGS[0], None, &[]).unwrap();
     let rot_secret = SecretBytes::copy_from(by_label(&cs, labels::OPENAI_API_KEY_ROTATED).value());
@@ -905,6 +931,11 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
     .unwrap();
     let a_after_rotate = read_anchor_file(&anchor_file);
     assert!(a_after_rotate.write_counter > a_before_rotate.write_counter);
+    assert_eq!(
+        c.status().unwrap().vault.keychain_anchor,
+        KeychainAnchorState::Missing,
+        "KeychainAnchorState::Missing must persist until the next lock/unlock cycle"
+    );
 
     // Snapshot `vault.db` before `app.items.remove`, then remove `temp/cli-item`
     // via `app.items.remove` without calling `lock` before dropping the daemon.
@@ -933,6 +964,10 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
         a_after_app_remove.write_counter > a_after_rotate.write_counter,
         "app.items.remove must update the keychain rollback anchor immediately"
     );
+    assert!(
+        a_after_app_remove.audit_seq > a_after_rotate.audit_seq,
+        "app.items.remove must immediately anchor its Removed audit_seq"
+    );
     drop(c);
     drop(d);
 
@@ -959,8 +994,9 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
 
     // Also verify `vault.create` transitions `status.vault.keychain_anchor`
     // from `None` to `Matched`, and that equal `write_counter` with altered
-    // `state_digest`, higher `epoch`, or higher `audit_seq` in the anchor file
-    // each trigger `Tampered` / `Ahead` / `rolled_back`.
+    // `state_digest`, higher `epoch`, higher `audit_seq`, a different
+    // `vault_id`, or a corrupt/wrong-length record in the anchor file each
+    // trigger `Tampered` / `Ahead` / `rolled_back` (`F-M3-16-02`).
     let fresh_home = TestHome::new();
     let fresh_anchor_file = fresh_home.root().join("fresh-anchor.bin");
     let d_fresh = start_daemon(&fresh_home, Some(&app_id), Some(&fresh_anchor_file));
@@ -998,10 +1034,14 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
             audit_seq: base_anchor.audit_seq + 1,
             ..base_anchor
         },
+        Anchor {
+            vault_id: VaultId([0x99; 16]),
+            ..base_anchor
+        },
     ] {
         let line = format!(
             "{}:{}\n",
-            hex_encode(&mutated.vault_id.0),
+            hex_encode(&base_anchor.vault_id.0),
             hex_encode(&mutated.encode()),
         );
         std::fs::write(&fresh_anchor_file, line).unwrap();
@@ -1014,6 +1054,24 @@ fn rollback_after_items_remove_and_app_items_remove_marks_vault_tampered() {
         );
         c_fresh.lock().unwrap();
     }
+
+    // Corrupt (wrong-length) keychain anchor record must also fail closed into
+    // `Integrity::Tampered` / `KeychainAnchorState::Ahead` without overwriting
+    // the corrupt anchor (`F-M3-16-02`).
+    let corrupt_line = format!("{}:deadbeef\n", hex_encode(&base_anchor.vault_id.0));
+    std::fs::write(&fresh_anchor_file, &corrupt_line).unwrap();
+    let unlocked = c_fresh.unlock(passphrase(&cs), &[]).unwrap();
+    assert_eq!(unlocked.integrity, Integrity::Tampered);
+    assert!(unlocked.read_only);
+    assert_eq!(
+        c_fresh.status().unwrap().vault.keychain_anchor,
+        KeychainAnchorState::Ahead
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fresh_anchor_file).unwrap(),
+        corrupt_line,
+        "corrupt keychain anchor must not be overwritten by unlock"
+    );
 
     drop(c_fresh);
     drop(d_fresh);

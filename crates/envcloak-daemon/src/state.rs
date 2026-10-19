@@ -914,8 +914,7 @@ impl State {
                 k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
             });
         }
-        self.anchor_if_due(None);
-        self.sync_anchor();
+        self.anchor_now();
         Ok(env)
     }
 
@@ -955,8 +954,7 @@ impl State {
                 k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
             });
         }
-        self.anchor_if_due(None);
-        self.sync_anchor();
+        self.anchor_now();
         Ok(())
     }
 
@@ -1125,13 +1123,24 @@ impl State {
     /// written now when the log is open, queued otherwise (see
     /// [`crate::audit::AuditLog`]).
     pub fn audit(&mut self, e: AuditEvent) {
+        let critical = matches!(
+            e,
+            AuditEvent::Removed { .. }
+                | AuditEvent::RecoveryConfirmed { .. }
+                | AuditEvent::UnlockerAdd { .. }
+                | AuditEvent::UnlockerRemove { .. }
+        );
         if let Some(line) = e.line() {
             log_line!("{line}");
         }
         self.audit_open();
         self.audit.record(e.record());
-        self.anchor_if_due(None);
-        self.sync_anchor();
+        if critical {
+            self.anchor_now();
+        } else {
+            self.anchor_if_due(None);
+            self.sync_anchor();
+        }
     }
 
     /// Writes a delivery's entry durably, before anything is released
@@ -1424,6 +1433,30 @@ impl State {
         }
     }
 
+    /// Immediately saves the current audit head in the unlocked vault's header
+    /// and syncs the keychain rollback anchor (SPEC §5 "Integrity", D3-12).
+    pub fn anchor_now(&mut self) {
+        let saved = match &mut self.slot {
+            Slot::Unlocked(v) if v.integrity() == Integrity::Ok => {
+                if let Some(head) = self.audit.head() {
+                    if v.header().ok().and_then(|h| h.audit_head) != Some(head) {
+                        Some((self.save_head)(v, head))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(res) = saved {
+            let ok = res.is_ok();
+            let _ = self.audit.anchor_saved(ok, None);
+        }
+        self.sync_anchor();
+    }
+
     /// Compares `v` at unlock against the stored keychain rollback anchor
     /// (SPEC §5 "Keychain rollback anchor", D3-12).
     fn check_anchor_at_unlock(&mut self, pid: i32, v: &mut Vault) -> Option<AuditEvent> {
@@ -1460,8 +1493,10 @@ impl State {
             }
             Ok(None) => {
                 let had_anchor = self.anchored_vaults.contains(&vault_id.0)
-                    || v.header().is_ok_and(|h| h.audit_head.is_some())
+                    || v.header()
+                        .is_ok_and(|h| h.write_counter > 1 || h.audit_head.is_some())
                     || v.se_unlockers().next().is_some();
+                let mut wrote_ok = false;
                 if v.integrity() == Integrity::Ok
                     && let Ok(anchor) = v.anchor()
                 {
@@ -1469,6 +1504,7 @@ impl State {
                         Ok(()) => {
                             self.anchored_vaults.insert(vault_id.0);
                             self.last_synced_anchor = Some(anchor);
+                            wrote_ok = true;
                         }
                         Err(AnchorError::Unavailable) => {
                             self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1489,9 +1525,21 @@ impl State {
                         reason: "keychain_anchor_missing",
                     })
                 } else {
-                    self.keychain_anchor = KeychainAnchorState::Matched;
+                    if wrote_ok {
+                        self.keychain_anchor = KeychainAnchorState::Matched;
+                    }
                     None
                 }
+            }
+            Err(AnchorError::Corrupt) => {
+                let _ = v.mark_tampered(TamperKind::RolledBack);
+                self.anchored_vaults.insert(vault_id.0);
+                self.keychain_anchor = KeychainAnchorState::Ahead;
+                Some(AuditEvent::KeychainAnchorMismatch {
+                    pid,
+                    outcome: "tampered",
+                    reason: "rolled_back",
+                })
             }
             Err(AnchorError::Unavailable) => {
                 self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1524,7 +1572,9 @@ impl State {
             Ok(()) => {
                 self.anchored_vaults.insert(v.vault_id().0);
                 self.last_synced_anchor = Some(anchor);
-                self.keychain_anchor = KeychainAnchorState::Matched;
+                if self.keychain_anchor != KeychainAnchorState::Missing {
+                    self.keychain_anchor = KeychainAnchorState::Matched;
+                }
             }
             Err(AnchorError::Unavailable) => {
                 self.keychain_anchor = KeychainAnchorState::Unavailable;
@@ -1559,7 +1609,9 @@ impl State {
             Ok(()) => {
                 self.anchored_vaults.insert(vault_id.0);
                 self.last_synced_anchor = Some(anchor);
-                self.keychain_anchor = KeychainAnchorState::Matched;
+                if self.keychain_anchor != KeychainAnchorState::Missing {
+                    self.keychain_anchor = KeychainAnchorState::Matched;
+                }
             }
             Err(AnchorError::Unavailable) => {
                 self.keychain_anchor = KeychainAnchorState::Unavailable;
