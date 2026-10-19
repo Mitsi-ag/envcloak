@@ -675,20 +675,20 @@ extension ExposedView {
 
 public struct FirstRunProviderView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `provider`: DaemonText
-    public let `keys`: UInt64
-    public let `live_keys`: UInt64
+    public let `total_count`: UInt64
+    public let `live_count`: UInt64
     public var description: String { "[FirstRunProviderView]" }
     public var debugDescription: String { description }
-    public init(provider: DaemonText, keys: UInt64, live_keys: UInt64) {
+    public init(provider: DaemonText, total_count: UInt64, live_count: UInt64) {
         self.provider = provider
-        self.keys = keys
-        self.live_keys = live_keys
+        self.total_count = total_count
+        self.live_count = live_count
     }
     init(wire: WireReader) throws {
-        let o = try wire.object(["provider", "keys", "live_keys"])
+        let o = try wire.object(["provider", "total_count", "live_count"])
         self.`provider` = try o.decode("provider")
-        self.`keys` = try o.decode("keys")
-        self.`live_keys` = try o.decode("live_keys")
+        self.`total_count` = try o.decode("total_count")
+        self.`live_count` = try o.decode("live_count")
     }
     public var displayName: String {
         let text = provider.escaped
@@ -710,124 +710,102 @@ public struct FirstRunProviderView: Sendable, Equatable, WireDecodable, CustomSt
         }
     }
     public var summaryLabel: String {
-        live_keys > 0 ? "\(displayName) \(keys), \(live_keys) live" : "\(displayName) \(keys)"
+        live_count > 0 ? "\(displayName) \(total_count), \(live_count) live" : "\(displayName) \(total_count)"
     }
 }
 
 public struct FirstRunAccountView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `email`: DaemonText
-    public let `keys`: UInt64
+    public let `account`: DaemonText
+    public let `count`: UInt64
     public var description: String { "[FirstRunAccountView]" }
     public var debugDescription: String { description }
-    public init(email: DaemonText, keys: UInt64) {
-        self.email = email
-        self.keys = keys
+    public init(account: DaemonText, count: UInt64) {
+        self.account = account
+        self.count = count
     }
     init(wire: WireReader) throws {
-        let o = try wire.object(["email", "keys"])
-        self.`email` = try o.decode("email")
-        self.`keys` = try o.decode("keys")
+        let o = try wire.object(["account", "count"])
+        self.`account` = try o.decode("account")
+        self.`count` = try o.decode("count")
     }
     public var summaryLabel: String {
-        "\(email.escaped) (\(keys))"
+        "\(account.escaped) (\(count))"
     }
 }
 
 public struct FirstRunLeakedPlaceView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `source`: ExposureSourceView
-    public let `subject`: DaemonText?
-    public let `files`: UInt64
-    public let `occurrences`: UInt64
+    public let `display_path`: DaemonText
+    public let `count`: UInt64
     public var description: String { "[FirstRunLeakedPlaceView]" }
     public var debugDescription: String { description }
-    public init(source: ExposureSourceView, subject: DaemonText? = nil, files: UInt64, occurrences: UInt64) {
-        self.source = source
-        self.subject = subject
-        self.files = files
-        self.occurrences = occurrences
+    public init(display_path: DaemonText, count: UInt64) {
+        self.display_path = display_path
+        self.count = count
     }
     init(wire: WireReader) throws {
-        let o = try wire.object(["source", "subject", "files", "occurrences"])
-        self.`source` = try o.decode("source")
-        self.`subject` = try o.optional("subject")
-        self.`files` = try o.decode("files")
-        self.`occurrences` = try o.decode("occurrences")
+        let o = try wire.object(["display_path", "count"])
+        self.`display_path` = try o.decode("display_path")
+        self.`count` = try o.decode("count")
     }
     public var placeSummary: String {
-        let label = subject?.escaped
-        let kind: String = switch source {
-        case .transcript:
-            if let label, !label.isEmpty { "\(label) transcripts" } else { "agent transcripts" }
-        case .gitHistory: "git history"
-        case .configBackup:
-            if let label, !label.isEmpty { "\(label) config backups" } else { "config backups" }
-        case .syncedFolder:
-            if let label, !label.isEmpty { "\(label) synced folder" } else { "synced folders" }
-        case .shellProfile: "shell profiles"
-        case .agentConfig:
-            if let label, !label.isEmpty { "\(label) configs" } else { "agent configs" }
-        case .envFile: ".env files"
-        }
-        return "\(kind), \(files) \(files == 1 ? "file" : "files")"
+        "\(display_path.escaped) (\(count))"
     }
 }
 
 public struct FirstRunLeakedItemView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `slug`: DaemonText
     public let `provider`: DaemonText?
-    public let `classification`: ClassificationView
     public let `rotate_url`: DaemonText?
+    public let `sources`: [ExposureSourceView]
     public let `places`: [FirstRunLeakedPlaceView]
     public var description: String { "[FirstRunLeakedItemView]" }
     public var debugDescription: String { description }
-    public init(slug: DaemonText, provider: DaemonText? = nil, classification: ClassificationView = .unknown, rotate_url: DaemonText? = nil, places: [FirstRunLeakedPlaceView]) {
+    public init(slug: DaemonText, provider: DaemonText? = nil, rotate_url: DaemonText? = nil, sources: [ExposureSourceView], places: [FirstRunLeakedPlaceView]) {
         self.slug = slug
         self.provider = provider
-        self.classification = classification
         self.rotate_url = rotate_url
+        self.sources = sources
         self.places = places
     }
     init(wire: WireReader) throws {
-        let o = try wire.object(["slug", "provider", "classification", "rotate_url", "places"])
+        let o = try wire.object(["slug", "provider", "rotate_url", "sources", "places"])
         self.`slug` = try o.decode("slug")
         self.`provider` = try o.optional("provider")
-        self.`classification` = try o.decode("classification")
         self.`rotate_url` = try o.optional("rotate_url")
+        self.`sources` = try o.decode("sources")
         self.`places` = try o.decode("places")
     }
     public var whereSummary: String {
-        places.map(\.placeSummary).joined(separator: "; ")
+        let sourceText = sources.isEmpty ? "local files" : sources.map(\.label).joined(separator: ", ")
+        guard !places.isEmpty else { return sourceText }
+        let fileWord = places.count == 1 ? "1 file" : "\(places.count) files"
+        return "\(sourceText), \(fileWord)"
     }
 }
 
 public struct FirstRunProjectPlaintextView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `project`: DaemonText
-    public let `dir`: DaemonText
+    public let `project_dir`: DaemonText
     public let `files`: [DaemonText]
-    public let `keys`: UInt64
+    public var dir: DaemonText { project_dir }
     public var description: String { "[FirstRunProjectPlaintextView]" }
     public var debugDescription: String { description }
-    public init(project: DaemonText, dir: DaemonText, files: [DaemonText], keys: UInt64) {
-        self.project = project
-        self.dir = dir
+    public init(project_dir: DaemonText, files: [DaemonText]) {
+        self.project_dir = project_dir
         self.files = files
-        self.keys = keys
     }
     init(wire: WireReader) throws {
-        let o = try wire.object(["project", "dir", "files", "keys"])
-        self.`project` = try o.decode("project")
-        self.`dir` = try o.decode("dir")
+        let o = try wire.object(["project_dir", "files"])
+        self.`project_dir` = try o.decode("project_dir")
         self.`files` = try o.decode("files")
-        self.`keys` = try o.decode("keys")
     }
     public var summaryLabel: String {
         let joined = files.map(\.escaped).joined(separator: ", ")
-        return "\(project.escaped): \(joined) (\(keys) \(keys == 1 ? "key" : "keys"))"
+        return "\(project_dir.escaped): \(joined)"
     }
 }
 
 public struct FirstRunReportView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
-    public let `version`: UInt32
+    public let `version`: UInt64
     public let `keys_found`: UInt64
     public let `projects`: UInt64
     public let `already_leaked`: UInt64
@@ -838,7 +816,7 @@ public struct FirstRunReportView: Sendable, Equatable, WireDecodable, CustomStri
     public let `plaintext_projects`: [FirstRunProjectPlaintextView]
     public var description: String { "[FirstRunReportView]" }
     public var debugDescription: String { description }
-    public init(version: UInt32 = 1, keys_found: UInt64, projects: UInt64, already_leaked: UInt64, plaintext_files: UInt64,
+    public init(version: UInt64 = 1, keys_found: UInt64, projects: UInt64, already_leaked: UInt64, plaintext_files: UInt64,
                 providers: [FirstRunProviderView], accounts: [FirstRunAccountView],
                 leaked: [FirstRunLeakedItemView], plaintext_projects: [FirstRunProjectPlaintextView]) {
         self.version = version
@@ -853,7 +831,7 @@ public struct FirstRunReportView: Sendable, Equatable, WireDecodable, CustomStri
     }
     init(wire: WireReader) throws {
         let o = try wire.object(["version", "keys_found", "projects", "already_leaked", "plaintext_files", "providers", "accounts", "leaked", "plaintext_projects"])
-        let version: UInt32 = try o.decode("version")
+        let version: UInt64 = try o.decode("version")
         guard version == 1 else { throw EnvCloakError.protocolError }
         self.`version` = version
         self.`keys_found` = try o.decode("keys_found")

@@ -37,16 +37,20 @@ enum MetadataRequest {
             index == 0 ? argument : "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }.joined(separator: " ")
     }
+    static let hiddenMarker = "[not shown: looks like a key or token]"
     static func replaceTarget(slug: DaemonText, field: DaemonText) -> String? {
         guard canCopy(slug), canCopy(field) else { return nil }
         return slug.unescaped + "#" + field.unescaped
     }
     static func changeDirectoryCommand(_ directory: DaemonText) -> String? {
-        guard canCopy(directory) else { return nil }
-        return "cd -- '" + directory.unescaped.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let raw = directory.unescaped
+        guard canCopy(directory), raw.hasPrefix("/"), !raw.contains(hiddenMarker) else { return nil }
+        return "cd -- '" + raw.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
     static func rotateSlugCommand(_ slug: DaemonText) -> TerminalCopy? {
-        guard canCopy(slug), let text = terminalCommand(["rotate", slug.unescaped]) else { return nil }
+        let raw = slug.unescaped
+        guard canCopy(slug), !raw.isEmpty, !raw.contains(hiddenMarker),
+              let text = terminalCommand(["rotate", raw]) else { return nil }
         return TerminalCopy(text)
     }
     static func deletePlaintextCommand(_ directory: DaemonText) -> TerminalCopy? {
@@ -63,8 +67,12 @@ struct TerminalCopy {
     private let text: String
     static let refusalMessage = "Copying to Terminal is unavailable because this text contains control or directional characters."
     static func isSafe(_ text: String) -> Bool {
-        !text.unicodeScalars.contains {
-            CharacterSet.controlCharacters.contains($0) || $0.value == 0x2028 || $0.value == 0x2029
+        !text.unicodeScalars.contains { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ||
+            scalar.value == 0x2028 || scalar.value == 0x2029 ||
+            (0x200B...0x200F).contains(scalar.value) ||
+            (0x202A...0x202E).contains(scalar.value) ||
+            (0x2060...0x206F).contains(scalar.value)
         }
     }
     init?(_ text: String) {

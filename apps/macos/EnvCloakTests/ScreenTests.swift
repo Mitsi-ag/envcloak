@@ -500,26 +500,28 @@ import XCTest
             "already_leaked": 12,
             "plaintext_files": 18,
             "providers": [
-                ["provider": "stripe", "keys": 4, "live_keys": 2]
+                ["provider": "stripe", "total_count": 4, "live_count": 2]
             ],
             "accounts": [],
             "leaked": [
                 [
                     "slug": "stripe/acme-live",
                     "provider": "stripe",
-                    "classification": "live",
                     "rotate_url": "https://dashboard.stripe.com/apikeys",
+                    "sources": ["transcript"],
                     "places": [
-                        ["source": "transcript", "subject": "Claude Code", "files": 14, "occurrences": 19]
+                        ["display_path": "/tmp/claude.jsonl", "count": 19]
                     ]
                 ]
             ],
             "plaintext_projects": [
                 [
-                    "project": "acme-web",
-                    "dir": "/tmp/acme-web",
-                    "files": [".env", ".env.local"],
-                    "keys": 3
+                    "project_dir": "/tmp/acme-web",
+                    "files": [".env", ".env.local"]
+                ],
+                [
+                    "project_dir": "[not shown: looks like a key or token]",
+                    "files": [".env"]
                 ]
             ]
         ]
@@ -540,11 +542,12 @@ import XCTest
         await assertVisible("Owning accounts are not detected yet. You can add them per key.", in: resultWindow)
         await assertVisible("Rotate these at the provider. EnvCloak cannot recall copies already sent to a model provider.", in: resultWindow)
         await assertVisible("stripe/acme-live", in: resultWindow)
-        await assertVisible("Claude Code transcripts, 14 files", in: resultWindow)
+        await assertVisible("agent transcripts, 1 file", in: resultWindow)
         await assertVisible("Open keys page", in: resultWindow)
         await assertVisible("Replace…", in: resultWindow)
         await assertVisible("Runs envcloak init --delete-plaintext in Terminal. It needs your Recovery Kit confirmed first, keeps an encrypted backup, and leaves files that changed in the last 2 minutes.", in: resultWindow)
-        await assertVisible("acme-web: .env, .env.local (3 keys)", in: resultWindow)
+        await assertVisible("/tmp/acme-web: .env, .env.local", in: resultWindow)
+        await assertVisible(TerminalCopy.refusalMessage, in: resultWindow)
         await assertVisible("Remove plaintext", in: resultWindow)
         await assertVisible("Open projects", in: resultWindow)
         await assertVisible("Done", in: resultWindow)

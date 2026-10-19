@@ -716,7 +716,7 @@ pub(super) fn run(options: &ImportArgs) -> Result<ExitCode, Failure> {
         }
     }
     if options.report {
-        write_app_report(&groups, &machine, &plan, &r)?;
+        write_app_report(&groups, &machine, &plan, committed, &r)?;
     }
     Ok(if r.incomplete.is_empty() {
         ExitCode::SUCCESS
@@ -729,12 +729,13 @@ fn write_app_report(
     groups: &[Group],
     machine: &[MachineEntry],
     plan: &ImportPlanView,
+    committed: bool,
     r: &FirstRunReport,
 ) -> Result<(), Failure> {
     use envcloak_client::doctor_report::{
         FIRST_RUN_REPORT_VERSION, FirstRunAccount, FirstRunLeakedItem, FirstRunProjectPlaintext,
-        FirstRunProvider, FirstRunReport as AppFirstRunReport, read_first_run_report,
-        write_first_run_report,
+        FirstRunProvider, FirstRunReport as AppFirstRunReport, read_first_run_report, report_name,
+        report_path, write_first_run_report,
     };
     use envcloak_ipc::view::ClassificationView;
 
@@ -745,14 +746,24 @@ fn write_app_report(
         .unwrap_or_default();
     let prior = read_first_run_report();
 
-    let (keys_found, providers, accounts) = if !plan.items.is_empty() {
-        let mut by_provider: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let (vault_keys, vault_providers, vault_accounts) =
+        AppFirstRunReport::summarize_vault_items(&vault_items);
+    let mut by_provider: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    for vp in vault_providers {
+        by_provider.insert(vp.provider, (vp.total_count, vp.live_count));
+    }
+    let mut unimported_plan_keys = 0u64;
+    if !committed {
         for item in &plan.items {
+            if item.existing {
+                continue;
+            }
+            unimported_plan_keys = unimported_plan_keys.saturating_add(1);
             let p = item
                 .provider
                 .as_deref()
                 .filter(|s| !s.trim().is_empty())
-                .map(safe_name)
+                .map(report_name)
                 .unwrap_or_else(|| "generic".to_owned());
             let entry = by_provider.entry(p).or_insert((0, 0));
             entry.0 = entry.0.saturating_add(1);
@@ -760,16 +771,15 @@ fn write_app_report(
                 entry.1 = entry.1.saturating_add(1);
             }
         }
-        let providers = by_provider
-            .into_iter()
-            .map(|(provider, (total, live))| FirstRunProvider::new(&provider, total, live))
-            .collect();
-        let (_, _, vault_accounts) = AppFirstRunReport::summarize_vault_items(&vault_items);
-        let accounts: Vec<FirstRunAccount> = vault_accounts;
-        (plan.items.len() as u64, providers, accounts)
-    } else {
-        AppFirstRunReport::summarize_vault_items(&vault_items)
-    };
+    }
+    let providers: Vec<FirstRunProvider> = by_provider
+        .into_iter()
+        .map(|(provider, (total, live))| FirstRunProvider::new(&provider, total, live))
+        .collect();
+    let keys_found = vault_keys
+        .saturating_add(unimported_plan_keys)
+        .max(plan.items.len() as u64);
+    let accounts: Vec<FirstRunAccount> = vault_accounts;
 
     let mut plaintext_projects: Vec<FirstRunProjectPlaintext> = Vec::new();
     let mut project_count = 0u64;
@@ -790,7 +800,7 @@ fn write_app_report(
                     .is_some_and(|c| c == "removed");
                 if !removed {
                     let rel_in_project = f.rel.strip_prefix(&p.rel_dir).unwrap_or(&f.rel);
-                    files.push(shown_rel(rel_in_project));
+                    files.push(report_path(rel_in_project));
                 }
             }
             if !files.is_empty() {
@@ -815,18 +825,18 @@ fn write_app_report(
             .to_path_buf();
         let file_name = full
             .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| display_path(full));
+            .and_then(|n| n.to_str().map(report_name))
+            .unwrap_or_else(|| report_path(full));
         machine_by_dir.entry(parent).or_default().push(file_name);
     }
     for (dir, files) in machine_by_dir {
-        let dir_str = display_path(&dir);
+        let dir_str = report_path(&dir);
         if let Some(existing) = plaintext_projects
             .iter_mut()
             .find(|p| p.project_dir == dir_str)
         {
             for f in files {
-                let clean = display_path(Path::new(&f));
+                let clean = report_path(Path::new(&f));
                 if !existing.files.contains(&clean) {
                     existing.files.push(clean);
                 }
