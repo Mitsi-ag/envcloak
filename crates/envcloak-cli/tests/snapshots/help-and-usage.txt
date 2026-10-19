@@ -10,10 +10,13 @@ usage:
   envcloak daemon uninstall
   envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
-  envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
+  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION]] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
   envcloak grants revoke <GRANT> | --all
+  envcloak standing ls [--json]
+  envcloak standing rm <ID> | --agent <AGENT> | --project <DIR> | --all [--json]
+  envcloak standing confirm [--passphrase-fd N] [--json]
   envcloak audit verify [--json]
   envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
   envcloak ls [--long] [--json]
@@ -39,10 +42,9 @@ usage:
   envcloak scrub [--path <path>]... [--yes] [--json]
   envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak doctor [--json] [--path <path>]... [--git-history]
+  envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak agents migrate-mcp
-  envcloak mcp-bridge
-  envcloak standing
   envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
@@ -66,10 +68,13 @@ usage:
   envcloak daemon uninstall
   envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
-  envcloak approve <REQUEST> [--once | --for DURATION] [--live NAME]... [--passphrase-fd N]
+  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION]] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
   envcloak grants revoke <GRANT> | --all
+  envcloak standing ls [--json]
+  envcloak standing rm <ID> | --agent <AGENT> | --project <DIR> | --all [--json]
+  envcloak standing confirm [--passphrase-fd N] [--json]
   envcloak audit verify [--json]
   envcloak add [PROVIDER] [--slug SLUG] [--field NAME] [--account ACCOUNT] [--env NAME] [--allow-short] [--stdin] [--json]
   envcloak ls [--long] [--json]
@@ -95,10 +100,9 @@ usage:
   envcloak scrub [--path <path>]... [--yes] [--json]
   envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak doctor [--json] [--path <path>]... [--git-history]
+  envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak agents migrate-mcp
-  envcloak mcp-bridge
-  envcloak standing
   envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
@@ -190,7 +194,7 @@ $ envcloak approve
 exit: 2
 --- stdout
 --- stderr
-envcloak: usage: envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h)] [--live NAME]... [--passphrase-fd N]
+envcloak: usage: envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h) | --standing [DURATION (30s to 30d)]] [--live NAME]... [--passphrase-fd N]
 $ envcloak deny
 exit: 2
 --- stdout

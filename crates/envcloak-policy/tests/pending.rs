@@ -174,6 +174,7 @@ fn approve(s: &mut GrantStore, id: &PendingId, now: &Now) {
         uses: Uses::Once,
         ttl_secs: 600,
         live: Vec::new(),
+        standing: None,
     };
     // The vault as the request recorded its item: a test secret.
     let vault = s

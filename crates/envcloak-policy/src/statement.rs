@@ -101,6 +101,32 @@ pub struct PendingDescriptor {
     /// canonical statement is byte for byte what it was before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<ManagedSummary>,
+    /// For a standing-eligible agent request (SPEC §10b, M2-15): its binary
+    /// identity, recognized release (on Linux), and any existing standing
+    /// record a self-update will append to in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing: Option<StandingSummary>,
+}
+
+/// What a `--standing` approval statement shows of the requesting agent's
+/// binary and any existing standing record it updates in place (SPEC §10b).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingSummary {
+    /// The nearest agent's executable path.
+    pub exe: String,
+    /// On Linux: the agent executable's SHA-256 as 64 lowercase hex characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_sha256: Option<String>,
+    /// On Linux: the release version in `integrations/agents-digests.toml`
+    /// when `linux_sha256` matches one, or `None` for an unrecognized build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recognized_release: Option<String>,
+    /// On Linux after an agent self-update: the existing standing record id
+    /// (26 Crockford base32 characters) to which approving will append the
+    /// new digest in place rather than creating a second record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appends_to: Option<String>,
 }
 
 /// A managed MCP server's record, as an approval surface shows it (SPEC
@@ -575,6 +601,20 @@ pub fn canonical_statement(p: &PendingDescriptor, o: &ApprovalOptions) -> Vec<u8
             .str(m.origin.as_deref().unwrap_or(""))
             .flag(m.origin.is_some());
     }
+    if let Some(standing) = o.standing {
+        e.str("standing")
+            .num(standing.as_secs())
+            .flag(p.standing.is_some());
+        if let Some(s) = &p.standing {
+            e.str(&s.exe)
+                .str(s.linux_sha256.as_deref().unwrap_or(""))
+                .flag(s.linux_sha256.is_some())
+                .str(s.recognized_release.as_deref().unwrap_or(""))
+                .flag(s.recognized_release.is_some())
+                .str(s.appends_to.as_deref().unwrap_or(""))
+                .flag(s.appends_to.is_some());
+        }
+    }
     e.0
 }
 
@@ -868,15 +908,54 @@ pub fn render_statement_with(
     }
     let _ = writeln!(t, "  command ({} arguments):", p.argv.len());
     t.push_str(&render_argv(&p.argv));
-    match o.uses {
-        Uses::Once => {
+    match (o.standing, o.uses) {
+        (Some(standing_dur), _) => {
+            let agent = match (&p.subject.kind, &p.subject.label) {
+                (SubjectKind::Agent, Some(l)) => e(l),
+                _ => "the agent".to_owned(),
+            };
+            let _ = writeln!(
+                t,
+                "  standing approval ({}): any {agent} session in this project, including one \
+                 started by another program, gets these keys without asking",
+                duration_words(standing_dur.as_secs())
+            );
+            if let Some(s) = &p.standing {
+                if let Some(record_id) = &s.appends_to {
+                    let _ = writeln!(
+                        t,
+                        "    self-update: the approved binary changed; adds this binary's digest in place to standing record {}",
+                        e(record_id)
+                    );
+                }
+                if let Some(sha256) = &s.linux_sha256 {
+                    let _ = writeln!(t, "    agent binary: {} (sha256:{})", e(&s.exe), e(sha256));
+                    match &s.recognized_release {
+                        Some(rel) => {
+                            let _ = writeln!(
+                                t,
+                                "    release: recognized release {} in integrations/agents-digests.toml",
+                                e(rel)
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                t,
+                                "  warning: unrecognized build: EnvCloak has not seen this binary"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        (None, Uses::Once) => {
             let _ = writeln!(
                 t,
                 "  grant: once, for the next matching request within {}",
                 duration_words(o.ttl_secs)
             );
         }
-        Uses::Session => {
+        (None, Uses::Session) => {
             let _ = writeln!(
                 t,
                 "  grant: every request from this process tree for {}",

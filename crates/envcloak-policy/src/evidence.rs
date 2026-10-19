@@ -419,6 +419,7 @@ pub struct SubjectEvidence {
     claims: Claims,
     claimed: Option<AgentLabel>,
     nearest_agent: Option<usize>,
+    nearest_agent_env_selects_code: bool,
     session_leader: Option<usize>,
     /// The session leader's index, or else the topmost one in the
     /// caller's session: the widest root rules 2 and 3 give.
@@ -477,10 +478,26 @@ impl SubjectEvidence {
             claims,
             claimed,
             nearest_agent,
+            nearest_agent_env_selects_code: false,
             session_leader,
             limit,
             root,
         })
+    }
+
+    /// Whether the nearest known agent's environment sets a variable that
+    /// may make its executable run code other than the agent's
+    /// ([`AgentCatalog::env_selects_code`]), or the environment could not be
+    /// read.
+    pub fn nearest_agent_env_selects_code(&self) -> bool {
+        self.nearest_agent_env_selects_code
+    }
+
+    /// Sets [`SubjectEvidence::nearest_agent_env_selects_code`] (for
+    /// synthetic evidence in tests).
+    pub fn with_nearest_agent_env_selects_code(mut self, selects: bool) -> Self {
+        self.nearest_agent_env_selects_code = selects;
+        self
     }
 
     /// The chain, the caller first, up to the top of the tree (or
@@ -966,6 +983,7 @@ fn gather_with(
 ) -> Result<SubjectEvidence, EvidenceError> {
     let want_argv = |p: &ProcInfo| classifiable(p, peer.uid) && cat.needs_argv(p);
     let mut procs = None;
+    let mut nearest_env_selects = false;
     for _ in 0..GATHER_ATTEMPTS {
         let mut walked = match ancestry_in(table, peer, MAX_ANCESTRY, &want_argv) {
             Ok(p) => p,
@@ -976,6 +994,20 @@ fn gather_with(
             Some(h) => hash_executables(&mut walked, peer.uid, &mut **h),
             None => Vec::new(),
         };
+        let env_selects = walked
+            .iter()
+            .find_map(|p| {
+                classifiable(p, peer.uid)
+                    .then(|| cat.classify(p))
+                    .flatten()
+                    .map(|a| (p.pid, a))
+            })
+            .is_some_and(|(pid, a)| {
+                a.may_root_above_session()
+                    && table
+                        .env_any(pid, &|name| cat.env_selects_code(&a.id, name))
+                        .unwrap_or(true)
+            });
         let hashed = hasher.as_deref_mut().map(|hasher| Hashed {
             hasher,
             keys: &keys,
@@ -983,6 +1015,7 @@ fn gather_with(
         if !recheck(table, &walked, peer.uid, cat, hashed)? {
             continue;
         }
+        nearest_env_selects = env_selects;
         procs = Some(walked);
         break;
     }
@@ -1024,5 +1057,6 @@ fn gather_with(
         .iter()
         .find_map(|m| cat.agent_for_marker(m));
     SubjectEvidence::from_chain(chain, end, terminal, claims, claimed)
+        .map(|ev| ev.with_nearest_agent_env_selects_code(nearest_env_selects))
         .ok_or(EvidenceError::CallerGone)
 }

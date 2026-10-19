@@ -132,6 +132,14 @@ pub enum AuditKind {
     /// An approval was refused by the live-key guard (`live_not_ticked`):
     /// the request id, and the items whose live bindings it left unticked.
     LiveRefused = 31,
+    /// A standing approval record was created or updated (`approve --standing`),
+    /// with a proof, or the proof failed.
+    StandingCreate = 32,
+    /// Standing approval records were revoked (`standing rm`).
+    StandingRevoke = 33,
+    /// A session grant was minted from a standing approval, before any value
+    /// left the daemon.
+    StandingGrant = 34,
     /// A request against a managed MCP server's project refused before any
     /// pending request: not its registered launch
     /// (`managed_command_mismatch`), a launch that changed
@@ -140,6 +148,8 @@ pub enum AuditKind {
     /// new device, inode and digest prefix), or a runner the daemon could
     /// not start (`runner_unavailable`).
     ManagedLaunch = 43,
+    /// `envcloak standing confirm`, with a proof, or the proof failed.
+    StandingConfirm = 44,
     /// A Secure Enclave unlocker enrolled (approved with the passphrase, or
     /// later signed in the app), with its label and both public keys'
     /// fingerprints.
@@ -158,7 +168,7 @@ pub enum AuditKind {
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 34] = [
+    pub const ALL: [AuditKind; 38] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -188,7 +198,11 @@ impl AuditKind {
         AuditKind::ManagedRegister,
         AuditKind::Reclassify,
         AuditKind::LiveRefused,
+        AuditKind::StandingCreate,
+        AuditKind::StandingRevoke,
+        AuditKind::StandingGrant,
         AuditKind::ManagedLaunch,
+        AuditKind::StandingConfirm,
         AuditKind::UnlockerAdd,
         AuditKind::UnlockerRemove,
         AuditKind::RevealApp,
@@ -227,7 +241,11 @@ impl AuditKind {
             AuditKind::ManagedRegister => "managed_register",
             AuditKind::Reclassify => "reclassify",
             AuditKind::LiveRefused => "live_refused",
+            AuditKind::StandingCreate => "standing_create",
+            AuditKind::StandingRevoke => "standing_revoke",
+            AuditKind::StandingGrant => "standing_grant",
             AuditKind::ManagedLaunch => "managed_launch",
+            AuditKind::StandingConfirm => "standing_confirm",
             AuditKind::UnlockerAdd => "unlocker_add",
             AuditKind::UnlockerRemove => "unlocker_remove",
             AuditKind::RevealApp => "reveal_app",

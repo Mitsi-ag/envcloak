@@ -1313,6 +1313,7 @@ fn five_waiters(noisy: bool) -> Vec<Seen> {
                 uses: Uses::Once,
                 ttl_secs: 600,
                 live: Vec::new(),
+                standing: None,
             };
             let vault = metas(item);
             let Some(d) = store.pending_descriptor(&id, &now, &vault) else {

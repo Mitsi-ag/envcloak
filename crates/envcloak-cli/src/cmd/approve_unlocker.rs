@@ -40,6 +40,7 @@ pub fn run(
         uses: Uses::Once,
         ttl_secs: DEFAULT_TTL.as_secs(),
         live: Vec::new(),
+        standing: None,
     };
     let approved = connect()?.approve(id, options, &digest, passphrase, claims)?;
     let unlocker = &approved.grant;

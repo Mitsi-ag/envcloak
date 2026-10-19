@@ -25,6 +25,7 @@ envcloak-agents.workspace = true
 envcloak-client.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
+envcloak-redact.workspace = true
 # Owned children: a call's child is signalled, as a group, only while it
 # is unreaped; this server's own identity and ancestry, read as the daemon
 # reads a caller's, to show the grants that cover its calls.
@@ -33,7 +34,11 @@ envcloak-sys.workspace = true
 # same evidence.
 envcloak-core.workspace = true
 libc.workspace = true
+rustls.workspace = true
+secrecy.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 envcloak-testkit.workspace = true

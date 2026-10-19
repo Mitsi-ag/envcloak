@@ -406,7 +406,25 @@ pub(crate) fn remove(
         }
     };
 
-    let grants = s.grants().on_item_removed(wt.item);
+    let mut grants = s.grants().on_item_removed(wt.item);
+    let standing_ids: Vec<envcloak_policy::StandingId> = s
+        .standing()
+        .all_records()
+        .filter(|r| r.bindings.iter().any(|b| b.item == wt.item))
+        .map(|r| r.id)
+        .collect();
+    if !standing_ids.is_empty()
+        && let Ok((revoked, extra_grants)) = crate::standing::delete_records(&mut s, &standing_ids)
+        && revoked > 0
+    {
+        grants = grants.saturating_add(extra_grants);
+        s.audit(AuditEvent::StandingRevoked {
+            pid: peer.pid,
+            revoked,
+            grants: extra_grants,
+            reason: Some("item_removed"),
+        });
+    }
     s.audit(AuditEvent::Removed {
         pid: peer.pid,
         subject: subject_summary(peer, &caller),

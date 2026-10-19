@@ -147,6 +147,16 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
         "grants: {} in force, {} waiting for approval",
         s.approvals.grants, s.approvals.pending
     );
+    if s.approvals.policy_epoch_unverified {
+        println!(
+            "standing approvals: {} in the vault, paused (policy_epoch_unverified: the vault's \
+             policy record does not match the daemon's epoch; run `envcloak standing confirm` or \
+             `envcloak standing rm --all`)",
+            s.approvals.standing
+        );
+    } else if s.approvals.standing > 0 {
+        println!("standing approvals: {} in force", s.approvals.standing);
+    }
     let audit = &s.audit;
     match (audit.open, audit.head_seq, s.vault.state) {
         (true, Some(seq), _) => println!(
@@ -253,6 +263,8 @@ mod tests {
             approvals: ApprovalsView {
                 grants: 0,
                 pending: 0,
+                standing: 0,
+                policy_epoch_unverified: false,
                 proof_failures: 0,
                 proof_wait_secs: 0,
             },

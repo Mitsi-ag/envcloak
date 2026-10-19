@@ -53,12 +53,13 @@ use envcloak_ipc::view::{
     Integrity as IntegrityView, LockReason, LockView, RecoveredView, StatusView, UnlockedView,
     VaultState, VaultView,
 };
-use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now, ProcessInstance};
+use envcloak_policy::{AttemptLimiter, GrantId, GrantStore, Now, ProcessInstance, StandingStore};
 
 use crate::audit::{AuditEvent, AuditLog, RequestAudit};
 use crate::clock::{Clocks, now_of};
 use crate::crowded::Crowded;
 use crate::lock::{LockTimer, Reading};
+use crate::policy_epoch::{EpochState, PolicyEpoch, SidecarState};
 
 /// The vault as the daemon holds it.
 pub enum Slot {
@@ -198,6 +199,9 @@ pub struct State {
     generation: u64,
     failed_unlocks: u32,
     grants: GrantStore,
+    standing: StandingStore,
+    epoch_state: EpochState,
+    standing_generation_floor: u64,
     limiter: AttemptLimiter,
     audit: AuditLog,
     /// The head of a log closed while a proof had the vault out: saved in
@@ -234,6 +238,9 @@ impl State {
             generation: 0,
             failed_unlocks: 0,
             grants: GrantStore::new(),
+            standing: StandingStore::new(),
+            epoch_state: EpochState::Verified,
+            standing_generation_floor: 0,
             limiter: AttemptLimiter::new(),
             audit: AuditLog::default(),
             unsaved_head: None,
@@ -261,6 +268,51 @@ impl State {
     /// The grants and pending requests.
     pub fn grants(&mut self) -> &mut GrantStore {
         &mut self.grants
+    }
+
+    /// The standing approvals.
+    pub fn standing(&self) -> &StandingStore {
+        &self.standing
+    }
+
+    /// Mutable access to standing approvals.
+    pub fn standing_mut(&mut self) -> &mut StandingStore {
+        &mut self.standing
+    }
+
+    /// Current policy-epoch verification state, refreshed against the
+    /// on-disk sidecar while unlocked.
+    pub fn epoch_state(&mut self) -> EpochState {
+        if self.epoch_state == EpochState::Verified
+            && let Slot::Unlocked(v) = &self.slot
+        {
+            match v.header() {
+                Ok(h) => {
+                    self.epoch_state = PolicyEpoch::new(v.vault_id().0, &self.paths.data_dir)
+                        .verify_live(h.standing_set);
+                }
+                Err(_) => {
+                    self.epoch_state = EpochState::Unverified;
+                }
+            }
+        }
+        self.epoch_state
+    }
+
+    /// Sets the policy-epoch verification state.
+    pub fn set_epoch_state(&mut self, state: EpochState) {
+        self.epoch_state = state;
+    }
+
+    /// Highest standing-set generation observed for the currently unlocked
+    /// vault or its `<data>/policy-epoch` sidecar.
+    pub fn standing_generation_floor(&self) -> u64 {
+        self.standing_generation_floor
+    }
+
+    /// Raises the standing-set generation floor to at least `generation`.
+    pub fn raise_standing_generation_floor(&mut self, generation: u64) {
+        self.standing_generation_floor = self.standing_generation_floor.max(generation);
     }
 
     /// Backups v2 in progress and restore leases.
@@ -386,6 +438,9 @@ impl State {
         // request (SPEC §5 "Lock"), every backup v2 in progress and every
         // restore lease.
         self.grants.on_lock();
+        self.standing.clear();
+        self.epoch_state = EpochState::Verified;
+        self.standing_generation_floor = 0;
         self.backups.on_lock();
         self.se_challenges.clear();
         self.write_targets.clear();
@@ -930,7 +985,8 @@ impl State {
         Ok(())
     }
 
-    /// An unlocked vault: the grant store starts empty at its epochs.
+    /// An unlocked vault: the grant store starts empty at its epochs, and
+    /// standing approvals are loaded and reconciled with `<data>/policy-epoch`.
     fn start_grants(&mut self, v: &Vault) {
         self.grants.on_lock();
         self.write_targets.clear();
@@ -938,6 +994,25 @@ impl State {
         self.paste_stages.clear();
         let policy_epoch = v.header().map(|h| h.policy_epoch).unwrap_or(0);
         self.grants.set_epochs(v.epoch(), policy_epoch);
+        match (v.header(), StandingStore::from_vault(v)) {
+            (Ok(h), Ok(store)) => {
+                self.standing = store;
+                let vault_id = v.vault_id().0;
+                let pe = PolicyEpoch::new(vault_id, &self.paths.data_dir);
+                let sidecar = pe.load();
+                let sidecar_gen = match sidecar {
+                    SidecarState::Present(sc) if sc.vault_id == vault_id => sc.generation,
+                    _ => 0,
+                };
+                self.standing_generation_floor = h.standing_set.generation.max(sidecar_gen);
+                self.epoch_state = pe.reconcile(h.standing_set, sidecar);
+            }
+            _ => {
+                self.standing.clear();
+                self.standing_generation_floor = 0;
+                self.epoch_state = EpochState::Unverified;
+            }
+        }
     }
 
     /// Starts `vault create`: there must be no vault.
@@ -1400,14 +1475,39 @@ impl State {
         Ok(view)
     }
 
-    /// The grants, pending requests and limiter parts of `status`.
+    /// The grants, standing approvals, pending requests and limiter parts
+    /// of `status`.
     pub fn approvals(&self, at: &Now) -> ApprovalsView {
         let (grants, pending) = self.grants.counts(at);
+        let standing = match &self.slot {
+            Slot::Unlocked(v) => self
+                .standing
+                .records(at.wall)
+                .filter(|r| r.items_are_test(v.items()))
+                .count(),
+            _ => 0,
+        };
+        let policy_epoch_unverified = match &self.slot {
+            Slot::Unlocked(v) => {
+                if self.epoch_state == EpochState::Unverified {
+                    true
+                } else if let Ok(h) = v.header() {
+                    PolicyEpoch::new(v.vault_id().0, &self.paths.data_dir)
+                        .verify_live(h.standing_set)
+                        == EpochState::Unverified
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
         ApprovalsView {
             grants: u32::try_from(grants).unwrap_or(u32::MAX),
+            standing: u32::try_from(standing).unwrap_or(u32::MAX),
             pending: u32::try_from(pending).unwrap_or(u32::MAX),
             proof_failures: self.limiter.failures(),
             proof_wait_secs: self.limiter.wait_remaining(at).as_secs(),
+            policy_epoch_unverified,
         }
     }
 }
@@ -1766,6 +1866,7 @@ mod tests {
                 uses: Uses::Session,
                 ttl_secs: DEFAULT_TTL.as_secs(),
                 live: Vec::new(),
+                standing: None,
             };
             let vault = metas(&first);
             let digest = statement_digest(

@@ -2395,3 +2395,514 @@ fn a_bridged_request_is_checked_on_every_binding_it_names() {
     assert_eq!(error_of(&by_ref), "managed_command_mismatch", "{by_ref}");
     assert_eq!(w.pending_count(), pending, "a pending request exists");
 }
+
+/// Gate 39 and 40 under a standing record (M2-15 CR-5, M2R-89 S04, S07):
+/// With a standing record in force for revision 1 of `launch` and `opencode`,
+/// after revoking all session and once grants:
+/// - Positive control: `w.standing_request(&opencode, &launch)` starts revision 1.
+/// - Explicit `--manifest` `sh -c 'printenv KEY'` and upward-search
+///   `sh -c 'printenv KEY'` from inside `w.project` under `opencode` are
+///   refused `managed_command_mismatch` before any pending request or standing
+///   mint (`pending_count`, `standing_grant_count`, `released` unchanged).
+/// - Requests naming `launch` without descriptors (`none`, `too_few`,
+///   `wrong_access`) under `opencode` are refused `managed_command_mismatch`
+///   before pending.
+/// - Replaced executable at the same path (`other_build`) and replaced working
+///   directory are refused `managed_launch_changed` before pending; restoring
+///   both succeeds under the standing record.
+/// - S04 / CR-5 healthy re-registration: replacing the executable with
+///   `other_build` and committing `managed.update` creates revision 2. A fresh
+///   `opencode` request passes the launch check (not `managed_launch_changed`)
+///   and is not covered by revision 1's standing record (`pending`, no stale
+///   standing mint, nothing released). Approving revision 2 with
+///   `--standing 7d` and revoking all grants allows the next fresh `opencode`
+///   request to start revision 2's executable.
+/// - S04 binding reclassification: reclassifying `stripe/fixture` to `live`
+///   revokes the standing record and active grants, leaves the next request
+///   `pending`, and refuses `--standing 7d` with `live_item_in_standing`;
+///   reclassifying to `unknown` likewise refuses `--standing 7d`; reclassifying
+///   back to `test` and approving with `--standing 7d` restores standing
+///   coverage.
+/// - S04 / S07 unbound routes: `script` (`sh server.sh`), unbound `native`
+///   (`checked_at_rest`), and `bridge` launches pass the launch check
+///   (`pending`, never an implicit pass) and refuse `approve --standing 7d`
+///   with `launch_not_standing_capable`; a changed script entry is refused
+///   `managed_launch_changed` before pending.
+#[test]
+fn a_standing_record_covers_only_its_bound_launch_and_current_revision() {
+    if cfg!(target_os = "macos")
+        && managed_common::release_run(
+            "a_standing_record_covers_only_its_bound_launch_and_current_revision",
+        )
+    {
+        return;
+    }
+    let mut w = World::new(&[]);
+    let work = w.project.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let argv = w.fixture_argv();
+    let reg = w.register(json!({"argv": argv, "cwd": work.to_str().unwrap()}));
+    assert_eq!(reg["revision"], 1, "{reg}");
+    assert_eq!(reg["receipt"]["class"], "native", "{reg}");
+    assert_eq!(reg["receipt"]["strength"], "bound", "{reg}");
+    let launch = reg["launch"].as_str().unwrap().to_owned();
+
+    let opencode = w.opencode_agent();
+    let first = w.standing_request(&opencode, &launch);
+    let first_id = pending_id(&first);
+    w.approve_with(&first_id, &["--standing", "7d"]);
+    w.revoke_all_grants();
+
+    // Positive control under revision 1 standing record.
+    let sg0 = w.standing_grant_count();
+    let pos = w.standing_request(&opencode, &launch);
+    assert!(started(&pos), "{pos}");
+    assert_eq!(reported_identity(&report(&pos)), receipt_identity(&reg));
+    assert_eq!(
+        report(&pos)["cwd_sha256"],
+        sha256_hex(work.as_os_str().as_encoded_bytes())
+    );
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg0 + 1);
+    }
+    w.assert_released(0, 1, "positive control released once to runner");
+    w.revoke_all_grants();
+
+    // S07 routes 1 & 2: explicit `--manifest` and upward-search `sh -c 'printenv KEY'`
+    // under opencode with standing record in force.
+    let pending = w.pending_count();
+    let released = w.released();
+    let sg = w.standing_grant_count();
+    let manifest = w.project.join("envcloak.toml");
+    let home = w.h.home.home();
+    let project = w.project.clone();
+    let cli = w.h.cli();
+    let q = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
+    let printenv = envcloak_e2e::quoted(&format!("printenv {KEY}"));
+    for (cwd, line) in [
+        (
+            home.clone(),
+            format!(
+                "{} run --manifest {} -- sh -c {}",
+                q(&cli),
+                q(&manifest),
+                printenv
+            ),
+        ),
+        (
+            project.clone(),
+            format!("{} run -- sh -c {}", q(&cli), printenv),
+        ),
+    ] {
+        let out = w.fresh_agent_line(&opencode, &cwd, &line);
+        assert_eq!(out.status.code(), Some(125), "{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("envcloak: managed_command_mismatch: "),
+            "{}",
+            text(&out)
+        );
+    }
+    assert_eq!(
+        w.pending_count(),
+        pending,
+        "other commands must not create pending"
+    );
+    assert_eq!(
+        w.released(),
+        released,
+        "other commands must release nothing"
+    );
+    if w.traced() {
+        assert_eq!(
+            w.standing_grant_count(),
+            sg,
+            "other commands must not mint standing grant"
+        );
+    }
+
+    // S07 route 3: launch requested without valid descriptors under opencode.
+    for mode in ["none", "too_few", "wrong_access"] {
+        let answer = w.fresh_agent(
+            &opencode,
+            "request",
+            &json!({"launch": launch, "fds": mode, "send": ["report"], "hold_ms": 0}),
+        );
+        assert_eq!(
+            error_of(&answer),
+            "managed_command_mismatch",
+            "{mode}: {answer}"
+        );
+    }
+    assert_eq!(w.pending_count(), pending);
+    assert_eq!(w.released(), released);
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg);
+    }
+
+    // S07 routes 4 & 5: replaced executable at the same path and replaced working
+    // directory under opencode with standing record in force.
+    let bin = w.fixture.parent().unwrap().to_path_buf();
+    let original = bin.join("fixture.original");
+    let other = bin.join("fixture.other");
+    other_build(&other);
+    swap_in(&w.fixture, &original, &other);
+    let bad_exe = w.standing_request(&opencode, &launch);
+    assert_eq!(error_of(&bad_exe), "managed_launch_changed", "{bad_exe}");
+    assert_eq!(w.pending_count(), pending);
+    assert_eq!(w.released(), released);
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg);
+    }
+    std::fs::rename(&original, &w.fixture).unwrap();
+
+    let fresh_work = w.project.join("work.new");
+    let aside_work = w.project.join("work.aside");
+    std::fs::create_dir(&fresh_work).unwrap();
+    std::fs::rename(&work, &aside_work).unwrap();
+    std::fs::rename(&fresh_work, &work).unwrap();
+    let bad_cwd = w.standing_request(&opencode, &launch);
+    assert_eq!(error_of(&bad_cwd), "managed_launch_changed", "{bad_cwd}");
+    assert_eq!(w.pending_count(), pending);
+    assert_eq!(w.released(), released);
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg);
+    }
+    std::fs::remove_dir(&work).unwrap();
+    std::fs::rename(&aside_work, &work).unwrap();
+
+    // Restored executable and cwd succeed under the standing record.
+    w.revoke_all_grants();
+    let restored = w.standing_request(&opencode, &launch);
+    assert!(started(&restored), "{restored}");
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg + 1);
+    }
+    w.assert_released(0, 2, "restored launch ran under standing record");
+    w.revoke_all_grants();
+
+    // S04 & S07 route 6 & CR-5: healthy re-registration to revision 2 separates
+    // launch-check refusal from standing revision mismatch.
+    other_build(&other);
+    std::fs::rename(&other, &w.fixture).unwrap();
+    let plan = w.person("plan", json!({"launch": launch}));
+    let digest = plan["statement"]["digest"].as_str().unwrap().to_owned();
+    let updated = w.person("update", json!({"launch": launch, "digest": digest}));
+    assert_eq!(updated["revision"], 2, "{updated}");
+    assert_eq!(
+        w.standing_list()["standing"][0]["revision"],
+        1,
+        "existing standing record remains bound to revision 1"
+    );
+
+    let sg_before_rev2 = w.standing_grant_count();
+    let rel_before_rev2 = w.released();
+    let rev2_req = w.standing_request(&opencode, &launch);
+    let rev2_id = pending_id(&rev2_req);
+    assert_eq!(
+        w.released(),
+        rel_before_rev2,
+        "revision 1 standing record must not release for revision 2"
+    );
+    if w.traced() {
+        assert_eq!(
+            w.standing_grant_count(),
+            sg_before_rev2,
+            "revision 1 standing record must not mint a grant for revision 2"
+        );
+    }
+
+    // Approve revision 2 with a new standing record and verify it covers revision 2.
+    w.approve_with(&rev2_id, &["--standing", "7d"]);
+    w.revoke_all_grants();
+    let rev2_started = w.standing_request(&opencode, &launch);
+    assert!(started(&rev2_started), "{rev2_started}");
+    assert_eq!(
+        reported_identity(&report(&rev2_started)),
+        file_identity(&w.fixture)
+    );
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg_before_rev2 + 1);
+    }
+    w.assert_released(0, 3, "revision 2 standing record released once to runner");
+    w.revoke_all_grants();
+
+    // S04: Reclassification of stripe/fixture to live and unknown stops standing
+    // minting and refuses standing approval; reclassifying back to test restores it.
+    let pass_file =
+        w.h.secret_file(envcloak_testkit::labels::VAULT_PASSPHRASE, true);
+    let reclass_live = w.h.human(
+        &home,
+        &["items", "reclassify", "stripe/fixture", "live"],
+        &[],
+        &[],
+    );
+    assert_eq!(reclass_live.code, 0, "{}", reclass_live.all());
+    let live_req = w.standing_request(&opencode, &launch);
+    let live_id = pending_id(&live_req);
+    let refuse_live = w.h.human(
+        &project,
+        &[
+            "approve",
+            &live_id,
+            "--standing",
+            "7d",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(refuse_live.code, 1, "{}", refuse_live.all());
+    assert!(
+        refuse_live.err().contains("envcloak: live_not_ticked:"),
+        "{}",
+        refuse_live.all()
+    );
+
+    let reclass_unk = w.h.human(
+        &home,
+        &[
+            "items",
+            "reclassify",
+            "stripe/fixture",
+            "unknown",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(reclass_unk.code, 0, "{}", reclass_unk.all());
+    let unk_req = w.standing_request(&opencode, &launch);
+    let unk_id = pending_id(&unk_req);
+    let refuse_unk = w.h.human(
+        &project,
+        &[
+            "approve",
+            &unk_id,
+            "--standing",
+            "7d",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(refuse_unk.code, 1, "{}", refuse_unk.all());
+    assert!(
+        refuse_unk.err().contains("envcloak: invalid_options:"),
+        "{}",
+        refuse_unk.all()
+    );
+
+    let reclass_test = w.h.human(
+        &home,
+        &[
+            "items",
+            "reclassify",
+            "stripe/fixture",
+            "test",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(reclass_test.code, 0, "{}", reclass_test.all());
+    let test_started = w.standing_request(&opencode, &launch);
+    assert!(started(&test_started), "{test_started}");
+    w.assert_released(0, 4, "restored test item covered by standing record");
+    w.revoke_all_grants();
+
+    // S04 & S07 route 7: unbound launches (script, checked_at_rest native, bridge)
+    // pass the launch check (`pending`, never an implicit pass) and refuse
+    // `approve --standing 7d` with `launch_not_standing_capable`.
+    // (a) Script launch (`sh server.sh`) and changed script entry.
+    let script_proj = w.h.home.root().join("script-proj");
+    std::fs::create_dir_all(&script_proj).unwrap();
+    std::fs::write(
+        script_proj.join("envcloak.toml"),
+        format!("[project]\nname = \"script-proj\"\n\n[env]\n{KEY} = \"stripe/fixture\"\n"),
+    )
+    .unwrap();
+    let script = script_proj.join("server.sh");
+    envcloak_e2e::write_script(
+        &script,
+        &format!("#!/bin/sh\nexec {} --var {KEY}\n", q(&w.fixture)),
+    );
+    let script_reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/script-proj",
+            "manifest": script_proj.join("envcloak.toml").to_str().unwrap(),
+            "argv": ["sh", script.to_str().unwrap()],
+        }),
+    );
+    assert_eq!(script_reg["receipt"]["class"], "script", "{script_reg}");
+    assert_eq!(
+        script_reg["receipt"]["strength"], "checked_at_rest",
+        "{script_reg}"
+    );
+    let script_launch = script_reg["launch"].as_str().unwrap().to_owned();
+    let script_req = w.standing_request(&opencode, &script_launch);
+    let script_id = pending_id(&script_req);
+    let refuse_script = w.h.human(
+        &project,
+        &[
+            "approve",
+            &script_id,
+            "--standing",
+            "7d",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(refuse_script.code, 1, "{}", refuse_script.all());
+    assert!(
+        refuse_script
+            .err()
+            .contains("envcloak: launch_not_standing_capable:"),
+        "{}",
+        refuse_script.all()
+    );
+    let mut sf = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&script)
+        .unwrap();
+    sf.write_all(b"# modified\n").unwrap();
+    drop(sf);
+    let pending_before_script_change = w.pending_count();
+    let script_changed = w.standing_request(&opencode, &script_launch);
+    assert_eq!(
+        error_of(&script_changed),
+        "managed_launch_changed",
+        "{script_changed}"
+    );
+    assert_eq!(w.pending_count(), pending_before_script_change);
+
+    // (b) Unbound native launch (`checked_at_rest`).
+    let unbound_proj = w.h.home.root().join("unbound-proj");
+    std::fs::create_dir_all(unbound_proj.join("bin")).unwrap();
+    std::fs::write(
+        unbound_proj.join("envcloak.toml"),
+        format!("[project]\nname = \"unbound-proj\"\n\n[env]\n{KEY} = \"stripe/fixture\"\n"),
+    )
+    .unwrap();
+    let unbound_bin = unbound_proj.join("bin").join("unbound");
+    if cfg!(target_os = "linux") {
+        let src = w.h.files().join("unbound-origin.c");
+        std::fs::write(&src, "int main(void) { return 0; }\n").unwrap();
+        let built = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&unbound_bin)
+            .arg("-Wl,-rpath,$ORIGIN/../lib")
+            .arg(&src)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{}", text(&built));
+    } else {
+        std::fs::copy(managed_common::fixture_bin(), &unbound_bin).unwrap();
+        let stripped = std::process::Command::new("/usr/bin/codesign")
+            .arg("--remove-signature")
+            .arg(&unbound_bin)
+            .output()
+            .unwrap();
+        assert!(stripped.status.success(), "{}", text(&stripped));
+    }
+    let unbound_reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/unbound-proj",
+            "manifest": unbound_proj.join("envcloak.toml").to_str().unwrap(),
+            "argv": [unbound_bin.to_str().unwrap()],
+        }),
+    );
+    assert_eq!(unbound_reg["receipt"]["class"], "native", "{unbound_reg}");
+    assert_eq!(
+        unbound_reg["receipt"]["strength"], "checked_at_rest",
+        "{unbound_reg}"
+    );
+    let unbound_launch = unbound_reg["launch"].as_str().unwrap().to_owned();
+    let unbound_req = w.standing_request(&opencode, &unbound_launch);
+    let unbound_id = pending_id(&unbound_req);
+    let refuse_unbound = w.h.human(
+        &project,
+        &[
+            "approve",
+            &unbound_id,
+            "--standing",
+            "7d",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(refuse_unbound.code, 1, "{}", refuse_unbound.all());
+    assert!(
+        refuse_unbound
+            .err()
+            .contains("envcloak: launch_not_standing_capable:"),
+        "{}",
+        refuse_unbound.all()
+    );
+
+    // (c) Bridge launch.
+    let origin = "https://api.example.test";
+    let bridge_proj = w.h.home.root().join("bridge-proj");
+    std::fs::create_dir_all(&bridge_proj).unwrap();
+    let suffix = envcloak_policy::managed::bridge_binding_suffix(origin);
+    let bridge_manifest = bridge_proj.join("envcloak.toml");
+    std::fs::write(
+        &bridge_manifest,
+        format!(
+            "[project]\nname = \"bridge-proj\"\n\n[env]\nAUTHORIZATION{suffix} = \"stripe/fixture\"\n"
+        ),
+    )
+    .unwrap();
+    let bridge_reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/bridge-proj",
+            "manifest": bridge_manifest.to_str().unwrap(),
+            "origin": origin,
+            "headers": ["Authorization"],
+        }),
+    );
+    assert_eq!(bridge_reg["receipt"]["transport"], "bridge", "{bridge_reg}");
+    let bridge_req = w.fresh_agent(
+        &opencode,
+        "request",
+        &json!({
+            "manifest": bridge_manifest.to_str().unwrap(),
+            "origin": origin,
+            "headers": ["Authorization"],
+        }),
+    );
+    let bridge_id = pending_id(&bridge_req);
+    let refuse_bridge = w.h.human(
+        &project,
+        &[
+            "approve",
+            &bridge_id,
+            "--standing",
+            "7d",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(refuse_bridge.code, 1, "{}", refuse_bridge.all());
+    assert!(
+        refuse_bridge
+            .err()
+            .contains("envcloak: launch_not_standing_capable:"),
+        "{}",
+        refuse_bridge.all()
+    );
+
+    w.h.assert_swept("after standing launch matrix");
+}
