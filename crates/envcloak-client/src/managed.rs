@@ -98,6 +98,32 @@ pub fn refuse_key_shaped_server(server: &ManagedServerDecl) -> Result<(), Failur
     }
 }
 
+/// Whether the provider registry permits `value` (sent in `header_name`) to
+/// go to `host` (SPEC §6.4; M2 plan D-18, M2R-5). When `value` matches a
+/// registered provider's key pattern, `host` must match that provider's
+/// `allowed_hosts`; when no pattern matches (an unknown provider), `true`
+/// so custom and internal MCP servers work.
+#[must_use]
+pub fn host_allowed_for_header(value: &SecretBytes, header_name: &str, host: &str) -> bool {
+    let Some(reg) = crate::render::registry() else {
+        return true;
+    };
+    let det = reg.detect(value, Some(header_name));
+    if let Some(id) = &det.provider {
+        if let Some(p) = reg.get(id.as_str()) {
+            return p.host_allowed(host);
+        }
+    }
+    if !det.candidates.is_empty() {
+        return det
+            .candidates
+            .iter()
+            .filter_map(|id| reg.get(id.as_str()))
+            .any(|p| p.host_allowed(host));
+    }
+    true
+}
+
 /// `managed.register`, its declaration checked
 /// ([`refuse_key_shaped_server`]) before `connect` is called.
 ///

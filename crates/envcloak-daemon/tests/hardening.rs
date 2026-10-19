@@ -245,7 +245,7 @@ fn linux_same_uid_ptrace_and_proc_reads_of_the_daemon_are_denied() {
     // read, and its environment holds the canary.
     let mut control = home
         .apply(&mut Command::new("sh"))
-        .args(["-c", "echo ready; exec cat"])
+        .args(["-c", "echo ready; read _"])
         .env("ENVCLOAK_TEST_CANARY", secret)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

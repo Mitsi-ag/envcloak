@@ -24,7 +24,6 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 /// its refusal names it.
 const STUBS: &[(&[&str], &str)] = &[
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
-    (&["mcp-bridge"], "`envcloak mcp-bridge`"),
     (&["login"], "`envcloak login`"),
     (&["signin"], "`envcloak signin`"),
 ];
@@ -293,6 +292,7 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
     assert!(lists(available, &["standing", "ls"]));
     assert!(lists(available, &["standing", "rm"]));
     assert!(lists(available, &["standing", "confirm"]));
+    assert!(lists(available, &["mcp-bridge"]));
     let run = available
         .lines()
         .find(|l| l.trim_start().starts_with("envcloak run "))
