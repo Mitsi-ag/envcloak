@@ -223,11 +223,11 @@ fn agents_digests_toml_matches_integrations_file_and_resolves_pinned_releases() 
         .expect("integrations/agents-digests.toml must exist");
     assert_eq!(AGENTS_DIGESTS_TOML, on_disk);
 
-    // Known Claude Code digest (2.1.280 x86_64-linux).
+    // Known Claude Code digest (2.1.280 x86_64-linux from versions.toml).
     let claude_x64 = [
-        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
-        0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
-        0xb8, 0x55,
+        0x1e, 0x08, 0x50, 0x3d, 0xbd, 0xf3, 0xc2, 0xcb, 0x0d, 0x70, 0x6d, 0x32, 0xf3, 0x40, 0x82,
+        0x77, 0x38, 0x8d, 0x1c, 0x76, 0xef, 0x10, 0x86, 0x73, 0xe8, 0xfe, 0x42, 0xc1, 0xb3, 0x22,
+        0x92, 0x5b,
     ];
     assert_eq!(
         recognized_release("claude-code", &claude_x64).as_deref(),
@@ -235,6 +235,14 @@ fn agents_digests_toml_matches_integrations_file_and_resolves_pinned_releases() 
     );
     assert_eq!(recognized_release("codex", &claude_x64), None);
     assert_eq!(recognized_release("claude-code", &[0xff; 32]), None);
+    assert_eq!(recognized_release("claude-code", &[0x00; 32]), None);
+    // Empty-file SHA-256 must never be treated as a recognized release (F-04).
+    let empty_sha256 = [
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9,
+        0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52,
+        0xb8, 0x55,
+    ];
+    assert_eq!(recognized_release("claude-code", &empty_sha256), None);
 }
 
 #[test]
@@ -789,4 +797,69 @@ fn standing_record_round_trips_vault_format() {
     assert_eq!(round_tripped.agent_id, rec.agent_id);
     assert_eq!(round_tripped.code_identity, rec.code_identity);
     assert_eq!(round_tripped.bindings, rec.bindings);
+}
+
+#[test]
+fn subset_session_grant_ends_on_sibling_item_reclassify_and_recently_denied_blocks_standing() {
+    let catalog = AgentCatalog::builtin();
+    let home = Path::new("/Users/alice");
+    let now = now_at(0);
+
+    let (meta_a, br_a) = make_binding(
+        "STRIPE_SECRET_KEY",
+        "stripe/acme-test",
+        Classification::Test,
+    );
+    let (meta_b, br_b) = make_binding(
+        "SENDGRID_API_KEY",
+        "sendgrid/acme-test",
+        Classification::Test,
+    );
+    let items = vec![meta_a.clone(), meta_b.clone()];
+
+    let ev = linux_claude_evidence(
+        "/Users/alice/.local/share/claude/versions/2.1.280",
+        [0xaa; 32],
+        false,
+    );
+    let full_req = make_request(ev.clone(), vec![br_a.clone(), br_b], None);
+    let subset_req = make_request(ev.clone(), vec![br_a], None);
+
+    let mut store = StandingStore::new();
+    let rec = store
+        .build_record(
+            &full_req,
+            &ApprovalOptions::standing(Duration::from_secs(86_400)),
+            None,
+            &catalog,
+            Some(home),
+            now.wall,
+            &items,
+        )
+        .unwrap();
+    store.insert(rec);
+
+    let mut grants = GrantStore::new();
+    grants.set_epochs(1, 1);
+
+    // 1. Subset request for item A only mints a session grant from the (A, B) standing record.
+    assert!(grants.can_try_standing(&subset_req, &now));
+    let (_, gid) = store
+        .match_request(&subset_req, &ev, None, &now, &items, &catalog, &mut grants)
+        .unwrap();
+    assert_eq!(grants.binding_item(meta_b.id), 1);
+
+    // Reclassifying sibling item B ends the subset-derived session grant `gid` (F-02)!
+    assert_eq!(grants.on_item_reclassified(meta_b.id), 1);
+    assert!(grants.grant(gid).is_none());
+
+    // 2. A recently denied request fingerprint is not eligible for `can_try_standing` (F-03).
+    let mut store_empty = StandingStore::new();
+    let _ = &mut store_empty;
+    let pid = match grants.decide(subset_req.clone(), &now) {
+        Decision::Pending(id) => id,
+        other => panic!("expected pending, got {other:?}"),
+    };
+    grants.deny(&pid, &now).unwrap();
+    assert!(!grants.can_try_standing(&subset_req, &now));
 }

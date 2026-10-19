@@ -384,6 +384,10 @@ pub struct Grant {
     /// For a bridged server: the origin the grant was made for (rule 6);
     /// it covers no other, and no request of a project not bridged.
     pub origin: Option<String>,
+    /// When minted from a standing approval: every item id bound by that
+    /// standing approval, so reclassifying or removing any sibling item on
+    /// the standing record also ends subset-derived session grants.
+    pub standing_items: Vec<ItemId>,
 }
 
 impl Grant {
@@ -842,13 +846,16 @@ impl GrantStore {
             .collect()
     }
 
-    /// Whether `r` at `now` is neither root-denied nor already covered by
-    /// an active grant, so a standing approval may be consulted before
+    /// Whether `r` at `now` is neither root-denied, recently denied for
+    /// this exact request fingerprint, nor already covered by an active
+    /// grant, so a standing approval may be consulted before
     /// [`GrantStore::decide`] opens a pending request.
     pub fn can_try_standing(&mut self, r: &AccessRequest, now: &Now) -> bool {
         self.expire(now);
         let root = r.subject.root();
-        !self.flood.root_denied(&root, now) && self.covering(r, now).is_none()
+        !self.flood.root_denied(&root, now)
+            && self.covering(r, now).is_none()
+            && !self.flood.recently_denied(&fingerprint(r), now)
     }
 
     /// Decides `r` at `now`: covered, pending or denied. See the module
@@ -1132,6 +1139,7 @@ impl GrantStore {
             policy_epoch: self.policy_epoch,
             launch: r.managed.as_ref().and_then(|m| m.launch),
             origin,
+            standing_items: Vec::new(),
         };
         self.grants.insert(id, grant);
         Ok(id)
@@ -1144,6 +1152,20 @@ impl GrantStore {
         r: &AccessRequest,
         ttl: Duration,
         now: &Now,
+    ) -> Option<GrantId> {
+        let standing_items = r.bindings.iter().map(|b| b.binding.item).collect();
+        self.mint_from_standing_items(r, ttl, now, standing_items)
+    }
+
+    /// Mints a `session` grant in `self` from a matching standing approval
+    /// for `r` at `now` with lifetime `ttl`, recording `standing_items` as
+    /// the full set of item ids bound by the minting standing record.
+    pub fn mint_from_standing_items(
+        &mut self,
+        r: &AccessRequest,
+        ttl: Duration,
+        now: &Now,
+        standing_items: Vec<ItemId>,
     ) -> Option<GrantId> {
         self.expire(now);
         if ttl.is_zero() || self.grants.len() >= MAX_GRANTS {
@@ -1182,6 +1204,7 @@ impl GrantStore {
             policy_epoch: self.policy_epoch,
             launch: ManagedRequest::launch(r),
             origin: ManagedRequest::origin(r).map(str::to_owned),
+            standing_items,
         };
         self.grants.insert(id, grant);
         Some(id)
@@ -1398,12 +1421,14 @@ impl GrantStore {
         self.end_item(item)
     }
 
-    /// Ends every grant and pending request that binds `item`. Returns how
-    /// many grants ended.
+    /// Ends every grant and pending request that binds `item` (or was minted
+    /// from a standing approval that binds `item`). Returns how many grants
+    /// ended.
     fn end_item(&mut self, item: ItemId) -> usize {
         let before = self.grants.len();
-        self.grants
-            .retain(|_, g| !g.bindings.iter().any(|b| b.item == item));
+        self.grants.retain(|_, g| {
+            !g.bindings.iter().any(|b| b.item == item) && !g.standing_items.contains(&item)
+        });
         self.pending
             .retain(|_, p| !p.request.bindings.iter().any(|b| b.binding.item == item));
         before - self.grants.len()
@@ -1413,7 +1438,9 @@ impl GrantStore {
     pub fn binding_item(&self, item: ItemId) -> usize {
         self.grants
             .values()
-            .filter(|g| g.bindings.iter().any(|b| b.item == item))
+            .filter(|g| {
+                g.bindings.iter().any(|b| b.item == item) || g.standing_items.contains(&item)
+            })
             .count()
     }
 

@@ -20,7 +20,7 @@ use envcloak_sys::PeerIdentity;
 use crate::audit::AuditEvent;
 use crate::clock::now_of;
 use crate::lock::Reading;
-use crate::policy_epoch::{EpochState, PolicyEpoch};
+use crate::policy_epoch::{EpochState, PolicyEpoch, SidecarState};
 use crate::requests::{
     digest_of, evidence, refuse_unless_prover_beside_pending, requester_terminal_in,
     subject_summary,
@@ -57,6 +57,24 @@ pub(crate) fn standing_error(e: StandingError) -> RpcError {
     }
 }
 
+/// Returns the highest standing-set generation observed across the unlocked
+/// vault header, the in-memory floor, and `<data>/policy-epoch`.
+pub(crate) fn sidecar_generation_floor(s: &State) -> Result<u64, RpcError> {
+    let v = s.unlocked()?;
+    let h = v
+        .header()
+        .map_err(|e| RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(e.kind())))?;
+    let vault_id = v.vault_id().0;
+    let pe = PolicyEpoch::new(vault_id, &s.paths().data_dir);
+    let on_disk = match pe.load() {
+        SidecarState::Present(sc) if sc.vault_id == vault_id => sc.generation,
+        _ => 0,
+    };
+    Ok(s.standing_generation_floor()
+        .max(h.standing_set.generation)
+        .max(on_disk))
+}
+
 /// Writes `<data>/policy-epoch` from the unlocked vault's current
 /// `standing_set` header, and returns its `generation`.
 pub(crate) fn commit_sidecar(s: &mut State) -> Result<u64, RpcError> {
@@ -70,6 +88,7 @@ pub(crate) fn commit_sidecar(s: &mut State) -> Result<u64, RpcError> {
     let pe = PolicyEpoch::new(vault_id, &s.paths().data_dir);
     match pe.commit(standing_set) {
         Ok(()) => {
+            s.raise_standing_generation_floor(standing_set.generation);
             s.set_epoch_state(EpochState::Verified);
             Ok(standing_set.generation)
         }
@@ -81,21 +100,26 @@ pub(crate) fn commit_sidecar(s: &mut State) -> Result<u64, RpcError> {
 }
 
 /// Persists `record` in `policies.sealed` (incrementing the vault header's
-/// `standing_set.generation` and recomputing `standing_set.set_digest`),
-/// updates the in-memory [`StandingStore`], and writes `<data>/policy-epoch`.
+/// `standing_set.generation` past any observed floor and recomputing
+/// `standing_set.set_digest`), updates the in-memory [`StandingStore`], and
+/// writes `<data>/policy-epoch`.
 pub(crate) fn put_record(s: &mut State, record: StandingRecord) -> Result<(), RpcError> {
+    let floor = sidecar_generation_floor(s)?;
     envcloak_sys::pause_point("standing.before_vault_commit");
     envcloak_sys::panic_point("standing.before_vault_commit");
     let (policy_id, approval) = record.to_vault();
     {
         let v = s.unlocked_mut()?;
-        v.transact(|txn| txn.put_policy(policy_id, &PolicyRecord::StandingApproval(approval)))
-            .map_err(|e| match e.kind() {
-                VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
-                    RpcError::new(ErrorKind::VaultTampered)
-                }
-                k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
-            })?;
+        v.transact(|txn| {
+            txn.advance_standing_set(floor);
+            txn.put_policy(policy_id, &PolicyRecord::StandingApproval(approval))
+        })
+        .map_err(|e| match e.kind() {
+            VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
+                RpcError::new(ErrorKind::VaultTampered)
+            }
+            k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
+        })?;
     }
     envcloak_sys::pause_point("standing.after_vault_commit");
     envcloak_sys::panic_point("standing.after_vault_commit");
@@ -107,21 +131,45 @@ pub(crate) fn put_record(s: &mut State, record: StandingRecord) -> Result<(), Rp
 
 /// Deletes `ids` from `policies.sealed` in one vault transaction, removes
 /// them from the in-memory [`StandingStore`], bumps `policy_epoch` (ending
-/// derived session grants), and writes `<data>/policy-epoch`.
+/// derived session grants), and updates `<data>/policy-epoch` when
+/// [`EpochState::Verified`] or when the standing set becomes empty.
+///
+/// When [`EpochState::Unverified`] and at least one unconfirmed standing
+/// record remains after deleting `ids`, the vault's `standing_set.generation`
+/// is frozen and `<data>/policy-epoch` is left untouched so selective
+/// revocation without a passphrase never unpauses remaining unconfirmed
+/// records or regresses the anti-rollback high-water mark.
 ///
 /// Returns `(records_revoked, grants_ended)`.
 pub(crate) fn delete_records(
     s: &mut State,
     ids: &[StandingId],
 ) -> Result<(usize, usize), RpcError> {
+    delete_records_inner(s, ids, false)
+}
+
+fn delete_records_inner(
+    s: &mut State,
+    ids: &[StandingId],
+    clear_all: bool,
+) -> Result<(usize, usize), RpcError> {
     let present: Vec<StandingId> = ids
         .iter()
         .copied()
         .filter(|id| s.standing().get(*id).is_some())
         .collect();
-    if present.is_empty() {
+    let unverified = s.epoch_state() == EpochState::Unverified;
+    let remaining_after = s
+        .standing()
+        .all_records()
+        .filter(|r| !present.contains(&r.id))
+        .count();
+    let clears_unverified_empty = unverified && (clear_all || remaining_after == 0);
+    if present.is_empty() && !clears_unverified_empty {
         return Ok((0, 0));
     }
+    let freeze_unverified = unverified && remaining_after > 0;
+    let floor = sidecar_generation_floor(s)?;
     envcloak_sys::pause_point("standing.before_vault_commit");
     envcloak_sys::panic_point("standing.before_vault_commit");
     let policy_epoch = {
@@ -129,6 +177,11 @@ pub(crate) fn delete_records(
         v.transact(|txn| {
             for id in &present {
                 txn.delete_policy(id.policy_id())?;
+            }
+            if freeze_unverified {
+                txn.freeze_unverified_standing_set();
+            } else {
+                txn.advance_standing_set(floor);
             }
             Ok(txn.bump_policy_epoch())
         })
@@ -147,7 +200,9 @@ pub(crate) fn delete_records(
     }
     let grants_before = s.grants().grants().count();
     s.grants().set_policy_epoch(policy_epoch);
-    commit_sidecar(s)?;
+    if !freeze_unverified {
+        commit_sidecar(s)?;
+    }
     Ok((present.len(), grants_before))
 }
 
@@ -218,7 +273,7 @@ pub fn standing_revoke(
         (None, None, None, true) => s.standing().all_records().map(|r| r.id).collect(),
         _ => return Err(RpcError::new(ErrorKind::InvalidParams)),
     };
-    let (revoked, grants) = delete_records(&mut s, &ids)?;
+    let (revoked, grants) = delete_records_inner(&mut s, &ids, p.all)?;
     s.audit(AuditEvent::StandingRevoked {
         pid: peer.pid,
         revoked,
@@ -279,6 +334,20 @@ pub fn standing_confirm(
             let records = summaries(shared, &s, now.wall)?;
             if confirm_statement_digest(&records) != digest {
                 return Err(RpcError::new(ErrorKind::StatementMismatch));
+            }
+            let floor = sidecar_generation_floor(&s)?;
+            {
+                let v = s.unlocked_mut()?;
+                v.transact(|txn| {
+                    txn.advance_standing_set(floor);
+                    Ok(())
+                })
+                .map_err(|e| match e.kind() {
+                    VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
+                        RpcError::new(ErrorKind::VaultTampered)
+                    }
+                    k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
+                })?;
             }
             let epoch_gen = commit_sidecar(&mut s)?;
             s.touch(Reading::now(&shared.clocks));

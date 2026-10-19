@@ -1094,7 +1094,27 @@ pub fn remove(
         Ok(w) => w,
         Err(e) => return Err(proven.aborted(peer, Write::Remove, e)),
     };
-    let grants = proven.s.grants().on_item_removed(t.item);
+    let mut grants = proven.s.grants().on_item_removed(t.item);
+    let standing_ids: Vec<envcloak_policy::StandingId> = proven
+        .s
+        .standing()
+        .all_records()
+        .filter(|r| r.bindings.iter().any(|b| b.item == t.item))
+        .map(|r| r.id)
+        .collect();
+    if !standing_ids.is_empty()
+        && let Ok((revoked, extra_grants)) =
+            crate::standing::delete_records(&mut proven.s, &standing_ids)
+        && revoked > 0
+    {
+        grants = grants.saturating_add(extra_grants);
+        proven.s.audit(AuditEvent::StandingRevoked {
+            pid: peer.pid,
+            revoked,
+            grants: extra_grants,
+            reason: Some("item_removed"),
+        });
+    }
     let subject = subject_summary(peer, &proven.caller);
     proven.s.audit(AuditEvent::Removed {
         pid: peer.pid,

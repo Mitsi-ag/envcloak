@@ -739,24 +739,43 @@ fn policy_epoch_detects_delete_corrupt_and_rollback_and_confirm_recovers() {
 
     let confirmed = f.standing_confirm(f.pass()).unwrap();
     assert_eq!(confirmed.records, 2);
-    assert_eq!(confirmed.generation, 2);
+    assert_eq!(confirmed.generation, 3);
     assert!(!f.standing_list().policy_epoch_unverified);
     assert_eq!(agent.request(&f.manifest, None, &[])["decision"], "covered");
 
     // Case 2: Corrupted `<data>/policy-epoch` across restart enters
-    // `PolicyEpochUnverified`.
+    // `PolicyEpochUnverified`. Selective revoke of one record (`s2`) while
+    // `PolicyEpochUnverified` removes `s2` from the vault but preserves
+    // `PolicyEpochUnverified` (so `s1` stays paused and restart does not
+    // auto-heal without a passphrase proof).
     f.d.signal("-TERM");
     assert!(f.d.wait_exit(Duration::from_secs(30)).is_some());
     std::fs::write(&sidecar_path, b"corrupted-sidecar-bytes").unwrap();
     f.d = Fixture::start_daemon(&f.home, &f.pause_release, &[]);
     client(&f.home).unlock(f.pass(), &[]).unwrap();
     assert!(f.standing_list().policy_epoch_unverified);
-    assert_eq!(f.standing_confirm(f.pass()).unwrap().records, 2);
+    assert_eq!(f.standing_list().standing.len(), 2);
+
+    let rev_s2 = f.standing_revoke_id(&s2).unwrap();
+    assert_eq!(rev_s2.revoked, 1);
+    assert!(f.standing_list().policy_epoch_unverified);
+    assert_eq!(f.standing_list().standing.len(), 1);
+    let r_still_paused = agent.request(&f.manifest, None, &[]);
+    assert_eq!(r_still_paused["decision"], "error");
+    assert_eq!(
+        r_still_paused["kind"],
+        ErrorKind::PolicyEpochUnverified.token()
+    );
+
+    // Confirming the remaining record raises generation to 4 and restores Verified.
+    let confirmed_after_selective = f.standing_confirm(f.pass()).unwrap();
+    assert_eq!(confirmed_after_selective.records, 1);
+    assert_eq!(confirmed_after_selective.generation, 4);
     assert!(!f.standing_list().policy_epoch_unverified);
 
-    // Case 3: Rollback of `vault.db` (and its WAL) from generation 2 back to
-    // the generation-1 snapshot while `<data>/policy-epoch` is at generation 2
-    // enters `PolicyEpochUnverified` at unlock.
+    // Case 3: Rollback of `vault.db` (and its WAL) back to the generation-1
+    // snapshot while `<data>/policy-epoch` is at generation 4 enters
+    // `PolicyEpochUnverified` at unlock.
     f.d.signal("-TERM");
     assert!(f.d.wait_exit(Duration::from_secs(30)).is_some());
     std::fs::copy(&snap_gen1, &vault_db).unwrap();
@@ -770,10 +789,13 @@ fn policy_epoch_detects_delete_corrupt_and_rollback_and_confirm_recovers() {
     assert!(f.standing_list().policy_epoch_unverified);
     assert_eq!(f.standing_list().standing.len(), 1);
 
-    // Selective revoke works even while `PolicyEpochUnverified`.
+    // Revoking the last standing record (`s1`) empties the standing set,
+    // advances generation past the sidecar floor (to 5), and clears
+    // `PolicyEpochUnverified`.
     let rev = f.standing_revoke_id(&s1).unwrap();
     assert_eq!(rev.revoked, 1);
     assert!(f.standing_list().standing.is_empty());
+    assert!(!f.standing_list().policy_epoch_unverified);
     drop(agent);
     f.sweep();
 }

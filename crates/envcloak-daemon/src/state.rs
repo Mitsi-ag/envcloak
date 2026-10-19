@@ -59,7 +59,7 @@ use crate::audit::{AuditEvent, AuditLog, RequestAudit};
 use crate::clock::{Clocks, now_of};
 use crate::crowded::Crowded;
 use crate::lock::{LockTimer, Reading};
-use crate::policy_epoch::{EpochState, PolicyEpoch};
+use crate::policy_epoch::{EpochState, PolicyEpoch, SidecarState};
 
 /// The vault as the daemon holds it.
 pub enum Slot {
@@ -141,6 +141,7 @@ pub struct State {
     grants: GrantStore,
     standing: StandingStore,
     epoch_state: EpochState,
+    standing_generation_floor: u64,
     limiter: AttemptLimiter,
     audit: AuditLog,
     /// The head of a log closed while a proof had the vault out: saved in
@@ -172,6 +173,7 @@ impl State {
             grants: GrantStore::new(),
             standing: StandingStore::new(),
             epoch_state: EpochState::Verified,
+            standing_generation_floor: 0,
             limiter: AttemptLimiter::new(),
             audit: AuditLog::default(),
             unsaved_head: None,
@@ -230,6 +232,17 @@ impl State {
     /// Sets the policy-epoch verification state.
     pub fn set_epoch_state(&mut self, state: EpochState) {
         self.epoch_state = state;
+    }
+
+    /// Highest standing-set generation observed for the currently unlocked
+    /// vault or its `<data>/policy-epoch` sidecar.
+    pub fn standing_generation_floor(&self) -> u64 {
+        self.standing_generation_floor
+    }
+
+    /// Raises the standing-set generation floor to at least `generation`.
+    pub fn raise_standing_generation_floor(&mut self, generation: u64) {
+        self.standing_generation_floor = self.standing_generation_floor.max(generation);
     }
 
     /// Backups v2 in progress and restore leases.
@@ -357,6 +370,7 @@ impl State {
         self.grants.on_lock();
         self.standing.clear();
         self.epoch_state = EpochState::Verified;
+        self.standing_generation_floor = 0;
         self.backups.on_lock();
         self.se_challenges.clear();
         let recorded = matches!(self.slot, Slot::Unlocked(_))
@@ -663,11 +677,19 @@ impl State {
         match (v.header(), StandingStore::from_vault(v)) {
             (Ok(h), Ok(store)) => {
                 self.standing = store;
-                let pe = PolicyEpoch::new(v.vault_id().0, &self.paths.data_dir);
-                self.epoch_state = pe.reconcile(h.standing_set, pe.load());
+                let vault_id = v.vault_id().0;
+                let pe = PolicyEpoch::new(vault_id, &self.paths.data_dir);
+                let sidecar = pe.load();
+                let sidecar_gen = match sidecar {
+                    SidecarState::Present(sc) if sc.vault_id == vault_id => sc.generation,
+                    _ => 0,
+                };
+                self.standing_generation_floor = h.standing_set.generation.max(sidecar_gen);
+                self.epoch_state = pe.reconcile(h.standing_set, sidecar);
             }
             _ => {
                 self.standing.clear();
+                self.standing_generation_floor = 0;
                 self.epoch_state = EpochState::Unverified;
             }
         }

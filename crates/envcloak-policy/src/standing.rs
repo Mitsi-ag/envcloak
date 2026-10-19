@@ -59,12 +59,7 @@ id = "claude-code"
 [[agents.releases]]
 version = "2.1.280"
 arch = "x86_64-linux"
-sha256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
-[[agents.releases]]
-version = "2.1.280"
-arch = "aarch64-linux"
-sha256 = "cbd539b6986d8b46825526521303f179c92736b58f742670679207407f9566e2"
+sha256 = "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b"
 
 [[agents]]
 id = "codex"
@@ -72,12 +67,7 @@ id = "codex"
 [[agents.releases]]
 version = "0.159.2"
 arch = "x86_64-linux"
-sha256 = "4d7f30d680a619231f2e0f41b5a7c031426619645269252d627c7a0c32145b20"
-
-[[agents.releases]]
-version = "0.159.2"
-arch = "aarch64-linux"
-sha256 = "7f8b92e15a6c3082941b02c48921736459a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4"
+sha256 = "1748767b230ebfc3d4ab7e4e254920d0c0ad9691fd8c11f190e7d44511a4a92e"
 
 [[agents]]
 id = "copilot-cli"
@@ -85,12 +75,7 @@ id = "copilot-cli"
 [[agents.releases]]
 version = "1.0.90"
 arch = "x86_64-linux"
-sha256 = "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b"
-
-[[agents.releases]]
-version = "1.0.90"
-arch = "aarch64-linux"
-sha256 = "1f2e3d4c5b6a798897a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4"
+sha256 = "be17b42705ca17490098d7b87f293300d72a094d125b6bb2b2557dc4a0a4f8a8"
 
 [[agents]]
 id = "opencode"
@@ -98,23 +83,33 @@ id = "opencode"
 [[agents.releases]]
 version = "1.18.34"
 arch = "x86_64-linux"
-sha256 = "5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b"
+sha256 = "9ca0b9953d49997601655e54f846a3efa464f237e47c6f1b04716d0f2e64c4c2"
+
+[[agents]]
+id = "cursor-cli"
 
 [[agents.releases]]
-version = "1.18.34"
-arch = "aarch64-linux"
-sha256 = "6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c"
+version = "2026.09.28-64d2043"
+arch = "x86_64-linux"
+sha256 = "2ccc9a8e167797641448b5e5c936f006ba137a2555f117f38c5eb76a5238a233"
 "#;
 
 /// Returns the recognized release version in `integrations/agents-digests.toml`
 /// when `sha256` matches a pinned release of `agent_id`, or `None` for an
 /// unrecognized build.
 pub fn recognized_release(agent_id: &str, sha256: &[u8; 32]) -> Option<String> {
+    const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    if *sha256 == [0u8; 32] {
+        return None;
+    }
+    let want = hex(sha256);
+    if want.eq_ignore_ascii_case(EMPTY_SHA256) {
+        return None;
+    }
     let doc = toml_edit::Document::parse(AGENTS_DIGESTS_TOML).ok()?;
     if doc.get("schema_version")?.as_integer()? != 1 {
         return None;
     }
-    let want = hex(sha256);
     let agents = doc.get("agents")?.as_array_of_tables()?;
     for agent in agents {
         if agent.get("id")?.as_str()? != agent_id {
@@ -832,7 +827,8 @@ impl StandingStore {
     ) -> Option<(StandingId, GrantId)> {
         let rec = self.find_matching(r, subject, launch, now.wall, items, catalog)?;
         let ttl = DEFAULT_TTL.min(MAX_AGENT_TTL).min(rec.remaining(now.wall));
-        let grant_id = grants.mint_from_standing(r, ttl, now)?;
+        let standing_items = rec.bindings.iter().map(|b| b.item).collect();
+        let grant_id = grants.mint_from_standing_items(r, ttl, now, standing_items)?;
         Some((rec.id, grant_id))
     }
 

@@ -72,6 +72,10 @@ public enum ErrorKind: String, CaseIterable, Sendable {
     case managedLaunchChanged = "managed_launch_changed"
     case codeSelectingEnv = "code_selecting_env"
     case runnerUnavailable = "runner_unavailable"
+    case identityNotStandingCapable = "identity_not_standing_capable"
+    case identityOutsideInstallTree = "identity_outside_install_tree"
+    case launchNotStandingCapable = "launch_not_standing_capable"
+    case policyEpochUnverified = "policy_epoch_unverified"
     case signatureInvalid = "signature_invalid"
     case unlockFailed = "unlock_failed"
     case noUnlocker = "no_unlocker"
@@ -128,6 +132,10 @@ public enum ErrorKind: String, CaseIterable, Sendable {
         case .managedLaunchChanged: -32040
         case .codeSelectingEnv: -32041
         case .runnerUnavailable: -32042
+        case .identityNotStandingCapable: -32043
+        case .identityOutsideInstallTree: -32044
+        case .launchNotStandingCapable: -32045
+        case .policyEpochUnverified: -32046
         case .signatureInvalid: -32051
         case .unlockFailed: -32052
         case .noUnlocker: -32053
