@@ -160,9 +160,10 @@ def encode_write(s):
 
 def encode_reveal(d):
     out = bytearray(b"envcloak-reveal-statement/1\n")
+    out += text(d["request"])
+    out += text(d["nonce"])
+    out += text(d.get("app_eph_pub", ""))
     for k in (
-        "request",
-        "nonce",
         "vault_id",
         "item",
         "slug",

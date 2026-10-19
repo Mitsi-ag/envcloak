@@ -50,8 +50,8 @@ use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{
     ItemClass, KdfParams, P256_PUBLIC_KEY_LEN, SE_CHALLENGE_LEN, SE_HPKE_CIPHERTEXT_LEN,
     SE_HPKE_ENC_LEN, SeEphemeralKey, SeHpkeEnvelope, UnlockerId, UnlockerKind, VaultId,
-    derive_p256_keypair, open_se_envelope, p256_fingerprint, se_reseal_aad, seal_secret_to_x25519,
-    seal_vmk_to_daemon, secret_sha256, sign_p256_prehash,
+    derive_p256_keypair, open_se_envelope, p256_fingerprint, se_reseal_aad, se_reveal_aad,
+    seal_secret_to_x25519, seal_vmk_to_daemon, secret_sha256, sign_p256_prehash,
 };
 use envcloak_core::vault::{FieldName, ItemDetails, LockedVault, NewItem, Slug, VaultPaths};
 use envcloak_core::{RecoveryKit, SecretBytes, create_vault_with_kit};
@@ -804,10 +804,10 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
 
     // Before adding a second SE unlocker: removing `uid_1` would leave the
     // vault with zero Secure Enclave unlockers -> refused with `last_unlocker`!
-    let nonce_last_se = hex_encode(&[0xaa; 32]);
+    let t_last_se = c.app_items_target("unlocker:remove", None, &[]).unwrap();
     let stmt_last_se = WriteStatement {
         target: "unlocker_remove".to_owned(),
-        nonce: nonce_last_se.clone(),
+        nonce: t_last_se.nonce.clone(),
         vault_id: hex_encode(&vault_id.0),
         action: WriteAction::UnlockerRemove {
             unlocker: UnlockerTarget::SecureEnclave {
@@ -822,7 +822,7 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
     let err = c
         .app_unlocker_remove(&AppUnlockerRemoveParams {
             unlocker: uid_1.clone(),
-            nonce: nonce_last_se,
+            nonce: t_last_se.nonce,
             digest: d_last_se,
             signature: s_last_se,
             created_secs: 1_800_000_000,
@@ -847,9 +847,46 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
         assert_eq!(rpc_kind(err).0, ErrorKind::NoUnlocker);
     }
 
-    // `app.unlocker.add`: enroll a second SE unlocker ("Touch ID 2") signed by
-    // `approve_sk_1`.
-    let nonce_add = hex_encode(&[0xac; 32]);
+    // F-02 regression check: calling `app.unlocker.add` with a caller-invented
+    // nonce (not issued by `app.items.target("unlocker:add")`) is rejected with
+    // `statement_mismatch` even when the signature is valid!
+    let invented_nonce = hex_encode(&[0xac; 32]);
+    let invented_add_stmt = WriteStatement {
+        target: "unlocker_add".to_owned(),
+        nonce: invented_nonce.clone(),
+        vault_id: hex_encode(&vault_id.0),
+        action: WriteAction::UnlockerAdd {
+            label: "Touch ID 2".to_owned(),
+            unlock_pub_sha256: hex_encode(&p256_fingerprint(&unlock_pub_2)),
+            approve_pub_sha256: hex_encode(&p256_fingerprint(&approve_pub_2)),
+            team_id: TEST_TEAM_ID.to_owned(),
+            signing_id: TEST_SIGNING_ID.to_owned(),
+        },
+    };
+    let (d_invented, s_invented) = sign_write(&approve_sk_1, &invented_add_stmt);
+    assert_eq!(
+        rpc_kind(
+            c.app_unlocker_add(&AppUnlockerAddParams {
+                label: "Touch ID 2".to_owned(),
+                unlock_pub: hex_encode(&unlock_pub_2),
+                approve_pub: hex_encode(&approve_pub_2),
+                nonce: invented_nonce,
+                digest: d_invented,
+                signature: s_invented,
+                created_secs: 1_800_000_000,
+                claims: Vec::new(),
+            })
+            .unwrap_err()
+        )
+        .0,
+        ErrorKind::StatementMismatch
+    );
+
+    // `app.unlocker.add`: acquire a daemon-issued 60s target via
+    // `app.items.target("unlocker:add")` and enroll a second SE unlocker
+    // ("Touch ID 2") signed by `approve_sk_1`.
+    let t_add = c.app_items_target("unlocker:add", None, &[]).unwrap();
+    let nonce_add = t_add.nonce;
     let add_stmt = WriteStatement {
         target: "unlocker_add".to_owned(),
         nonce: nonce_add.clone(),
@@ -862,7 +899,7 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
             signing_id: TEST_SIGNING_ID.to_owned(),
         },
     };
-    // Wrong key -> `signature_invalid`.
+    // Wrong key -> `signature_invalid` (does not consume the target).
     let (d_add_wrong, s_add_wrong) = sign_write(&wrong_sk, &add_stmt);
     assert_eq!(
         rpc_kind(
@@ -905,9 +942,37 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
                 label: "Touch ID 2".to_owned(),
                 unlock_pub: hex_encode(&unlock_pub_2),
                 approve_pub: hex_encode(&approve_pub_2),
-                nonce: nonce_add,
-                digest: d_add,
-                signature: s_add,
+                nonce: nonce_add.clone(),
+                digest: d_add.clone(),
+                signature: s_add.clone(),
+                created_secs: 1_800_000_000,
+                claims: Vec::new(),
+            })
+            .unwrap_err()
+        )
+        .0,
+        ErrorKind::StatementMismatch
+    );
+
+    // Using an `"unlocker:add"` target nonce for `app.unlocker.remove` is
+    // rejected with `statement_mismatch`.
+    let t_wrong_kind = c.app_items_target("unlocker:add", None, &[]).unwrap();
+    let rm_wrong_kind_stmt = WriteStatement {
+        target: "unlocker_remove".to_owned(),
+        nonce: t_wrong_kind.nonce.clone(),
+        vault_id: hex_encode(&vault_id.0),
+        action: WriteAction::UnlockerRemove {
+            unlocker: UnlockerTarget::Passphrase,
+        },
+    };
+    let (d_wk, s_wk) = sign_write(&approve_sk_2, &rm_wrong_kind_stmt);
+    assert_eq!(
+        rpc_kind(
+            c.app_unlocker_remove(&AppUnlockerRemoveParams {
+                unlocker: "passphrase".to_owned(),
+                nonce: t_wrong_kind.nonce,
+                digest: d_wk,
+                signature: s_wk,
                 created_secs: 1_800_000_000,
                 claims: Vec::new(),
             })
@@ -918,7 +983,8 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
     );
 
     // Remove the passphrase unlocker (`"passphrase"`), signed by `approve_sk_2`!
-    let nonce_rm_pass = hex_encode(&[0xad; 32]);
+    let t_rm_pass = c.app_items_target("unlocker:remove", None, &[]).unwrap();
+    let nonce_rm_pass = t_rm_pass.nonce;
     let rm_pass_stmt = WriteStatement {
         target: "unlocker_remove".to_owned(),
         nonce: nonce_rm_pass.clone(),
@@ -941,7 +1007,8 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
     assert_eq!(removed_pass.removed.len(), 32);
 
     // Remove `uid_1` (now allowed since `uid_2` remains).
-    let nonce_rm_se1 = hex_encode(&[0xae; 32]);
+    let t_rm_se1 = c.app_items_target("unlocker:remove", None, &[]).unwrap();
+    let nonce_rm_se1 = t_rm_se1.nonce;
     let rm_se1_stmt = WriteStatement {
         target: "unlocker_remove".to_owned(),
         nonce: nonce_rm_se1.clone(),
@@ -970,7 +1037,8 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
 
     // Removed unlocker `uid_1`'s `approve_sk_1` is now rejected with
     // `signature_invalid`!
-    let nonce_rm_se2 = hex_encode(&[0xaf; 32]);
+    let t_rm_se2 = c.app_items_target("unlocker:remove", None, &[]).unwrap();
+    let nonce_rm_se2 = t_rm_se2.nonce;
     let rm_se2_stmt = WriteStatement {
         target: "unlocker_remove".to_owned(),
         nonce: nonce_rm_se2.clone(),
@@ -1069,6 +1137,28 @@ fn unlocker_add_and_remove_passphrase_se_and_last_unlocker_guards() {
         .app_unlock(&begin_u2.request_id, &hex_encode(&sealed_vmk), &[])
         .unwrap();
     assert!(!unlocked.already);
+
+    // F-02 regression check: replaying a captured `(nonce_add, d_add, s_add)`
+    // after a lock/unlock cycle (signed by `approve_sk_2` too) is rejected with
+    // `statement_mismatch`!
+    let (d_replay_after_lock, s_replay_after_lock) = sign_write(&approve_sk_2, &add_stmt);
+    assert_eq!(
+        rpc_kind(
+            c.app_unlocker_add(&AppUnlockerAddParams {
+                label: "Touch ID 2".to_owned(),
+                unlock_pub: hex_encode(&unlock_pub_2),
+                approve_pub: hex_encode(&approve_pub_2),
+                nonce: nonce_add,
+                digest: d_replay_after_lock,
+                signature: s_replay_after_lock,
+                created_secs: 1_800_000_000,
+                claims: Vec::new(),
+            })
+            .unwrap_err()
+        )
+        .0,
+        ErrorKind::StatementMismatch
+    );
 
     drop(c);
     d.signal("-TERM");
@@ -1178,9 +1268,11 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
 
     let app_eph = SeEphemeralKey::generate().unwrap();
     let app_eph_pub_hex = hex_encode(app_eph.public_key());
+    let mut signed_desc = desc.clone();
+    signed_desc.app_eph_pub.clone_from(&app_eph_pub_hex);
 
     // Mutated statement -> `statement_mismatch`.
-    let mut bad_desc = desc.clone();
+    let mut bad_desc = signed_desc.clone();
     "stripe/acme-web".clone_into(&mut bad_desc.slug);
     let bad_digest = reveal_statement_digest(&bad_desc);
     let bad_sig = sign_p256_prehash(&approve_sk, &bad_digest).unwrap();
@@ -1201,7 +1293,7 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
     );
 
     // Wrong key -> `signature_invalid`.
-    let digest = reveal_statement_digest(&desc);
+    let digest = reveal_statement_digest(&signed_desc);
     let wrong_sig = sign_p256_prehash(&wrong_sk, &digest).unwrap();
     assert_eq!(
         rpc_kind(
@@ -1219,10 +1311,50 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
         ErrorKind::SignatureInvalid
     );
 
+    // F-01 regression check: substituting a different `app_eph_pub` while
+    // reusing `(digest, sig)` signed over `app_eph_pub_hex` is rejected with
+    // `statement_mismatch`; recomputing `digest` for `other_eph_pub` while
+    // reusing `sig` is rejected with `signature_invalid`.
+    let sig = sign_p256_prehash(&approve_sk, &digest).unwrap();
+    let other_eph = SeEphemeralKey::generate().unwrap();
+    let other_eph_pub_hex = hex_encode(other_eph.public_key());
+    assert_eq!(
+        rpc_kind(
+            proxy_c
+                .app_reveal(&AppRevealParams {
+                    request: req.request.clone(),
+                    digest: hex_encode(&digest),
+                    signature: hex_encode(&sig),
+                    app_eph_pub: other_eph_pub_hex.clone(),
+                    claims: Vec::new(),
+                })
+                .unwrap_err()
+        )
+        .0,
+        ErrorKind::StatementMismatch
+    );
+    let mut swapped_eph_desc = signed_desc.clone();
+    swapped_eph_desc.app_eph_pub.clone_from(&other_eph_pub_hex);
+    let swapped_eph_digest = reveal_statement_digest(&swapped_eph_desc);
+    assert_eq!(
+        rpc_kind(
+            proxy_c
+                .app_reveal(&AppRevealParams {
+                    request: req.request.clone(),
+                    digest: hex_encode(&swapped_eph_digest),
+                    signature: hex_encode(&sig),
+                    app_eph_pub: other_eph_pub_hex,
+                    claims: Vec::new(),
+                })
+                .unwrap_err()
+        )
+        .0,
+        ErrorKind::SignatureInvalid
+    );
+
     // 3. Mutation Check 2: block `<data>/audit` so the durable `reveal_app`
     //    audit write fails -> `app.reveal` returns `audit_failed`, releases
     //    nothing, and keeps the pending reveal open.
-    let sig = sign_p256_prehash(&approve_sk, &digest).unwrap();
     let audit_dir = data_dir(&home).join("audit");
     std::fs::remove_dir_all(&audit_dir).unwrap();
     std::fs::write(&audit_dir, b"blocked").unwrap();
@@ -1244,7 +1376,7 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
     );
 
     // Restore `<data>/audit` and retry: `app.reveal` now succeeds and seals
-    // the secret to `app_eph_pub` with AAD `request || nonce`.
+    // the secret to `app_eph_pub` with AAD `request || nonce || app_eph_pub`.
     std::fs::remove_file(&audit_dir).unwrap();
     std::fs::create_dir(&audit_dir).unwrap();
     std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1276,7 +1408,32 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
         ErrorKind::NoSuchRequest
     );
 
-    // 4. App-initiated reveal (`app.reveal.begin` with `slug: Some("stripe/acme-web")`).
+    // 4. App-initiated reveal (`app.reveal.begin` with `slug: Some("stripe/acme-web")`)
+    //    and F-03 regression checks:
+    //    - `app.reveal.begin(slug)` does not increment `status.app_requests` or
+    //      `status.pending_requests`.
+    //    - Opening >64 app-originated reveal stages evicts the oldest stage.
+    let first_stage = proxy_c
+        .app_reveal_begin(&AppRevealBeginParams {
+            request: None,
+            slug: Some("stripe/acme-web".to_owned()),
+            field: None,
+            claims: Vec::new(),
+        })
+        .unwrap();
+    let status_after_begin = c.status().unwrap();
+    assert_eq!(status_after_begin.app_requests, 0);
+    assert_eq!(status_after_begin.approvals.pending, 0);
+    for _ in 0..63 {
+        let _ = proxy_c
+            .app_reveal_begin(&AppRevealBeginParams {
+                request: None,
+                slug: Some("stripe/acme-web".to_owned()),
+                field: None,
+                claims: Vec::new(),
+            })
+            .unwrap();
+    }
     let direct_desc = proxy_c
         .app_reveal_begin(&AppRevealBeginParams {
             request: None,
@@ -1286,15 +1443,45 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
         })
         .unwrap();
     assert!(direct_desc.requester.is_none());
-    let direct_digest = reveal_statement_digest(&direct_desc);
-    let direct_sig = sign_p256_prehash(&approve_sk, &direct_digest).unwrap();
+    let status_after_burst = c.status().unwrap();
+    assert_eq!(status_after_burst.app_requests, 0);
+    assert_eq!(status_after_burst.approvals.pending, 0);
+
+    // `first_stage` (1st of 65) was evicted by the 64-entry cap -> `no_such_request`.
     let app_eph_2 = SeEphemeralKey::generate().unwrap();
+    let app_eph_2_pub_hex = hex_encode(app_eph_2.public_key());
+    let mut evicted_desc = first_stage.clone();
+    evicted_desc.app_eph_pub.clone_from(&app_eph_2_pub_hex);
+    let evicted_digest = reveal_statement_digest(&evicted_desc);
+    let evicted_sig = sign_p256_prehash(&approve_sk, &evicted_digest).unwrap();
+    assert_eq!(
+        rpc_kind(
+            proxy_c
+                .app_reveal(&AppRevealParams {
+                    request: first_stage.request,
+                    digest: hex_encode(&evicted_digest),
+                    signature: hex_encode(&evicted_sig),
+                    app_eph_pub: app_eph_2_pub_hex.clone(),
+                    claims: Vec::new(),
+                })
+                .unwrap_err()
+        )
+        .0,
+        ErrorKind::NoSuchRequest
+    );
+
+    let mut direct_signed_desc = direct_desc.clone();
+    direct_signed_desc
+        .app_eph_pub
+        .clone_from(&app_eph_2_pub_hex);
+    let direct_digest = reveal_statement_digest(&direct_signed_desc);
+    let direct_sig = sign_p256_prehash(&approve_sk, &direct_digest).unwrap();
     let direct_out = proxy_c
         .app_reveal(&AppRevealParams {
             request: direct_desc.request.clone(),
             digest: hex_encode(&direct_digest),
             signature: hex_encode(&direct_sig),
-            app_eph_pub: hex_encode(app_eph_2.public_key()),
+            app_eph_pub: app_eph_2_pub_hex,
             claims: Vec::new(),
         })
         .unwrap();
@@ -1323,7 +1510,16 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
     }
 
     let nonce_bytes: [u8; 32] = decode_hex(&desc.nonce);
-    let aad = se_reseal_aad(&desc.request, &nonce_bytes);
+    let aad = se_reveal_aad(&desc.request, &nonce_bytes, app_eph.public_key());
+    assert!(
+        app_eph
+            .open_secret(
+                &se_reveal_aad(&desc.request, &nonce_bytes, other_eph.public_key()),
+                &decode_hex_vec(&revealed.sealed_value)
+            )
+            .is_err(),
+        "HPKE reveal ciphertext must reject wrong app_eph_pub in AAD"
+    );
     let opened = app_eph
         .open_secret(&aad, &decode_hex_vec(&revealed.sealed_value))
         .unwrap();
@@ -1331,7 +1527,7 @@ fn signed_reveal_and_failed_audit_write_before_app_reveal_releases_nothing() {
     drop(opened);
 
     let direct_nonce: [u8; 32] = decode_hex(&direct_desc.nonce);
-    let direct_aad = se_reseal_aad(&direct_desc.request, &direct_nonce);
+    let direct_aad = se_reveal_aad(&direct_desc.request, &direct_nonce, app_eph_2.public_key());
     let direct_opened = app_eph_2
         .open_secret(&direct_aad, &decode_hex_vec(&direct_out.sealed_value))
         .unwrap();

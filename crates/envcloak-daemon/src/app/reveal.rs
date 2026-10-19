@@ -4,7 +4,7 @@
 
 use envcloak_core::audit::AuditKind;
 use envcloak_core::crypto::{
-    P256_SIGNATURE_LEN, SeEnrolledUnder, X25519_PUBLIC_KEY_LEN, se_reseal_aad,
+    P256_SIGNATURE_LEN, SeEnrolledUnder, X25519_PUBLIC_KEY_LEN, se_reveal_aad,
     seal_secret_to_x25519,
 };
 use envcloak_ipc::app::{AppRevealBeginParams, AppRevealOutput, AppRevealParams};
@@ -179,7 +179,7 @@ pub(crate) fn reveal(
         .cloned()
         .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?;
 
-    let current_desc = {
+    let mut current_desc = {
         let v = s.unlocked()?;
         if v.vault_id() != pending.spec.vault_id {
             return Err(RpcError::new(ErrorKind::StatementMismatch));
@@ -206,6 +206,7 @@ pub(crate) fn reveal(
             .current(v.items())
             .ok_or(RpcError::new(ErrorKind::NoSuchItem))?
     };
+    current_desc.app_eph_pub = hex_encode(&app_eph_pub);
 
     let expected = reveal_statement_digest(&current_desc);
     if expected != digest {
@@ -228,7 +229,7 @@ pub(crate) fn reveal(
         .unlocked()?
         .read_value(pending.spec.field)
         .map_err(|e| RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(e.kind())))?;
-    let aad = se_reseal_aad(&pending.id.to_string(), &pending.nonce);
+    let aad = se_reveal_aad(&pending.id.to_string(), &pending.nonce, &app_eph_pub);
     let sealed = seal_secret_to_x25519(&app_eph_pub, &aad, &value)
         .map_err(|_| RpcError::new(ErrorKind::InvalidParams))?;
     drop(value);

@@ -130,9 +130,23 @@ pub(crate) const PASTE_STAGE_TTL: Duration = Duration::from_secs(120);
 /// Maximum concurrent in-flight `app.paste` stages.
 const MAX_PASTE_STAGES: usize = 64;
 
-/// Maximum remembered single-use nonces for `app.unlocker.add` and
-/// `app.unlocker.remove`.
-const MAX_USED_WRITE_NONCES: usize = 256;
+/// Kind of unlocker write target issued by `app.items.target`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnlockerWriteKind {
+    Add,
+    Remove,
+}
+
+/// A single-use target and daemon-generated 32-byte nonce for
+/// `app.unlocker.add` and `app.unlocker.remove` (M3-14).
+#[derive(Debug)]
+pub(crate) struct UnlockerWriteTarget {
+    pub(crate) target: envcloak_policy::PendingId,
+    pub(crate) kind: UnlockerWriteKind,
+    pub(crate) nonce: [u8; 32],
+    pub(crate) vault_id: envcloak_core::crypto::VaultId,
+    pub(crate) opened_awake: Duration,
+}
 
 /// A single-use challenge and daemon ephemeral X25519 key for `app.unlock`
 /// (SPEC §5 "Unlock flow" step 2).
@@ -202,11 +216,11 @@ pub struct State {
     se_challenges: Vec<SeUnlockChallenge>,
     /// Single-use item write targets (`app.items.target`).
     write_targets: Vec<WriteTarget>,
+    /// Single-use unlocker write targets (`app.items.target` with
+    /// `"unlocker:add"` or `"unlocker:remove"`).
+    unlocker_targets: Vec<UnlockerWriteTarget>,
     /// Single-use paste stages (`app.paste.begin`, `app.paste.inspect`).
     paste_stages: Vec<PasteStage>,
-    /// Single-use nonces consumed by `app.unlocker.add` and
-    /// `app.unlocker.remove`.
-    used_write_nonces: Vec<[u8; 32]>,
 }
 
 impl State {
@@ -230,8 +244,8 @@ impl State {
             backups: crate::backups::Registry::default(),
             se_challenges: Vec::new(),
             write_targets: Vec::new(),
+            unlocker_targets: Vec::new(),
             paste_stages: Vec::new(),
-            used_write_nonces: Vec::new(),
         }
     }
 
@@ -375,8 +389,8 @@ impl State {
         self.backups.on_lock();
         self.se_challenges.clear();
         self.write_targets.clear();
+        self.unlocker_targets.clear();
         self.paste_stages.clear();
-        self.used_write_nonces.clear();
         let recorded = matches!(self.slot, Slot::Unlocked(_))
             || (matches!(self.slot, Slot::Busy) && reason != LockReason::Idle);
         if recorded {
@@ -480,6 +494,8 @@ impl State {
     pub(crate) fn prune_app_stages(&mut self, awake: Duration) {
         self.write_targets
             .retain(|t| awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL);
+        self.unlocker_targets
+            .retain(|t| awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL);
         self.paste_stages
             .retain(|s| awake.saturating_sub(s.opened_awake) < PASTE_STAGE_TTL);
     }
@@ -519,11 +535,14 @@ impl State {
         }
     }
 
-    /// Allocates a fresh `PendingId` not currently in use by `write_targets`.
+    /// Allocates a fresh `PendingId` not currently in use by `write_targets`
+    /// or `unlocker_targets`.
     pub(crate) fn fresh_write_target_id(&self) -> envcloak_policy::PendingId {
         loop {
             let id = envcloak_policy::PendingId::generate();
-            if !self.write_targets.iter().any(|t| t.target == id) {
+            if !self.write_targets.iter().any(|t| t.target == id)
+                && !self.unlocker_targets.iter().any(|t| t.target == id)
+            {
                 break id;
             }
         }
@@ -632,17 +651,46 @@ impl State {
             .and_then(|mut s| s.staged_secret.take())
     }
 
-    /// Records a single-use nonce for `app.unlocker.add` or
-    /// `app.unlocker.remove`. Returns `false` if the nonce was already used.
-    pub(crate) fn record_write_nonce(&mut self, nonce: [u8; 32]) -> bool {
-        if self.used_write_nonces.contains(&nonce) {
-            return false;
+    /// Allocates and stores a single-use `UnlockerWriteTarget` for
+    /// `app.unlocker.add` or `app.unlocker.remove`, evicting the oldest if at
+    /// cap.
+    pub(crate) fn open_unlocker_write_target(
+        &mut self,
+        kind: UnlockerWriteKind,
+        nonce: [u8; 32],
+        vault_id: envcloak_core::crypto::VaultId,
+        awake: Duration,
+    ) -> envcloak_policy::PendingId {
+        self.prune_app_stages(awake);
+        let target = self.fresh_write_target_id();
+        if self.unlocker_targets.len() >= MAX_WRITE_TARGETS {
+            self.unlocker_targets.remove(0);
         }
-        if self.used_write_nonces.len() >= MAX_USED_WRITE_NONCES {
-            self.used_write_nonces.remove(0);
-        }
-        self.used_write_nonces.push(nonce);
-        true
+        self.unlocker_targets.push(UnlockerWriteTarget {
+            target,
+            kind,
+            nonce,
+            vault_id,
+            opened_awake: awake,
+        });
+        target
+    }
+
+    /// Atomically consumes a live single-use `UnlockerWriteTarget` matching
+    /// `(nonce, kind)` if still within `WRITE_TARGET_TTL` on the awake clock.
+    pub(crate) fn take_unlocker_write_target(
+        &mut self,
+        nonce: &[u8; 32],
+        kind: UnlockerWriteKind,
+        awake: Duration,
+    ) -> Option<UnlockerWriteTarget> {
+        let found = self
+            .unlocker_targets
+            .iter()
+            .position(|t| t.nonce == *nonce)
+            .map(|idx| self.unlocker_targets.remove(idx));
+        self.prune_app_stages(awake);
+        found.filter(|t| t.kind == kind && awake.saturating_sub(t.opened_awake) < WRITE_TARGET_TTL)
     }
 
     fn se_unlock_failed(&mut self, pid: i32) -> RpcError {
@@ -886,8 +934,8 @@ impl State {
     fn start_grants(&mut self, v: &Vault) {
         self.grants.on_lock();
         self.write_targets.clear();
+        self.unlocker_targets.clear();
         self.paste_stages.clear();
-        self.used_write_nonces.clear();
         let policy_epoch = v.header().map(|h| h.policy_epoch).unwrap_or(0);
         self.grants.set_epochs(v.epoch(), policy_epoch);
     }

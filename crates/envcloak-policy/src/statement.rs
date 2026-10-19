@@ -1243,6 +1243,11 @@ pub struct RevealDescriptor {
     pub request: String,
     /// The 32-byte daemon nonce, as 64 lower-case hex characters.
     pub nonce: String,
+    /// The 32-byte app ephemeral X25519 public key, as 64 lower-case hex
+    /// characters (empty on `app.reveal.begin` before `app.reveal` supplies the
+    /// recipient key).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub app_eph_pub: String,
     /// The vault id, 16 bytes as 32 lower-case hex characters.
     pub vault_id: String,
     /// The item id: 26 Crockford base32 characters.
@@ -1272,6 +1277,7 @@ pub fn canonical_reveal_statement(d: &RevealDescriptor) -> Vec<u8> {
     e.0.extend_from_slice(REVEAL_STATEMENT_DOMAIN);
     e.str(&d.request)
         .str(&d.nonce)
+        .str(&d.app_eph_pub)
         .str(&d.vault_id)
         .str(&d.item)
         .str(&d.slug)

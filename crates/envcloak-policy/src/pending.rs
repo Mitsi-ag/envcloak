@@ -883,6 +883,7 @@ impl PendingReveal {
         let descriptor = RevealDescriptor {
             request: id.to_string(),
             nonce: hex(&nonce),
+            app_eph_pub: String::new(),
             vault_id: hex(&spec.vault_id.0),
             item: spec.item.to_string(),
             slug: spec.slug.as_str().to_owned(),

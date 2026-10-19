@@ -112,6 +112,9 @@ pub const MAX_AGENT_TTL: Duration = Duration::from_secs(24 * 3600);
 pub const MAX_TERMINAL_TTL: Duration = Duration::from_secs(12 * 3600);
 /// Grants held at once.
 pub const MAX_GRANTS: usize = 256;
+/// Maximum concurrent app-originated reveal stages (`app.reveal.begin` with
+/// `slug`, `requester == None`).
+pub const MAX_APP_REVEAL_STAGES: usize = 64;
 
 /// One reading of the clocks a decision needs: the wall clock (UTC), time
 /// awake, and time including sleep.
@@ -1480,9 +1483,27 @@ impl GrantStore {
     }
 
     /// Opens an app-originated `app.reveal.begin` request (60-second awake
-    /// TTL).
+    /// TTL), evicting the oldest app-originated reveal stage if at cap.
     pub fn open_app_reveal(&mut self, spec: RevealRequestSpec, now: &Now) -> PendingId {
         self.expire(now);
+        while self
+            .pending_reveals
+            .values()
+            .filter(|p| p.spec.requester.is_none())
+            .count()
+            >= MAX_APP_REVEAL_STAGES
+        {
+            let Some(oldest) = self
+                .pending_reveals
+                .values()
+                .filter(|p| p.spec.requester.is_none())
+                .min_by_key(|p| (p.opened, p.id))
+                .map(|p| p.id)
+            else {
+                break;
+            };
+            self.pending_reveals.remove(&oldest);
+        }
         let fp = spec.fingerprint();
         let id = self.fresh_pending_id();
         self.pending_reveals
@@ -1511,7 +1532,7 @@ impl GrantStore {
             + self
                 .pending_reveals
                 .values()
-                .filter(|p| !p.expired(now))
+                .filter(|p| !p.expired(now) && p.spec.requester.is_some())
                 .count()
     }
 

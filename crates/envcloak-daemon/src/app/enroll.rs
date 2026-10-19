@@ -24,6 +24,7 @@ use crate::clock::now_of;
 use crate::lock::Reading;
 use crate::requests::{self, digest_of, subject_summary};
 use crate::server::{Shared, locked, refuse_if_traced};
+use crate::state::UnlockerWriteKind;
 
 use super::{decode_fixed_bytes, decode_hex, hex_encode};
 
@@ -118,6 +119,7 @@ pub(crate) fn add(
     let caller = requests::evidence(shared, peer, &p.claims)?;
 
     let mut s = locked(&shared.state);
+    let now = now_of(&shared.clocks);
     let vault_id = s.unlocked()?.vault_id();
     let unlock_fp = p256_fingerprint(&unlock_pub);
     let approve_fp = p256_fingerprint(&approve_pub);
@@ -147,7 +149,10 @@ pub(crate) fn add(
         });
         return Err(RpcError::new(ErrorKind::SignatureInvalid));
     }
-    if !s.record_write_nonce(nonce) {
+    let Some(ut) = s.take_unlocker_write_target(&nonce, UnlockerWriteKind::Add, now.awake) else {
+        return Err(RpcError::new(ErrorKind::StatementMismatch));
+    };
+    if ut.vault_id != vault_id {
         return Err(RpcError::new(ErrorKind::StatementMismatch));
     }
 
@@ -160,12 +165,17 @@ pub(crate) fn add(
             }
         }
     };
+    let _ = p.created_secs;
+    let now_secs = now
+        .wall
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
     let record = SeUnlockerRecord {
         unlocker_id,
         unlock_pub,
         approve_pub,
         label: p.label.clone(),
-        created_secs: p.created_secs,
+        created_secs: now_secs,
         enrolled_under: enrolled_under.clone(),
     };
     let unlocker_hex = hex_encode(&unlocker_id.0);
@@ -207,6 +217,7 @@ pub(crate) fn remove(
     let caller = requests::evidence(shared, peer, &p.claims)?;
 
     let mut s = locked(&shared.state);
+    let now = now_of(&shared.clocks);
     let vault = s.unlocked()?;
     let vault_id = vault.vault_id();
     let (unlocker_id, target, kind_str, label, unlock_fp, approve_fp) = if p.unlocker
@@ -286,7 +297,11 @@ pub(crate) fn remove(
         });
         return Err(RpcError::new(ErrorKind::SignatureInvalid));
     }
-    if !s.record_write_nonce(nonce) {
+    let Some(ut) = s.take_unlocker_write_target(&nonce, UnlockerWriteKind::Remove, now.awake)
+    else {
+        return Err(RpcError::new(ErrorKind::StatementMismatch));
+    };
+    if ut.vault_id != vault_id {
         return Err(RpcError::new(ErrorKind::StatementMismatch));
     }
 
