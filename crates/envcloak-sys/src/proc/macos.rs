@@ -251,10 +251,16 @@ fn signature(pid: i32) -> Option<CodeSignature> {
     if rc != 0 || flags & CS_VALID == 0 {
         return None;
     }
+    let identifier = cs_string(pid, CS_OPS_IDENTITY)?;
+    let cdhash = cdhash(pid);
+    let team_id = cs_string(pid, CS_OPS_TEAMID);
+    #[cfg(feature = "testing")]
+    let team_id =
+        team_id.or_else(|| crate::testing::pretended_team_id(&identifier, cdhash.as_ref()));
     Some(CodeSignature {
-        identifier: cs_string(pid, CS_OPS_IDENTITY)?,
-        team_id: cs_string(pid, CS_OPS_TEAMID),
-        cdhash: cdhash(pid),
+        identifier,
+        team_id,
+        cdhash,
     })
 }
 
@@ -266,8 +272,20 @@ fn exe(pid: i32) -> Option<ExeIdentity> {
         .ok()
         .filter(|n| *n > 0 && *n < buf.len())?;
     buf.truncate(n);
+    let path = PathBuf::from(OsString::from_vec(buf));
+    #[cfg(feature = "testing")]
+    if crate::testing::linux_standing_forced() {
+        use std::os::unix::fs::MetadataExt;
+        let file = std::fs::metadata(&path).ok().map(|m| (m.dev(), m.ino()));
+        return Some(ExeIdentity {
+            path,
+            file,
+            sha256: None,
+            signature: None,
+        });
+    }
     Some(ExeIdentity {
-        path: PathBuf::from(OsString::from_vec(buf)),
+        path,
         file: None,
         sha256: None,
         signature: signature(pid),
@@ -365,5 +383,31 @@ pub(super) fn proc_argv(pid: i32) -> io::Result<Argv> {
         .get(..len)
         .ok_or_else(|| io::Error::other("the kernel reported more than it wrote"))?;
     parse_procargs2(filled)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process arguments"))
+}
+
+pub(super) fn proc_env_any(pid: i32, pred: &dyn Fn(&[u8]) -> bool) -> io::Result<bool> {
+    let mut buf = Zeroizing::new(vec![0u8; argmax()?]);
+    let mut len = buf.len();
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    // SAFETY: `mib` names three ints; `buf` is writable for `len` bytes,
+    // and the kernel writes at most that many and reports how many.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let filled = buf
+        .get(..len)
+        .ok_or_else(|| io::Error::other("the kernel reported more than it wrote"))?;
+    super::procargs2_env_any(filled, pred)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed process arguments"))
 }

@@ -44,6 +44,7 @@ use crate::view::{
 };
 use crate::view::{
     ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
+    StandingConfirmedView, StandingListView, StandingRevokedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -573,6 +574,85 @@ pub struct RevokeParams {
     pub grant: Option<String>,
     #[serde(default)]
     pub all: bool,
+}
+
+/// `standing.list`: the standing approvals in the vault, and whether the
+/// policy epoch is unverified. Metadata only.
+#[derive(Debug)]
+pub struct StandingList;
+
+impl Method for StandingList {
+    const NAME: &'static str = "standing.list";
+    type Params = NoParams;
+    type Output = StandingListView;
+}
+
+/// `standing.revoke`: ends standing approvals by id, by agent, by project
+/// directory, or all at once, and ends the session grants derived from
+/// them. Tightening needs no proof.
+#[derive(Debug)]
+pub struct StandingRevoke;
+
+impl Method for StandingRevoke {
+    const NAME: &'static str = "standing.revoke";
+    type Params = StandingRevokeParams;
+    type Output = StandingRevokedView;
+}
+
+/// One standing approval by id, by agent, by project directory, or all.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingRevokeParams {
+    /// 26 Crockford base32 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Agent registry id or display name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Canonical project directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// `standing.confirm`: re-seals the policy record over every standing
+/// approval in the vault and updates `<data>/policy-epoch`, with the
+/// passphrase as the proof from a terminal subject (M2 plan D-10). Sent
+/// without `passphrase`, it checks that the caller may give a proof and
+/// that `digest` matches the current standing set before the CLI prompts
+/// for a passphrase.
+#[derive(Debug)]
+pub struct StandingConfirm;
+
+impl Method for StandingConfirm {
+    const NAME: &'static str = "standing.confirm";
+    type Params = StandingConfirmParams;
+    type Output = StandingConfirmedView;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandingConfirmParams {
+    /// SHA-256 of the canonical confirmation statement, 64 hex characters
+    /// (`envcloak_policy::confirm_statement_digest`).
+    pub digest: String,
+    /// The proof; omitted for a pre-prompt check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<WireSecret>,
+    /// As [`UnlockParams::claims`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for StandingConfirmParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StandingConfirmParams")
+            .field("digest", &self.digest)
+            .field("passphrase", &self.passphrase.is_some())
+            .field("claims", &self.claims)
+            .finish()
+    }
 }
 
 /// `audit.verify`: checks the audit log against the head saved in the
@@ -1777,7 +1857,7 @@ impl core::fmt::Debug for ManagedUpdateParams {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 45] = [
+pub const CLIENT_METHODS: [&str; 48] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1790,6 +1870,9 @@ pub const CLIENT_METHODS: [&str; 45] = [
     Deny::NAME,
     GrantsList::NAME,
     GrantsRevoke::NAME,
+    StandingList::NAME,
+    StandingRevoke::NAME,
+    StandingConfirm::NAME,
     AuditVerify::NAME,
     ItemsList::NAME,
     ItemsShow::NAME,
@@ -2008,6 +2091,19 @@ pub enum ErrorKind {
     /// server (on Linux, the sealed copy of the `envcloak` beside it, made
     /// when it started, cannot be made or run); nothing is released.
     RunnerUnavailable,
+    /// `--standing` for an agent matched other than by a builtin executable
+    /// path or code signature (SPEC §10b; M2-15).
+    IdentityNotStandingCapable,
+    /// `--standing` for a Linux executable outside its agent's documented
+    /// install trees (SPEC §10b; M2-15).
+    IdentityOutsideInstallTree,
+    /// `--standing` for a managed launch that is not `bound` (SPEC §10b;
+    /// M2-15).
+    LaunchNotStandingCapable,
+    /// Standing approvals are paused until `envcloak standing confirm`,
+    /// because the vault's policy record does not match `<data>/policy-epoch`
+    /// (M2 plan D-10; M2-15).
+    PolicyEpochUnverified,
     /// A signed approval (`app.approve`) or signed write whose 64-byte raw
     /// P-256 signature does not verify against any enrolled Secure Enclave
     /// unlocker's `approve` key; audited.
@@ -2024,7 +2120,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 53] = [
+    pub const ALL: [ErrorKind; 57] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -2074,6 +2170,10 @@ impl ErrorKind {
         ErrorKind::ManagedLaunchChanged,
         ErrorKind::CodeSelectingEnv,
         ErrorKind::RunnerUnavailable,
+        ErrorKind::IdentityNotStandingCapable,
+        ErrorKind::IdentityOutsideInstallTree,
+        ErrorKind::LaunchNotStandingCapable,
+        ErrorKind::PolicyEpochUnverified,
         ErrorKind::SignatureInvalid,
         ErrorKind::UnlockFailed,
         ErrorKind::NoUnlocker,
@@ -2132,6 +2232,10 @@ impl ErrorKind {
             ErrorKind::ManagedLaunchChanged => -32040,
             ErrorKind::CodeSelectingEnv => -32041,
             ErrorKind::RunnerUnavailable => -32042,
+            ErrorKind::IdentityNotStandingCapable => -32043,
+            ErrorKind::IdentityOutsideInstallTree => -32044,
+            ErrorKind::LaunchNotStandingCapable => -32045,
+            ErrorKind::PolicyEpochUnverified => -32046,
             ErrorKind::SignatureInvalid => -32051,
             ErrorKind::UnlockFailed => -32052,
             ErrorKind::NoUnlocker => -32053,
@@ -2191,6 +2295,10 @@ impl ErrorKind {
             ErrorKind::ManagedLaunchChanged => "managed_launch_changed",
             ErrorKind::CodeSelectingEnv => "code_selecting_env",
             ErrorKind::RunnerUnavailable => "runner_unavailable",
+            ErrorKind::IdentityNotStandingCapable => "identity_not_standing_capable",
+            ErrorKind::IdentityOutsideInstallTree => "identity_outside_install_tree",
+            ErrorKind::LaunchNotStandingCapable => "launch_not_standing_capable",
+            ErrorKind::PolicyEpochUnverified => "policy_epoch_unverified",
             ErrorKind::SignatureInvalid => "signature_invalid",
             ErrorKind::UnlockFailed => "unlock_failed",
             ErrorKind::NoUnlocker => "no_unlocker",
@@ -2328,6 +2436,21 @@ impl ErrorKind {
                 "EnvCloak could not start its own runner for this server (on Linux it runs from a \
                  sealed copy, which this system's policy may refuse); nothing was released, and \
                  the server is reported as manual"
+            }
+            ErrorKind::IdentityNotStandingCapable => {
+                "standing approvals require an agent identified by a signed macOS binary or a \
+                 builtin executable path"
+            }
+            ErrorKind::IdentityOutsideInstallTree => {
+                "standing approvals on Linux require the agent executable to live under its \
+                 documented install tree"
+            }
+            ErrorKind::LaunchNotStandingCapable => {
+                "standing approvals for a managed server require a bound launch"
+            }
+            ErrorKind::PolicyEpochUnverified => {
+                "standing approvals are paused because the vault's policy record does not match \
+                 the daemon's epoch; run `envcloak standing confirm`"
             }
             ErrorKind::SignatureInvalid => {
                 "the approval signature could not be verified against an enrolled Secure Enclave \

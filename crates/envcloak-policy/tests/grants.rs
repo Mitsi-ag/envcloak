@@ -295,6 +295,7 @@ fn session(secs: u64) -> ApprovalOptions {
         uses: Uses::Session,
         ttl_secs: secs,
         live: Vec::new(),
+        standing: None,
     }
 }
 
@@ -303,6 +304,7 @@ fn once() -> ApprovalOptions {
         uses: Uses::Once,
         ttl_secs: 3600,
         live: Vec::new(),
+        standing: None,
     }
 }
 
@@ -789,6 +791,7 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
             uses: Uses::Once,
             ttl_secs: 3600,
             live: Vec::new(),
+            standing: None,
         },
         &now,
     )
@@ -1619,6 +1622,7 @@ fn live(names: &[&str], uses: Uses) -> ApprovalOptions {
         uses,
         ttl_secs: 600,
         live: names.iter().map(|n| EnvName::new(n).unwrap()).collect(),
+        standing: None,
     }
 }
 

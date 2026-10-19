@@ -198,7 +198,20 @@ pub fn open_exe(pid: i32) -> io::Result<std::fs::File> {
     {
         linux::open_exe(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[cfg(all(target_os = "macos", feature = "testing"))]
+    {
+        if crate::testing::linux_standing_forced() {
+            let info = macos::proc_info(pid)?;
+            let exe = info.exe.ok_or(io::ErrorKind::NotFound)?;
+            return std::fs::File::open(exe.path);
+        }
+        Err(io::ErrorKind::Unsupported.into())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        all(target_os = "macos", feature = "testing")
+    )))]
     {
         Err(io::ErrorKind::Unsupported.into())
     }
@@ -416,6 +429,12 @@ pub trait ProcessTable {
     fn info(&mut self, pid: i32) -> io::Result<ProcInfo>;
     /// The arguments of process `pid`, capped as [`proc_argv`] caps them.
     fn argv(&mut self, pid: i32) -> io::Result<Argv>;
+    /// Whether any environment variable name of process `pid` satisfies
+    /// `pred` ([`proc_env_any`]). Synthetic tables default to `Ok(false)`.
+    fn env_any(&mut self, pid: i32, pred: &dyn Fn(&[u8]) -> bool) -> io::Result<bool> {
+        let _ = (pid, pred);
+        Ok(false)
+    }
 }
 
 /// The kernel's process table: [`proc_info`] and [`proc_argv`].
@@ -429,6 +448,10 @@ impl ProcessTable for LiveProcesses {
 
     fn argv(&mut self, pid: i32) -> io::Result<Argv> {
         proc_argv(pid)
+    }
+
+    fn env_any(&mut self, pid: i32, pred: &dyn Fn(&[u8]) -> bool) -> io::Result<bool> {
+        proc_env_any(pid, pred)
     }
 }
 
@@ -523,6 +546,30 @@ pub fn proc_argv(pid: i32) -> io::Result<Argv> {
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
     {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Whether any environment variable name of process `pid` satisfies `pred`,
+/// reading into wiped storage so values never leave this function.
+///
+/// # Errors
+/// When the kernel refuses or the environment area is malformed.
+pub fn proc_env_any(pid: i32, pred: &dyn Fn(&[u8]) -> bool) -> io::Result<bool> {
+    if pid <= 0 {
+        return Err(io::ErrorKind::NotFound.into());
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        linux::proc_env_any(pid, pred)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::proc_env_any(pid, pred)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        let _ = pred;
         Err(io::ErrorKind::Unsupported.into())
     }
 }
@@ -833,6 +880,39 @@ pub fn parse_procargs2(buf: &[u8]) -> Option<Argv> {
     Some(Argv::from_slices(&args))
 }
 
+/// Checks whether any `NAME=VALUE` entry in a Linux `/proc/<pid>/environ`
+/// buffer has a `NAME` satisfying `pred`.
+pub fn environ_env_any(bytes: &[u8], pred: &dyn Fn(&[u8]) -> bool) -> bool {
+    for part in bytes.split(|b| *b == 0) {
+        if let Some(eq) = part.iter().position(|b| *b == b'=')
+            && eq > 0
+            && pred(&part[..eq])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Checks whether any environment entry in a macOS `KERN_PROCARGS2` buffer
+/// has a `NAME` satisfying `pred`.
+pub fn procargs2_env_any(buf: &[u8], pred: &dyn Fn(&[u8]) -> bool) -> Option<bool> {
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?);
+    let argc = usize::try_from(argc).ok()?;
+    let area = buf.get(4..)?;
+    let path_len = area.iter().position(|b| *b == 0)?;
+    let mut i = (path_len + 1).checked_next_multiple_of(PROCARGS_ALIGN)?;
+    if area.get(path_len..i)?.iter().any(|b| *b != 0) {
+        return None;
+    }
+    for _ in 0..argc {
+        let rest = area.get(i..)?;
+        let n = rest.iter().position(|b| *b == 0)?;
+        i += n + 1;
+    }
+    Some(environ_env_any(area.get(i..)?, pred))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1088,5 +1168,39 @@ mod tests {
         let mut no_path_end = 1i32.to_ne_bytes().to_vec();
         no_path_end.extend_from_slice(b"/bin/x");
         assert_eq!(parse_procargs2(&no_path_end), None);
+    }
+
+    #[test]
+    fn env_any_matches_names_in_environ_and_procargs2() {
+        let b = procargs(
+            2,
+            b"/usr/local/bin/claude",
+            &[
+                b"claude",
+                b"NODE_OPTIONS=in_argv_not_env",
+                b"HOME=/Users/x",
+                b"CLAUDE_CODE_ENTRYPOINT=/tmp/entry.js",
+            ],
+        );
+        assert_eq!(
+            procargs2_env_any(&b, &|n| n == b"CLAUDE_CODE_ENTRYPOINT"),
+            Some(true)
+        );
+        assert_eq!(
+            procargs2_env_any(&b, &|n| n == b"NODE_OPTIONS"),
+            Some(false)
+        );
+        assert_eq!(
+            procargs2_env_any(&b, &|n| n == b"/tmp/entry.js"),
+            Some(false)
+        );
+        assert!(environ_env_any(
+            b"HOME=/home/x\0NODE_OPTIONS=--require=/tmp/a.js\0",
+            &|n| n == b"NODE_OPTIONS"
+        ));
+        assert!(!environ_env_any(
+            b"HOME=/home/x\0SAFE_VAR=NODE_OPTIONS=1\0",
+            &|n| n == b"NODE_OPTIONS"
+        ));
     }
 }

@@ -139,8 +139,8 @@ pub use inuse::{InUse, open_elsewhere};
 pub use lockfile::try_lock_exclusive;
 pub use owned::{OwnedChild, ProcessOps, SystemProcesses};
 pub use panic::{
-    fail_point, idle_connection_override, install as install_panic_hook, panic_point,
-    panic_with_input, pause_point, test_app_identity, test_clock_offset, test_event,
+    fail_point, idle_connection_override, install as install_panic_hook, linux_standing_forced,
+    panic_point, panic_with_input, pause_point, test_app_identity, test_clock_offset, test_event,
     test_hook_vars, test_trace,
 };
 pub use peer::{
@@ -151,9 +151,9 @@ pub use perm::{PRIVATE_UMASK, effective_uid, restrict_umask};
 pub use proc::{
     AncestryError, Argv, CDHASH_LEN, CodeSignature, ExeIdentity, FileKey, LiveProcesses,
     MAX_ANCESTRY, MAX_ARGV, MAX_ARGV_BYTES, PROCARGS_ALIGN, ProcInfo, ProcessTable, StatFields,
-    ancestry, ancestry_in, open_exe, parse_cmdline, parse_proc_stat, parse_procargs2,
-    parse_stat_state, parse_status_euid, proc_argv, proc_info, process_running, reaches_top,
-    stat_state_exited,
+    ancestry, ancestry_in, environ_env_any, open_exe, parse_cmdline, parse_proc_stat,
+    parse_procargs2, parse_stat_state, parse_status_euid, proc_argv, proc_env_any, proc_info,
+    procargs2_env_any, process_running, reaches_top, stat_state_exited,
 };
 pub use relay_io::{Readiness, reopen_terminal, set_nonblocking, wait_any};
 pub use session::new_session_on_spawn;

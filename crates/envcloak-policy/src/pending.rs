@@ -444,6 +444,7 @@ fn describe(
                 strength: m.strength.map(str::to_owned),
                 origin: m.origin.clone(),
             }),
+        standing: crate::standing::describe_standing(r, None),
     }
 }
 

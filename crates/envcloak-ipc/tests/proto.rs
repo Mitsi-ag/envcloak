@@ -208,6 +208,9 @@ fn managed_and_reveal_methods_are_known_client_methods() {
         "managed.update_plan",
         "managed.update",
         "projects.list",
+        "standing.list",
+        "standing.revoke",
+        "standing.confirm",
     ] {
         assert_eq!(
             CLIENT_METHODS

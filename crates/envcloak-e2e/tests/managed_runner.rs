@@ -126,11 +126,11 @@ json.dump({"response": resp.decode("utf-8", "replace"), "reply": reply.decode("u
 /// key in every encoding, and the daemon released values to a client
 /// never.
 ///
-/// It runs under each grant this build issues: the default session grant
-/// and a `once` grant. Each is the grant that covers the second request
-/// (it is `started`, with no fresh pending request). A standing record is
-/// not issued by this build (`envcloak standing` is M2-15's, not in this
-/// build): that leg is M2R-89, owned by M2-15.
+/// It runs under each grant this build issues: the default session grant,
+/// a `once` grant, and (in
+/// [`a_foreign_client_under_a_standing_record_gets_started_and_no_value`])
+/// a standing record after all session and once grants are revoked. Each
+/// covers the subsequent request (`started`, with no fresh pending request).
 ///
 /// Mutation checked: the values returned to the requesting client instead
 /// of starting the runner: the answer the foreign client received holds
@@ -188,6 +188,445 @@ fn foreign_client_under(grant: &[&str]) {
     );
     w.assert_released(0, 1, "values went to the runner once, to the client never");
     w.h.assert_swept("after the foreign client");
+}
+
+fn check_foreign_started(receipt: &Value, expected_key_digest: &str) -> Result<(), &'static str> {
+    let raw_resp = receipt["response"].as_str().ok_or("missing_response")?;
+    let resp: Value = serde_json::from_str(raw_resp).map_err(|_| "invalid_response_json")?;
+    if resp["result"]["decision"]["decision"] != "started" {
+        return Err("not_started");
+    }
+    let raw_reply = receipt["reply"].as_str().ok_or("missing_reply")?.trim();
+    if raw_reply.is_empty() {
+        return Err("empty_server_reply");
+    }
+    let rep: Value = serde_json::from_str(raw_reply).map_err(|_| "invalid_reply_json")?;
+    if rep["vars"][KEY].as_str() != Some(expected_key_digest) {
+        return Err("wrong_key_digest");
+    }
+    Ok(())
+}
+
+/// Gate 39 and 40 under a standing record (M2-15, M2R-89 S01, S02, S03, S05):
+/// - S01: A test-only standing record is created from a pending eligible
+///   `opencode` request with terminal passphrase proof. Before and after
+///   record counts, bound launch revision, agent identity and project are
+///   checked. All session and once grants are revoked (`grants revoke --all`),
+///   and a fresh `opencode` process tree runs the genuine hardened client,
+///   which receives `started` and the server's key-digest report while zero
+///   values are released to a client and one `standing_grant` event is
+///   minted.
+/// - S02: After revoking all grants again, a fresh `opencode` root runs the
+///   foreign Python client (`FOREIGN`) and then the injected-library readable
+///   memory dumper (`DUMPER`). Each receives `started` and a non-empty server
+///   report, zero values are released to any client, and every output, log and
+///   readable-memory dump (holding both positive and read-only controls) is
+///   clean of the key in every encoding.
+/// - S03: After revoking all grants, the same foreign client run outside
+///   eligible agent ancestry (by a terminal subject and by an unknown subject),
+///   under a different agent identity (`claude-code`), under an untrusted
+///   copy of the binary outside the install tree, and against a different
+///   managed project each returns `pending`, mints no standing grant, and
+///   releases nothing.
+/// - S05: Independent checker controls verify that raw and base64-encoded
+///   synthetic witnesses planted in a scratch buffer are caught by `Detector`
+///   without printing the secret value, that a fake `started`-only receipt
+///   with an empty server reply fails `check_foreign_started`, and that the
+///   sealed audit log records `StandingCreate` and each `StandingGrant`
+///   immediately preceding its `Run` (`covered`) entry under the same grant id.
+#[test]
+fn a_foreign_client_under_a_standing_record_gets_started_and_no_value() {
+    if cfg!(target_os = "macos")
+        && managed_common::release_run(
+            "a_foreign_client_under_a_standing_record_gets_started_and_no_value",
+        )
+    {
+        return;
+    }
+    let mut w = World::new(&[]);
+    let (launch, reg) = w.register_fixture();
+    let opencode = w.opencode_agent();
+    assert_eq!(
+        w.standing_list()["standing"].as_array().unwrap().len(),
+        0,
+        "no standing record before approval"
+    );
+
+    // Create the standing record from a pending opencode request with proof.
+    let first = w.standing_request(&opencode, &launch);
+    let req_id = pending_id(&first);
+    w.approve_with(&req_id, &["--standing", "7d"]);
+
+    let listed = w.standing_list();
+    let records = listed["standing"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{listed}");
+    let standing_id = records[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(records[0]["launch"], launch, "{listed}");
+    assert_eq!(records[0]["revision"], 1, "{listed}");
+    assert_eq!(records[0]["agent_id"], "opencode", "{listed}");
+    assert_eq!(
+        records[0]["project_dir"],
+        w.project.to_str().unwrap(),
+        "{listed}"
+    );
+    assert_eq!(
+        records[0]["bindings"],
+        json!([format!("{KEY}=stripe/fixture")]),
+        "{listed}"
+    );
+
+    // S01: Revoke all grants so no session/once grant can mask standing coverage;
+    // run the genuine hardened client in a fresh opencode root.
+    w.revoke_all_grants();
+    let pending_before = w.pending_count();
+    let sg_before = w.standing_grant_count();
+    let s01 = w.standing_request(&opencode, &launch);
+    assert!(started(&s01), "{s01}");
+    let r01 = report(&s01);
+    assert_eq!(reported_identity(&r01), receipt_identity(&reg), "{r01}");
+    assert_eq!(r01["vars"][KEY], w.key_digest(), "{r01}");
+    assert_eq!(
+        w.pending_count(),
+        pending_before,
+        "standing record covered the hardened client without a pending request"
+    );
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg_before + 1);
+    }
+    w.assert_released(
+        0,
+        1,
+        "S01: values went to the runner once, to the client never",
+    );
+
+    // S02 (part 1): Revoke all grants and run the foreign Python client in a
+    // fresh opencode root.
+    w.revoke_all_grants();
+    let socket = envcloak_testkit::daemon_socket(&w.h.home);
+    let foreign_cmd = |out: &Path| -> String {
+        format!(
+            "{} -c {} {} {} {}",
+            envcloak_e2e::quoted(python3().to_str().unwrap()),
+            envcloak_e2e::quoted(FOREIGN),
+            envcloak_e2e::quoted(socket.to_str().unwrap()),
+            launch,
+            envcloak_e2e::quoted(out.to_str().unwrap())
+        )
+    };
+    let home = w.h.home.home();
+    let (_, foreign_out) = w.io_paths();
+    let line = foreign_cmd(&foreign_out);
+    let ran = w.fresh_agent_line(&opencode, &home, &line);
+    assert!(ran.status.success(), "{}", text(&ran));
+    let foreign_ans = w.read_out(&foreign_out, "the foreign client under standing");
+    assert_eq!(
+        check_foreign_started(&foreign_ans, &w.key_digest()),
+        Ok(()),
+        "{foreign_ans}"
+    );
+    assert_eq!(
+        w.pending_count(),
+        pending_before,
+        "standing record covered the foreign client without a pending request"
+    );
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg_before + 2);
+    }
+    w.assert_released(
+        0,
+        2,
+        "S02 foreign client: values went to the runner twice, to the client never",
+    );
+
+    // S02 (part 2): Revoke all grants and run the client with the readable-memory
+    // dumper loaded in a fresh opencode root.
+    w.revoke_all_grants();
+    let lib = dumper(w.h.files());
+    let control = format!("ec-m15-control-{:016x}", envcloak_testkit::fresh_seed());
+    let read_only = format!("ec-m15-read-only-{:016x}", envcloak_testkit::fresh_seed());
+    let dumps = tempfile::Builder::new()
+        .prefix("ecd")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let dump = dumps.path().join("standing-client.dump");
+    let (input, output) = w.io_paths();
+    std::fs::write(
+        &input,
+        json!({"launch": launch, "send": ["report"], "control": control}).to_string(),
+    )
+    .unwrap();
+    let preload = if cfg!(target_os = "macos") {
+        "DYLD_INSERT_LIBRARIES"
+    } else {
+        "LD_PRELOAD"
+    };
+    let me = std::env::current_exe().unwrap();
+    let q = |p: &Path| envcloak_e2e::quoted(p.to_str().unwrap());
+    let dump_line = format!(
+        "{preload}={} EC_M27_DUMP={} EC_M27_RO_CONTROL={} {}=request {}={} {}={} {} --exact \
+         helper --nocapture --test-threads 1",
+        q(&lib),
+        q(&dump),
+        read_only,
+        managed_common::HELPER,
+        managed_common::HELPER_IN,
+        q(&input),
+        managed_common::HELPER_OUT,
+        q(&output),
+        q(&me)
+    );
+    let ran = w.fresh_agent_line(&opencode, &home, &dump_line);
+    assert!(ran.status.success(), "{}", text(&ran));
+    let bytes = std::fs::read(&dump).unwrap();
+    let needle = control.as_bytes();
+    assert!(
+        bytes.windows(needle.len()).any(|win| win == needle),
+        "the standing dump does not hold the positive control ({} bytes)",
+        bytes.len()
+    );
+    let reversed: Vec<u8> = read_only.bytes().rev().collect();
+    assert!(
+        bytes
+            .windows(reversed.len())
+            .any(|win| win == reversed.as_slice()),
+        "the standing dump does not hold the read-only control ({} bytes)",
+        bytes.len()
+    );
+    w.h.assert_clean("the standing client's readable memory", &bytes);
+    let dumped_ans = w.read_out(&output, "the standing injected client's");
+    assert!(started(&dumped_ans), "{dumped_ans}");
+    assert_eq!(report(&dumped_ans)["vars"][KEY], w.key_digest());
+    assert_eq!(w.pending_count(), pending_before);
+    if w.traced() {
+        assert_eq!(w.standing_grant_count(), sg_before + 3);
+    }
+    w.assert_released(
+        0,
+        3,
+        "S02 readable-memory client: values went to the runner 3 times, to the client never",
+    );
+
+    // S03: Revoke all grants; verify terminal, unknown, different agent identity,
+    // untrusted binary path, and different managed project mint no standing grant
+    // and receive no value.
+    w.revoke_all_grants();
+    let sg_s03 = w.standing_grant_count();
+
+    // S03a: Terminal subject running FOREIGN.
+    let (_, term_out) = w.io_paths();
+    let term_line = foreign_cmd(&term_out);
+    let term_ran =
+        w.h.human_argv(&home, &["/bin/sh", "-c", &term_line], &[], &[]);
+    assert_eq!(term_ran.code, 0, "{}", term_ran.all());
+    let term_ans = w.read_out(&term_out, "the terminal foreign client");
+    let term_resp: Value = serde_json::from_str(term_ans["response"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        term_resp["result"]["decision"]["decision"], "pending",
+        "{term_ans}"
+    );
+    assert_eq!(term_ans["reply"].as_str().unwrap_or(""), "", "{term_ans}");
+
+    // S03b: Unknown subject running FOREIGN.
+    let (_, unk_out) = w.io_paths();
+    let unk_line = foreign_cmd(&unk_out);
+    let unk_ran = w.unknown_line(&home, &unk_line);
+    assert!(unk_ran.status.success(), "{}", text(&unk_ran));
+    let unk_ans = w.read_out(&unk_out, "the unknown foreign client");
+    let unk_resp: Value = serde_json::from_str(unk_ans["response"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        unk_resp["result"]["decision"]["decision"], "pending",
+        "{unk_ans}"
+    );
+    assert_eq!(unk_ans["reply"].as_str().unwrap_or(""), "", "{unk_ans}");
+
+    // S03c: Different agent identity (claude-code) running FOREIGN.
+    let claude = w.claude_agent();
+    let (_, claude_out) = w.io_paths();
+    let claude_line = foreign_cmd(&claude_out);
+    let claude_ran = w.fresh_agent_line(&claude, &home, &claude_line);
+    assert!(claude_ran.status.success(), "{}", text(&claude_ran));
+    let claude_ans = w.read_out(&claude_out, "the claude foreign client");
+    let claude_resp: Value =
+        serde_json::from_str(claude_ans["response"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        claude_resp["result"]["decision"]["decision"], "pending",
+        "{claude_ans}"
+    );
+    assert_eq!(
+        claude_ans["reply"].as_str().unwrap_or(""),
+        "",
+        "{claude_ans}"
+    );
+
+    // S03d: Untrusted agent binary outside the install tree (tampered digest on
+    // Linux, untrusted signature / team-id on macOS).
+    let untrusted = w.install_standing_agent("untrusted/opencode", "untrusted.opencode");
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&untrusted)
+            .unwrap();
+        f.write_all(&[0]).unwrap();
+    }
+    let (_, untrusted_out) = w.io_paths();
+    let untrusted_line = foreign_cmd(&untrusted_out);
+    let untrusted_ran = w.fresh_agent_line(&untrusted, &home, &untrusted_line);
+    assert!(untrusted_ran.status.success(), "{}", text(&untrusted_ran));
+    let untrusted_ans = w.read_out(&untrusted_out, "the untrusted foreign client");
+    let untrusted_resp: Value =
+        serde_json::from_str(untrusted_ans["response"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        untrusted_resp["result"]["decision"]["decision"], "pending",
+        "{untrusted_ans}"
+    );
+    assert_eq!(
+        untrusted_ans["reply"].as_str().unwrap_or(""),
+        "",
+        "{untrusted_ans}"
+    );
+
+    // S03e: Different managed project requested from the same opencode agent.
+    let other_proj = w.h.home.root().join("other-managed");
+    std::fs::create_dir_all(other_proj.join("bin")).unwrap();
+    std::fs::write(
+        other_proj.join("envcloak.toml"),
+        format!("[project]\nname = \"other-managed\"\n\n[env]\n{KEY} = \"stripe/fixture\"\n"),
+    )
+    .unwrap();
+    let other_fix = other_proj.join("bin").join("ec-launch-fixture");
+    std::fs::copy(managed_common::fixture_bin(), &other_fix).unwrap();
+    let other_reg = w.person(
+        "register",
+        json!({
+            "name": "claude-code/other-managed",
+            "manifest": other_proj.join("envcloak.toml").to_str().unwrap(),
+            "argv": w.fixture_argv_for(other_fix.to_str().unwrap()),
+        }),
+    );
+    let other_launch = other_reg["launch"].as_str().unwrap().to_owned();
+    let other_ans = w.standing_request(&opencode, &other_launch);
+    let _ = pending_id(&other_ans);
+
+    if w.traced() {
+        assert_eq!(
+            w.standing_grant_count(),
+            sg_s03,
+            "S03 negative cases must mint zero standing grants"
+        );
+    }
+    w.assert_released(
+        0,
+        3,
+        "S03 negative cases must release nothing to clients or runners",
+    );
+
+    // S05: Independent checker controls.
+    // (a) Plant raw and base64-encoded synthetic witnesses in a scratch buffer and
+    // verify the detector catches both without printing the secret value.
+    let key_canary = w.h.canary(KEY).clone();
+    let encs = envcloak_testkit::encodings(&key_canary);
+    let raw_secret = w.h.value(KEY).to_vec();
+    let raw_secret_str = std::str::from_utf8(&raw_secret).unwrap();
+    let mut planted_raw = b"client output before ".to_vec();
+    planted_raw.extend_from_slice(&raw_secret);
+    planted_raw.extend_from_slice(b" after");
+    let hits_raw = envcloak_testkit::find(&planted_raw, std::slice::from_ref(&key_canary));
+    assert!(
+        !hits_raw.is_empty(),
+        "detector must catch planted raw witness"
+    );
+    let hit_raw_msg = format!("{hits_raw:?}");
+    assert!(
+        !hit_raw_msg.contains(raw_secret_str),
+        "detector message must never print the secret"
+    );
+    drop(planted_raw);
+
+    let b64_bytes = encs
+        .iter()
+        .find_map(|(name, bytes)| (*name == "base64").then(|| bytes.clone()))
+        .expect("base64 encoding present");
+    let b64_secret = String::from_utf8(b64_bytes.clone()).unwrap();
+    let mut planted_b64 = b"{\"wire\":\"".to_vec();
+    planted_b64.extend_from_slice(&b64_bytes);
+    planted_b64.extend_from_slice(b"\"}\n");
+    let hits_b64 = envcloak_testkit::find(&planted_b64, std::slice::from_ref(&key_canary));
+    assert!(
+        !hits_b64.is_empty(),
+        "detector must catch planted base64 witness"
+    );
+    let hit_b64_msg = format!("{hits_b64:?}");
+    assert!(
+        !hit_b64_msg.contains(raw_secret_str) && !hit_b64_msg.contains(&b64_secret),
+        "detector message must never print raw or encoded secret"
+    );
+    drop(planted_b64);
+
+    // (b) Fake started-only receipt with no server reply fails liveness check,
+    // while the real foreign client receipt passes.
+    let fake_started = json!({
+        "response": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"decision\":{\"decision\":\"started\"}}}",
+        "reply": ""
+    });
+    assert_eq!(
+        check_foreign_started(&fake_started, &w.key_digest()),
+        Err("empty_server_reply")
+    );
+    assert_eq!(check_foreign_started(&foreign_ans, &w.key_digest()), Ok(()));
+
+    w.h.assert_swept("after standing foreign client and controls");
+
+    // (c) Verify the sealed audit log records StandingCreate and each StandingGrant
+    // immediately preceding its covered Run entry under the same grant_id.
+    let _ = w.h.stop_daemon();
+    let pass = envcloak_core::SecretBytes::copy_from(
+        w.h.value(envcloak_testkit::labels::VAULT_PASSPHRASE),
+    );
+    let vault = envcloak_core::vault::LockedVault::open(&envcloak_core::vault::VaultPaths::under(
+        w.h.data_dir(),
+    ))
+    .unwrap()
+    .unlock_with_passphrase(&pass)
+    .map_err(|(_, e)| e)
+    .unwrap();
+    let (entries, _) = vault.read_audit().unwrap();
+    drop(vault);
+    use envcloak_core::audit::AuditKind;
+    assert!(
+        entries.iter().any(|e| {
+            e.record.kind == AuditKind::StandingCreate && e.record.decision.outcome == "created"
+        }),
+        "missing StandingCreate in sealed audit log"
+    );
+    let mint_indices: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, e)| {
+            (e.record.kind == AuditKind::StandingGrant
+                && e.record.decision.outcome == "granted"
+                && e.record.request_id.as_deref() == Some(standing_id.as_str()))
+            .then_some(idx)
+        })
+        .collect();
+    assert_eq!(
+        mint_indices.len(),
+        3,
+        "expected 3 standing_grant mint entries in sealed audit log"
+    );
+    for idx in mint_indices {
+        let gid = entries[idx]
+            .record
+            .grant_id
+            .as_deref()
+            .expect("StandingGrant must carry grant_id");
+        let next_run = entries[idx + 1..]
+            .iter()
+            .find(|e| e.record.kind == AuditKind::Run && e.record.grant_id.as_deref() == Some(gid))
+            .expect("StandingGrant must be followed by a Run entry with the same grant_id");
+        assert_eq!(next_run.record.decision.outcome, "covered");
+    }
 }
 
 /// The test library the injected-library control loads into the client

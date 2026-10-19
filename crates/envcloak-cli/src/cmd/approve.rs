@@ -50,17 +50,20 @@ use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, refuse_if_traced, usage};
 use envcloak_client::render::looks_like_value;
 use envcloak_client::tty::{Terminal, read_secret_fd};
+use envcloak_ipc::ClientError;
 use envcloak_ipc::proto::{ErrorKind, PendingGetOutput};
 use envcloak_policy::{
-    ApprovalOptions, DEFAULT_TTL, EnvName, GrantId, MAX_AGENT_TTL, PendingId, Uses,
-    escape_for_display, proposed_for, render_statement_with, statement_digest, unticked_live,
+    ApprovalOptions, DEFAULT_TTL, EnvName, GrantId, MAX_AGENT_TTL, MAX_STANDING_TTL, PendingId,
+    StandingId, Uses, escape_for_display, proposed_for, render_statement_with, statement_digest,
+    unticked_live,
 };
 
 use super::fd_number;
 
-const APPROVE_USAGE: &str = "envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h)] [--live NAME]... \
-     [--passphrase-fd N]";
+const APPROVE_USAGE: &str = "envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h) | \
+     --standing [DURATION (30s to 30d)]] [--live NAME]... [--passphrase-fd N]";
 const DENY_USAGE: &str = "envcloak deny <REQUEST>";
+const DEFAULT_STANDING_TTL: Duration = Duration::from_secs(7 * 86_400);
 
 /// The parsed options of `approve`.
 #[derive(Debug, PartialEq, Eq)]
@@ -93,14 +96,36 @@ fn parse_duration(s: &str) -> Option<Duration> {
         .then_some(d)
 }
 
+/// `<n>s`, `<n>m`, `<n>h` or `<n>d`, from 30 seconds to 30 days.
+fn parse_standing_duration(s: &str) -> Option<Duration> {
+    let (digits, per_unit) = if let Some(d) = s.strip_suffix('s') {
+        (d, 1)
+    } else if let Some(d) = s.strip_suffix('m') {
+        (d, 60)
+    } else if let Some(d) = s.strip_suffix('h') {
+        (d, 3600)
+    } else {
+        (s.strip_suffix('d')?, 86_400)
+    };
+    if digits.is_empty() || digits.len() > 7 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let secs = digits.parse::<u64>().ok()?.checked_mul(per_unit)?;
+    let d = Duration::from_secs(secs);
+    (Duration::from_secs(30)..=MAX_STANDING_TTL)
+        .contains(&d)
+        .then_some(d)
+}
+
 fn parse(args: &[&str]) -> Option<ApproveArgs> {
     let (first, rest) = args.split_first()?;
     let request = PendingId::parse(first)?;
     let mut uses = None;
     let mut ttl = None;
+    let mut standing = None;
     let mut live = Vec::new();
     let mut passphrase_fd = None;
-    let mut it = rest.iter();
+    let mut it = rest.iter().peekable();
     while let Some(flag) = it.next() {
         match *flag {
             "--once" if uses.is_none() => uses = Some(Uses::Once),
@@ -108,12 +133,23 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
                 uses = Some(Uses::Session);
                 ttl = Some(parse_duration(it.next()?)?);
             }
+            "--standing" if uses.is_none() && standing.is_none() => {
+                uses = Some(Uses::Session);
+                let d = match it.peek() {
+                    Some(next) if !next.starts_with('-') => parse_standing_duration(it.next()?)?,
+                    _ => DEFAULT_STANDING_TTL,
+                };
+                standing = Some(d);
+            }
             "--live" => live.push(EnvName::new(it.next()?).ok()?),
             "--passphrase-fd" if passphrase_fd.is_none() => {
                 passphrase_fd = Some(fd_number(it.next()?)?);
             }
             _ => return None,
         }
+    }
+    if standing.is_some() && !live.is_empty() {
+        return None;
     }
     live.sort();
     live.dedup();
@@ -124,6 +160,7 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
             uses: uses.unwrap_or(Uses::Session),
             ttl_secs: ttl.unwrap_or(DEFAULT_TTL).as_secs(),
             live,
+            standing,
         },
         has_run_options,
         passphrase_fd,
@@ -183,6 +220,22 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
             _ => refused,
         });
     }
+    if a.options.standing.is_some() {
+        match connect()?.approve_check(&id, a.options.clone(), &digest, &claims) {
+            Err(ClientError::Rpc(r)) if r.kind == ErrorKind::InvalidParams => {}
+            Err(e) => {
+                print!("{statement}");
+                return Err(Failure::from(e));
+            }
+            Ok(_) => {
+                print!("{statement}");
+                return Err(Failure::new(
+                    "protocol_error",
+                    "the daemon's answer was malformed",
+                ));
+            }
+        }
+    }
     let passphrase = match a.passphrase_fd {
         Some(fd) => {
             print!("{statement}");
@@ -197,6 +250,20 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
     let approved = connect()?.approve(&id, a.options.clone(), &digest, passphrase, &claims)?;
     let grant = GrantId::parse(&approved.grant)
         .ok_or_else(|| Failure::new("protocol_error", "the daemon's answer was malformed"))?;
+    if let Some(standing) = &approved.standing {
+        let standing = StandingId::parse(standing)
+            .ok_or_else(|| Failure::new("protocol_error", "the daemon's answer was malformed"))?;
+        let standing_secs = approved
+            .standing_expires_in_secs
+            .unwrap_or_else(|| a.options.standing.unwrap_or_default().as_secs());
+        println!(
+            "Approved request {id}: standing approval {standing} (for {}), and grant {grant} \
+             (for {}).",
+            words(standing_secs),
+            words(approved.expires_in_secs)
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
     match a.options.uses {
         Uses::Once => println!("Approved request {id}: grant {grant}, for one request."),
         Uses::Session => println!(
@@ -254,6 +321,12 @@ mod tests {
         assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
         assert_eq!(parse_duration("90m"), Some(Duration::from_secs(5400)));
         assert_eq!(parse_duration("24h"), Some(MAX_AGENT_TTL));
+        assert_eq!(
+            parse_standing_duration("7d"),
+            Some(Duration::from_secs(7 * 86_400))
+        );
+        assert_eq!(parse_standing_duration("30d"), Some(MAX_STANDING_TTL));
+        assert_eq!(parse_standing_duration("31d"), None);
         for bad in [
             "",
             "h",
@@ -278,6 +351,7 @@ mod tests {
         assert_eq!(a.options.uses, Uses::Session);
         assert_eq!(a.options.ttl_secs, DEFAULT_TTL.as_secs());
         assert!(a.options.live.is_empty());
+        assert_eq!(a.options.standing, None);
         assert_eq!(a.passphrase_fd, None);
         let a = parse(&[
             "abcdefgh",
@@ -301,11 +375,20 @@ mod tests {
         assert_eq!(a.passphrase_fd, Some(3));
         let a = parse(&["ABCDEFGH", "--once"]).unwrap();
         assert_eq!(a.options.uses, Uses::Once);
+        let a = parse(&["ABCDEFGH", "--standing"]).unwrap();
+        assert_eq!(a.options.standing, Some(DEFAULT_STANDING_TTL));
+        let a = parse(&["ABCDEFGH", "--standing", "14d", "--passphrase-fd", "3"]).unwrap();
+        assert_eq!(a.options.standing, Some(Duration::from_secs(14 * 86_400)));
+        assert_eq!(a.passphrase_fd, Some(3));
         for bad in [
             &[][..],
             &["ABCDEFG"],
             &["ABCDEFGH!"],
             &["ABCDEFGH", "--once", "--for", "1h"],
+            &["ABCDEFGH", "--once", "--standing", "7d"],
+            &["ABCDEFGH", "--for", "1h", "--standing", "7d"],
+            &["ABCDEFGH", "--standing", "31d"],
+            &["ABCDEFGH", "--standing", "7d", "--live", "A"],
             &["ABCDEFGH", "--for"],
             &["ABCDEFGH", "--for", "1d"],
             &["ABCDEFGH", "--live", "not a name"],

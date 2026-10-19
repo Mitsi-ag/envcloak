@@ -63,6 +63,7 @@ fn descriptor(argv: Vec<String>) -> PendingDescriptor {
         mode: Mode::Inject,
         argv,
         managed: None,
+        standing: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn opts() -> ApprovalOptions {
         uses: Uses::Session,
         ttl_secs: 3600,
         live: vec![EnvName::new("STRIPE_SECRET_KEY").unwrap()],
+        standing: None,
     }
 }
 
@@ -480,6 +482,7 @@ fn the_canonical_statement_matches_an_independent_encoder() {
         uses: Uses::Once,
         ttl_secs: 1,
         live: Vec::new(),
+        standing: None,
     };
     cases.push((bare, once.clone()));
     cases.push((descriptor(Vec::new()), once.clone()));
@@ -625,6 +628,7 @@ fn ticking(names: &[&str]) -> ApprovalOptions {
         uses: Uses::Once,
         ttl_secs: 600,
         live: names.iter().map(|n| EnvName::new(n).unwrap()).collect(),
+        standing: None,
     }
 }
 

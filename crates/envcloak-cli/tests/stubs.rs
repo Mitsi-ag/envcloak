@@ -25,7 +25,6 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 const STUBS: &[(&[&str], &str)] = &[
     (&["agents", "migrate-mcp"], "`envcloak agents migrate-mcp`"),
     (&["mcp-bridge"], "`envcloak mcp-bridge`"),
-    (&["standing"], "`envcloak standing`"),
     (&["login"], "`envcloak login`"),
     (&["signin"], "`envcloak signin`"),
 ];
@@ -159,11 +158,13 @@ fn every_stub_refuses_an_argument_that_is_not_utf8() {
         assert_eq!(stderr(&out), want, "{what}");
     }
     // Elsewhere the argument is the usage error it was, `agents status`
-    // (landed by M2-09) and its `--probe` (landed by M2-28) included.
+    // (landed by M2-09), its `--probe` (landed by M2-28) and `standing`
+    // (landed by M2-15) included.
     for words in [
         &["run", "--"][..],
         &["agents", "status"],
         &["agents", "status", "--probe"],
+        &["standing"],
     ] {
         let mut cmd = cli_command(&home, words, &[]);
         cmd.arg(bad);
@@ -218,7 +219,8 @@ fn every_stub_exits_125_and_echoes_nothing() {
 
 /// A subcommand that no task adds is a usage error, as any unknown
 /// command is, and is not echoed either. `items` has its one subcommand
-/// since M2-13 (`reclassify`); its usage names it, with no stub left.
+/// since M2-13 (`reclassify`), and `standing` has its subcommands since
+/// M2-15; their usage names them, with no stub left.
 #[test]
 fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
     let cs = canaries(fresh_seed());
@@ -228,10 +230,12 @@ fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
         (vec!["agents", "--json"], true),
         (vec!["items"], false),
         (vec!["items", "list"], false),
+        (vec!["standing"], false),
     ];
     for c in &cs {
         cases.push((vec!["agents", c.as_str()], true));
         cases.push((vec!["items", c.as_str()], false));
+        cases.push((vec!["standing", c.as_str()], false));
     }
     for (args, stub) in cases {
         let out = run(&home, &args, &[]);
@@ -281,11 +285,14 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
             "{what} is listed as available: {help}"
         );
     }
-    // The check sees the commands this build has, those M2-03 and M2-06
-    // landed among them.
+    // The check sees the commands this build has, those M2-03, M2-06 and
+    // M2-15 landed among them.
     assert!(lists(available, &["run"]));
     assert!(lists(available, &["pending"]));
     assert!(lists(available, &["mcp"]));
+    assert!(lists(available, &["standing", "ls"]));
+    assert!(lists(available, &["standing", "rm"]));
+    assert!(lists(available, &["standing", "confirm"]));
     let run = available
         .lines()
         .find(|l| l.trim_start().starts_with("envcloak run "))

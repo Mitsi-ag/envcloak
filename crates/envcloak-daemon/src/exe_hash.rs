@@ -178,7 +178,7 @@ impl ExeHashCache {
         key: &FileKey,
         budget: &mut HashBudget,
     ) -> Result<[u8; 32], HashError> {
-        if !settled(key, SystemTime::now(), self.settle) {
+        if !envcloak_sys::linux_standing_forced() && !settled(key, SystemTime::now(), self.settle) {
             return Err(HashError::Unsettled);
         }
         let cached = {
