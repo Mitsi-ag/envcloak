@@ -67,6 +67,7 @@ const DENY_USAGE: &str = "envcloak deny <REQUEST>";
 struct ApproveArgs {
     request: PendingId,
     options: ApprovalOptions,
+    has_run_options: bool,
     passphrase_fd: Option<i32>,
 }
 
@@ -116,6 +117,7 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
     }
     live.sort();
     live.dedup();
+    let has_run_options = uses.is_some() || ttl.is_some() || !live.is_empty();
     Some(ApproveArgs {
         request,
         options: ApprovalOptions {
@@ -123,6 +125,7 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
             ttl_secs: ttl.unwrap_or(DEFAULT_TTL).as_secs(),
             live,
         },
+        has_run_options,
         passphrase_fd,
     })
 }
@@ -144,6 +147,12 @@ fn run_approve(a: ApproveArgs) -> Result<ExitCode, Failure> {
     let descriptor = match connect()?.pending_get_any(&id, &claims)? {
         PendingGetOutput::Run(d) => d,
         PendingGetOutput::UnlockerAdd(u) => {
+            if a.has_run_options {
+                return Err(Failure::new(
+                    ErrorKind::InvalidOptions.token(),
+                    "--once, --for and --live do not apply to an unlocker enrolment request",
+                ));
+            }
             return super::approve_unlocker::run(&id, u, a.passphrase_fd, &claims);
         }
     };

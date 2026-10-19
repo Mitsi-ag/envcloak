@@ -435,7 +435,16 @@ impl LockedVault {
     /// restored `meta` or header row), the vault opens under the first one
     /// its header or rows open under, and reports the row read-only.
     pub fn unlock(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
-        self.unlock_with(vmk, true)
+        self.unlock_with(vmk, true, false)
+    }
+
+    /// Unlocks with a VMK unsealed from a Secure Enclave unlocker (`app.unlock`,
+    /// SPEC §5 step 4): requires the sealed `header` row to open under the
+    /// derived `header` subkey so a caller-supplied VMK is always verified
+    /// against the vault's sealed header even when the vault holds no other
+    /// sealed rows.
+    pub fn unlock_se(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
+        self.unlock_with(vmk, true, true)
     }
 
     /// Unlocks as [`LockedVault::unlock`] does but never migrates: the
@@ -443,10 +452,15 @@ impl LockedVault {
     /// stored. For a restore, which checks a staged vault against its
     /// backup's manifest before migrating it.
     pub(crate) fn unlock_as_stored(self, vmk: Vmk) -> Result<Vault, (Self, VaultError)> {
-        self.unlock_with(vmk, false)
+        self.unlock_with(vmk, false, false)
     }
 
-    fn unlock_with(mut self, vmk: Vmk, migrate: bool) -> Result<Vault, (Self, VaultError)> {
+    fn unlock_with(
+        mut self,
+        vmk: Vmk,
+        migrate: bool,
+        require_header: bool,
+    ) -> Result<Vault, (Self, VaultError)> {
         // A vault locked after opening read-only is judged afresh.
         if let Err(e) = self.conn.pragma_update(None, "query_only", "OFF") {
             return Err((self, e.into()));
@@ -474,6 +488,9 @@ impl LockedVault {
                 epoch: self.epoch,
             };
             match load_verified(&self.conn, &keys, &ctx, &self.plan) {
+                Ok(l)
+                    if require_header
+                        && l.integrity == Integrity::Tampered(TamperKind::HeaderUnreadable) => {}
                 Ok(l) => {
                     opened = Some((ctx, l));
                     break;
@@ -1106,20 +1123,30 @@ impl Vault {
         self.state.se_unlockers.get(&id)
     }
 
+    /// Seals the vault's VMK to `record.unlock_pub` without writing the row
+    /// yet, so the daemon can stage [`Txn::add_se_unlocker`] inside a
+    /// transaction that writes its durable audit entry before committing.
+    pub fn prepare_se_unlocker(
+        &self,
+        record: SeUnlockerRecord,
+    ) -> Result<SeUnlockerEnvelope, VaultError> {
+        seal_se_unlocker(&self.vmk, self.ctx.vault_id, self.ctx.epoch, record).map_err(|e| match e
+            .kind()
+        {
+            crate::crypto::CryptoErrorKind::EnvelopeFormat => {
+                VaultError::from(VaultErrorKind::InvalidRecord)
+            }
+            _ => VaultError::from(e),
+        })
+    }
+
     /// Seals the vault's VMK to `record.unlock_pub` and stores the new Secure
     /// Enclave unlocker row in one transaction.
     pub fn enroll_se_unlocker(
         &mut self,
         record: SeUnlockerRecord,
     ) -> Result<SeUnlockerEnvelope, VaultError> {
-        let env = seal_se_unlocker(&self.vmk, self.ctx.vault_id, self.ctx.epoch, record).map_err(
-            |e| match e.kind() {
-                crate::crypto::CryptoErrorKind::EnvelopeFormat => {
-                    VaultError::from(VaultErrorKind::InvalidRecord)
-                }
-                _ => VaultError::from(e),
-            },
-        )?;
+        let env = self.prepare_se_unlocker(record)?;
         self.transact(|t| t.add_se_unlocker(env.clone()))?;
         Ok(env)
     }

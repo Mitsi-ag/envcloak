@@ -1377,6 +1377,12 @@ pub fn approve(
         refuse_requester_terminal(&mut s, peer, &approver, &id, &now, "approve")?;
         let is_unlocker = s.grants().pending_unlocker(&id, &now).is_some();
         if is_unlocker {
+            if p.options.uses != Uses::Once
+                || p.options.ttl_secs != envcloak_policy::DEFAULT_TTL.as_secs()
+                || !p.options.live.is_empty()
+            {
+                return Err(RpcError::new(ErrorKind::InvalidOptions));
+            }
             if let Some(r) = requester_terminal_in(&mut s, &approver, &now) {
                 s.audit(AuditEvent::ProofRefused {
                     pid: peer.pid,
@@ -1438,6 +1444,12 @@ pub fn approve(
                 kind: ProofKind::Passphrase,
             };
             if is_unlocker {
+                if p.options.uses != Uses::Once
+                    || p.options.ttl_secs != envcloak_policy::DEFAULT_TTL.as_secs()
+                    || !p.options.live.is_empty()
+                {
+                    return Err(RpcError::new(ErrorKind::InvalidOptions));
+                }
                 refuse_requester_terminal(&mut s, peer, &approver, &id, &now, "approve")?;
                 if let Some(r) = requester_terminal_in(&mut s, &approver, &now) {
                     s.audit(AuditEvent::ProofRefused {
@@ -1480,32 +1492,21 @@ pub fn approve(
                     created_secs,
                     enrolled_under: pending.request.enrolled_under.clone(),
                 };
-                s.unlocked_mut()?
-                    .enroll_se_unlocker(record)
-                    .map_err(|e| match e.kind() {
-                        VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
-                            RpcError::new(ErrorKind::VaultTampered)
-                        }
-                        VaultErrorKind::InvalidRecord => {
-                            RpcError::with_reason(ErrorKind::InvalidParams, "invalid_record")
-                        }
-                        k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
-                    })?;
-                let completed = s
-                    .grants()
-                    .complete_unlocker_approval(&id, proof, digest, unlocker_id, &now)
-                    .map_err(approve_error)?;
                 let unlocker_hex = crate::app::hex_encode(&unlocker_id.0);
-                s.touch(Reading::now(&shared.clocks));
-                s.audit(AuditEvent::UnlockerAdd {
+                let audit_event = AuditEvent::UnlockerAdd {
                     pid: peer.pid,
                     subject: who,
                     request: id.to_string(),
                     unlocker: unlocker_hex.clone(),
-                    label: completed.request.label,
-                    unlock_pub_sha256: p256_fingerprint(&completed.request.unlock_pub),
-                    approve_pub_sha256: p256_fingerprint(&completed.request.approve_pub),
-                });
+                    label: pending.request.label.clone(),
+                    unlock_pub_sha256: p256_fingerprint(&pending.request.unlock_pub),
+                    approve_pub_sha256: p256_fingerprint(&pending.request.approve_pub),
+                };
+                s.enroll_se_unlocker(record, audit_event)?;
+                s.grants()
+                    .complete_unlocker_approval(&id, proof, digest, unlocker_id, &now)
+                    .map_err(approve_error)?;
+                s.touch(Reading::now(&shared.clocks));
                 return Ok(ApprovedView {
                     grant: unlocker_hex,
                     expires_in_secs: 0,

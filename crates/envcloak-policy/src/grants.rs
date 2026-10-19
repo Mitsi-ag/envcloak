@@ -1048,12 +1048,12 @@ impl GrantStore {
             let root_auto_denied = self.flood.record_denial(root, p.fingerprint, now);
             return Ok(DenyOutcome { root_auto_denied });
         }
-        if let Some(p) = self.pending_unlockers.remove(id) {
-            let root = p.request.subject.root();
+        if self.pending_unlockers.remove(id).is_some() {
             self.ended_unlockers
                 .record(*id, UnlockerEnrollOutcome::Denied, now);
-            let root_auto_denied = self.flood.record_denial(root, p.fingerprint, now);
-            return Ok(DenyOutcome { root_auto_denied });
+            return Ok(DenyOutcome {
+                root_auto_denied: false,
+            });
         }
         Err(NoSuchRequest)
     }

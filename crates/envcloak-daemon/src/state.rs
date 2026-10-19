@@ -533,7 +533,7 @@ impl State {
         let Slot::Locked(locked) = std::mem::replace(&mut self.slot, Slot::Absent) else {
             return Err(RpcError::new(ErrorKind::Internal));
         };
-        match locked.unlock(vmk) {
+        match locked.unlock_se(vmk) {
             Ok(v) => {
                 let view = unlocked_view(&v, false);
                 self.start_grants(&v);
@@ -559,6 +559,58 @@ impl State {
                 }
             }
         }
+    }
+
+    /// Enrolls a Secure Enclave unlocker in one transaction with its durable
+    /// `unlocker_add` audit append (gate 33): stages the new row, writes the
+    /// audit entry durably before committing `vault.db`, and rolls back the
+    /// staged row on audit failure.
+    pub fn enroll_se_unlocker(
+        &mut self,
+        record: envcloak_core::crypto::SeUnlockerRecord,
+        e: AuditEvent,
+    ) -> Result<envcloak_core::crypto::SeUnlockerEnvelope, RpcError> {
+        self.audit_open();
+        let Slot::Unlocked(vault) = &mut self.slot else {
+            return Err(RpcError::new(ErrorKind::VaultLocked));
+        };
+        let env = vault
+            .prepare_se_unlocker(record)
+            .map_err(|err| match err.kind() {
+                VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
+                    RpcError::new(ErrorKind::VaultTampered)
+                }
+                VaultErrorKind::InvalidRecord => {
+                    RpcError::with_reason(ErrorKind::InvalidParams, "invalid_record")
+                }
+                k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
+            })?;
+        let audit = &mut self.audit;
+        let mut audit_failed = false;
+        let result = vault.transact(|t| {
+            t.add_se_unlocker(env.clone())?;
+            if !Self::write_delivery(audit, e.clone()) {
+                audit_failed = true;
+                return Err(VaultErrorKind::Io(std::io::ErrorKind::Interrupted).into());
+            }
+            Ok(())
+        });
+        if let Err(err) = result {
+            if audit_failed {
+                return Err(RpcError::new(ErrorKind::AuditFailed));
+            }
+            return Err(match err.kind() {
+                VaultErrorKind::ReadOnly | VaultErrorKind::Tampered => {
+                    RpcError::new(ErrorKind::VaultTampered)
+                }
+                VaultErrorKind::InvalidRecord => {
+                    RpcError::with_reason(ErrorKind::InvalidParams, "invalid_record")
+                }
+                k => RpcError::with_reason(ErrorKind::VaultUnavailable, vault_reason(k)),
+            });
+        }
+        self.anchor_if_due(None);
+        Ok(env)
     }
 
     /// An unlocked vault: the grant store starts empty at its epochs.

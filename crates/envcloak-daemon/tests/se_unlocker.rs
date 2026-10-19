@@ -1056,3 +1056,204 @@ fn unlock_behind_recording_proxy_and_replay_guards() {
     assert_no_canary(&d.log_bytes(), &all_cs);
     home.assert_clean(&all_cs);
 }
+
+/// Regression tests for Round 1 review findings:
+/// - `F-01`: An empty vault (no items, fields, projects or policies) whose
+///   `header` row was deleted (`DELETE FROM header`) refuses `app.unlock` with
+///   `unlock_failed` even when given the valid resealed VMK, rather than
+///   opening read-only without verifying the VMK against the sealed header.
+/// - `F-02`: An `unlocker_add` approval whose durable `unlocker_add` audit
+///   write fails (`audit` directory blocked) fails with `audit_failed`, rolls
+///   back the staged unlocker row (`app.unlock.begin` returns `no_unlocker`),
+///   and leaves the enrolment request pending until the audit directory is
+///   restored.
+/// - `F-03`: Denying three `unlocker_add` requests from the same root never
+///   sets `root_auto_denied` or blocks `run.request` for that root.
+/// - `F-04`: Passing `--once`, `--for` or `--live` to `envcloak approve` on an
+///   `unlocker_add` request is refused before reading the passphrase, and raw
+///   IPC `approve` with non-default options is refused with `invalid_options`.
+#[test]
+fn enrolment_audit_failure_rolls_back_and_empty_vault_deleted_header_refuses_se_unlock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    common::terminal_session();
+    let cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let paths = VaultPaths::under(data_dir(&home));
+    let vmk = Vmk::generate();
+    let vault_id = VaultId::generate();
+    let pass_env = wrap_vmk_with(
+        &vmk,
+        &passphrase(&cs),
+        UnlockerKind::Passphrase,
+        &EnvelopeCtx {
+            vault_id,
+            unlocker_id: UnlockerId::generate(),
+            epoch: INITIAL_EPOCH,
+        },
+        &KdfParams::minimum(),
+        &Argon2id,
+    )
+    .unwrap();
+    // Create an empty vault (0 items, 0 fields, 0 projects, 0 policies).
+    let v = Vault::create(&paths, vault_id, vmk, vec![pass_env]).unwrap();
+    drop(v.lock());
+
+    let app_id = this_process_app_id();
+    let mut d = start_with_app_id(&home, Some(&app_id), None);
+    let mut c = client(&home);
+    c.unlock(passphrase(&cs), &[]).unwrap();
+
+    // F-03: Denying three distinct `unlocker_add` requests never auto-denies
+    // the app root (`root_auto_denied == false`).
+    for seed in [0x61u8, 0x62, 0x63] {
+        let (_, upub, apub) = sample_se_keys(seed);
+        let b = c
+            .app_unlocker_enroll_begin(
+                &hex_encode(&upub),
+                &hex_encode(&apub),
+                &format!("Denied {seed}"),
+                &[],
+            )
+            .unwrap();
+        let denied = c.deny(&b.request).unwrap();
+        assert!(!denied.root_auto_denied, "seed {seed}");
+        assert_eq!(
+            c.app_unlocker_enroll(&b.request, &[]).unwrap(),
+            AppUnlockerEnrollOutput::Denied
+        );
+    }
+
+    // Open a fresh enrolment request.
+    let (unlock_sk, unlock_pub, approve_pub) = sample_se_keys(0x70);
+    let enroll_begin = c
+        .app_unlocker_enroll_begin(
+            &hex_encode(&unlock_pub),
+            &hex_encode(&approve_pub),
+            "Audit Gate Unlocker",
+            &[],
+        )
+        .unwrap();
+    let PendingGetOutput::UnlockerAdd(desc) =
+        c.pending_get_any(&enroll_begin.request, &[]).unwrap()
+    else {
+        panic!("expected unlocker_add descriptor");
+    };
+    let digest = unlocker_statement_digest(&desc);
+
+    // F-04: CLI `envcloak approve <id> --once` and `--for 1h` and `--live X`
+    // are refused with `invalid_options` before reading the passphrase.
+    let pass_dir = tempfile::tempdir().unwrap();
+    let pass_file = pass_dir.path().join("pass");
+    std::fs::write(&pass_file, by_label(&cs, labels::VAULT_PASSPHRASE).value()).unwrap();
+    for bad_args in [
+        &["approve", enroll_begin.request.as_str(), "--once"][..],
+        &["approve", enroll_begin.request.as_str(), "--for", "1h"][..],
+        &["approve", enroll_begin.request.as_str(), "--live", "A"][..],
+    ] {
+        let out = run_cli_in_pty(&home, bad_args, &pass_file);
+        assert!(!out.status.success(), "{bad_args:?}");
+        let stderr_text = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr_text.contains("invalid_options"),
+            "expected invalid_options in stderr for {bad_args:?}: {stderr_text}"
+        );
+    }
+    // Raw IPC `approve` with non-default options is also refused with
+    // `invalid_options` without counting a proof failure.
+    let err_opts = c
+        .approve(
+            &enroll_begin.request,
+            ApprovalOptions {
+                uses: Uses::Session,
+                ttl_secs: 3600,
+                live: Vec::new(),
+            },
+            &digest,
+            passphrase(&cs),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(rpc_kind(err_opts).0, ErrorKind::InvalidOptions);
+    assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
+
+    // F-02: Block the audit directory so durable `unlocker_add` audit write
+    // fails. `approve` must fail with `audit_failed`, roll back the staged
+    // unlocker row in `vault.db`, and leave the request pending.
+    let audit_dir = data_dir(&home).join("audit");
+    std::fs::remove_dir_all(&audit_dir).unwrap();
+    std::fs::write(&audit_dir, b"blocked").unwrap();
+    let err_audit = c
+        .approve(
+            &enroll_begin.request,
+            ApprovalOptions {
+                uses: Uses::Once,
+                ttl_secs: DEFAULT_TTL.as_secs(),
+                live: Vec::new(),
+            },
+            &digest,
+            passphrase(&cs),
+            &[],
+        )
+        .unwrap_err();
+    assert_eq!(rpc_kind(err_audit).0, ErrorKind::AuditFailed);
+    assert_eq!(
+        c.app_unlocker_enroll(&enroll_begin.request, &[]).unwrap(),
+        AppUnlockerEnrollOutput::Pending
+    );
+    assert_eq!(
+        rpc_kind(c.app_unlock_begin(None, &[]).unwrap_err()).0,
+        ErrorKind::NoUnlocker
+    );
+
+    // Restore the audit directory and complete the enrolment.
+    std::fs::remove_file(&audit_dir).unwrap();
+    std::fs::create_dir(&audit_dir).unwrap();
+    std::fs::set_permissions(&audit_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    c.approve(
+        &enroll_begin.request,
+        ApprovalOptions {
+            uses: Uses::Once,
+            ttl_secs: DEFAULT_TTL.as_secs(),
+            live: Vec::new(),
+        },
+        &digest,
+        passphrase(&cs),
+        &[],
+    )
+    .unwrap();
+    let AppUnlockerEnrollOutput::Enrolled { unlocker_id } =
+        c.app_unlocker_enroll(&enroll_begin.request, &[]).unwrap()
+    else {
+        panic!("expected enrolled after audit recovery");
+    };
+
+    // Stop the daemon, delete the `header` row from the empty vault on disk,
+    // and restart.
+    drop(c);
+    d.signal("-TERM");
+    assert!(d.wait_exit(Duration::from_secs(30)).is_some());
+    assert_no_canary(&d.log_bytes(), &cs);
+    drop(d);
+
+    {
+        let conn = rusqlite::Connection::open(&paths.db).unwrap();
+        conn.execute("DELETE FROM header", []).unwrap();
+    }
+
+    // F-01: With the `header` row deleted on an empty vault, `app.unlock`
+    // cannot verify the caller-supplied VMK against a sealed header and must
+    // refuse with `unlock_failed` (even with the valid resealed VMK).
+    let d2 = start_with_app_id(&home, Some(&app_id), None);
+    let mut c2 = client(&home);
+    let begin = c2.app_unlock_begin(Some(&unlocker_id), &[]).unwrap();
+    let (_, sealed) = perform_app_hpke_reseal(&unlock_sk, &begin);
+    let err_deleted_header = c2
+        .app_unlock(&begin.request_id, &hex_encode(&sealed), &[])
+        .unwrap_err();
+    assert_eq!(rpc_kind(err_deleted_header).0, ErrorKind::UnlockFailed);
+    assert_eq!(c2.status().unwrap().vault.state, VaultState::Locked);
+    assert_eq!(c2.status().unwrap().vault.failed_unlocks, 1);
+    assert_no_canary(&d2.log_bytes(), &cs);
+    home.assert_clean(&cs);
+}
