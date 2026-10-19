@@ -50,3 +50,4 @@ crates/envcloak-scan/tests/scrub_oracle.rs    # generated previews sent only to 
 crates/envcloak-scan/src/formats/entry.rs # validate export names in wiping buffers
 crates/envcloak-scan/src/formats/stream.rs # decode bounded wiping export records
 crates/envcloak-scan/src/formats/bitwarden.rs # validate numeric export type tags
+crates/envcloak-mcp/src/bridge/relay.rs # hands the daemon's released header values to the response redactor and sets them on outbound requests to the registered origin only
