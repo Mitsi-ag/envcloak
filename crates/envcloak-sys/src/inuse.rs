@@ -51,11 +51,13 @@ pub fn open_elsewhere(f: &File) -> InUse {
 mod imp {
     use std::fs::File;
     use std::os::fd::AsRawFd;
+    use std::time::Duration;
 
     use super::InUse;
 
     pub fn open_elsewhere(f: &File) -> InUse {
         let fd = f.as_raw_fd();
+        let mut retries = 0u8;
         loop {
             // SAFETY: `f` keeps its descriptor open for the call;
             // F_SETLEASE takes an int argument.
@@ -67,6 +69,10 @@ mod imp {
             }
             match std::io::Error::last_os_error().raw_os_error() {
                 Some(libc::EINTR) => continue,
+                Some(libc::EAGAIN) if retries < 5 => {
+                    retries += 1;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
                 Some(libc::EAGAIN) => return InUse::Yes,
                 _ => return InUse::Unknown,
             }

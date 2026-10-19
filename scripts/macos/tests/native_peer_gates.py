@@ -24,8 +24,8 @@ METHODS = ["app.unlock.begin", "app.unlock", "app.unlocker.enroll.begin", "app.u
            "app.unlocker.add", "app.unlocker.remove", "app.pending.list", "app.pending.get",
            "app.approve", "app.items.target", "app.items.rotate", "app.items.remove",
            "app.reveal.begin", "app.reveal", "app.paste.begin", "app.paste.inspect", "app.paste",
-           "app.asks.list", "app.asks.decline", "app.policy.set", "app.device.add",
-           "app.device.remove", "app.registry.override", "app.future"]
+           "app.asks.list", "app.asks.decline", "app.audit.list", "app.lock", "app.policy.set",
+           "app.device.add", "app.device.remove", "app.registry.override", "app.future"]
 
 
 def read_exact(pipe, count):
@@ -226,10 +226,10 @@ class App(Native):
             self.assertEqual(response(child)["error"]["data"]["kind"], kind)
             child.stdin.close()
             self.assertEqual(child.wait(timeout=10), 0)
-        # Locking only tightens; still reserved in M3-07.
+        # Locking only tightens: answered whatever an app peer's evidence is.
         child = self.peer("genuine")
-        send(child, "app.lock", {"claims": ["CODEX_CI"]})
-        self.assertEqual(response(child)["error"]["data"]["kind"], "method_not_found")
+        send(child, "app.lock", {"reason": "user", "claims": ["CODEX_CI"]})
+        self.assertEqual(response(child)["result"], {"was_unlocked": False})
 
     def test_g4_exec_and_passed_descriptor(self):
         self.daemon()

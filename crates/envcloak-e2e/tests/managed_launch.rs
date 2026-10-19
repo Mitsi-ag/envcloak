@@ -648,7 +648,15 @@ fn the_server_gets_only_the_launch_environment() {
     }
     assert_eq!(r["vars"][KEY], w.key_digest(), "{r}");
     let allowed = [
-        KEY, "HOME", "USER", "LOGNAME", "LANG", "TZ", "TMPDIR", "PATH",
+        KEY,
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "TZ",
+        "TMPDIR",
+        "PATH",
+        "__CF_USER_TEXT_ENCODING",
     ];
     for name in r["env"].as_array().unwrap() {
         let name = name.as_str().unwrap();
