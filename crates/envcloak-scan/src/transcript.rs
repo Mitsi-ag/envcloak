@@ -606,21 +606,28 @@ pub fn scan_transcript_sources(
         _ => 3,
     });
     let mut scanned = std::collections::HashMap::new();
+    let mut scanned_ids = std::collections::HashMap::new();
     crate::sources::walk_sources(
         &ordered,
         budget,
         &mut report,
         |root, rel, source, opened, _attempts, report| {
             let path = root.path().join(rel);
+            let obj_id = crate::sources::ObjectIdentity::of(&opened.1);
             let format = crate::sources::effective_format(rel, source.format);
-            if let Some(previous) = scanned.get(&path) {
-                if *previous != format && matches!(format, ConfigFormat::Json | ConfigFormat::Jsonl)
+            if let Some(previous) = scanned
+                .get(&path)
+                .copied()
+                .or_else(|| scanned_ids.get(&obj_id).copied())
+            {
+                if previous != format && matches!(format, ConfigFormat::Json | ConfigFormat::Jsonl)
                 {
                     report.issue(path, "conflicting_formats");
                 }
                 return;
             }
             scanned.insert(path.clone(), format);
+            scanned_ids.insert(obj_id, format);
             report.transcript_formats.insert(path, format);
             scan_file(
                 root,

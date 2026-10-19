@@ -2,6 +2,7 @@
 """CI entry point for the real-daemon UI story, with a private short HOME."""
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,5 +26,8 @@ if 'DEVELOPER_DIR' in os.environ:
 command = [str(root / ('scripts/macos/test-eu1.sh' if '--eu1' in sys.argv else 'scripts/macos/test-workspace.sh'))]
 if '--eu1' in sys.argv and '--package' in sys.argv:
     command.append('--package')
+    target_dir = pathlib.Path(env['CARGO_TARGET_DIR'])
+    for ui_dir in ('m305-ui', 'm306-ui'):
+        shutil.rmtree(target_dir / ui_dir, ignore_errors=True)
 result = subprocess.run(command, cwd=root, env=env, stdin=subprocess.DEVNULL)
 sys.exit(result.returncode)
