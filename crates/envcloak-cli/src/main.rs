@@ -106,7 +106,7 @@ const HELP: &str = "usage:
   envcloak items reclassify <slug> test|live|unknown [--passphrase-fd N] [--json]
   envcloak init [--import] [--yes] [--delete-plaintext] [--agents-note] [--json]
   envcloak init --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
-  envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json]
+  envcloak import --scan <root>... [--machine] [--dry-run | --yes] [--delete-plaintext] [--json] [--report]
   envcloak recovery confirm [--kit-fd N] [--json]
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
@@ -122,7 +122,7 @@ const HELP: &str = "usage:
   envcloak reveal <slug>[#field]
   envcloak scrub [--path <path>]... [--yes] [--json]
   envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
-  envcloak doctor [--json] [--path <path>]... [--git-history]
+  envcloak doctor [--json] [--path <path>]... [--git-history] [--report]
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
 Not in this build (each exits 125 with not_in_this_build):
   envcloak login

@@ -1,5 +1,5 @@
 //! `envcloak reveal <slug>[#field]`: one freshly proven secret on the
-//! controlling terminal only (SPEC §6.7). macOS needs the M3 app.
+//! controlling terminal on Linux, or in the EnvCloak app on macOS (SPEC §6.7).
 
 use std::process::ExitCode;
 
@@ -21,16 +21,58 @@ pub fn run(args: &[&str]) -> ExitCode {
     if let Err(f) = super::refuse_value_like(&names) {
         return f.report(USAGE);
     }
-    #[cfg(target_os = "macos")]
-    {
+    reveal(slug, field).unwrap_or_else(|f| f.report(RUN_FAILURE))
+}
+
+#[cfg(target_os = "macos")]
+fn reveal(slug: &str, field: Option<&str>) -> Result<ExitCode, Failure> {
+    use std::time::Duration;
+
+    use envcloak_client::claims::refuse_if_claimed;
+    use envcloak_client::connect::run_paths;
+    use envcloak_client::fail::refuse_if_traced;
+    use envcloak_client::tty::Terminal;
+    use envcloak_ipc::proto::ErrorKind;
+    use envcloak_ipc::{Client, ClientError, RevealWaitOutcome, RpcError};
+
+    const MAX_WAIT: Duration = Duration::from_secs(600);
+
+    refuse_if_traced()?;
+    let claims_now = refuse_if_claimed()?;
+    let _tty = Terminal::open().map_err(|_| {
         Failure::new(
             "app_required",
-            "reveal on macOS requires the EnvCloak app (M3)",
+            "revealing a value on macOS uses the EnvCloak app; it is never printed to the terminal",
         )
-        .report(RUN_FAILURE)
+    })?;
+    if envcloak_sys::termination_ends_process().is_err() {
+        return Err(Failure::new(
+            "run_failed",
+            "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
+        ));
     }
-    #[cfg(target_os = "linux")]
-    reveal(slug, field).unwrap_or_else(|f| f.report(RUN_FAILURE))
+    match Client::wait_for_reveal(&run_paths()?, slug, field, &claims_now, MAX_WAIT) {
+        Ok(RevealWaitOutcome::Shown) => {
+            println!("Shown in EnvCloak");
+            Ok(ExitCode::SUCCESS)
+        }
+        Ok(RevealWaitOutcome::Declined) => Err(Failure::new(
+            "declined",
+            "the reveal request was declined in the EnvCloak app",
+        )),
+        Ok(RevealWaitOutcome::Expired) => Err(Failure::new(
+            "expired",
+            "the reveal request expired before it was shown in the EnvCloak app",
+        )),
+        Err(ClientError::Rpc(RpcError {
+            kind: ErrorKind::NoUnlocker,
+            ..
+        })) => Err(Failure::new(
+            "app_required",
+            "revealing a value on macOS uses the EnvCloak app; it is never printed to the terminal",
+        )),
+        Err(e) => Err(Failure::from(e)),
+    }
 }
 
 #[cfg(target_os = "linux")]

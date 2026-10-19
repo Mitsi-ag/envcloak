@@ -289,3 +289,29 @@ Run with `scripts/macos/qa-run.sh` on a clean macOS user account the founder cre
 | A20 the canary sweep | gate 12 | not run |
 
 The founder's Touch ID subset (A3, A4, A7, A8's cancel, A9 and A10's Touch ID parts, about 15 minutes) runs first at EU-2 on the founder's own account, then again in full at M3-21 on the clean account.
+
+## First-run scan report and Exposed filter (M3-J4, D3-13, R-M3-38)
+
+The first-run scan runs in Terminal (`envcloak import --scan ~ --machine --report`, `envcloak doctor --report`), so macOS asks Terminal rather than EnvCloak for folder access (D3-13). When `--report` is passed, the CLI writes a value-free JSON report atomically to `<data>/reports/first-run.json` with mode `0600` inside `<data>/reports/` (mode `0700`).
+
+### `<data>/reports/first-run.json` schema (`FirstRunReport`, version 1)
+
+Every field in `FirstRunReport` (`crates/envcloak-client/src/doctor_report.rs`, decoded in Swift by `FirstRunReportView` in `EnvCloakKit`) is an unsigned count, a sanitized slug, a sanitized display path, a validated account identifier, or an enum token (R-M3-38); unknown fields are refused on both sides and no field can hold a secret value or value preview:
+
+| Field | Type | Description |
+|---|---|---|
+| `version` | `u64` | Schema version (`1`) |
+| `keys_found` | `u64` | Total keys discovered or held in the vault |
+| `projects` | `u64` | Total projects discovered with env files |
+| `already_leaked` | `u64` | Total keys marked exposed (`leaked.len()`) |
+| `plaintext_files` | `u64` | Total plaintext files still holding keys |
+| `providers` | `[FirstRunProvider]` | Sorted provider summaries: `provider` (`String`), `total_count` (`u64`), `live_count` (`u64`) |
+| `accounts` | `[FirstRunAccount]` | Sorted account summaries when known: `account` (`String`, rejected if shaped like a value), `count` (`u64`); empty when no owning accounts are recorded |
+| `leaked` | `[FirstRunLeakedItem]` | Sorted exposed keys: `slug` (`String`), `provider` (`Option<String>`), `rotate_url` (`Option<String>` from the embedded provider registry), `sources` (`[String]` exposure source tokens), `places` (`[FirstRunLeakedPlace]` with `display_path: String` and `count: u64`) |
+| `plaintext_projects` | `[FirstRunProjectPlaintext]` | Sorted projects with remaining plaintext files: `project_dir` (`String` display path) and `files` (`[String]` relative display paths) |
+
+### App surfaces
+
+- **Welcome and First-Run Scan (`FirstRunScanView`, `WelcomeView`)**: watches `<data>/reports/first-run.json` (resolved from `getpwuid_r`, never from launch arguments, environment variables or Foundation home lookups). Before a report is present, step 6 shows the Terminal explanation, the Martian Mono command block (`envcloak import --scan ~ --machine --report` and `envcloak doctor --report`) with **Copy** and **Open Terminal**, and `ECBusy(size: .large)` with `Waiting for the scan in Terminal`. When a report arrives, it renders the 120 pt Ink hero plate with `ECRedaction`, the four headline figures (`<N> keys found`, `<N> projects`, `<N> already leaked`, `<N> plaintext files`), **By provider** (`<Provider> <total>, <live> live`), **By account** (or `Owning accounts are not detected yet. You can add them per key.` when `accounts` is empty), **Already leaked** (`Rotate these at the provider. EnvCloak cannot recall copies already sent to a model provider.` with **Open keys page** and **Replace…**), **Still in plain text** (files per project and the `envcloak init --delete-plaintext` explanation), and the footer (**Open projects** and **Done**).
+- **Keys > Exposed filter and inspector banner (`Route.keys(.exposed)`, `KeysView`, `KeyInspector`)**: filters the Keys list to items with `exposed != nil`, shows the warning badge on exposed rows, and renders the warning banner in the key inspector with `Open keys page` and `Replace…`.
+

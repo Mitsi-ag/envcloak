@@ -458,13 +458,11 @@ import XCTest
         }
         await assertVisible("Spend · M4", in: window)
         await assertVisible("Devices · M5", in: window)
-        await assertVisible("Leak checks arrive with envcloak doctor", in: window)
         window.close()
         for (route, expected) in [
             (Route.approvals, "Approvals. Arrives with Touch ID approvals"),
             (.activity, "Activity. Arrives with Touch ID approvals"),
             (.agents, "Agents. Arrives with Touch ID approvals"),
-            (.keys(.exposed), "Keys. Leak checks arrive with envcloak doctor"),
             (.later(.spend), "Spend. Spend arrives in M4"),
             (.later(.devices), "Devices. Devices arrive in M5"),
             (.later(.dashboard), "Dashboard. Spend arrives in M4"),
@@ -474,6 +472,114 @@ import XCTest
             await assertElementLabel(expected, identifier: "feature.unavailable", in: detail)
             detail.close()
         }
+        let exposed = host(MainView(session: session, initialRoute: .keys(.exposed)))
+        await assertVisible("No exposed keys.", in: exposed)
+        XCTAssertTrue(identified("feature.unavailable", in: exposed, accessibilityOnly: true).isEmpty)
+        exposed.close()
+    }
+
+    func testFirstRunScanScreenRendersWaitingAndFixtureReportAndSweepsClean() async throws {
+        let dir = URL(fileURLWithPath: "/tmp/ec05-first-run-" + UUID().uuidString.prefix(8))
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let client = ScriptedClient(); await client.plainSlugs()
+        let session = VaultSession(client: client); await session.poll()
+        let model = FirstRunScanModel(session: session, reportsDirectory: dir.path)
+        let waiting = host(FirstRunScanView(model: model))
+        await assertVisible("Find every key on this Mac. The scan reads .env files, shell profiles, agent MCP configs and exports you name. It runs in Terminal, so macOS asks Terminal, not EnvCloak, for folder access.", in: waiting)
+        await assertVisible(FirstRunScanModel.scanCommands, in: waiting)
+        await assertVisible("Waiting for the scan in Terminal", in: waiting)
+        waiting.close()
+
+        let canary = "CANARY_SECRET_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        let reportObject: [String: Any] = [
+            "version": 1,
+            "keys_found": 47,
+            "projects": 23,
+            "already_leaked": 12,
+            "plaintext_files": 18,
+            "providers": [
+                ["provider": "stripe", "total_count": 4, "live_count": 2]
+            ],
+            "accounts": [],
+            "leaked": [
+                [
+                    "slug": "stripe/acme-live",
+                    "provider": "stripe",
+                    "rotate_url": "https://dashboard.stripe.com/apikeys",
+                    "sources": ["transcript"],
+                    "places": [
+                        ["display_path": "/tmp/claude.jsonl", "count": 19]
+                    ]
+                ]
+            ],
+            "plaintext_projects": [
+                [
+                    "project_dir": "/tmp/acme-web",
+                    "files": [".env", ".env.local"]
+                ],
+                [
+                    "project_dir": "[not shown: looks like a key or token]",
+                    "files": [".env"]
+                ]
+            ]
+        ]
+        let file = dir.appendingPathComponent("first-run.json")
+        let data = try JSONSerialization.data(withJSONObject: reportObject)
+        try data.write(to: file)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        await model.refresh()
+
+        let resultWindow = host(WelcomeView(session: session, initialStep: .firstRunScan, scanModel: model))
+        await assertVisible("First-run scan, step 6 of 6", in: resultWindow)
+        await assertVisible("OPENAI_API_KEY, value hidden", in: resultWindow)
+        await assertVisible("47 keys found", in: resultWindow)
+        await assertVisible("23 projects", in: resultWindow)
+        await assertVisible("12 already leaked", in: resultWindow)
+        await assertVisible("18 plaintext files", in: resultWindow)
+        await assertVisible("Stripe 4, 2 live", in: resultWindow)
+        await assertVisible("Owning accounts are not detected yet. You can add them per key.", in: resultWindow)
+        await assertVisible("Rotate these at the provider. EnvCloak cannot recall copies already sent to a model provider.", in: resultWindow)
+        await assertVisible("stripe/acme-live", in: resultWindow)
+        await assertVisible("agent transcripts, 1 file", in: resultWindow)
+        await assertVisible("Open keys page", in: resultWindow)
+        await assertVisible("Replace…", in: resultWindow)
+        await assertVisible("Runs envcloak init --delete-plaintext in Terminal. It needs your Recovery Kit confirmed first, keeps an encrypted backup, and leaves files that changed in the last 2 minutes.", in: resultWindow)
+        await assertVisible("/tmp/acme-web: .env, .env.local", in: resultWindow)
+        await assertVisible(TerminalCopy.refusalMessage, in: resultWindow)
+        await assertVisible("Remove plaintext", in: resultWindow)
+        await assertVisible("Open projects", in: resultWindow)
+        await assertVisible("Done", in: resultWindow)
+
+        // Positive control and sweep over rendered labels and report file bytes.
+        let renderedText = labels(resultWindow).joined(separator: "\n")
+        let rawReportText = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertTrue(("positive control " + canary).contains(canary))
+        XCTAssertFalse(renderedText.contains(canary))
+        XCTAssertFalse(rawReportText.contains(canary))
+        resultWindow.close()
+    }
+
+    func testExposedFilterAndInspectorWarningBannerRenderFlaggedKeys() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(itemCount: 2)
+        await client.expose([1])
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        let keysWindow = host(KeysView(session: session, filter: .exposed, query: "", scope: nil, grouping: .constant(.none), selectedKey: .constant(nil)))
+        await assertVisible("1 keys", in: keysWindow)
+        await assertVisible("fixture-1", in: keysWindow)
+        XCTAssertFalse(labels(keysWindow).contains("fixture-0"))
+        keysWindow.close()
+
+        let inspectorWindow = host(KeyInspector(session: session, slug: DaemonText("fixture-1"), route: .constant(.keys(.exposed))))
+        await assertVisible("Found in past agent transcripts (14 files). Replace it at the provider: EnvCloak cannot recall copies already sent to a model provider.", in: inspectorWindow)
+        await assertVisible("Open keys page", in: inspectorWindow)
+        await assertVisible("Replace…", in: inspectorWindow)
+        inspectorWindow.close()
     }
 
     func testTwoThousandKeysRenderAndScrollWithoutLoader() async {

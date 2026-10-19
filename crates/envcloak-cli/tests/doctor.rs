@@ -737,3 +737,87 @@ fn a_new_run_recomputes_matches_after_rotation() {
             .any(|u| u["provider"] == "openai")
     );
 }
+
+#[test]
+fn first_run_and_doctor_report_flag_writes_private_value_free_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    f.transcript();
+    let project_dir = f.home.home().join("acme-web");
+    std::fs::create_dir_all(&project_dir).unwrap();
+    let stripe = by_label(&f.values, labels::STRIPE_SECRET_KEY).as_str();
+    std::fs::write(
+        project_dir.join(".env"),
+        format!("STRIPE_SECRET_KEY={stripe}\n"),
+    )
+    .unwrap();
+    // Positive control: raw canary is detected by the testkit sweep.
+    assert!(!envcloak_testkit::find(stripe.as_bytes(), &f.values).is_empty());
+
+    let mut scan_cmd = cli_command(
+        &f.home,
+        &[
+            "import",
+            "--scan",
+            project_dir.to_str().unwrap(),
+            "--machine",
+            "--report",
+        ],
+        &[],
+    );
+    scan_cmd.env("CLAUDE_CODE_TMPDIR", f.home.root().join("tmp"));
+    let scan_out = finish_within(scan_cmd, std::time::Duration::from_secs(60));
+    assert!(scan_out.status.success(), "{}", stderr(&scan_out));
+    assert_no_canary(&scan_out.stdout, &f.values);
+    assert_no_canary(&scan_out.stderr, &f.values);
+
+    let reports_dir = data_dir(&f.home).join("reports");
+    let report_path = reports_dir.join("first-run.json");
+    assert_eq!(
+        std::fs::symlink_metadata(&reports_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&report_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let scan_bytes = std::fs::read(&report_path).unwrap();
+    assert_no_canary(&scan_bytes, &f.values);
+    let scan_report: Value = serde_json::from_slice(&scan_bytes).unwrap();
+    assert_eq!(scan_report["version"], 1);
+    assert!(scan_report["keys_found"].as_u64().unwrap() >= 1);
+    assert_eq!(scan_report["projects"], 1);
+    assert_eq!(scan_report["plaintext_files"], 1);
+    assert_eq!(scan_report["accounts"], json!([]));
+    assert_eq!(
+        scan_report["plaintext_projects"][0]["files"],
+        json!([".env"])
+    );
+
+    let mut doc_cmd = on_terminal_command(&f.home, &["doctor", "--report"], &[]);
+    doc_cmd.env("CLAUDE_CODE_TMPDIR", f.home.root().join("tmp"));
+    let doc_out = finish_within(doc_cmd, std::time::Duration::from_secs(60));
+    assert!(doc_out.status.success(), "{}", stderr(&doc_out));
+    assert_no_canary(&doc_out.stdout, &f.values);
+    assert_no_canary(&doc_out.stderr, &f.values);
+
+    let doc_bytes = std::fs::read(&report_path).unwrap();
+    assert_no_canary(&doc_bytes, &f.values);
+    let doc_report: Value = serde_json::from_slice(&doc_bytes).unwrap();
+    assert_eq!(doc_report["version"], 1);
+    assert_eq!(doc_report["projects"], 1);
+    assert_eq!(doc_report["plaintext_files"], 1);
+    assert_eq!(doc_report["already_leaked"], 1);
+    assert_eq!(doc_report["leaked"][0]["slug"], "openai/doctor");
+    assert_eq!(doc_report["leaked"][0]["provider"], "openai");
+    assert_eq!(doc_report["leaked"][0]["sources"], json!(["transcript"]));
+    assert_eq!(doc_report["leaked"][0]["places"][0]["count"], 2);
+}
