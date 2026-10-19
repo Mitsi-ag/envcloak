@@ -99,6 +99,7 @@ pub mod launch;
 mod lockfile;
 pub mod owned;
 mod panic;
+pub mod pasteboard;
 mod peer;
 pub mod peer_code;
 mod perm;
@@ -148,6 +149,7 @@ pub use panic::{
     panic_point, panic_with_input, pause_point, test_app_identity, test_clock_offset, test_event,
     test_hook_vars, test_trace,
 };
+pub use pasteboard::{PasteboardError, PasteboardRead, read_and_clear_pasteboard};
 pub use peer::{
     PeerIdentity, PeerSource, StartTime, boot_id, parse_boot_id, parse_stat_start_time,
     peer_identity, peer_uid, peer_unchanged, process_start_time,
