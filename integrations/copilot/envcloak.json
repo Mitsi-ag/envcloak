@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "envcloak hook --host copilot --event preToolUse",
+        "timeoutSec": 5
+      }
+    ],
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "envcloak hook --host copilot --event sessionStart",
+        "timeoutSec": 5
+      }
+    ]
+  }
+}

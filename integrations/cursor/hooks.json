@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeSubmitPrompt": [
+      {
+        "command": "envcloak hook --host cursor --event beforeSubmitPrompt",
+        "timeout": 5
+      }
+    ],
+    "beforeShellExecution": [
+      {
+        "command": "envcloak hook --host cursor --event beforeShellExecution",
+        "timeout": 5,
+        "failClosed": true
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "envcloak hook --host cursor --event beforeReadFile",
+        "matcher": "Read",
+        "timeout": 5,
+        "failClosed": true
+      }
+    ],
+    "beforeMCPExecution": [
+      {
+        "command": "envcloak hook --host cursor --event beforeMCPExecution",
+        "timeout": 5,
+        "failClosed": true
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "envcloak hook --host cursor --event preToolUse",
+        "matcher": "Read|Grep|Shell|MCP:.*",
+        "timeout": 5
+      }
+    ],
+    "sessionStart": [
+      {
+        "command": "envcloak hook --host cursor --event sessionStart",
+        "timeout": 5
+      }
+    ]
+  }
+}

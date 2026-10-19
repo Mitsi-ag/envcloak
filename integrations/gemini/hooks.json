@@ -1,0 +1,41 @@
+{
+  "hooks": {
+    "BeforeAgent": [
+      {
+        "hooks": [
+          {
+            "name": "envcloak-BeforeAgent",
+            "type": "command",
+            "command": "envcloak hook --host gemini --event BeforeAgent",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command|read_file|read_many_files|write_file|replace|grep_search|glob|mcp_.*",
+        "hooks": [
+          {
+            "name": "envcloak-BeforeTool",
+            "type": "command",
+            "command": "envcloak hook --host gemini --event BeforeTool",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "name": "envcloak-SessionStart",
+            "type": "command",
+            "command": "envcloak hook --host gemini --event SessionStart",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

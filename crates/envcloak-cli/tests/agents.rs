@@ -3133,3 +3133,69 @@ fn hosts_without_a_prompt_contract_read_unsupported_without_a_probe() {
         "{text}"
     );
 }
+
+/// Tier-2 and Tier-3 hosts on `PATH` are installed by `envcloak agents install`,
+/// reported by `envcloak agents status --json` (`not_drivable` on non-drivable
+/// hosts, `unsupported` on Copilot/OpenCode/Goose prompt surfaces, and no
+/// `active` surface without a probe), and cleanly uninstalled by
+/// `envcloak agents uninstall`.
+#[test]
+fn tier_2_and_tier_3_install_status_and_uninstall() {
+    let f = Fixture::new();
+    for (exe, ver) in [
+        ("cursor-agent", "2026.09.28-64d2043"),
+        ("gemini", "0.62.0"),
+        ("copilot", "GitHub Copilot CLI 1.0.90."),
+        ("opencode", "1.18.34"),
+        ("kimi", "kimi-code 2.1.1"),
+        ("qwen", "0.24.7"),
+        ("goose", "goose 1.29.1"),
+        ("aider", "aider 0.86.2"),
+    ] {
+        let p = f.bin.join(exe);
+        std::fs::write(&p, format!("#!/bin/sh\necho '{ver}'\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let (r, code) = f.report(&["install", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+
+    let v = f.status_json();
+    for agent in [
+        "cursor", "gemini", "copilot", "opencode", "kimi", "qwen", "goose", "aider",
+    ] {
+        let a = row(&v, agent);
+        assert!(
+            a["surfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|s| s["state"] != "active"),
+            "{agent} must not have any active surface without a probe: {a}"
+        );
+    }
+    for not_drivable in ["cursor", "gemini", "goose", "aider"] {
+        assert!(
+            reasons_of(&v, not_drivable, "output").contains(&"not_drivable".to_owned()),
+            "{not_drivable} output must carry not_drivable: {v}"
+        );
+    }
+    for no_prompt in ["copilot", "opencode", "goose"] {
+        assert_eq!(
+            surface_line(&v, no_prompt, "prompt_to_model"),
+            "unsupported (probe=skipped)",
+            "{no_prompt}"
+        );
+    }
+    for surf in HOOK_SURFACES {
+        assert_eq!(
+            surface_line(&v, "aider", surf),
+            "unsupported (probe=skipped)",
+            "aider {surf}"
+        );
+    }
+
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    f.sweep();
+}

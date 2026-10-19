@@ -531,7 +531,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `needs_host_approval` | reason | M2-09 | landed | the host asks before each call of EnvCloak's tool, or refuses it (`codex exec` with approval policy "never") |
 | `outside_host_sandbox` | reason | M2-09 | landed | commands `run_with_secrets` starts run outside the host's sandbox, as a qualification result |
 | `persists_blocked_prompt` | reason | M2-09 | landed | the host keeps a blocked prompt in its local history |
-| `not_drivable` | reason | M2-04 | reserved | no documented setting lets the scripted model drive the host |
+| `not_drivable` | reason | M2-04 | landed | no documented setting lets the scripted model drive the host |
 | `sandbox_blocks_socket` | reason | M2-04 | landed | the host's sandbox cannot reach EnvCloak's socket with any documented allowance |
 | `probe_needs_terminal` | reason | M2-28 | landed | the output probe needs an approval only a terminal subject can give |
 | `switched_off_managed` | reason | M2-09 | landed | a managed or system setting switches every hook off (Claude Code's managed `disableAllHooks`, Codex's `[features] hooks = false` in a system or managed layer) |

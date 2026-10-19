@@ -22,8 +22,14 @@
 
 pub mod claude;
 pub mod codex;
+pub mod copilot;
+pub mod cursor;
+pub mod gemini;
+pub mod kimi;
+pub mod opencode;
 mod payload;
 pub mod prompt;
+pub mod qwen;
 pub mod shell;
 
 use envcloak_core::SecretBuf;
@@ -33,19 +39,63 @@ use payload::Parsed;
 
 use shell::Class;
 
-/// The hosts the handler answers for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// The hosts the handler and installers know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Host {
     ClaudeCode,
     Codex,
+    Cursor,
+    Gemini,
+    Copilot,
+    OpenCode,
+    Kimi,
+    Qwen,
+    Goose,
+    Aider,
 }
 
 impl Host {
-    /// The catalog id `--host` takes.
+    /// Every supported host, in tier order.
+    pub const ALL: [Host; 10] = [
+        Host::ClaudeCode,
+        Host::Codex,
+        Host::Cursor,
+        Host::Gemini,
+        Host::Copilot,
+        Host::OpenCode,
+        Host::Kimi,
+        Host::Qwen,
+        Host::Goose,
+        Host::Aider,
+    ];
+
+    /// The canonical id `--host` and `--agent` use.
     pub fn id(self) -> &'static str {
         match self {
             Host::ClaudeCode => "claude-code",
             Host::Codex => "codex",
+            Host::Cursor => "cursor",
+            Host::Gemini => "gemini",
+            Host::Copilot => "copilot",
+            Host::OpenCode => "opencode",
+            Host::Kimi => "kimi",
+            Host::Qwen => "qwen",
+            Host::Goose => "goose",
+            Host::Aider => "aider",
+        }
+    }
+
+    /// The host's tier (1, 2 or 3).
+    pub fn tier(self) -> u8 {
+        match self {
+            Host::ClaudeCode | Host::Codex => 1,
+            Host::Cursor
+            | Host::Gemini
+            | Host::Copilot
+            | Host::OpenCode
+            | Host::Kimi
+            | Host::Qwen => 2,
+            Host::Goose | Host::Aider => 3,
         }
     }
 
@@ -53,6 +103,14 @@ impl Host {
         match id {
             "claude-code" => Some(Host::ClaudeCode),
             "codex" => Some(Host::Codex),
+            "cursor" | "cursor-cli" => Some(Host::Cursor),
+            "gemini" | "gemini-cli" => Some(Host::Gemini),
+            "copilot" | "copilot-cli" => Some(Host::Copilot),
+            "opencode" => Some(Host::OpenCode),
+            "kimi" | "kimi-code" | "kimi-cli" => Some(Host::Kimi),
+            "qwen" | "qwen-code" => Some(Host::Qwen),
+            "goose" => Some(Host::Goose),
+            "aider" => Some(Host::Aider),
             _ => None,
         }
     }
@@ -64,10 +122,18 @@ pub enum Event {
     UserPromptSubmit,
     PreToolUse,
     SessionStart,
+    BeforeSubmitPrompt,
+    BeforeShellExecution,
+    BeforeReadFile,
+    BeforeMcpExecution,
+    PreToolUseLower,
+    SessionStartLower,
+    BeforeAgent,
+    BeforeTool,
 }
 
 impl Event {
-    /// Every event, in the order the hosts' hook files list them.
+    /// The three Claude/Codex events, in the order their hook files list them.
     pub const ALL: [Event; 3] = [
         Event::UserPromptSubmit,
         Event::PreToolUse,
@@ -80,6 +146,14 @@ impl Event {
             Event::UserPromptSubmit => "UserPromptSubmit",
             Event::PreToolUse => "PreToolUse",
             Event::SessionStart => "SessionStart",
+            Event::BeforeSubmitPrompt => "beforeSubmitPrompt",
+            Event::BeforeShellExecution => "beforeShellExecution",
+            Event::BeforeReadFile => "beforeReadFile",
+            Event::BeforeMcpExecution => "beforeMCPExecution",
+            Event::PreToolUseLower => "preToolUse",
+            Event::SessionStartLower => "sessionStart",
+            Event::BeforeAgent => "BeforeAgent",
+            Event::BeforeTool => "BeforeTool",
         }
     }
 
@@ -88,7 +162,52 @@ impl Event {
             "UserPromptSubmit" => Some(Event::UserPromptSubmit),
             "PreToolUse" => Some(Event::PreToolUse),
             "SessionStart" => Some(Event::SessionStart),
+            "beforeSubmitPrompt" => Some(Event::BeforeSubmitPrompt),
+            "beforeShellExecution" => Some(Event::BeforeShellExecution),
+            "beforeReadFile" => Some(Event::BeforeReadFile),
+            "beforeMCPExecution" => Some(Event::BeforeMcpExecution),
+            "preToolUse" => Some(Event::PreToolUseLower),
+            "sessionStart" => Some(Event::SessionStartLower),
+            "BeforeAgent" => Some(Event::BeforeAgent),
+            "BeforeTool" => Some(Event::BeforeTool),
             _ => None,
+        }
+    }
+
+    /// Whether this event is a session-start event (`SessionStart` or
+    /// `sessionStart`).
+    pub fn is_session_start(self) -> bool {
+        matches!(self, Event::SessionStart | Event::SessionStartLower)
+    }
+
+    /// Whether `self` is a valid hook event for `host` on the CLI.
+    pub fn valid_for_host(self, host: Host) -> bool {
+        match host {
+            Host::ClaudeCode | Host::Codex | Host::Kimi | Host::Qwen => matches!(
+                self,
+                Event::UserPromptSubmit | Event::PreToolUse | Event::SessionStart
+            ),
+            Host::Cursor => matches!(
+                self,
+                Event::BeforeSubmitPrompt
+                    | Event::BeforeShellExecution
+                    | Event::BeforeReadFile
+                    | Event::BeforeMcpExecution
+                    | Event::PreToolUseLower
+                    | Event::SessionStartLower
+            ),
+            Host::Gemini => matches!(
+                self,
+                Event::BeforeAgent | Event::BeforeTool | Event::SessionStart
+            ),
+            Host::Copilot | Host::OpenCode | Host::Goose => matches!(
+                self,
+                Event::PreToolUse
+                    | Event::PreToolUseLower
+                    | Event::SessionStart
+                    | Event::SessionStartLower
+            ),
+            Host::Aider => false,
         }
     }
 }
@@ -256,14 +375,29 @@ pub fn decide(host: Host, event: Event, payload: &SecretBuf) -> Decision {
         Parsed::Unfit => return Decision::NoDecision,
         Parsed::Fits(p) => p,
     };
+    match host {
+        Host::Cursor => return cursor::decide(event, &p),
+        Host::Gemini => return gemini::decide(event, &p),
+        Host::Copilot => return copilot::decide(event, &p),
+        Host::OpenCode => return opencode::decide(event, &p),
+        Host::Kimi => return kimi::decide(event, &p),
+        Host::Qwen => return qwen::decide(event, &p),
+        Host::Goose => {
+            if opencode::fits(event, &p) {
+                return opencode::decide(event, &p);
+            }
+        }
+        Host::Aider => return Decision::NoDecision,
+        Host::ClaudeCode | Host::Codex => {}
+    }
     match event {
-        Event::SessionStart => Decision::Allow,
+        Event::SessionStart | Event::SessionStartLower => Decision::Allow,
         Event::UserPromptSubmit => match p.get("prompt").and_then(Value::as_str) {
             Some(text) if prompt::holds_key(text) => Decision::Deny(Reason::KeyInPrompt),
             Some(_) => Decision::Allow,
             None => Decision::NoDecision,
         },
-        Event::PreToolUse => {
+        Event::PreToolUse | Event::PreToolUseLower => {
             let (Some(tool), Some(Value::Object(input))) = (
                 p.get("tool_name").and_then(Value::as_str),
                 p.get("tool_input"),
@@ -272,6 +406,7 @@ pub fn decide(host: Host, event: Event, payload: &SecretBuf) -> Decision {
             };
             tool_call(host, tool, input)
         }
+        _ => Decision::NoDecision,
     }
 }
 
@@ -447,8 +582,14 @@ pub fn answer(host: Host, event: Event, decision: Decision) -> Answer {
         };
     };
     let json = match host {
-        Host::ClaudeCode => claude::deny(event, reason.message()),
+        Host::ClaudeCode | Host::Goose | Host::Aider => claude::deny(event, reason.message()),
         Host::Codex => codex::deny(event, reason.message()),
+        Host::Cursor => cursor::deny(event, reason.message()),
+        Host::Gemini => gemini::deny(reason.message()),
+        Host::Copilot => copilot::deny(reason.message()),
+        Host::OpenCode => opencode::deny(reason.message()),
+        Host::Kimi => kimi::deny(event, reason.message()),
+        Host::Qwen => qwen::deny(event, reason.message()),
     };
     let mut stdout = serde_json::to_vec(&json).unwrap_or_default();
     stdout.push(b'\n');
@@ -472,8 +613,14 @@ pub fn session_context(host: Host, names: &[String]) -> Vec<u8> {
         names.join(", ")
     );
     let json = match host {
-        Host::ClaudeCode => claude::context(&text),
+        Host::ClaudeCode | Host::Goose | Host::Aider => claude::context(&text),
         Host::Codex => codex::context(&text),
+        Host::Cursor => cursor::context(&text),
+        Host::Gemini => gemini::context(&text),
+        Host::Copilot => copilot::context(&text),
+        Host::OpenCode => opencode::context(&text),
+        Host::Kimi => kimi::context(&text),
+        Host::Qwen => qwen::context(&text),
     };
     let mut out = serde_json::to_vec(&json).unwrap_or_default();
     out.push(b'\n');
@@ -488,6 +635,12 @@ pub fn payload_cwd(host: Host, event: Event, payload: &SecretBuf) -> Option<Stri
     };
     p.get("cwd")
         .and_then(Value::as_str)
+        .or_else(|| {
+            p.get("workspace_roots")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+        })
         .filter(|c| c.starts_with('/'))
         .map(str::to_owned)
 }

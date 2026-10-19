@@ -33,6 +33,7 @@ pub fn fits(event: Event, p: &Map<String, Value>) -> bool {
             s("turn_id") && s("tool_name") && p.get("tool_input").is_some_and(Value::is_object)
         }
         Event::SessionStart => true,
+        _ => false,
     }
 }
 
@@ -43,7 +44,7 @@ pub fn deny(event: Event, message: &str) -> Value {
             "decision": "block",
             "reason": message,
         }),
-        Event::PreToolUse | Event::SessionStart => json!({
+        _ => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",

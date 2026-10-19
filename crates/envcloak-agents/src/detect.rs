@@ -33,6 +33,9 @@ pub struct Detected {
     /// The executable found on `PATH`.
     pub exe: PathBuf,
     pub version: String,
+    /// Whether `--version` named the product itself rather than printing a
+    /// bare version number alone.
+    pub named: bool,
 }
 
 /// Why a host was not detected.
@@ -77,12 +80,32 @@ impl DetectError {
     }
 }
 
-/// The executable's name on `PATH`.
+/// The primary executable name on `PATH` for `host`.
 pub fn exe_name(host: Host) -> &'static str {
+    exe_names(host)[0]
+}
+
+/// Candidate executable names on `PATH` for `host`, in priority order.
+pub fn exe_names(host: Host) -> &'static [&'static str] {
     match host {
-        Host::ClaudeCode => "claude",
-        Host::Codex => "codex",
+        Host::ClaudeCode => &["claude"],
+        Host::Codex => &["codex"],
+        Host::Cursor => &["cursor-agent", "cursor"],
+        Host::Gemini => &["gemini"],
+        Host::Copilot => &["copilot"],
+        Host::OpenCode => &["opencode"],
+        Host::Kimi => &["kimi", "kimi-code", "kimi-cli"],
+        Host::Qwen => &["qwen"],
+        Host::Goose => &["goose"],
+        Host::Aider => &["aider"],
     }
+}
+
+/// Finds the first candidate executable for `host` on `path`.
+pub fn find_host_on_path(host: Host, path: &OsStr) -> Option<PathBuf> {
+    exe_names(host)
+        .iter()
+        .find_map(|name| find_on_path(name, path))
 }
 
 /// The first executable regular file named `name` in the directories of
@@ -98,16 +121,50 @@ pub fn find_on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
         })
 }
 
-/// Reads a version line: Claude Code's or Codex's.
+/// Reads a version line for `host`.
 pub fn parse_version(host: Host, stdout: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(stdout).ok()?;
-    let line = text.strip_suffix('\n').unwrap_or(text);
-    if line.contains('\n') || line.contains('\r') {
+    if text.contains('\r') {
+        return None;
+    }
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if matches!(host, Host::Copilot) {
+        let first = body.lines().next()?;
+        let v = first
+            .strip_prefix("GitHub Copilot CLI ")
+            .map(|s| s.strip_suffix('.').unwrap_or(s))
+            .or_else(|| first.strip_prefix("copilot "))?;
+        return is_version(v).then(|| v.to_owned());
+    }
+    if body.contains('\n') {
         return None;
     }
     let v = match host {
-        Host::ClaudeCode => line.strip_suffix(" (Claude Code)")?,
-        Host::Codex => line.strip_prefix("codex-cli ")?,
+        Host::ClaudeCode => body.strip_suffix(" (Claude Code)")?,
+        Host::Codex => body.strip_prefix("codex-cli ")?,
+        Host::Cursor => body
+            .strip_prefix("cursor-agent ")
+            .or_else(|| body.strip_prefix("cursor "))
+            .unwrap_or(body),
+        Host::Gemini => body
+            .strip_prefix("gemini-cli ")
+            .or_else(|| body.strip_prefix("gemini "))
+            .unwrap_or(body),
+        Host::Copilot => unreachable!(),
+        Host::OpenCode => body.strip_prefix("opencode ").unwrap_or(body),
+        Host::Kimi => body
+            .strip_prefix("kimi, version ")
+            .or_else(|| body.strip_prefix("kimi-code, version "))
+            .or_else(|| body.strip_prefix("kimi-cli "))
+            .or_else(|| body.strip_prefix("kimi-code "))
+            .or_else(|| body.strip_prefix("kimi "))
+            .unwrap_or(body),
+        Host::Qwen => body
+            .strip_prefix("qwen-code ")
+            .or_else(|| body.strip_prefix("qwen "))
+            .unwrap_or(body),
+        Host::Goose => body.strip_prefix("goose ").unwrap_or(body),
+        Host::Aider => body.strip_prefix("aider ").unwrap_or(body),
     };
     is_version(v).then(|| v.to_owned())
 }
@@ -129,15 +186,30 @@ fn is_version(v: &str) -> bool {
         })
 }
 
+fn host_env_vars(host: Host) -> &'static [&'static str] {
+    match host {
+        Host::ClaudeCode => &["CLAUDE_CONFIG_DIR"],
+        Host::Codex => &["CODEX_HOME"],
+        Host::Cursor => &["CURSOR_CONFIG_DIR"],
+        Host::Gemini => &["GEMINI_CLI_HOME"],
+        Host::Copilot => &["COPILOT_HOME"],
+        Host::OpenCode => &["XDG_CONFIG_HOME", "OPENCODE_CONFIG_DIR"],
+        Host::Kimi => &["KIMI_CODE_HOME", "KIMI_SHARE_DIR"],
+        Host::Qwen => &["QWEN_CODE_HOME"],
+        Host::Goose => &["XDG_CONFIG_HOME", "GOOSE_PATH_ROOT"],
+        Host::Aider => &["XDG_CONFIG_HOME"],
+    }
+}
+
 /// Finds `host` on `path` and asks it for its version, with only `HOME`,
-/// `PATH` and the host's own location variable (`CODEX_HOME`,
-/// `CLAUDE_CONFIG_DIR`) from `env` in its environment.
+/// `PATH` and the host's own location variables from `env` in its
+/// environment.
 pub fn detect(
     host: Host,
     path: &OsStr,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Result<Detected, DetectError> {
-    let exe = find_on_path(exe_name(host), path).ok_or(DetectError::NotFound)?;
+    let exe = find_host_on_path(host, path).ok_or(DetectError::NotFound)?;
     let mut cmd = Command::new(&exe);
     cmd.arg("--version")
         .env_clear()
@@ -145,11 +217,10 @@ pub fn detect(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let own = match host {
-        Host::ClaudeCode => "CLAUDE_CONFIG_DIR",
-        Host::Codex => "CODEX_HOME",
-    };
-    for k in ["HOME", own] {
+    if let Some(v) = env("HOME") {
+        cmd.env("HOME", v);
+    }
+    for &k in host_env_vars(host) {
         if let Some(v) = env(k) {
             cmd.env(k, v);
         }
@@ -168,7 +239,7 @@ pub fn detect_with(
     path: &OsStr,
     vars: &[(OsString, OsString)],
 ) -> Result<Detected, DetectError> {
-    let exe = find_on_path(exe_name(host), path).ok_or(DetectError::NotFound)?;
+    let exe = find_host_on_path(host, path).ok_or(DetectError::NotFound)?;
     let mut cmd = Command::new(&exe);
     cmd.arg("--version")
         .env_clear()
@@ -200,7 +271,7 @@ pub fn detect_identified(
     path: &OsStr,
     vars: &[(OsString, OsString)],
 ) -> Result<(Detected, String), DetectError> {
-    let exe = find_on_path(exe_name(host), path).ok_or(DetectError::NotFound)?;
+    let exe = find_host_on_path(host, path).ok_or(DetectError::NotFound)?;
     let digest = || {
         std::fs::canonicalize(&exe)
             .ok()
@@ -214,6 +285,21 @@ pub fn detect_identified(
     Ok((d, before))
 }
 
+fn named_in_version(host: Host, stdout: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(stdout) else {
+        return false;
+    };
+    let lower = text.to_ascii_lowercase();
+    match host {
+        Host::ClaudeCode => lower.contains("claude"),
+        Host::Codex => lower.contains("codex"),
+        Host::Copilot => lower.contains("copilot"),
+        Host::OpenCode => lower.contains("opencode"),
+        Host::Goose => lower.contains("goose"),
+        Host::Cursor | Host::Gemini | Host::Kimi | Host::Qwen | Host::Aider => true,
+    }
+}
+
 /// Runs `cmd` (`exe --version`) and reads `host`'s version from it.
 fn version_of(host: Host, exe: PathBuf, cmd: &mut Command) -> Result<Detected, DetectError> {
     let out = run_limited(cmd, LIMIT).map_err(|timed_out| {
@@ -224,7 +310,13 @@ fn version_of(host: Host, exe: PathBuf, cmd: &mut Command) -> Result<Detected, D
         }
     })?;
     let version = parse_version(host, &out).ok_or(DetectError::NotRecognized)?;
-    Ok(Detected { host, exe, version })
+    let named = named_in_version(host, &out);
+    Ok(Detected {
+        host,
+        exe,
+        version,
+        named,
+    })
 }
 
 /// Runs `cmd`, reading at most [`MAX_OUTPUT`] bytes of its standard

@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host goose --event PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

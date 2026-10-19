@@ -38,7 +38,7 @@ use crate::blocks;
 use crate::codex_layers;
 use crate::detect::{self, DetectError, Detected};
 use crate::hook::Host;
-use crate::hosts::{claude, codex};
+use crate::hosts::{aider, claude, codex, copilot, cursor, gemini, goose, kimi, opencode, qwen};
 use crate::jsonedit::Doc;
 use crate::locations::Locations;
 use crate::writer::{
@@ -71,7 +71,7 @@ impl std::fmt::Debug for Context<'_> {
 /// What to install, and where.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// The hosts named with `--agent`; none: every tier-1 host found.
+    /// The hosts named with `--agent`; none: every detected host found.
     pub hosts: Vec<Host>,
     /// The global scope (the default).
     pub global: bool,
@@ -137,14 +137,32 @@ pub enum Recheck {
         file: PathBuf,
         locations: Locations,
     },
+    /// Gemini CLI's global instruction file.
+    GeminiGlobal {
+        gemini_dir: PathBuf,
+        settings: PathBuf,
+        file: PathBuf,
+    },
+    /// Gemini CLI's project instruction file.
+    GeminiProject {
+        dir: PathBuf,
+        settings: PathBuf,
+        file: PathBuf,
+    },
+    /// Qwen Code's global instruction file.
+    QwenGlobal {
+        qwen_dir: PathBuf,
+        settings: PathBuf,
+        file: PathBuf,
+    },
 }
 
 impl CodexBudget {
     /// The budget and the files read before this one, now.
     ///
     /// # Errors
-    /// `instruction_file_moved` when Codex now reads another file in the
-    /// project than the one planned (its settings or files changed since).
+    /// `instruction_file_moved` when the host now reads another file than
+    /// the one planned (its settings or files changed since).
     fn now(&self) -> Result<(usize, Vec<PathBuf>), Refusal> {
         match &self.recheck {
             None => Ok((self.limit, self.before.clone())),
@@ -169,6 +187,61 @@ impl CodexBudget {
                     ));
                 }
                 Ok((view.limit, codex_layers::files_before(&view, dir)))
+            }
+            Some(Recheck::GeminiGlobal {
+                gemini_dir,
+                settings,
+                file,
+            }) => {
+                let reads = gemini::resolve_global_instruction_path(gemini_dir, settings);
+                if &reads != file {
+                    return Err(Refusal::new(
+                        "instruction_file_moved",
+                        format!(
+                            "Gemini CLI now reads {} instead (context.fileName changed since this \
+                             run looked): the block was not written; run this again",
+                            reads.display()
+                        ),
+                    ));
+                }
+                Ok((usize::MAX, Vec::new()))
+            }
+            Some(Recheck::GeminiProject {
+                dir,
+                settings,
+                file,
+            }) => {
+                let reads = gemini::resolve_project_instruction_path(dir, settings);
+                if &reads != file {
+                    return Err(Refusal::new(
+                        "instruction_file_moved",
+                        format!(
+                            "Gemini CLI now reads {} in this project instead (context.fileName \
+                             changed since this run looked): the block was not written; run this \
+                             again",
+                            reads.display()
+                        ),
+                    ));
+                }
+                Ok((usize::MAX, Vec::new()))
+            }
+            Some(Recheck::QwenGlobal {
+                qwen_dir,
+                settings,
+                file,
+            }) => {
+                let reads = qwen::resolve_global_instruction_path(qwen_dir, settings);
+                if &reads != file {
+                    return Err(Refusal::new(
+                        "instruction_file_moved",
+                        format!(
+                            "Qwen Code now reads {} instead (context.fileName changed since this \
+                             run looked): the block was not written; run this again",
+                            reads.display()
+                        ),
+                    ));
+                }
+                Ok((usize::MAX, Vec::new()))
             }
         }
     }
@@ -219,6 +292,12 @@ pub enum StepKind {
         host_owned: bool,
         additions: Vec<(Vec<String>, Value)>,
     },
+    /// Array elements and object members added to a JSON config file.
+    JsonConfig {
+        host_owned: bool,
+        additions: Vec<(Vec<String>, Value)>,
+        members: Vec<(Vec<String>, String, Value)>,
+    },
     /// Settings in a TOML file. With `allowance_layers`, the socket
     /// allowance among them is written only while Codex's other layers
     /// still leave it limited to EnvCloak's socket, read again when it is
@@ -227,6 +306,13 @@ pub enum StepKind {
         host_owned: bool,
         settings: Vec<codex::Setting>,
         allowance_layers: Option<Locations>,
+    },
+    /// Kimi's `[[hooks]]` entries in `config.toml`.
+    KimiToml { host_owned: bool, envcloak: PathBuf },
+    /// Aider's `read:` entry in `~/.aider.conf.yml`.
+    AiderConf {
+        host_owned: bool,
+        agents_md: PathBuf,
     },
     /// A file that is EnvCloak's whole.
     OwnFile { content: String },
@@ -284,11 +370,41 @@ pub fn host_name(host: Host) -> &'static str {
     match host {
         Host::ClaudeCode => "Claude Code",
         Host::Codex => "Codex",
+        Host::Cursor => "Cursor",
+        Host::Gemini => "Gemini CLI",
+        Host::Copilot => "Copilot CLI",
+        Host::OpenCode => "OpenCode",
+        Host::Kimi => "Kimi Code",
+        Host::Qwen => "Qwen Code",
+        Host::Goose => "Goose",
+        Host::Aider => "Aider",
     }
 }
 
 /// The tier-1 hosts, in report order.
 pub const TIER_1: [Host; 2] = [Host::ClaudeCode, Host::Codex];
+
+/// The tier-2 hosts, in report order.
+pub const TIER_2: [Host; 6] = [
+    Host::Cursor,
+    Host::Gemini,
+    Host::Copilot,
+    Host::OpenCode,
+    Host::Kimi,
+    Host::Qwen,
+];
+
+/// The tier-3 hosts, in report order.
+pub const TIER_3: [Host; 2] = [Host::Goose, Host::Aider];
+
+/// The tier number (1, 2 or 3) of `host`.
+pub fn host_tier(host: Host) -> u8 {
+    match host {
+        Host::ClaudeCode | Host::Codex => 1,
+        Host::Cursor | Host::Gemini | Host::Copilot | Host::OpenCode | Host::Kimi | Host::Qwen => 2,
+        Host::Goose | Host::Aider => 3,
+    }
+}
 
 /// The socket's path with its directories' symlinks resolved, as Claude
 /// Code's sandbox compares it (M2-04: `/tmp/...` is not allowed by a rule
@@ -349,7 +465,7 @@ pub fn read_json(path: &Path) -> Option<Value> {
 /// What an install with `opts` would do.
 pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
     let requested = !opts.hosts.is_empty();
-    let hosts: Vec<Host> = if requested {
+    let project_hosts: Vec<Host> = if requested {
         opts.hosts.clone()
     } else {
         TIER_1.to_vec()
@@ -360,13 +476,21 @@ pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
         project: opts
             .project
             .as_ref()
-            .map(|d| project_plan(d, &hosts, &ctx.locations)),
+            .map(|d| project_plan(d, &project_hosts, &ctx.locations)),
     };
     if !global {
         return out;
     }
-    for host in hosts {
+    let candidates: Vec<Host> = if requested {
+        opts.hosts.clone()
+    } else {
+        Host::ALL.to_vec()
+    };
+    for host in candidates {
         let found = detect::detect(host, &ctx.path, ctx.env);
+        if !requested && host_tier(host) > 1 && matches!(found, Err(DetectError::NotFound)) {
+            continue;
+        }
         let mut hp = HostPlan {
             host,
             requested,
@@ -378,6 +502,14 @@ pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
             match host {
                 Host::ClaudeCode => claude_plan(ctx, &mut hp),
                 Host::Codex => codex_plan(ctx, opts, d, &mut hp),
+                Host::Cursor => cursor_plan(ctx, &mut hp),
+                Host::Gemini => gemini_plan(ctx, &mut hp),
+                Host::Copilot => copilot_plan(ctx, &mut hp),
+                Host::OpenCode => opencode_plan(ctx, d, &mut hp),
+                Host::Kimi => kimi_plan(ctx, d, &mut hp),
+                Host::Qwen => qwen_plan(ctx, &mut hp),
+                Host::Goose => goose_plan(ctx, &mut hp),
+                Host::Aider => aider_plan(ctx, &mut hp),
             }
         }
         out.hosts.push(hp);
@@ -625,6 +757,316 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
     ));
 }
 
+fn cursor_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    hp.steps.push(Step {
+        what: "add EnvCloak's hooks".to_owned(),
+        path: l.cursor_hooks(),
+        kind: StepKind::JsonConfig {
+            host_owned: false,
+            additions: cursor::hooks_additions(&ctx.envcloak)
+                .into_iter()
+                .map(|(p, v)| (strings(&p), v))
+                .collect(),
+            members: vec![(Vec::new(), "version".to_owned(), Value::from(1))],
+        },
+    });
+    hp.steps.push(Step {
+        what: "register EnvCloak's MCP server".to_owned(),
+        path: l.cursor_mcp(),
+        kind: StepKind::JsonConfig {
+            host_owned: true,
+            additions: Vec::new(),
+            members: vec![(
+                strings(&["mcpServers"]),
+                cursor::SERVER.to_owned(),
+                cursor::mcp_entry(&ctx.envcloak),
+            )],
+        },
+    });
+    if let Some(proj) = ctx.locations.home().parent() {
+        let _ = proj;
+    }
+    hp.notes.push(note(
+        "cursor_no_global_rules_file",
+        "Cursor keeps global User Rules in its IDE settings rather than a file under ~/.cursor; \
+         run `envcloak agents install --project --agent cursor` in a project to write \
+         .cursor/rules/envcloak.mdc and AGENTS.md",
+    ));
+    hp.notes.push(note(
+        "not_drivable",
+        "Cursor cannot be headless-driven in CI, so its surfaces report unverified \
+         (not_drivable)",
+    ));
+}
+
+fn gemini_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    let settings = l.gemini_settings();
+    let instr = gemini::resolve_global_instruction_path(&l.gemini_dir(), &settings);
+    let budget = CodexBudget {
+        limit: usize::MAX,
+        before: Vec::new(),
+        shadowed_by: None,
+        recheck: Some(Recheck::GeminiGlobal {
+            gemini_dir: l.gemini_dir(),
+            settings: settings.clone(),
+            file: instr.clone(),
+        }),
+    };
+    hp.steps.push(Step {
+        what: "add EnvCloak's instruction block".to_owned(),
+        path: instr,
+        kind: StepKind::Block {
+            codex: Some(budget),
+        },
+    });
+    hp.steps.push(Step {
+        what: "add EnvCloak's hooks and MCP server".to_owned(),
+        path: settings,
+        kind: StepKind::JsonConfig {
+            host_owned: true,
+            additions: gemini::hooks_additions(&ctx.envcloak)
+                .into_iter()
+                .map(|(p, v)| (strings(&p), v))
+                .collect(),
+            members: vec![(
+                strings(&["mcpServers"]),
+                gemini::SERVER.to_owned(),
+                gemini::mcp_entry(&ctx.envcloak),
+            )],
+        },
+    });
+    hp.notes.push(note(
+        "not_drivable",
+        "Gemini CLI is not headless-probed in this build, so its surfaces report unverified \
+         (not_drivable)",
+    ));
+}
+
+fn copilot_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    hp.steps.push(Step {
+        what: "write EnvCloak's instructions file".to_owned(),
+        path: l.copilot_instructions(),
+        kind: StepKind::OwnFile {
+            content: copilot::instructions_content(),
+        },
+    });
+    hp.steps.push(Step {
+        what: "write EnvCloak's hooks file".to_owned(),
+        path: l.copilot_hooks(),
+        kind: StepKind::OwnFile {
+            content: copilot::hooks_file_content(&ctx.envcloak),
+        },
+    });
+    hp.steps.push(Step {
+        what: "register EnvCloak's MCP server".to_owned(),
+        path: l.copilot_mcp(),
+        kind: StepKind::JsonConfig {
+            host_owned: true,
+            additions: Vec::new(),
+            members: vec![(
+                strings(&["mcpServers"]),
+                copilot::SERVER.to_owned(),
+                copilot::mcp_entry(&ctx.envcloak),
+            )],
+        },
+    });
+    hp.notes.push(note(
+        "prompt_guard_unsupported",
+        "Copilot CLI's userPromptSubmitted hook cannot reject a prompt, so prompt_to_model and \
+         transcript remain unsupported",
+    ));
+}
+
+fn opencode_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    let opencode_agents = l.opencode_instructions();
+    let claude_md = l.claude_instructions();
+    if opencode::should_skip_global_agents_md(&opencode_agents, &claude_md, ctx.env) {
+        hp.notes.push(note(
+            "opencode_reads_claude_md",
+            "OpenCode falls back to ~/.claude/CLAUDE.md while ~/.config/opencode/AGENTS.md is \
+             absent; EnvCloak did not create ~/.config/opencode/AGENTS.md so it does not shadow \
+              your ~/.claude/CLAUDE.md",
+        ));
+    } else {
+        hp.steps.push(Step {
+            what: "add EnvCloak's instruction block".to_owned(),
+            path: opencode_agents,
+            kind: StepKind::Block { codex: None },
+        });
+    }
+    hp.steps.push(Step {
+        what: "write EnvCloak's OpenCode plugin".to_owned(),
+        path: l.opencode_plugin(),
+        kind: StepKind::OwnFile {
+            content: opencode::plugin_content(&ctx.envcloak, &d.version),
+        },
+    });
+    hp.steps.push(Step {
+        what: "register EnvCloak's MCP server".to_owned(),
+        path: l.opencode_config(),
+        kind: StepKind::JsonConfig {
+            host_owned: true,
+            additions: Vec::new(),
+            members: vec![(
+                strings(&["mcp"]),
+                opencode::SERVER.to_owned(),
+                opencode::mcp_entry(&ctx.envcloak),
+            )],
+        },
+    });
+}
+
+fn kimi_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    let product = kimi::detect_product(Some(&d.exe), Some(&d.version), l, ctx.env);
+    match product {
+        kimi::KimiProduct::Code => {
+            hp.steps.push(Step {
+                what: "add EnvCloak's instruction block".to_owned(),
+                path: l.kimi_code_instructions(),
+                kind: StepKind::Block { codex: None },
+            });
+            hp.steps.push(Step {
+                what: "add EnvCloak's hooks".to_owned(),
+                path: l.kimi_code_config(),
+                kind: StepKind::KimiToml {
+                    host_owned: true,
+                    envcloak: ctx.envcloak.clone(),
+                },
+            });
+            hp.steps.push(Step {
+                what: "register EnvCloak's MCP server".to_owned(),
+                path: l.kimi_code_mcp(),
+                kind: StepKind::JsonConfig {
+                    host_owned: true,
+                    additions: Vec::new(),
+                    members: vec![(
+                        strings(&["mcpServers"]),
+                        kimi::SERVER.to_owned(),
+                        kimi::mcp_entry(&ctx.envcloak),
+                    )],
+                },
+            });
+            hp.notes.push(note(
+                "kimi_product_code",
+                "detected Kimi Code (@moonshot-ai/kimi-code); configured ~/.kimi-code and left \
+                 ~/.kimi untouched",
+            ));
+        }
+        kimi::KimiProduct::Cli => {
+            hp.steps.push(Step {
+                what: "add EnvCloak's hooks".to_owned(),
+                path: l.kimi_cli_config(),
+                kind: StepKind::KimiToml {
+                    host_owned: true,
+                    envcloak: ctx.envcloak.clone(),
+                },
+            });
+            hp.steps.push(Step {
+                what: "register EnvCloak's MCP server".to_owned(),
+                path: l.kimi_cli_mcp(),
+                kind: StepKind::JsonConfig {
+                    host_owned: true,
+                    additions: Vec::new(),
+                    members: vec![(
+                        strings(&["mcpServers"]),
+                        kimi::SERVER.to_owned(),
+                        kimi::mcp_entry(&ctx.envcloak),
+                    )],
+                },
+            });
+            hp.notes.push(note(
+                "kimi_product_cli",
+                "detected kimi-cli (Python); configured ~/.kimi and left ~/.kimi-code untouched \
+                 (kimi-cli has no global AGENTS.md; use --project for project instructions)",
+            ));
+        }
+    }
+}
+
+fn qwen_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    let settings = l.qwen_settings();
+    let instr = qwen::resolve_global_instruction_path(&l.qwen_dir(), &settings);
+    let budget = CodexBudget {
+        limit: usize::MAX,
+        before: Vec::new(),
+        shadowed_by: None,
+        recheck: Some(Recheck::QwenGlobal {
+            qwen_dir: l.qwen_dir(),
+            settings: settings.clone(),
+            file: instr.clone(),
+        }),
+    };
+    hp.steps.push(Step {
+        what: "add EnvCloak's instruction block".to_owned(),
+        path: instr,
+        kind: StepKind::Block {
+            codex: Some(budget),
+        },
+    });
+    hp.steps.push(Step {
+        what: "add EnvCloak's hooks and MCP server".to_owned(),
+        path: settings,
+        kind: StepKind::JsonConfig {
+            host_owned: true,
+            additions: qwen::hooks_additions(&ctx.envcloak)
+                .into_iter()
+                .map(|(p, v)| (strings(&p), v))
+                .collect(),
+            members: vec![(
+                strings(&["mcpServers"]),
+                qwen::SERVER.to_owned(),
+                qwen::mcp_entry(&ctx.envcloak),
+            )],
+        },
+    });
+}
+
+fn goose_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    hp.steps.push(Step {
+        what: "add EnvCloak's instruction block".to_owned(),
+        path: l.goose_hints(),
+        kind: StepKind::Block { codex: None },
+    });
+    hp.steps.push(Step {
+        what: "write EnvCloak's Open Plugins hook file".to_owned(),
+        path: l.goose_plugin_hooks(),
+        kind: StepKind::OwnFile {
+            content: goose::plugin_hooks_content(&ctx.envcloak),
+        },
+    });
+    hp.notes.push(note(
+        "goose_manual_yaml",
+        goose::manual_yaml_note(&ctx.envcloak),
+    ));
+}
+
+fn aider_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+    let l = &ctx.locations;
+    let agents_md = l.home().join(".agents").join("AGENTS.md");
+    hp.steps.push(Step {
+        what: "add EnvCloak's instruction block".to_owned(),
+        path: agents_md.clone(),
+        kind: StepKind::Block { codex: None },
+    });
+    hp.steps.push(Step {
+        what: "add EnvCloak's instruction file to read:".to_owned(),
+        path: l.aider_conf(),
+        kind: StepKind::AiderConf {
+            host_owned: true,
+            agents_md,
+        },
+    });
+    hp.notes
+        .push(note("aider_unsupported_surfaces", aider::AIDER_NOTE));
+}
+
 /// Settings EnvCloak may have written in an earlier run that `hp` no
 /// longer writes, and what the report says when they were taken out, or
 /// are still there.
@@ -738,45 +1180,40 @@ fn claude_file_above(dir: &Path, user: &Path) -> Option<PathBuf> {
         .find(|p| p != user && std::fs::symlink_metadata(p).is_ok())
 }
 
-/// The project scope's steps for `hosts` (Map C section 6; Codex review:
-/// one destination for every host missed Codex beside a lone `CLAUDE.md`,
-/// and wrote an `AGENTS.md` an `AGENTS.override.md` shadows). Each host's
-/// file is chosen by that host's own precedence, in `dir`:
-///
-/// - Codex reads one file: `AGENTS.override.md`, else `AGENTS.md`, else
-///   the first of `project_doc_fallback_filenames` there; with none, a new
-///   `AGENTS.md`. An override is never written: the note says the block
-///   is not there for Codex. The block ends within Codex's budget, after
-///   the files Codex reads above `dir` up to the project root.
-/// - Claude Code reads `CLAUDE.md`, `.claude/CLAUDE.md` or
-///   `CLAUDE.local.md`, the first there; with none, `AGENTS.md` (from
-///   2.1.277, while no such file is above `dir` either: a note names one
-///   that is). A `CLAUDE.md` or `CLAUDE.local.md` is never created beside
-///   a lone `AGENTS.md`.
-///
-/// One file both read gets one step.
+/// The project scope's steps for `hosts` (Map C section 6). Each host's
+/// file is chosen by that host's own precedence, in `dir`.
 pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
     let present = |n: &str| std::fs::symlink_metadata(dir.join(n)).is_ok();
     let mut notes = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
     let mut readers: Vec<(PathBuf, Vec<Host>)> = Vec::new();
     let mut add = |path: PathBuf, codex: Option<CodexBudget>, host: Host| {
-        match readers.iter_mut().find(|(p, _)| *p == path) {
-            Some((_, hs)) => hs.push(host),
-            None => readers.push((path.clone(), vec![host])),
-        }
+        let hs = match readers.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, hs)) => {
+                if !hs.contains(&host) {
+                    hs.push(host);
+                }
+                hs.clone()
+            }
+            None => {
+                readers.push((path.clone(), vec![host]));
+                vec![host]
+            }
+        };
+        let names: Vec<&str> = hs.iter().map(|h| host_name(*h)).collect();
+        let what = format!(
+            "add EnvCloak's instruction block (read by {})",
+            names.join(" and ")
+        );
         if let Some(s) = steps.iter_mut().find(|s| s.path == path) {
-            s.what = "add EnvCloak's instruction block (read by Claude Code and Codex)".to_owned();
+            s.what = what;
             if let (StepKind::Block { codex: c @ None }, Some(b)) = (&mut s.kind, codex) {
                 *c = Some(b);
             }
             return;
         }
         steps.push(Step {
-            what: format!(
-                "add EnvCloak's instruction block (read by {})",
-                host_name(host)
-            ),
+            what,
             path,
             kind: StepKind::Block { codex },
         });
@@ -810,11 +1247,6 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
         }
     }
     if hosts.contains(&Host::Codex) {
-        // The settings a session in `dir` gets, as Codex merges its layers
-        // (Codex review, round 6: the fallback names of two layers were
-        // joined, where the higher one's list replaces the lower one's, and
-        // the project root was found by `.git` alone, where
-        // `project_root_markers` decides it).
         let view = codex_layers::doc_view(l, dir);
         if present("AGENTS.override.md") {
             notes.push(note(
@@ -838,6 +1270,47 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
             };
             add(file, Some(budget), Host::Codex);
         }
+    }
+    if hosts.contains(&Host::Cursor) {
+        add(dir.join("AGENTS.md"), None, Host::Cursor);
+    }
+    if hosts.contains(&Host::Gemini) {
+        let settings = l.gemini_settings();
+        let file = gemini::resolve_project_instruction_path(dir, &settings);
+        let budget = CodexBudget {
+            limit: usize::MAX,
+            before: Vec::new(),
+            shadowed_by: None,
+            recheck: Some(Recheck::GeminiProject {
+                dir: dir.to_path_buf(),
+                settings,
+                file: file.clone(),
+            }),
+        };
+        add(file, Some(budget), Host::Gemini);
+    }
+    for &host in &[
+        Host::Copilot,
+        Host::OpenCode,
+        Host::Kimi,
+        Host::Qwen,
+        Host::Goose,
+        Host::Aider,
+    ] {
+        if hosts.contains(&host) {
+            add(dir.join("AGENTS.md"), None, host);
+        }
+    }
+    if hosts.contains(&Host::Cursor) {
+        let rule_path = dir.join(".cursor").join("rules").join("envcloak.mdc");
+        readers.push((rule_path.clone(), vec![Host::Cursor]));
+        steps.push(Step {
+            what: "write EnvCloak's Cursor rule file".to_owned(),
+            path: rule_path,
+            kind: StepKind::OwnFile {
+                content: cursor::mdc_content(),
+            },
+        });
     }
     ProjectPlan {
         dir: dir.to_path_buf(),
@@ -962,10 +1435,6 @@ fn edit_for(
                 Some(b) => Doc::parse(b).map_err(|e| Refusal::new(e.name(), e.message()))?,
                 None => Doc::empty(),
             };
-            // EnvCloak's earlier elements this run does not add go first,
-            // while they are still there (the verifier's finding, in
-            // JSON: the hooks the enabled plugin now carries, a socket or
-            // a data directory that moved, were left beside the new ones).
             let stale: Vec<Edit> = rec
                 .map(|r| {
                     r.edits
@@ -1013,6 +1482,104 @@ fn edit_for(
                 dropped: stale,
             }))
         }
+        StepKind::JsonConfig {
+            additions, members, ..
+        } => {
+            let json = |e: crate::jsonedit::JsonError| Refusal::new(e.name(), e.message());
+            let mut doc = match before {
+                Some(b) => Doc::parse(b).map_err(json)?,
+                None => Doc::empty(),
+            };
+            let stale: Vec<Edit> = rec
+                .map(|r| {
+                    r.edits
+                        .iter()
+                        .filter(|e| match e {
+                            Edit::JsonElement { path, value, .. } => {
+                                !additions.iter().any(|(p, v)| p == path && v == value)
+                            }
+                            Edit::JsonMember {
+                                path, key, value, ..
+                            } => !members
+                                .iter()
+                                .any(|(p, k, v)| p == path && k == key && v == value),
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            for e in stale.iter().rev() {
+                match e {
+                    Edit::JsonElement {
+                        path,
+                        value,
+                        created,
+                    } => {
+                        let p: Vec<&str> = path.iter().map(String::as_str).collect();
+                        doc.remove_from_array(&p, value, *created).map_err(json)?;
+                    }
+                    Edit::JsonMember {
+                        path,
+                        key,
+                        value,
+                        created,
+                    } => {
+                        let p: Vec<&str> = path.iter().map(String::as_str).collect();
+                        doc.remove_member(&p, key, value, *created).map_err(json)?;
+                    }
+                    _ => {}
+                }
+            }
+            let mut edits = Vec::new();
+            for (path, key, value) in members {
+                let p: Vec<&str> = path.iter().map(String::as_str).collect();
+                let mut check_path = p.clone();
+                check_path.push(key.as_str());
+                let current_val = doc
+                    .get(&check_path)
+                    .and_then(|n| serde_json::from_str::<Value>(&doc.text()[n.start..n.end]).ok());
+                match current_val {
+                    Some(v) if &v == value => {}
+                    Some(_) => {
+                        return Err(Refusal::new(
+                            "conflict",
+                            format!(
+                                "`{key}` is already set in this file, and EnvCloak did not set it"
+                            ),
+                        ));
+                    }
+                    None => {
+                        if let Some(created) = doc.add_member(&p, key, value).map_err(json)? {
+                            edits.push(Edit::JsonMember {
+                                path: path.clone(),
+                                key: key.clone(),
+                                value: value.clone(),
+                                created,
+                            });
+                        }
+                    }
+                }
+            }
+            for (path, value) in additions {
+                let p: Vec<&str> = path.iter().map(String::as_str).collect();
+                if let Some(created) = doc.add_to_array(&p, value).map_err(json)? {
+                    edits.push(Edit::JsonElement {
+                        path: path.clone(),
+                        value: value.clone(),
+                        created,
+                    });
+                }
+            }
+            if edits.is_empty() && stale.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(Change {
+                bytes: doc.text().as_bytes().to_vec(),
+                added: edits,
+                dropped: stale,
+            }))
+        }
         StepKind::Toml {
             settings,
             allowance_layers,
@@ -1026,6 +1593,8 @@ fn edit_for(
             let owned = rec.map(|r| r.edits.as_slice()).unwrap_or_default();
             codex::apply(before, settings, owned)
         }
+        StepKind::KimiToml { envcloak, .. } => kimi::apply_config_toml(before, envcloak),
+        StepKind::AiderConf { agents_md, .. } => aider::apply_aider_conf(before, agents_md),
         StepKind::OwnFile { content } => match (before, rec) {
             (Some(b), _) if b == content.as_bytes() => Ok(None),
             // An older version of EnvCloak's own file, as EnvCloak left it.
@@ -1101,7 +1670,16 @@ pub fn apply(ctx: &Context<'_>, plan: &Plan, w: &mut Writer<'_>) -> Report {
                 StepKind::Json {
                     host_owned: true,
                     ..
+                } | StepKind::JsonConfig {
+                    host_owned: true,
+                    ..
                 } | StepKind::Toml {
+                    host_owned: true,
+                    ..
+                } | StepKind::KimiToml {
+                    host_owned: true,
+                    ..
+                } | StepKind::AiderConf {
                     host_owned: true,
                     ..
                 } | StepKind::ClaudeMcp { .. }
@@ -1373,6 +1951,16 @@ pub fn structural(current: &[u8], edits: &[Edit], created: bool) -> Result<Undo,
             Err(e) => Err(Refusal::new(e.name(), e.message())),
         };
     }
+    if edits.iter().any(
+        |e| matches!(e, Edit::TomlValue { path, .. } if path.first().is_some_and(|k| k == "hooks")),
+    ) {
+        return kimi::remove_config_toml(current, edits, created);
+    }
+    if edits.iter().any(
+        |e| matches!(e, Edit::TomlValue { path, .. } if path.first().is_some_and(|k| k == "read")),
+    ) {
+        return aider::remove_aider_conf(current, created);
+    }
     if edits.iter().any(|e| matches!(e, Edit::TomlValue { .. })) {
         return codex::undo(current, edits, created);
     }
@@ -1421,7 +2009,14 @@ pub fn structural(current: &[u8], edits: &[Edit], created: bool) -> Result<Undo,
 /// Takes out what EnvCloak installed for `opts`'s hosts and scopes.
 pub fn uninstall(opts: &Options, w: &mut Writer<'_>) -> Report {
     let hosts: Vec<Host> = if opts.hosts.is_empty() {
-        TIER_1.to_vec()
+        Host::ALL
+            .into_iter()
+            .filter(|&h| {
+                host_tier(h) == 1
+                    || w.state.files.values().any(|r| r.host == h.id())
+                    || w.state.dirs.values().any(|d| d.host == h.id())
+            })
+            .collect()
     } else {
         opts.hosts.clone()
     };
@@ -1570,7 +2165,7 @@ pub fn project_shares(
 
 /// The display names of the hosts with these ids, joined.
 fn names_of(ids: &[String]) -> String {
-    let names: Vec<&str> = TIER_1
+    let names: Vec<&str> = Host::ALL
         .iter()
         .filter(|h| ids.iter().any(|i| i == h.id()))
         .map(|h| host_name(*h))

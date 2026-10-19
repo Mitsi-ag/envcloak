@@ -88,6 +88,46 @@ pub fn run_surfaces(
         config_shape: String::new(),
     };
     let want = |s: Surface| surfaces.contains(&s);
+    if !coverage::is_drivable(host.host) {
+        let mut p = Prober {
+            host,
+            home,
+            flags,
+            runs: Vec::new(),
+            config: None,
+        };
+        let exe_sha = std::fs::canonicalize(&host.exe)
+            .ok()
+            .and_then(|e| coverage::file_sha256(&e))
+            .unwrap_or_default();
+        p.config = p.read_config();
+        report.config_digest = p
+            .config
+            .as_ref()
+            .and_then(|c| c.fingerprint(&home.envcloak))
+            .unwrap_or_default();
+        report.config_shape = p
+            .config
+            .as_ref()
+            .and_then(|c| c.shape(&home.home, &home.envcloak))
+            .unwrap_or_default();
+        report.exe_sha256 = exe_sha;
+        for s in Surface::ALL.into_iter().filter(|s| want(*s)) {
+            let unsupported = (matches!(host.host, Host::Copilot | Host::OpenCode | Host::Goose)
+                && matches!(s, Surface::PromptToModel | Surface::Transcript))
+                || (host.host == Host::Aider && s.hook_based());
+            let why: &[Reason] = if unsupported {
+                &[]
+            } else {
+                &[Reason::NotDrivable]
+            };
+            report.surfaces.push(skipped(s, Outcome::Skipped, why));
+        }
+        if server {
+            report.server.outcome = Outcome::Skipped;
+        }
+        return report;
+    }
     if !model::qualified(host.host.id(), &host.version) {
         for s in Surface::ALL.into_iter().filter(|s| want(*s)) {
             report.surfaces.push(skipped(s, Outcome::NotQualified, &[]));
@@ -139,7 +179,14 @@ pub fn run_surfaces(
         return report;
     };
     if want(Surface::PromptToModel) || want(Surface::Transcript) {
-        let (prompt, transcript) = p.prompt_and_transcript();
+        let (prompt, transcript) = if matches!(host.host, Host::Copilot | Host::OpenCode) {
+            (
+                skipped(Surface::PromptToModel, Outcome::Skipped, &[]),
+                skipped(Surface::Transcript, Outcome::Skipped, &[]),
+            )
+        } else {
+            p.prompt_and_transcript()
+        };
         if want(Surface::PromptToModel) {
             report.surfaces.push(prompt);
         }
@@ -495,7 +542,7 @@ impl Prober<'_, '_> {
             (Session::New, Host::Codex) => {
                 flags.extend(["--sandbox".to_owned(), spec.sandbox.to_owned()]);
             }
-            (Session::New, Host::ClaudeCode) => {}
+            _ => {}
         }
         flags.extend(self.flags.args.iter().cloned());
         RunSummary {
@@ -586,6 +633,50 @@ impl Prober<'_, '_> {
                     ),
                 }
             }
+            Host::Copilot => {
+                cmd.env("COPILOT_OFFLINE", "true")
+                    .env("COPILOT_AUTO_UPDATE", "false")
+                    .env("COPILOT_PROVIDER_BASE_URL", base)
+                    .env("COPILOT_PROVIDER_TYPE", "anthropic")
+                    .env("COPILOT_PROVIDER_API_KEY", token.as_str())
+                    .env("COPILOT_MODEL", "ec-scripted");
+                let mut a = vec![
+                    "-p".to_owned(),
+                    spec.prompt.as_str().to_owned(),
+                    "--allow-all-tools".to_owned(),
+                ];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            Host::OpenCode => {
+                cmd.env("EC_MODEL_TOKEN", token.as_str());
+                let mut a = vec!["run".to_owned(), spec.prompt.as_str().to_owned()];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            Host::Kimi => {
+                cmd.env("EC_MODEL_TOKEN", token.as_str());
+                let mut a = vec!["-p".to_owned(), spec.prompt.as_str().to_owned()];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            Host::Qwen => {
+                cmd.env("EC_MODEL_TOKEN", token.as_str());
+                let mut a = vec![
+                    spec.prompt.as_str().to_owned(),
+                    "--approval-mode".to_owned(),
+                    "default".to_owned(),
+                    "--allowed-tools".to_owned(),
+                    "run_shell_command".to_owned(),
+                ];
+                a.extend(spec.probe.iter().cloned());
+                a.extend(self.flags.args.iter().cloned());
+                a.into_iter().map(OsString::from).collect()
+            }
+            _ => Vec::new(),
         };
         cmd.args(&args)
             .envs(spec.env.iter().map(|(k, v)| (k, v)))
@@ -1336,6 +1427,7 @@ fn flags_add_rules_or_hooks(host: Host, args: &[String]) -> bool {
                 .iter()
                 .any(|t| k == *t || k.starts_with(&format!("{t}.")))
         }),
+        _ => false,
     }
 }
 
@@ -1614,6 +1706,11 @@ mod tests {
                 "hook_event_name": "PreToolUse", "model": "m", "turn_id": "t",
                 "permission_mode": "bypassPermissions",
                 "tool_name": tool, "tool_input": input, "tool_use_id": "u",
+            }),
+            _ => json!({
+                "session_id": "s", "cwd": "/p",
+                "hook_event_name": "PreToolUse",
+                "tool_name": tool, "tool_input": input,
             }),
         };
         let bytes = serde_json::to_vec(&v).unwrap_or_default();

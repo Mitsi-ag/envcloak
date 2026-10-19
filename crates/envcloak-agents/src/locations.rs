@@ -305,6 +305,146 @@ impl Locations {
         dir.join(".codex").join("config.toml")
     }
 
+    /// Cursor's user directory (`~/.cursor`).
+    pub fn cursor_dir(&self) -> PathBuf {
+        self.home.join(".cursor")
+    }
+
+    /// Cursor's user hooks (`~/.cursor/hooks.json`).
+    pub fn cursor_hooks(&self) -> PathBuf {
+        self.cursor_dir().join("hooks.json")
+    }
+
+    /// Cursor's user MCP configuration (`~/.cursor/mcp.json`).
+    pub fn cursor_mcp(&self) -> PathBuf {
+        self.cursor_dir().join("mcp.json")
+    }
+
+    /// Gemini CLI's user directory (`~/.gemini`).
+    pub fn gemini_dir(&self) -> PathBuf {
+        self.home.join(".gemini")
+    }
+
+    /// Gemini CLI's user settings (`~/.gemini/settings.json`).
+    pub fn gemini_settings(&self) -> PathBuf {
+        self.gemini_dir().join("settings.json")
+    }
+
+    /// Copilot CLI's user directory (`$COPILOT_HOME`, else `~/.copilot`).
+    pub fn copilot_dir(&self) -> &Path {
+        &self.copilot_home
+    }
+
+    /// Copilot CLI's global instructions file.
+    pub fn copilot_instructions(&self) -> PathBuf {
+        self.copilot_home
+            .join("instructions")
+            .join("envcloak.instructions.md")
+    }
+
+    /// Copilot CLI's global hook configuration (`~/.copilot/hooks/envcloak.json`).
+    pub fn copilot_hooks(&self) -> PathBuf {
+        self.copilot_home.join("hooks").join("envcloak.json")
+    }
+
+    /// Copilot CLI's global MCP configuration (`~/.copilot/mcp-config.json`).
+    pub fn copilot_mcp(&self) -> PathBuf {
+        self.copilot_home.join("mcp-config.json")
+    }
+
+    /// Kimi Code's data directory (`$KIMI_CODE_HOME`, else `~/.kimi-code`).
+    pub fn kimi_code_dir(&self) -> &Path {
+        &self.kimi_code
+    }
+
+    /// Kimi Code's global instructions (`~/.kimi-code/AGENTS.md`).
+    pub fn kimi_code_instructions(&self) -> PathBuf {
+        self.kimi_code.join("AGENTS.md")
+    }
+
+    /// Kimi Code's configuration (`~/.kimi-code/config.toml`).
+    pub fn kimi_code_config(&self) -> PathBuf {
+        self.kimi_code.join("config.toml")
+    }
+
+    /// Kimi Code's MCP configuration (`~/.kimi-code/mcp.json`).
+    pub fn kimi_code_mcp(&self) -> PathBuf {
+        self.kimi_code.join("mcp.json")
+    }
+
+    /// Kimi CLI's data directory (`$KIMI_SHARE_DIR`, else `~/.kimi`).
+    pub fn kimi_cli_dir(&self) -> &Path {
+        &self.kimi_share
+    }
+
+    /// Kimi CLI's configuration (`~/.kimi/config.toml`).
+    pub fn kimi_cli_config(&self) -> PathBuf {
+        self.kimi_share.join("config.toml")
+    }
+
+    /// Kimi CLI's MCP configuration (`~/.kimi/mcp.json`).
+    pub fn kimi_cli_mcp(&self) -> PathBuf {
+        self.kimi_share.join("mcp.json")
+    }
+
+    /// OpenCode's configuration directory (`~/.config/opencode`).
+    pub fn opencode_config_dir(&self) -> PathBuf {
+        self.home.join(".config").join("opencode")
+    }
+
+    /// OpenCode's global instructions (`~/.config/opencode/AGENTS.md`).
+    pub fn opencode_instructions(&self) -> PathBuf {
+        self.opencode_config_dir().join("AGENTS.md")
+    }
+
+    /// OpenCode's configuration (`~/.config/opencode/opencode.json`).
+    pub fn opencode_config(&self) -> PathBuf {
+        self.opencode_config_dir().join("opencode.json")
+    }
+
+    /// EnvCloak's OpenCode plugin (`~/.config/opencode/plugins/envcloak.js`).
+    pub fn opencode_plugin(&self) -> PathBuf {
+        self.opencode_config_dir()
+            .join("plugins")
+            .join("envcloak.js")
+    }
+
+    /// Qwen Code's user directory (`~/.qwen`).
+    pub fn qwen_dir(&self) -> PathBuf {
+        self.home.join(".qwen")
+    }
+
+    /// Qwen Code's user settings (`~/.qwen/settings.json`).
+    pub fn qwen_settings(&self) -> PathBuf {
+        self.qwen_dir().join("settings.json")
+    }
+
+    /// Goose's configuration directory (`~/.config/goose`).
+    pub fn goose_config_dir(&self) -> PathBuf {
+        self.home.join(".config").join("goose")
+    }
+
+    /// Goose's global hints file (`~/.config/goose/.goosehints`).
+    pub fn goose_hints(&self) -> PathBuf {
+        self.goose_config_dir().join(".goosehints")
+    }
+
+    /// Goose's Open Plugins hook file
+    /// (`~/.agents/plugins/envcloak/hooks/hooks.json`).
+    pub fn goose_plugin_hooks(&self) -> PathBuf {
+        self.home
+            .join(".agents")
+            .join("plugins")
+            .join("envcloak")
+            .join("hooks")
+            .join("hooks.json")
+    }
+
+    /// Aider's user configuration (`~/.aider.conf.yml`).
+    pub fn aider_conf(&self) -> PathBuf {
+        self.home.join(".aider.conf.yml")
+    }
+
     fn src(path: PathBuf, format: ConfigFormat, kind: SourceKind, label: &str) -> ConfigSource {
         ConfigSource {
             path,

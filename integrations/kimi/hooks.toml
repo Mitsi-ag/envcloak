@@ -1,0 +1,15 @@
+[[hooks]]
+event = "UserPromptSubmit"
+command = "envcloak hook --host kimi --event UserPromptSubmit"
+timeout = 5
+
+[[hooks]]
+event = "PreToolUse"
+matcher = "Bash|Shell|Read|ReadFile|Write|WriteFile|Edit|StrReplaceFile|Glob|Grep|mcp:.*|mcp__.*"
+command = "envcloak hook --host kimi --event PreToolUse"
+timeout = 5
+
+[[hooks]]
+event = "SessionStart"
+command = "envcloak hook --host kimi --event SessionStart"
+timeout = 5

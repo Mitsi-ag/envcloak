@@ -7,7 +7,7 @@
 //! apart from a failed probe, and the message names the versions CI
 //! results exist for (docs/INSTALLERS.md, "Coverage").
 
-use super::model::QUALIFIED;
+use super::model::{QUALIFIED, QUALIFIED_TIER_2};
 use crate::hook::Host;
 use crate::install::host_name;
 
@@ -40,7 +40,7 @@ impl Qualification {
 }
 
 /// Whether `host` at `version` is probed: its id and exact version in
-/// [`QUALIFIED`].
+/// [`QUALIFIED`] or [`QUALIFIED_TIER_2`].
 pub fn qualify(host: Host, version: &str) -> Qualification {
     if super::model::qualified(host.id(), version) {
         return Qualification::Qualified;
@@ -48,6 +48,7 @@ pub fn qualify(host: Host, version: &str) -> Qualification {
     Qualification::NotQualified {
         qualified: QUALIFIED
             .iter()
+            .chain(QUALIFIED_TIER_2.iter())
             .filter(|q| q.host == host.id())
             .map(|q| q.version)
             .collect(),

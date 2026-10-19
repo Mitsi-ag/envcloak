@@ -379,6 +379,7 @@ pub fn rule_refusal(host: crate::hook::Host, result: &str) -> Option<&'static st
             .then_some("the host's own permission settings, under EnvCloak's deny rule"),
         Host::Codex => codex_rule_refused(result)
             .then_some("Codex's exec policy, under EnvCloak's forbidden rule"),
+        _ => None,
     }
 }
 

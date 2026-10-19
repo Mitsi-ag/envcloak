@@ -26,6 +26,12 @@ pub fn fits(event: Event, p: &Map<String, Value>) -> bool {
         || !s("session_id")
         || !s("cwd")
         || p.contains_key("turn_id")
+        || p.contains_key("cursor_version")
+        || p.contains_key("conversation_id")
+        || p.contains_key("workspace_roots")
+        || p.contains_key("toolName")
+        || p.contains_key("toolArgs")
+        || p.contains_key("timestamp")
     {
         return false;
     }
@@ -33,6 +39,7 @@ pub fn fits(event: Event, p: &Map<String, Value>) -> bool {
         Event::UserPromptSubmit => s("prompt"),
         Event::PreToolUse => s("tool_name") && p.get("tool_input").is_some_and(Value::is_object),
         Event::SessionStart => true,
+        _ => false,
     }
 }
 
@@ -47,7 +54,7 @@ pub fn deny(event: Event, message: &str) -> Value {
                 "suppressOriginalPrompt": true,
             },
         }),
-        Event::PreToolUse | Event::SessionStart => json!({
+        _ => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",

@@ -106,10 +106,36 @@ pub const QUALIFIED: &[Qualified] = &[
     },
 ];
 
-/// Whether `host` at `version` is in [`QUALIFIED`].
+/// The qualified tier-2 host versions (crates/envcloak-e2e/agents/versions.toml
+/// `[tier_2]`).
+pub const QUALIFIED_TIER_2: &[Qualified] = &[
+    Qualified {
+        host: "copilot",
+        version: "1.0.90",
+        api: wire::Api::Messages,
+    },
+    Qualified {
+        host: "opencode",
+        version: "1.18.34",
+        api: wire::Api::Messages,
+    },
+    Qualified {
+        host: "kimi",
+        version: "2.1.1",
+        api: wire::Api::Messages,
+    },
+    Qualified {
+        host: "qwen",
+        version: "0.24.7",
+        api: wire::Api::Messages,
+    },
+];
+
+/// Whether `host` at `version` is in [`QUALIFIED`] or [`QUALIFIED_TIER_2`].
 pub fn qualified(host: &str, version: &str) -> bool {
     QUALIFIED
         .iter()
+        .chain(QUALIFIED_TIER_2.iter())
         .any(|q| q.host == host && q.version == version)
 }
 

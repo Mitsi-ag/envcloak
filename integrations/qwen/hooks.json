@@ -1,0 +1,38 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host qwen --event UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "run_shell_command|read_file|write_file|edit|replace|read_many_files|glob|grep_search|Bash|Read|Write|Edit|Glob|Grep|mcp__.*|mcp_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host qwen --event PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "envcloak hook --host qwen --event SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
