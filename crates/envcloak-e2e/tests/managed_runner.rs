@@ -469,6 +469,8 @@ fn a_foreign_client_under_a_standing_record_gets_started_and_no_value() {
             .open(&untrusted)
             .unwrap();
         f.write_all(&[0]).unwrap();
+        drop(f);
+        std::thread::sleep(Duration::from_millis(2100));
     }
     let (_, untrusted_out) = w.io_paths();
     let untrusted_line = foreign_cmd(&untrusted_out);

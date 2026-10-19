@@ -968,7 +968,12 @@ impl World {
             assert!(signed.status.success(), "{}", text(&signed));
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = identifier;
+        {
+            let _ = identifier;
+            // ExeHashCache requires the agent binary's ctime to be at least
+            // SETTLE (2s) before the lookup begins on Linux (exe_hash.rs).
+            std::thread::sleep(Duration::from_millis(2100));
+        }
         dest
     }
 
