@@ -2652,20 +2652,41 @@ fn step_s15_reveal(w: &mut StoryWorld) {
         assert_eq!(rev.code, 125, "{}", rev.all());
         assert_eq!(token(&rev.stderr), "app_required", "{}", rev.all());
     } else {
-        let out_file = w.h.files().join("reveal.stdout");
-        let err_file = w.h.files().join("reveal.stderr");
-        let pass = w.pass_file.clone();
-        let cli = quoted(&w.h.cli().to_string_lossy());
-        let o_q = quoted(&out_file.to_string_lossy());
-        let e_q = quoted(&err_file.to_string_lossy());
-        let line = format!("{cli} reveal openai/acme-web --passphrase-fd 3 >{o_q} 2>{e_q}");
-        let rev =
-            w.h.human_argv(&repo, &["/bin/sh", "-c", &line], &[(3, &pass, true)], &[]);
-        assert_eq!(rev.code, 0, "{}", rev.all());
-        let out_bytes = std::fs::read(&out_file).unwrap();
-        let err_bytes = std::fs::read(&err_file).unwrap();
-        assert_no_canary(&out_bytes, &w.h.canaries);
-        assert_no_canary(&err_bytes, &w.h.canaries);
+        let hex = |b: &[u8]| b.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let spec = w.h.files().join("s15_reveal.json");
+        std::fs::write(
+            &spec,
+            serde_json::to_vec(&json!({
+                "value": hex(w.h.value(labels::OPENAI_API_KEY)),
+                "proof": hex(w.h.value(labels::VAULT_PASSPHRASE)),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let observer = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../envcloak-cli/tests/fixtures/reveal_terminal.py");
+        let mut command = Command::new(python3());
+        let out =
+            w.h.home
+                .apply(&mut command)
+                .current_dir(&repo)
+                .arg(observer)
+                .arg(&spec)
+                .arg(w.h.cli())
+                .args(["reveal", "openai/acme-web"])
+                .output()
+                .unwrap();
+        assert!(
+            out.status.success(),
+            "reveal_terminal failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let o: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(o["code"], 0, "{o}");
+        assert_eq!(o["tty_hits"], 1, "{o}");
+        assert_eq!(o["stdout_hits"], 0, "{o}");
+        assert_eq!(o["stderr_hits"], 0, "{o}");
+        assert_eq!(o["warning"], true, "{o}");
     }
 }
 
