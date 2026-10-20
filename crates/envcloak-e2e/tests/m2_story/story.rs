@@ -1855,7 +1855,7 @@ fn step_s12_standing_approval_and_stdio_bridge(w: &mut StoryWorld, launch_id: &s
     let codex_cfg_path = w.h.home.home().join(".codex/config.toml");
     let orig_codex_cfg = std::fs::read_to_string(&codex_cfg_path).unwrap();
     let temp_codex_cfg = format!(
-        "{orig_codex_cfg}\n[mcp_servers.fixture-stdio]\ncommand = {:?}\nargs = [\"mcp-bridge\", \"--stdio\", \"--launch\", {:?}]\ndefault_tools_approval_mode = \"approve\"\n",
+        "{orig_codex_cfg}\n[mcp_servers.fixture-stdio]\ncommand = {:?}\nargs = [\"mcp-bridge\", \"--stdio\", \"--launch\", {:?}]\nenv_vars = [\"XDG_RUNTIME_DIR\", \"XDG_DATA_HOME\", \"XDG_STATE_HOME\"]\ndefault_tools_approval_mode = \"approve\"\n",
         cli.to_string_lossy(),
         launch_id
     );
