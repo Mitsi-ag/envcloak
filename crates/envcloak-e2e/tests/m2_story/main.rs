@@ -20,10 +20,13 @@ mod first_run;
 mod install;
 mod live_guard;
 mod mcp;
+mod readme;
 mod reveal;
 mod scanners;
 mod scrub;
 mod skeleton;
+mod story;
+mod variants;
 mod vendor_exports;
 
 /// The story runs with the network CI says (`ENVCLOAK_TEST_NETWORK`):

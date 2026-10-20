@@ -98,6 +98,14 @@ pub fn rewrite_codex_toml(
         }
         srv_table.insert("args", Item::Value(TomlValue::Array(arr)));
 
+        if cfg!(target_os = "linux") {
+            let mut xdg = Array::new();
+            for v in ["XDG_RUNTIME_DIR", "XDG_DATA_HOME", "XDG_STATE_HOME"] {
+                xdg.push(v);
+            }
+            srv_table.insert("env_vars", Item::Value(TomlValue::Array(xdg)));
+        }
+
         if rw.set_startup_timeout {
             let existing = srv_table
                 .get("startup_timeout_sec")
