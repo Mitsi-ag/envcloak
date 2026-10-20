@@ -95,6 +95,134 @@ enum MetadataRequest {
         guard canCopy(request), let text = terminalCommand(["approve", request.unescaped]) else { return nil }
         return TerminalCopy(text)
     }
+    static func itemsTarget(slug: DaemonText, field: DaemonText? = nil) -> AppItemsTarget {
+        AppItemsTarget(slug: slug.unescaped, field: field?.unescaped)
+    }
+    static func itemsTargetUnlockerAdd() -> AppItemsTarget {
+        AppItemsTarget(slug: "unlocker:add", field: nil)
+    }
+    static func itemsTargetUnlockerRemove() -> AppItemsTarget {
+        AppItemsTarget(slug: "unlocker:remove", field: nil)
+    }
+    static func itemsRotate(
+        target: DaemonText,
+        sealedValueHex: String,
+        digestHex: String,
+        signatureHex: String
+    ) -> AppItemsRotate {
+        AppItemsRotate(
+            target: target.unescaped,
+            sealed_value: sealedValueHex,
+            digest: digestHex,
+            signature: signatureHex
+        )
+    }
+    static func itemsRemove(
+        target: DaemonText,
+        digestHex: String,
+        signatureHex: String
+    ) -> AppItemsRemove {
+        AppItemsRemove(
+            target: target.unescaped,
+            digest: digestHex,
+            signature: signatureHex
+        )
+    }
+    static func unlockerAdd(
+        unlockPublicKeyHex: String,
+        approvePublicKeyHex: String,
+        label: String,
+        createdSecs: UInt64,
+        nonceHex: String,
+        digestHex: String,
+        signatureHex: String
+    ) -> AppUnlockerAdd {
+        AppUnlockerAdd(
+            label: label,
+            unlock_pub: unlockPublicKeyHex,
+            approve_pub: approvePublicKeyHex,
+            nonce: nonceHex,
+            digest: digestHex,
+            signature: signatureHex,
+            created_secs: createdSecs
+        )
+    }
+    static func unlockerRemove(
+        unlocker: String,
+        createdSecs: UInt64,
+        nonceHex: String,
+        digestHex: String,
+        signatureHex: String
+    ) -> AppUnlockerRemove {
+        AppUnlockerRemove(
+            unlocker: unlocker,
+            nonce: nonceHex,
+            digest: digestHex,
+            signature: signatureHex,
+            created_secs: createdSecs
+        )
+    }
+
+    static func revealBegin(request: DaemonText) -> AppRevealBegin {
+        AppRevealBegin(request: request.unescaped, slug: nil, field: nil)
+    }
+    static func revealBegin(slug: DaemonText, field: DaemonText? = nil) -> AppRevealBegin {
+        AppRevealBegin(request: nil, slug: slug.unescaped, field: field?.unescaped)
+    }
+    static func revealFinish(
+        request: DaemonText,
+        digestHex: String,
+        signatureHex: String,
+        appEphPubHex: String
+    ) -> AppReveal {
+        AppReveal(
+            request: request.unescaped,
+            digest: digestHex,
+            signature: signatureHex,
+            app_eph_pub: appEphPubHex
+        )
+    }
+    static func pasteBegin() -> AppPasteBegin {
+        AppPasteBegin()
+    }
+    static func pasteInspect(stage: DaemonText, sealedHex: String) -> AppPasteInspect {
+        AppPasteInspect(stage: stage.unescaped, sealed: sealedHex)
+    }
+    static func pasteCommit(
+        stage: DaemonText,
+        slug: String? = nil,
+        provider: String? = nil,
+        field: String? = nil,
+        account: String? = nil,
+        envHint: String? = nil,
+        allowShort: Bool = false,
+        ask: DaemonText? = nil
+    ) -> AppPaste {
+        AppPaste(
+            stage: stage.unescaped,
+            slug: slug,
+            provider: provider,
+            field: field,
+            account: account,
+            env_hint: envHint,
+            allow_short: allowShort,
+            ask: ask?.unescaped
+        )
+    }
+    static func asksDecline(_ ask: DaemonText) -> AppAsksDecline {
+        AppAsksDecline(ask: ask.unescaped)
+    }
+    static func referenceString(slug: DaemonText, field: DaemonText? = nil) -> String {
+        if let field, !field.unescaped.isEmpty, field.unescaped != "value" {
+            return "envcloak://\(slug.unescaped)#\(field.unescaped)"
+        }
+        return "envcloak://\(slug.unescaped)"
+    }
+    static func envLineString(item: ItemView) -> String {
+        let rawEnv = item.env_hint?.unescaped ?? ""
+        let envName = rawEnv.isEmpty ? "KEY" : rawEnv
+        return "\(envName)=\"envcloak://\(item.slug.unescaped)\""
+    }
 }
 
 /// Views can display or copy this text, but cannot obtain its raw String.

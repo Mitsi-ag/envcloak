@@ -202,6 +202,43 @@ public struct KeyStore: Sendable {
         return key
     }
 
+    public struct StagedKeyPair: Sendable, Equatable {
+        public let keys: EnrolledPublicKeys
+        public let unlockBlob: Data
+        public let approveBlob: Data
+
+        public init(keys: EnrolledPublicKeys, unlockBlob: Data, approveBlob: Data) {
+            self.keys = keys
+            self.unlockBlob = unlockBlob
+            self.approveBlob = approveBlob
+        }
+    }
+
+    public func stageNewPublicKeys(touchIDOnly: Bool) throws(KeyStoreError) -> StagedKeyPair {
+        guard SecureEnclave.isAvailable else {
+            throw .secureEnclaveUnavailable
+        }
+        let accessControl = try Self.makeAccessControl(touchIDOnly: touchIDOnly)
+        guard let unlockKey = try? SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: accessControl),
+              let approveKey = try? SecureEnclave.P256.Signing.PrivateKey(accessControl: accessControl) else {
+            throw .secureEnclaveUnavailable
+        }
+        let keys = EnrolledPublicKeys(
+            unlockPublicKeyHex: HexCoding.encode(unlockKey.publicKey.x963Representation),
+            approvePublicKeyHex: HexCoding.encode(approveKey.publicKey.x963Representation)
+        )
+        return StagedKeyPair(
+            keys: keys,
+            unlockBlob: unlockKey.dataRepresentation,
+            approveBlob: approveKey.dataRepresentation
+        )
+    }
+
+    public func commitStagedKeys(_ staged: StagedKeyPair) throws(KeyStoreError) {
+        try storage.writeBlob(staged.unlockBlob, account: Self.unlockAccount)
+        try storage.writeBlob(staged.approveBlob, account: Self.approveAccount)
+    }
+
     public func deleteKeys() throws(KeyStoreError) {
         try storage.deleteBlob(account: Self.unlockAccount)
         try storage.deleteBlob(account: Self.approveAccount)

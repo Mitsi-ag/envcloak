@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import SwiftUI
 import XCTest
 import EnvCloakKitTestSupport
 @testable import EnvCloak
@@ -108,6 +109,45 @@ actor ScriptedClient: WorkspaceClient {
     var lastApprovedDigest: String?
     var lastApprovedSignature: String?
     func approvedReceipt() -> (digest: String?, signature: String?) { (lastApprovedDigest, lastApprovedSignature) }
+    let daemonEphKey = Curve25519.KeyAgreement.PrivateKey()
+    var lastWriteDigest: String?
+    var lastWriteSignature: String?
+    var lastRotatedSealedValue: String?
+    var lastRevealDigest: String?
+    var lastRevealSignature: String?
+    var lastRevealAppEphPub: String?
+    var revealSecretPlaintext = "sk_test_synthetic_reveal_42"
+    func setRevealPlaintext(_ value: String) { revealSecretPlaintext = value }
+    func writeReceipt() -> (digest: String?, signature: String?, sealed: String?) {
+        (lastWriteDigest, lastWriteSignature, lastRotatedSealedValue)
+    }
+    func revealReceipt() -> (digest: String?, signature: String?, appEphPub: String?) {
+        (lastRevealDigest, lastRevealSignature, lastRevealAppEphPub)
+    }
+    var asksCount = 0
+    func setAsksCount(_ count: Int) { asksCount = count }
+    var hostileAskAccount = false
+    func setHostileAskAccount(_ enabled: Bool) { hostileAskAccount = enabled }
+    var incrementTargetId = false
+    var targetCounter = 0
+    func setIncrementTargetId(_ enabled: Bool) { incrementTargetId = enabled }
+    var lastUnlockBeginUnlockerID: String?
+    func unlockBeginUnlockerID() -> String? { lastUnlockBeginUnlockerID }
+    var removedUnlockers: [String] = []
+    func removedUnlockerIDs() -> [String] { removedUnlockers }
+    var rotateErrors: [EnvCloakError] = []
+    func queueRotateErrors(_ errors: [EnvCloakError]) { rotateErrors = errors }
+    var removeErrors: [EnvCloakError] = []
+    func queueRemoveErrors(_ errors: [EnvCloakError]) { removeErrors = errors }
+    var pasteBeginErrors: [EnvCloakError] = []
+    func queuePasteBeginErrors(_ errors: [EnvCloakError]) { pasteBeginErrors = errors }
+    var pasteInspectErrors: [EnvCloakError] = []
+    func queuePasteInspectErrors(_ errors: [EnvCloakError]) { pasteInspectErrors = errors }
+    var pasteCommitErrors: [EnvCloakError] = []
+    func queuePasteCommitErrors(_ errors: [EnvCloakError]) { pasteCommitErrors = errors }
+    var lastPastedProvider: String?
+    var lastPastedAccount: String?
+    func pasteReceipt() -> (provider: String?, account: String?) { (lastPastedProvider, lastPastedAccount) }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
         var row: [String: Any] = ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
@@ -132,7 +172,8 @@ actor ScriptedClient: WorkspaceClient {
             "vault": ["state": busy ? "locked" : vault, "integrity": integrity, "read_only": readOnly, "busy": busy, "failed_unlocks": 0],
             "lock": ["last_reason": lockReason, "idle_limit_secs": idleLimit],
             "approvals": ["grants": grants, "pending": pending, "proof_failures": 0, "proof_wait_secs": 0],
-            "audit": ["open": true, "head_seq": head, "unanchored": 0, "anchor_failed": false, "queued": 0, "dropped": 0]]
+            "audit": ["open": true, "head_seq": head, "unanchored": 0, "anchor_failed": false, "queued": 0, "dropped": 0],
+            "app_requests": asksCount]
         case "items.list": result = ["items": (0..<itemCount).map { item($0) }]
         case "items.show":
             if showFailure { throw EnvCloakError.protocolError }
@@ -287,6 +328,7 @@ actor ScriptedClient: WorkspaceClient {
             if pending > 0 { pending -= 1 }
             result = ["root_auto_denied": false]
         case "app.unlock.begin":
+            lastUnlockBeginUnlockerID = (method as? AppUnlockBegin)?.unlocker_id
             guard let unlockBeginData else { throw EnvCloakError.rpc(.noUnlocker, nil) }
             result = unlockBeginData
         case "app.unlock":
@@ -299,6 +341,183 @@ actor ScriptedClient: WorkspaceClient {
                 "state": enrollState,
                 "unlocker_id": enrollState == "enrolled" ? "unlocker-1" : NSNull(),
             ]
+        case "app.items.target":
+            let slug = (method as? AppItemsTarget)?.slug ?? "fixture-0"
+            if slug.hasPrefix("unlocker"), slug != "unlocker:add", slug != "unlocker:remove" {
+                throw EnvCloakError.rpc(.noSuchItem, nil)
+            }
+            let field = (method as? AppItemsTarget)?.field ?? "value"
+            let ephHex = daemonEphKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+            targetCounter += 1
+            let targetID = incrementTargetId ? "target-\(targetCounter)" : "target-1"
+            result = [
+                "target": targetID,
+                "nonce": pendingNonce,
+                "daemon_eph_pub": ephHex,
+                "vault_id": "vault-0",
+                "item": "item-0",
+                "slug": slug,
+                "field": field,
+                "field_name": field,
+                "classification": "test",
+                "prior_count": 1,
+                "grants": 1,
+                "created_secs": 1000,
+                "expires_in_secs": 60,
+            ]
+        case "app.items.rotate":
+            if !rotateErrors.isEmpty {
+                throw rotateErrors.removeFirst()
+            }
+            if let req = method as? AppItemsRotate {
+                lastWriteDigest = req.digest
+                lastWriteSignature = req.signature
+                lastRotatedSealedValue = req.sealed_value
+            }
+            head += 1
+            result = [
+                "slug": "fixture-0",
+                "field": "value",
+                "prior_count": 2,
+                "length": "ok",
+                "classification": "test",
+                "reclassified_from": NSNull(),
+                "grants_ended": 0,
+            ]
+        case "app.items.remove":
+            if !removeErrors.isEmpty {
+                throw removeErrors.removeFirst()
+            }
+            if let req = method as? AppItemsRemove {
+                lastWriteDigest = req.digest
+                lastWriteSignature = req.signature
+            }
+            head += 1
+            result = [
+                "slug": "fixture-0",
+                "grants_ended": 1,
+                "backup": "/tmp/backup.vault",
+            ]
+        case "app.unlocker.add":
+            if let req = method as? AppUnlockerAdd {
+                lastWriteDigest = req.digest
+                lastWriteSignature = req.signature
+            }
+            head += 1
+            result = ["unlocker_id": "ffeeddccbbaa99887766554433221100"]
+        case "app.unlocker.remove":
+            if let req = method as? AppUnlockerRemove {
+                lastWriteDigest = req.digest
+                lastWriteSignature = req.signature
+                removedUnlockers.append(req.unlocker)
+            }
+            head += 1
+            result = ["removed": (method as? AppUnlockerRemove)?.unlocker ?? "passphrase"]
+        case "app.reveal.begin":
+            let slug = (method as? AppRevealBegin)?.slug ?? "fixture-0"
+            let field = (method as? AppRevealBegin)?.field ?? "value"
+            result = [
+                "request": "REV12345",
+                "nonce": pendingNonce,
+                "vault_id": "vault-0",
+                "item": "item-0",
+                "slug": slug,
+                "field": field,
+                "field_name": field,
+                "classification": "test",
+                "created_secs": 1000,
+                "expires_in_secs": 60,
+            ]
+        case "app.reveal":
+            guard let req = method as? AppReveal else { throw EnvCloakError.protocolError }
+            lastRevealDigest = req.digest
+            lastRevealSignature = req.signature
+            lastRevealAppEphPub = req.app_eph_pub
+            let aad = try SEHPKE.revealAAD(
+                requestID: req.requestID,
+                challengeHex: pendingNonce,
+                appEphPubHex: req.app_eph_pub
+            )
+            var secBuf = try SecretBuffer(capacity: revealSecretPlaintext.utf8.count)
+            try revealSecretPlaintext.withUTF8 { try secBuf.append(contentsOf: UnsafeRawBufferPointer($0)) }
+            let sealedHex = try SEHPKE.sealSecretToX25519(
+                secBuf,
+                recipientPubHex: req.app_eph_pub,
+                aad: aad
+            )
+            result = ["sealed_value": sealedHex]
+        case "app.paste.begin":
+            if !pasteBeginErrors.isEmpty {
+                throw pasteBeginErrors.removeFirst()
+            }
+            let ephHex = daemonEphKey.publicKey.rawRepresentation.map { String(format: "%02x", $0) }.joined()
+            result = [
+                "stage": "STAGE123",
+                "daemon_eph_pub": ephHex,
+                "expires_in_secs": 120,
+            ]
+        case "app.paste.inspect":
+            if !pasteInspectErrors.isEmpty {
+                throw pasteInspectErrors.removeFirst()
+            }
+            result = [
+                "provider": "openai" + hostileSuffix,
+                "detected": "openai",
+                "ambiguous": false,
+                "classification": "live",
+                "length": "ok",
+                "suggested_slug": "openai-work",
+                "env_hint": "OPENAI_API_KEY",
+            ]
+        case "app.paste":
+            if !pasteCommitErrors.isEmpty {
+                throw pasteCommitErrors.removeFirst()
+            }
+            let req = method as? AppPaste
+            lastPastedProvider = req?.provider
+            lastPastedAccount = req?.account
+            var addedItem = item(0)
+            addedItem["slug"] = req?.slug ?? "openai-work"
+            addedItem["provider"] = req?.provider ?? "openai"
+            addedItem["classification"] = "live"
+            head += 1
+            if asksCount > 0 { asksCount -= 1 }
+            result = [
+                "item": addedItem,
+                "field": "value",
+                "detected": "openai",
+                "ambiguous": false,
+                "length": "ok",
+            ]
+        case "app.asks.list":
+            let accountVal = hostileAskAccount ? "dev\\acct@example.com" : "dev@example.com"
+            result = [
+                "asks": (0..<asksCount).map { idx in
+                    [
+                        "ask": "ASK\(idx)ABCD",
+                        "created_secs": 1000,
+                        "expires_in_secs": 540,
+                        "requester": [
+                            "kind": "agent",
+                            "label": "cursor",
+                            "caller_pid": 555,
+                            "root": [
+                                "pid": 550,
+                                "start_time": 100,
+                                "exe": "/usr/local/bin/cursor",
+                            ],
+                        ],
+                        "provider": "openai" + hostileSuffix,
+                        "project_dir": "/tmp/project",
+                        "account": accountVal,
+                        "env_hint": "OPENAI_API_KEY",
+                        "note": NSNull(),
+                    ] as [String: Any]
+                }
+            ]
+        case "app.asks.decline":
+            if asksCount > 0 { asksCount -= 1 }
+            result = ["declined": "ASK0ABCD"]
         case "lock": vault = "locked"; result = ["was_unlocked": true]
         default: throw EnvCloakError.protocolError
         }
@@ -311,6 +530,7 @@ actor ScriptedClient: WorkspaceClient {
         return try await client.call(method)
     }
 }
+
 
 final class SessionTests: XCTestCase {
     @MainActor func testRemovalRequiresAnExistingSelectionInTheCurrentProfile() async throws {
@@ -1379,7 +1599,466 @@ final class SessionTests: XCTestCase {
         let denyCalls = await client.calls("deny")
         XCTAssertEqual(denyCalls, 1)
     }
+
+    @MainActor func testPaletteAndMenuBarActionsEmitOnlyPaletteEffectsAndSearchCopiesPlainReference() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(grants: 1, pending: 2)
+        await client.expose([0])
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        let key = try XCTUnwrap(session.items.rows.first)
+        let titles: [DaemonText: String] = [DaemonText("/tmp/project"): "Project"]
+        for query in ["", "p ", "k ", "a ", ">", "fixture"] {
+            let items = PaletteBuilder.items(
+                query: query,
+                selectedKey: key,
+                projects: session.projects.directories,
+                projectTitles: titles,
+                keys: session.items.rows,
+                grants: session.grants.rows,
+                pendingCount: Int(session.pendingCount)
+            )
+            XCTAssertFalse(items.isEmpty, "Expected items for query '\(query)'")
+            for item in items {
+                XCTAssertFalse(item.isDirectPrivilegeAction, "Direct privilege action found in palette: \(item.title)")
+                XCTAssertFalse(item.primaryEffect.isDirectPrivilegeAction)
+                if let sec = item.secondaryEffect {
+                    XCTAssertFalse(sec.isDirectPrivilegeAction)
+                }
+                if let opt = item.optionEffect {
+                    XCTAssertFalse(opt.isDirectPrivilegeAction)
+                }
+            }
+        }
+
+        let menuItems = MenuBarCatalog.allActionItems(
+            keys: session.items.rows,
+            projects: session.projects.directories,
+            projectTitles: titles,
+            grants: session.grants.rows,
+            pendingCount: Int(session.pendingCount),
+            exposedCount: 1
+        )
+        XCTAssertFalse(menuItems.isEmpty)
+        for item in menuItems {
+            XCTAssertFalse(item.isDirectPrivilegeAction, "Direct privilege action found in menu bar: \(item.title)")
+            XCTAssertFalse(item.primaryEffect.isDirectPrivilegeAction)
+        }
+
+        // Menu bar search copies reference on Return and env line on Option-Return as plain text only.
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let writer = ClipboardWriter(pasteboard: board)
+        let popover = MenuBarPopover(session: session, clipboardWriter: writer)
+        let search = MenuBarCatalog.searchItems(
+            query: "fixture-0",
+            keys: session.items.rows,
+            projects: session.projects.directories,
+            projectTitles: titles
+        )
+        let keyItem = try XCTUnwrap(search.shown.first)
+        popover.runEffect(keyItem.primaryEffect)
+        XCTAssertEqual(board.string(forType: .string), "envcloak://fixture-0")
+        XCTAssertNil(board.data(forType: ClipboardWriter.concealedType))
+        XCTAssertNil(board.data(forType: ClipboardWriter.transientType))
+
+        let optEffect = try XCTUnwrap(keyItem.optionEffect)
+        popover.runEffect(optEffect)
+        XCTAssertEqual(board.string(forType: .string), "VARIABLE=\"envcloak://fixture-0\"")
+        XCTAssertNil(board.data(forType: ClipboardWriter.concealedType))
+
+        // Blink stops under Reduce Motion.
+        for t in stride(from: 0.0, through: 2.0, by: 0.15) {
+            XCTAssertTrue(MenuBarCatalog.isBlinkVisible(waitingCount: 2, reduceMotion: true, elapsed: t))
+        }
+        XCTAssertFalse(MenuBarCatalog.isBlinkVisible(waitingCount: 2, reduceMotion: false, elapsed: 0.7))
+
+        // Dock menu items have empty keyEquivalent and match design §5.8.
+        let delegate = EnvCloakAppDelegate()
+        delegate.session = session
+        let dockMenu = try XCTUnwrap(delegate.applicationDockMenu(NSApplication.shared))
+        XCTAssertEqual(dockMenu.items.map(\.title), ["Review requests", "Add key", "Lock"])
+        for menuItem in dockMenu.items {
+            XCTAssertEqual(menuItem.keyEquivalent, "")
+        }
+    }
+
+    @MainActor func testSignedRotateRemoveAndUnlockerWritesVerifyCanonicalStatementAndSealValue() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        let signer = SoftwareApprovalSigner()
+        let session = VaultSession(
+            client: client,
+            approvalSigner: signer,
+            enrolledTouchID: true
+        )
+        await session.poll()
+
+        let writeModel = KeyWriteModel(slug: DaemonText("fixture-0"), field: DaemonText("value"))
+        await writeModel.loadTarget(session)
+        let target = try XCTUnwrap(writeModel.target)
+        XCTAssertEqual(target.grants, 1)
+
+        var newSecret = "sk_test_rotated_canary_998877"
+        var draftInput = newSecret
+        writeModel.receive(&draftInput)
+        XCTAssertEqual(writeModel.count, newSecret.count)
+        await writeModel.submitRotation(session)
+        XCTAssertTrue(writeModel.completed)
+
+        let rotateReceipt = await client.writeReceipt()
+        let sealedHex = try XCTUnwrap(rotateReceipt.sealed)
+        XCTAssertFalse(sealedHex.contains(newSecret))
+        let rotateAAD = try SEHPKE.resealAAD(
+            requestID: target.target.raw,
+            challengeHex: target.nonce.raw
+        )
+        let openedRotated = try SEHPKE.openSecretFromX25519(
+            sealedHex: sealedHex,
+            privateKey: client.daemonEphKey,
+            aad: rotateAAD
+        )
+        XCTAssertEqual(ClipboardWriter.utf8String(openedRotated), newSecret)
+
+        var newSecBuf = try SecretBuffer(capacity: newSecret.utf8.count)
+        try newSecret.withUTF8 { try newSecBuf.append(contentsOf: UnsafeRawBufferPointer($0)) }
+        let expectedRotateStmt = WriteStatement(
+            target: target.target.raw,
+            nonce: target.nonce.raw,
+            vault_id: target.vault_id.raw,
+            action: .rotate(
+                item: target.item.raw,
+                slug: target.slug.raw,
+                field: target.field!.raw,
+                field_name: target.field_name!.raw,
+                classification: target.classification.rawValue,
+                prior_count: target.prior_count,
+                grants: target.grants,
+                new_value_sha256: SEHPKE.secretSHA256Hex(newSecBuf)
+            )
+        )
+        XCTAssertEqual(rotateReceipt.digest, CanonicalStatement.writeDigestHex(expectedRotateStmt))
+
+        // Signed remove
+        let removeModel = KeyWriteModel(slug: DaemonText("fixture-0"), field: nil)
+        await removeModel.loadTarget(session)
+        await removeModel.submitRemoval(session)
+        XCTAssertTrue(removeModel.completed)
+        let removeReceipt = await client.writeReceipt()
+        let expectedRemoveStmt = WriteStatement(
+            target: target.target.raw,
+            nonce: target.nonce.raw,
+            vault_id: target.vault_id.raw,
+            action: .remove(
+                item: target.item.raw,
+                slug: target.slug.raw,
+                grants: target.grants
+            )
+        )
+        XCTAssertEqual(removeReceipt.digest, CanonicalStatement.writeDigestHex(expectedRemoveStmt))
+
+        // Signed passphrase unlocker removal
+        let removedUnlocker = await session.removePassphraseUnlockerWithTouchID()
+        XCTAssertTrue(removedUnlocker)
+        XCTAssertTrue(session.passphraseUnlockerRemoved)
+    }
+
+    @MainActor func testRevealOpensSealedSecretHidesOnResignKeyAndWipesBuffer() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        let canary = "sk_live_reveal_canary_" + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        await client.setRevealPlaintext(canary)
+        let signer = SoftwareApprovalSigner()
+        let session = VaultSession(
+            client: client,
+            approvalSigner: signer,
+            enrolledTouchID: true
+        )
+        await session.poll()
+        let item = try XCTUnwrap(session.items.rows.first)
+
+        final class WipeTracker: @unchecked Sendable {
+            var wipedAllZero = false
+            var wipeCallbacks = 0
+        }
+        let tracker = WipeTracker()
+        let board = NSPasteboard.withUniqueName()
+        defer { board.releaseGlobally() }
+        let writer = ClipboardWriter(pasteboard: board)
+
+        try await BufferProbe.$observer.withValue(BufferObserver { buf in
+            tracker.wipeCallbacks += 1
+            if !buf.isEmpty && buf.allSatisfy({ $0 == 0 }) {
+                tracker.wipedAllZero = true
+            }
+        }) {
+            let sightModel = KeySightModel(slug: item.slug, field: DaemonText("value"))
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 480, height: 360),
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            let sheet = RevealSheet(
+                session: session,
+                item: item,
+                field: DaemonText("value"),
+                clipboardWriter: writer,
+                model: sightModel
+            )
+            let host = NSHostingView(rootView: sheet)
+            window.contentView = host
+            window.makeKeyAndOrderFront(nil)
+            defer { window.orderOut(nil); window.contentView = nil }
+            host.layoutSubtreeIfNeeded()
+
+            await sightModel.performSight(session)
+            XCTAssertTrue(sightModel.isShown)
+            XCTAssertTrue(sightModel.hasSecretBuffer)
+            XCTAssertEqual(sightModel.renderedSecret, canary)
+            XCTAssertFalse(RevealSheet.allowsValueSelection)
+
+            var desc = try XCTUnwrap(sightModel.descriptor)
+            let receipt = await client.revealReceipt()
+            desc.app_eph_pub = DaemonText(try XCTUnwrap(receipt.appEphPub))
+            XCTAssertEqual(receipt.digest, CanonicalStatement.revealDigestHex(desc))
+
+            // Copy writes both ConcealedType and TransientType.
+            sightModel.copySecret(using: writer)
+            XCTAssertEqual(sightModel.copiedNotice, "Copied. Cleared in 30 s.")
+            XCTAssertEqual(board.string(forType: .string), canary)
+            XCTAssertNotNil(board.data(forType: ClipboardWriter.concealedType))
+            XCTAssertNotNil(board.data(forType: ClipboardWriter.transientType))
+
+            // Simulated resign key hides at once and wipes the SecretBuffer.
+            NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+            try await Task.sleep(for: .milliseconds(30))
+            XCTAssertFalse(sightModel.isShown)
+            XCTAssertFalse(sightModel.hasSecretBuffer)
+            XCTAssertNil(sightModel.renderedSecret)
+            XCTAssertTrue(tracker.wipedAllZero)
+        }
+    }
+
+    @MainActor func testSealedPasteInspectCommitAndAskDecline() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.setAsksCount(1)
+        await client.configure(pending: 1)
+        let session = VaultSession(client: client)
+        await session.poll()
+
+        XCTAssertEqual(session.grants.asks.count, 1)
+        let ask = try XCTUnwrap(session.grants.asks.first)
+        XCTAssertEqual(ask.ask.escaped, "ASK0ABCD")
+
+        let model = PasteModel(ask: ask)
+        XCTAssertEqual(model.account, "dev@example.com")
+        var secret = ["sk", "proj", UUID().uuidString.replacingOccurrences(of: "-", with: "") + UUID().uuidString.replacingOccurrences(of: "-", with: "")].joined(separator: "-")
+        model.receive(&secret)
+
+        XCTAssertTrue(secret.isEmpty)
+        await model.inspect(session)
+        XCTAssertEqual(model.stagedId?.escaped, "STAGE123")
+        XCTAssertEqual(model.inspection?.provider?.escaped, "openai")
+        XCTAssertEqual(model.inspection?.suggested_slug?.escaped, "openai-work")
+
+        await model.save(session)
+        let saved = try XCTUnwrap(model.saved)
+        XCTAssertEqual(saved.item.slug.escaped, "openai-work")
+        let pasteCommitCalls = await client.calls("app.paste")
+        XCTAssertEqual(pasteCommitCalls, 1)
+
+        // Decline ask
+        let declineModel = PasteModel(ask: ask)
+        let declined = await declineModel.decline(session)
+        XCTAssertTrue(declined)
+        let declineCalls = await client.calls("app.asks.decline")
+        XCTAssertEqual(declineCalls, 1)
+    }
+
+    @MainActor func testReviewRemediationF01ThroughF05() async throws {
+        // F-01: Target sentinel colons ("unlocker:add" / "unlocker:remove"), signing identity,
+        // and Touch ID-only transition removing the earlier SE unlocker and updating unlocker_id.
+        XCTAssertEqual(MetadataRequest.itemsTargetUnlockerAdd().slug, "unlocker:add")
+        XCTAssertEqual(MetadataRequest.itemsTargetUnlockerRemove().slug, "unlocker:remove")
+
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        do {
+            _ = try await client.call(AppItemsTarget(slug: "unlocker_add"))
+            XCTFail("Expected ScriptedClient to reject underscore sentinel unlocker_add")
+        } catch let error as EnvCloakError {
+            XCTAssertEqual(error, .rpc(.noSuchItem, nil))
+        }
+
+        let unlockPub = P256.KeyAgreement.PrivateKey().publicKey
+        let approveKey = P256.Signing.PrivateKey()
+        let enrolledKeys = EnrolledPublicKeys(
+            unlockPublicKeyHex: HexCoding.encode(unlockPub.x963Representation),
+            approvePublicKeyHex: HexCoding.encode(approveKey.publicKey.x963Representation)
+        )
+        let signer = SoftwareApprovalSigner(privateKey: approveKey)
+        let unlockKey = SoftwareUnlockKey()
+        let session = VaultSession(
+            client: client,
+            unlockKey: unlockKey,
+            approvalSigner: signer,
+            enrolledPublicKeysOverride: enrolledKeys,
+            enrolledTouchID: true
+        )
+        let ownIdentity = VaultSession.readOwnSigningIdentity()
+        XCTAssertFalse(ownIdentity.teamID.isEmpty)
+        XCTAssertFalse(ownIdentity.signingID.isEmpty)
+        session.enrolledTeamID = "TEAM998877"
+        session.enrolledSigningID = "ai.envcloak.custom"
+        await session.poll()
+
+        // Enrol initial SE unlocker and poll to record enrolledUnlockerID ("unlocker-1")
+        let began = await session.beginEnrolment()
+        XCTAssertTrue(began)
+        let enrollState = await session.pollEnrolment()
+        XCTAssertEqual(enrollState, .enrolled)
+        XCTAssertEqual(session.enrolledUnlockerID?.raw, "unlocker-1")
+
+        // Transition to Touch ID-only unlocker: adds new unlocker AND removes prior SE unlocker ("unlocker-1")
+        let upgraded = await session.enrollTouchIDOnlyUnlocker(label: "Mac Studio Touch ID Only")
+        XCTAssertTrue(upgraded)
+        XCTAssertTrue(session.touchIDOnlyEnabled)
+        let upgradedUnlockerHex = "ffeeddccbbaa99887766554433221100"
+        XCTAssertEqual(session.enrolledUnlockerID?.raw, upgradedUnlockerHex)
+        let removedUnlockers = await client.removedUnlockerIDs()
+        XCTAssertEqual(removedUnlockers, ["unlocker-1"])
+
+        // Subsequent Touch ID unlock passes the active enrolledUnlockerID to app.unlock.begin
+        let vmk = Data((0..<32).map { UInt8($0 + 1) })
+        let vaultIDHex = "00112233445566778899aabbccddeeff"
+        let daemonEph = Curve25519.KeyAgreement.PrivateKey()
+        let env = try SoftwareUnlockKey.sealEnvelope(
+            vmk: vmk,
+            recipientPublicKey: unlockKey.privateKey.publicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: upgradedUnlockerHex,
+            epoch: 1
+        )
+        await client.configure(vault: "locked")
+        await client.setUnlockBegin([
+            "request_id": "REQUNLOCK2",
+            "unlocker_id": upgradedUnlockerHex,
+            "vault_id": vaultIDHex,
+            "epoch": 1,
+            "challenge": String(repeating: "11", count: 32),
+            "envelope": ["enc": env.enc.raw, "ciphertext": env.ciphertext.raw],
+            "daemon_eph_pub": HexCoding.encode(daemonEph.publicKey.rawRepresentation),
+        ])
+        await session.poll()
+        let unlocked = await session.unlockWithTouchID()
+        XCTAssertTrue(unlocked)
+        let beginUnlockerID = await client.unlockBeginUnlockerID()
+        XCTAssertEqual(beginUnlockerID, upgradedUnlockerHex)
+
+        // F-02: PasteModel preserves draft across inspect failure and stage expiry, and sends raw provider/account.
+        await client.hostileMetadata()
+        await client.setHostileAskAccount(true)
+        await client.setAsksCount(1)
+        await session.poll()
+        let ask = try XCTUnwrap(session.grants.asks.first)
+        let pasteModel = PasteModel(ask: ask)
+        XCTAssertEqual(pasteModel.account, "dev\\acct@example.com")
+
+        // Fail first beginPasteStage during inspect, then fail first commitPasteStage with .noSuchRequest
+        await client.queuePasteBeginErrors([.rpc(.busy, nil)])
+        var rawSecret = "sk_test_f02_preserve_draft_123456"
+        pasteModel.receive(&rawSecret)
+        await pasteModel.inspect(session)
+        XCTAssertNil(pasteModel.stagedId, "inspect failed so stagedId is nil, but draft must remain intact")
+        await pasteModel.save(session)
+        XCTAssertNotNil(pasteModel.saved, "save must succeed using preserved draft after inspect failure")
+        let receipt = await client.pasteReceipt()
+        XCTAssertEqual(receipt.account, "dev\\acct@example.com")
+        XCTAssertEqual(receipt.provider, "openai\u{202e}\u{1b}[31m")
+
+        // Stage expiry (.noSuchRequest) re-stages from preserved draft
+        let expiryModel = PasteModel(ask: nil)
+        var secondSecret = "sk_test_f02_expiry_restage_654321"
+        expiryModel.receive(&secondSecret)
+        await expiryModel.inspect(session)
+        XCTAssertNotNil(expiryModel.stagedId)
+        await client.queuePasteCommitErrors([.rpc(.noSuchRequest, nil)])
+        await expiryModel.save(session)
+        XCTAssertNotNil(expiryModel.saved, "save must re-stage and succeed when initial stage expired")
+
+        // F-03: KeyWriteModel preserves draft on Touch ID cancellation, ignores stale session.notice,
+        // and reloads a fresh target after RPC failure.
+        await client.plainSlugs()
+        await client.setIncrementTargetId(true)
+        session.notice = "Stale unrelated workspace notice"
+        let rotModel = KeyWriteModel(slug: DaemonText("fixture-0"), field: DaemonText("value"))
+        await rotModel.loadTarget(session)
+        XCTAssertEqual(rotModel.target?.target.raw, "target-3")
+
+        var rotSecret = "sk_test_f03_rotate_draft_777"
+        rotModel.receive(&rotSecret)
+        signer.simulatedFailure = SignerError.userCancelled
+        await rotModel.submitRotation(session)
+        XCTAssertFalse(rotModel.completed)
+        XCTAssertEqual(rotModel.count, "sk_test_f03_rotate_draft_777".count)
+        XCTAssertEqual(rotModel.notice, "Touch ID was cancelled. The key value was not replaced.")
+        XCTAssertNil(session.notice, "Stale session.notice must be cleared on entry to rotateItemWithTouchID")
+
+        // Now let signer succeed, but fail first rotate RPC with .noSuchRequest -> target reloads to target-4
+        signer.simulatedFailure = nil
+        await client.queueRotateErrors([.rpc(.noSuchRequest, nil)])
+        await rotModel.submitRotation(session)
+        XCTAssertFalse(rotModel.completed)
+        XCTAssertEqual(rotModel.count, "sk_test_f03_rotate_draft_777".count)
+        XCTAssertEqual(rotModel.target?.target.raw, "target-4")
+        XCTAssertEqual(rotModel.notice, "The key value could not be replaced.")
+
+        // Retry with refreshed target-4 succeeds without re-pasting
+        await rotModel.submitRotation(session)
+        XCTAssertTrue(rotModel.completed)
+        XCTAssertEqual(rotModel.count, 0)
+
+        // F-04: Dock badge includes asksCount and AppDelegate.reviewRequests does not double-invoke or open empty window
+        await client.configure(pending: 0)
+        await client.setAsksCount(2)
+        await session.poll()
+        XCTAssertEqual(session.notifications.lastBadge, "2")
+
+        var approvalOpenCount = 0
+        var mainOpenCount = 0
+        var focusedApprovals = 0
+        session.onOpenApprovalWindow = { approvalOpenCount += 1 }
+        session.onOpenMainWindow = { mainOpenCount += 1 }
+        session.onFocusApprovals = { focusedApprovals += 1 }
+
+        let delegate = EnvCloakAppDelegate()
+        delegate.session = session
+        delegate.reviewRequests(nil)
+        XCTAssertEqual(approvalOpenCount, 0, "Should not open empty approval window when only asks are waiting")
+        XCTAssertEqual(focusedApprovals, 1)
+        XCTAssertEqual(mainOpenCount, 1)
+
+        await client.configure(pending: 1)
+        await session.poll()
+        XCTAssertEqual(session.notifications.lastBadge, "3")
+        delegate.reviewRequests(nil)
+        XCTAssertEqual(approvalOpenCount, 1, "Must invoke onOpenApprovalWindow exactly once")
+
+        // F-05: session.canSignInApp and selectedField reset on key change
+        XCTAssertTrue(session.canSignInApp)
+        session.sshSession = true
+        XCTAssertFalse(session.canSignInApp)
+        session.sshSession = false
+        session.selectedField = DaemonText("secondary")
+        await session.selectKey(DaemonText("fixture-0"))
+        XCTAssertNil(session.selectedField)
+    }
 }
+
 
 actor ItemBarrierClient: WorkspaceClient {
     let client = ScriptedClient()
