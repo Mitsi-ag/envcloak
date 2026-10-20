@@ -134,9 +134,16 @@ struct MainView: View {
                     .buttonStyle(.borderedProminent)
                     .accessibilityIdentifier("toolbar.review")
                 }
-                Button { paste = true } label: { Label("Add key", systemImage: "plus") }.accessibilityIdentifier("key.add").disabled(session.state != .ready)
+                Button { paste = true } label: { Label("Add key", systemImage: "plus") }
+                    .help("Add key")
+                    .accessibilityLabel("Add key")
+                    .accessibilityIdentifier("key.add")
+                    .disabled(session.state != .ready)
                 Button { addFolder() } label: { Label("Add project folder…", systemImage: "folder.badge.plus") }
-                    .help("Add project folder…").disabled(session.state != .ready)
+                    .help("Add project folder…")
+                    .accessibilityLabel("Add project folder…")
+                    .accessibilityIdentifier("project.addFolder")
+                    .disabled(session.state != .ready)
             }
             ToolbarSpacer(.fixed)
             ToolbarItemGroup {
@@ -146,11 +153,17 @@ struct MainView: View {
                     if let scope, !session.projects.scopeDirectories.contains(scope) { Text(MetadataRequest.basename(scope)).tag(Optional(scope)) }
                 }.accessibilityIdentifier("workspace.scope")
                 Button { Task { await session.lock() } } label: { Label("Lock", systemImage: "lock") }
-                    .help("Lock the vault").disabled(!session.state.canLock)
+                    .help("Lock the vault")
+                    .accessibilityLabel("Lock")
+                    .accessibilityIdentifier("toolbar.lock")
+                    .disabled(!session.state.canLock)
             }
             ToolbarSpacer(.fixed)
             ToolbarItem {
-                Button { inspector.toggle() } label: { Label("Show inspector", systemImage: "sidebar.right") }.help("Show inspector")
+                Button { inspector.toggle() } label: { Label("Show inspector", systemImage: "sidebar.right") }
+                    .help("Show inspector")
+                    .accessibilityLabel("Show inspector")
+                    .accessibilityIdentifier("toolbar.inspector")
             }
         }
         .sheet(isPresented: $paste, onDismiss: {

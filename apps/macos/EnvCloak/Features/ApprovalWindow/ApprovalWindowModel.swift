@@ -67,7 +67,13 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
 @Observable @MainActor final class ApprovalWindowModel {
     let session: VaultSession
     var descriptor: PendingDescriptor?
-    var outcome: ApprovalOutcome = .pending
+    var outcome: ApprovalOutcome = .pending {
+        didSet {
+            if oldValue != outcome {
+                announceOutcomeIfNeeded()
+            }
+        }
+    }
     var durationChoice: ApprovalDurationChoice = .hours8 {
         didSet {
             if oldValue != durationChoice {
@@ -397,6 +403,23 @@ enum ApprovalDurationChoice: String, CaseIterable, Identifiable {
             envName: proposal.env_name.escaped,
             slug: proposal.testReferenceDisplay
         )
+    }
+
+    private func announceOutcomeIfNeeded() {
+        guard outcome != .pending, outcome != .signing else { return }
+        let agent = descriptor.map { NotificationManager.subjectLabel($0.subject) } ?? "Agent"
+        let project = descriptor.map { MetadataRequest.basename($0.project.dir) } ?? "project"
+        let count = requestedBindings.count
+        let keyWord = count == 1 ? "1 key" : "\(count) keys"
+        if let text = ApprovalWindowView.outcomeText(
+            outcome,
+            agent: agent,
+            project: project,
+            keys: keyWord,
+            durationWords: durationChoice.words
+        ) {
+            session.notifications.announce(text)
+        }
     }
 
     static func headerCommand(_ argv: [DaemonText]) -> String {

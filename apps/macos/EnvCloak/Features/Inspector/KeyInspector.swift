@@ -49,7 +49,11 @@ struct KeyInspector: View {
                     Text([item.provider?.escaped, item.classification.rawValue.capitalized].compactMap { $0 }.joined(separator: " · "))
                     HStack {
                         Text((item.env_hint?.escaped ?? "VALUE") + "=").font(ECFont.martianMono(size: 12))
-                        Rectangle().fill(colorScheme == .dark ? ECToken.amber.color : ECToken.text.color).frame(width: 48, height: 14).accessibilityLabel("Value held in the vault")
+                        Rectangle()
+                            .fill(colorScheme == .dark ? ECToken.amber.color : ECToken.text.color)
+                            .frame(width: 48, height: 14)
+                            .accessibilityLabel("Value hidden")
+                            .accessibilityIdentifier("inspector.valueBlock")
                     }
                     Text("Stored in the vault. \(item.fields.count) fields, \(item.fields.reduce(0) { $0 + Int($1.prior_count) }) earlier values kept.")
                     if item.fields.count > 1 {

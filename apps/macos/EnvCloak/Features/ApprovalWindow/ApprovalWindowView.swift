@@ -17,15 +17,28 @@ struct ApprovalWindowView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         headerSection(descriptor)
+                            .accessibilitySortPriority(7)
+                            .accessibilityIdentifier("approval.section.header")
                         commandSection(descriptor)
+                            .accessibilitySortPriority(6)
+                            .accessibilityIdentifier("approval.section.command")
                         projectSection(descriptor)
+                            .accessibilitySortPriority(5)
+                            .accessibilityIdentifier("approval.section.project")
                         keysSection(descriptor)
+                            .accessibilitySortPriority(4)
+                            .accessibilityIdentifier("approval.section.keys")
                         accessSection(descriptor)
+                            .accessibilitySortPriority(3)
+                            .accessibilityIdentifier("approval.section.access")
                         evidenceSection(descriptor)
+                            .accessibilitySortPriority(2)
                     }
                     .padding(24)
                 }
                 footerSection(descriptor)
+                    .accessibilitySortPriority(1)
+                    .accessibilityIdentifier("approval.section.footer")
             } else if model.outcome == .vaultLocked {
                 VStack(spacing: 16) {
                     Text("EnvCloak locked, so this request ended. Agents ask again after you unlock.")
@@ -80,10 +93,10 @@ struct ApprovalWindowView: View {
         let projectName = MetadataRequest.basename(descriptor.project.dir)
         let count = model.requestedBindings.count
         let keyWord = count == 1 ? "1 key" : "\(count) keys"
-        let isWaiting = model.outcome == .pending || model.outcome == .signing
 
         return HStack(alignment: .top, spacing: 16) {
-            ECApprovalMark(waiting: isWaiting, module: 6)
+            ECApprovalMark(waiting: model.outcome == .signing, module: 6)
+                .accessibilityIdentifier("approval.mark")
             VStack(alignment: .leading, spacing: 6) {
                 HStack(spacing: 6) {
                     Text("\(agentName) wants to run")
@@ -105,6 +118,7 @@ struct ApprovalWindowView: View {
                         Label("Live key", systemImage: "bolt.fill")
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(ECToken.text.color)
+                            .accessibilityLabel("Live key")
                     }
                     if model.requestedBindings.contains(where: { $0.first_use }) {
                         Label("First use", systemImage: "sparkles")
@@ -127,7 +141,7 @@ struct ApprovalWindowView: View {
                     Text(line.formatted)
                         .font(ECFont.martianMono(size: 12))
                         .foregroundStyle(ECToken.text.color)
-                        .accessibilityLabel("Argument \(line.index): \(line.text)")
+                        .accessibilityLabel(Self.argvAccessibilityLabel(index: line.index, text: line.text))
                         .accessibilityIdentifier("approval.argv.\(line.index)")
                 }
                 if rendered.isTruncated {
@@ -211,7 +225,7 @@ struct ApprovalWindowView: View {
                                         set: { model.toggleLiveKey(envEscaped, isTicked: $0) }
                                     )
                                 )
-                                .accessibilityLabel("Allow live key \(envEscaped), \(item.slug.escaped)")
+                                .accessibilityLabel(Self.liveTickAccessibilityLabel(envName: envEscaped, slug: item.slug.escaped))
                                 .accessibilityIdentifier("approval.live." + envEscaped)
                             }
                             Text(envEscaped)
@@ -226,6 +240,7 @@ struct ApprovalWindowView: View {
                             Text(item.classificationView.rawValue.capitalized)
                                 .font(.caption)
                                 .foregroundStyle(ECToken.secondary.color)
+                                .accessibilityLabel(KeysView.classBadgeAccessibilityLabel(item.classificationView))
                         }
                         .accessibilityElement(children: .contain)
                         .accessibilityIdentifier("approval.covered." + envEscaped)
@@ -252,7 +267,7 @@ struct ApprovalWindowView: View {
                             set: { model.toggleLiveKey(envEscaped, isTicked: $0) }
                         )
                     )
-                    .accessibilityLabel("Allow live key \(envEscaped), \(binding.slug.escaped)")
+                    .accessibilityLabel(Self.liveTickAccessibilityLabel(envName: envEscaped, slug: binding.slug.escaped))
                     .accessibilityIdentifier("approval.live." + envEscaped)
                 }
                 Text(envEscaped)
@@ -266,10 +281,11 @@ struct ApprovalWindowView: View {
                 Spacer()
                 Label(
                     binding.classificationView.rawValue.capitalized,
-                    systemImage: isLive ? "bolt.fill" : "testtube.2"
+                    systemImage: KeysView.classBadgeSymbol(binding.classificationView)
                 )
                 .font(.subheadline)
                 .foregroundStyle(isLive ? ECToken.text.color : ECToken.secondary.color)
+                .accessibilityLabel(KeysView.classBadgeAccessibilityLabel(binding.classificationView))
                 if binding.first_use {
                     Text("First use")
                         .font(.caption)
@@ -461,6 +477,28 @@ struct ApprovalWindowView: View {
         .padding(24)
         .frame(width: 520, height: 420)
         .background(ECToken.background.color)
+    }
+
+    static let readingOrderSections = [
+        "header",
+        "command",
+        "project",
+        "keys",
+        "access",
+        "evidence",
+        "footer",
+    ]
+
+    static func liveTickAccessibilityLabel(envName: String, slug: String) -> String {
+        let spokenSlug = slug.replacingOccurrences(of: "/", with: " slash ")
+        return "Allow live key \(envName), \(spokenSlug)"
+    }
+
+    static func argvAccessibilityLabel(index: Int, text: String) -> String {
+        let spoken = text.replacing(#/\\u\{([0-9A-Fa-f]+)\}/#) { match in
+            "backslash u, \(match.output.1.uppercased())"
+        }
+        return "Argument \(index): \(spoken)"
     }
 
     static func subjectBadgeTitle(_ kind: SubjectKind) -> String {

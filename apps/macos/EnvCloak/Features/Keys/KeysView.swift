@@ -41,10 +41,18 @@ struct KeysView: View {
                     TableColumn("Account") { Text($0.item.account?.email?.escaped ?? "None") }.customizationID("account")
                     TableColumn("Class") { row in
                         HStack(spacing: 6) {
-                            Text(row.item.classification.rawValue.capitalized)
+                            Label(
+                                row.item.classification.rawValue.capitalized,
+                                systemImage: Self.classBadgeSymbol(row.item.classification)
+                            )
+                            .font(row.item.classification == .live ? .body.weight(.semibold) : .body)
+                            .foregroundStyle(Self.classBadgeToken(row.item.classification).color)
+                            .accessibilityLabel(Self.classBadgeAccessibilityLabel(row.item.classification))
+                            .accessibilityIdentifier("keys.class." + row.item.slug.escaped)
                             if row.item.exposed != nil {
                                 Label("Exposed", systemImage: "exclamationmark.triangle")
                                     .foregroundStyle(ECToken.warning.color)
+                                    .accessibilityLabel("Exposed")
                             }
                         }
                     }.customizationID("class")
@@ -68,6 +76,29 @@ struct KeysView: View {
                 .onChange(of: selection) { _, value in selectedKey = rows.first(where: { $0.id == value })?.item.slug }
             }
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    static func classBadgeSymbol(_ classification: ClassificationView) -> String {
+        switch classification {
+        case .live: "bolt.fill"
+        case .test: "testtube.2"
+        case .unknown: "questionmark.circle"
+        }
+    }
+
+    static func classBadgeToken(_ classification: ClassificationView) -> ECToken {
+        switch classification {
+        case .live: .text
+        case .test, .unknown: .secondary
+        }
+    }
+
+    static func classBadgeAccessibilityLabel(_ classification: ClassificationView) -> String {
+        switch classification {
+        case .live: "Live key"
+        case .test: "Test key"
+        case .unknown: "Unknown kind"
+        }
     }
 }
 

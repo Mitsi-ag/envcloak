@@ -448,11 +448,15 @@ struct MenuBarPopover: View {
                     NSApplication.shared.terminate(nil)
                 }
             } label: {
-                Label("Menu", systemImage: "gearshape")
-                    .labelStyle(.iconOnly)
+                if let gearImage = NSImage(systemSymbolName: "gearshape", accessibilityDescription: "EnvCloak menu") {
+                    Image(nsImage: gearImage)
+                } else {
+                    Image(systemName: "gearshape")
+                }
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .help("EnvCloak menu")
             .accessibilityLabel("EnvCloak menu")
             .accessibilityIdentifier("menubar.gear")
         }

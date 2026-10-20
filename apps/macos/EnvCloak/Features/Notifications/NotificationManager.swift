@@ -162,6 +162,11 @@ struct ApprovalNotificationPayload: Equatable, Sendable {
         }
     }
 
+    func announce(_ text: String) {
+        lastAnnouncement = text
+        sink.postVoiceOverAnnouncement(text)
+    }
+
     func clear() {
         if !notifiedRequests.isEmpty {
             sink.removeDelivered(requestIDs: Array(notifiedRequests))
