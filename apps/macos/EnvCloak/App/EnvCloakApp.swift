@@ -5,6 +5,7 @@ import SwiftUI
 /// The EU-0 metadata workspace. Launch input never selects a vault or action.
 @main
 struct EnvCloakApp: App {
+    @NSApplicationDelegateAdaptor(EnvCloakAppDelegate.self) private var appDelegate
     #if ENVCLOAK_SCREEN_TESTS
     // A compile-only test host. It never connects to the person's daemon.
     @State private var session = ScreenTestBootstrap.session()
@@ -21,6 +22,7 @@ struct EnvCloakApp: App {
     var body: some Scene {
         Window("EnvCloak", id: WindowID.main) {
             MainView(session: session)
+                .onAppear { appDelegate.session = session }
                 #if ENVCLOAK_SCREEN_TESTS
                 .task { await ScreenTestBootstrap.positionWindow() }
                 #endif
@@ -61,8 +63,28 @@ struct EnvCloakApp: App {
         .windowResizability(.contentSize)
         .restorationBehavior(.disabled)
         .commandsRemoved()
+
+        Window("Add Key", id: WindowID.paste) {
+            PasteSheet(session: session, useInProject: { _ in }, ask: session.activeAsk)
+        }
+        .windowResizability(.contentSize)
+        .restorationBehavior(.disabled)
+        .commandsRemoved()
+
+        MenuBarExtra(
+            isInserted: Binding(
+                get: { session.showMenuBarExtra },
+                set: { session.setShowMenuBarExtra($0) }
+            )
+        ) {
+            MenuBarPopover(session: session)
+        } label: {
+            MenuBarLabelView(session: session)
+        }
+        .menuBarExtraStyle(.window)
     }
 }
+
 
 /// The app's log events: fixed words, the only text the app's log holds.
 enum AppEvent: String, LogToken {

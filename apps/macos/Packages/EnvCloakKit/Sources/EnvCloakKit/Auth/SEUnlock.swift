@@ -134,6 +134,107 @@ public enum SEHPKE {
             throw .sealFailed
         }
     }
+
+    public static func revealAAD(
+        requestID: String,
+        challengeHex: String,
+        appEphPubHex: String
+    ) throws(SEUnlockError) -> Data {
+        guard !requestID.isEmpty,
+              let challenge = HexCoding.decode(challengeHex, expectedByteCount: 32),
+              let appEphPub = HexCoding.decode(appEphPubHex, expectedByteCount: 32) else {
+            throw .invalidChallenge
+        }
+        var aad = Data(requestID.utf8)
+        aad.append(challenge)
+        aad.append(appEphPub)
+        return aad
+    }
+
+    public static func sealSecretToX25519(
+        _ secret: borrowing SecretBuffer,
+        recipientPubHex: String,
+        aad: Data
+    ) throws(SEUnlockError) -> String {
+        guard let pubBytes = HexCoding.decode(recipientPubHex, expectedByteCount: 32),
+              !pubBytes.allSatisfy({ $0 == 0 }) else {
+            throw .invalidEnvelope
+        }
+        do {
+            let recipientPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: pubBytes)
+            var sender = try HPKE.Sender(
+                recipientKey: recipientPub,
+                ciphersuite: .Curve25519_SHA256_ChachaPoly,
+                info: Data()
+            )
+            let sealedCiphertext = try secret.withUnsafeBytes { secretBytes in
+                try sender.seal(secretBytes, authenticating: aad)
+            }
+            let encapped = sender.encapsulatedKey
+            guard encapped.count == 32, sealedCiphertext.count >= 16 else {
+                throw SEUnlockError.sealFailed
+            }
+            var combined = Data(capacity: encapped.count + sealedCiphertext.count)
+            combined.append(encapped)
+            combined.append(sealedCiphertext)
+            return HexCoding.encode(combined)
+        } catch let error as SEUnlockError {
+            throw error
+        } catch {
+            throw .sealFailed
+        }
+    }
+
+    public static func openSecretFromX25519(
+        sealedHex: String,
+        privateKey: Curve25519.KeyAgreement.PrivateKey,
+        aad: Data
+    ) throws(SEUnlockError) -> SecretBuffer {
+        guard let combined = HexCoding.decode(sealedHex),
+              combined.count > 48 else {
+            throw .invalidEnvelope
+        }
+        let enc = combined.prefix(32)
+        let ciphertext = combined.dropFirst(32)
+        do {
+            var recipient = try HPKE.Recipient(
+                privateKey: privateKey,
+                ciphersuite: .Curve25519_SHA256_ChachaPoly,
+                info: Data(),
+                encapsulatedKey: enc
+            )
+            var opened = try recipient.open(ciphertext, authenticating: aad)
+            defer {
+                opened.withUnsafeMutableBytes { ptr in
+                    if let base = ptr.baseAddress {
+                        _ = memset_s(base, ptr.count, 0, ptr.count)
+                    }
+                }
+            }
+            var out = try SecretBuffer(capacity: opened.count)
+            try opened.withUnsafeBytes { rawPtr in
+                try out.append(contentsOf: rawPtr)
+            }
+            return out
+        } catch {
+            throw .openFailed
+        }
+    }
+
+    public static func secretSHA256Hex(_ secret: borrowing SecretBuffer) -> String {
+        let digest = secret.withUnsafeBytes { rawPtr in
+            Data(SHA256.hash(data: rawPtr))
+        }
+        return HexCoding.encode(digest)
+    }
+
+    public static func p256FingerprintHex(_ sec1UncompressedHex: String) throws(SEUnlockError) -> String {
+        guard let pubData = HexCoding.decode(sec1UncompressedHex, expectedByteCount: 65),
+              pubData.first == 0x04 else {
+            throw .invalidEnvelope
+        }
+        return HexCoding.encode(Data(SHA256.hash(data: pubData)))
+    }
 }
 
 public struct SecureEnclaveUnlockKey: UnlockKeyAgreement {

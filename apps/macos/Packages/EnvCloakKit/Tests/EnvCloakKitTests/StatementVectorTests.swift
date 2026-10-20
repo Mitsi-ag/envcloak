@@ -519,4 +519,315 @@ final class StatementVectorTests: XCTestCase {
             XCTAssertEqual(error, .openFailed)
         }
     }
+
+    func testWriteAndRevealStatementsMatchPythonOracleAcross1000Vectors() throws {
+        let oracleScript = repoRoot().appendingPathComponent("crates/envcloak-policy/tests/oracles/statement.py")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: oracleScript.path))
+
+        let specialStrings = [
+            "",
+            "simple",
+            "control\n\r\t\0\u{1b}[31m\u{7f}\u{85}",
+            "bidi\u{202e}override\u{200d}\u{feff}\u{2066}\u{2028}",
+            "quote\"backslash\\tick'space ",
+            "emoji🧪🔑🚀",
+            "/Users/acme/my project/envcloak.toml"
+        ]
+
+        var swiftWriteHex: [String] = []
+        var swiftRevealHex: [String] = []
+        var writeCases: [[String: Any]] = []
+        var revealCases: [[String: Any]] = []
+        swiftWriteHex.reserveCapacity(1000)
+        swiftRevealHex.reserveCapacity(1000)
+        writeCases.reserveCapacity(1000)
+        revealCases.reserveCapacity(1000)
+
+        for i in 0..<1000 {
+            let pick = { (offset: Int) -> String in
+                specialStrings[(i + offset) % specialStrings.count]
+            }
+            let nonceHex = String(repeating: String(format: "%02x", (i * 7) % 256), count: 32)
+            let vaultHex = String(repeating: String(format: "%02x", (i * 13) % 256), count: 16)
+            let shaHex = String(repeating: String(format: "%02x", (i * 19) % 256), count: 32)
+
+            let writeStmt: WriteStatement
+            let actionDict: [String: Any]
+            let targetStr: String
+            switch i % 5 {
+            case 0:
+                targetStr = String(format: "WT%06d", i)
+                let slug = "openai/key-\(i)-" + pick(1)
+                let item = String(format: "01HITEM%019d", i)
+                let field = String(format: "01HFLD%020d", i)
+                let fieldName = "api_key_" + pick(2)
+                let classification = (i % 2 == 0) ? "live" : "test"
+                let priorCount = UInt8(i % 4)
+                let grants = UInt64(i * 3)
+                writeStmt = WriteStatement(
+                    target: targetStr,
+                    nonce: nonceHex,
+                    vault_id: vaultHex,
+                    action: .rotate(
+                        item: item,
+                        slug: slug,
+                        field: field,
+                        field_name: fieldName,
+                        classification: classification,
+                        prior_count: priorCount,
+                        grants: grants,
+                        new_value_sha256: shaHex
+                    )
+                )
+                actionDict = [
+                    "kind": "rotate",
+                    "item": item,
+                    "slug": slug,
+                    "field": field,
+                    "field_name": fieldName,
+                    "classification": classification,
+                    "prior_count": Int(priorCount),
+                    "grants": grants,
+                    "new_value_sha256": shaHex
+                ]
+            case 1:
+                targetStr = String(format: "RM%06d", i)
+                let slug = "stripe/key-\(i)-" + pick(3)
+                let item = String(format: "01HITEM%019d", i)
+                let grants = UInt64(i * 5)
+                writeStmt = WriteStatement(
+                    target: targetStr,
+                    nonce: nonceHex,
+                    vault_id: vaultHex,
+                    action: .remove(item: item, slug: slug, grants: grants)
+                )
+                actionDict = [
+                    "kind": "remove",
+                    "item": item,
+                    "slug": slug,
+                    "grants": grants
+                ]
+            case 2:
+                targetStr = "unlocker_add"
+                let label = "MacBook-" + pick(4)
+                let teamID = "TEAM\(i % 99)"
+                let signingID = "ai.envcloak.app.\(i)"
+                writeStmt = WriteStatement(
+                    target: targetStr,
+                    nonce: nonceHex,
+                    vault_id: vaultHex,
+                    action: .unlockerAdd(
+                        label: label,
+                        unlock_pub_sha256: shaHex,
+                        approve_pub_sha256: nonceHex,
+                        team_id: teamID,
+                        signing_id: signingID
+                    )
+                )
+                actionDict = [
+                    "kind": "unlocker_add",
+                    "label": label,
+                    "unlock_pub_sha256": shaHex,
+                    "approve_pub_sha256": nonceHex,
+                    "team_id": teamID,
+                    "signing_id": signingID
+                ]
+            case 3:
+                targetStr = "unlocker_remove"
+                writeStmt = WriteStatement(
+                    target: targetStr,
+                    nonce: nonceHex,
+                    vault_id: vaultHex,
+                    action: .unlockerRemove(unlocker: .passphrase)
+                )
+                actionDict = [
+                    "kind": "unlocker_remove",
+                    "unlocker": ["kind": "passphrase"]
+                ]
+            default:
+                targetStr = "unlocker_remove"
+                let uid = vaultHex
+                let label = "TouchID-" + pick(5)
+                writeStmt = WriteStatement(
+                    target: targetStr,
+                    nonce: nonceHex,
+                    vault_id: vaultHex,
+                    action: .unlockerRemove(
+                        unlocker: .secureEnclave(
+                            unlocker_id: uid,
+                            label: label,
+                            unlock_pub_sha256: shaHex,
+                            approve_pub_sha256: nonceHex
+                        )
+                    )
+                )
+                actionDict = [
+                    "kind": "unlocker_remove",
+                    "unlocker": [
+                        "kind": "secure_enclave",
+                        "unlocker_id": uid,
+                        "label": label,
+                        "unlock_pub_sha256": shaHex,
+                        "approve_pub_sha256": nonceHex
+                    ]
+                ]
+            }
+
+            swiftWriteHex.append(HexCoding.encode(CanonicalStatement.encodeWrite(writeStmt)))
+            writeCases.append([
+                "write": [
+                    "target": targetStr,
+                    "nonce": nonceHex,
+                    "vault_id": vaultHex,
+                    "action": actionDict
+                ]
+            ])
+
+            let hasRequester = (i % 2 == 0)
+            let subjectKind: SubjectKind = (i % 4 == 0) ? .terminal : .agent
+            let labelStr: String? = (i % 3 == 0) ? ("Terminal-" + pick(2)) : nil
+            let exeStr: String? = (i % 5 == 0) ? nil : ("/bin/zsh-" + pick(3))
+            let callerPid = Int32((i % 7 == 0 ? -1 : 1) * (200 + i))
+            let rootPid = Int32((i % 11 == 0 ? -1 : 1) * (100 + i))
+            let startTime = UInt64(1_700_000_000 + i * 10)
+            let requester: SubjectSummary? = hasRequester ? SubjectSummary(
+                kind: subjectKind,
+                label: labelStr.map(DaemonText.init),
+                caller_pid: callerPid,
+                root: ProcessSummary(
+                    pid: rootPid,
+                    start_time: startTime,
+                    exe: exeStr.map(DaemonText.init)
+                )
+            ) : nil
+
+            let reqID = String(format: "RV%06d", i)
+            let itemID = String(format: "01HRVITEM%017d", i)
+            let slugStr = "anthropic/key-\(i)-" + pick(6)
+            let fieldID = String(format: "01HRVFLD%018d", i)
+            let fieldName = "secret_" + pick(1)
+            let classStr = (i % 3 == 0) ? "live" : ((i % 3 == 1) ? "test" : "unknown")
+            let createdSecs = UInt64(1_750_000_000 + i)
+            let expiresInSecs = UInt64(60 + (i % 540))
+
+            let revealDesc = RevealDescriptor(
+                request: DaemonText(reqID),
+                nonce: DaemonText(nonceHex),
+                app_eph_pub: DaemonText(shaHex),
+                vault_id: DaemonText(vaultHex),
+                item: DaemonText(itemID),
+                slug: DaemonText(slugStr),
+                field: DaemonText(fieldID),
+                field_name: DaemonText(fieldName),
+                classification: DaemonText(classStr),
+                requester: requester,
+                created_secs: createdSecs,
+                expires_in_secs: expiresInSecs
+            )
+            swiftRevealHex.append(HexCoding.encode(CanonicalStatement.encodeReveal(revealDesc)))
+
+            var revealDict: [String: Any] = [
+                "request": reqID,
+                "nonce": nonceHex,
+                "app_eph_pub": shaHex,
+                "vault_id": vaultHex,
+                "item": itemID,
+                "slug": slugStr,
+                "field": fieldID,
+                "field_name": fieldName,
+                "classification": classStr,
+                "created_secs": createdSecs,
+                "expires_in_secs": expiresInSecs
+            ]
+            if hasRequester {
+                revealDict["requester"] = [
+                    "kind": subjectKind.rawValue,
+                    "label": labelStr as Any? ?? NSNull(),
+                    "caller_pid": callerPid,
+                    "root": [
+                        "pid": rootPid,
+                        "start_time": startTime,
+                        "exe": exeStr as Any? ?? NSNull()
+                    ]
+                ]
+            } else {
+                revealDict["requester"] = NSNull()
+            }
+            revealCases.append(["reveal": revealDict])
+        }
+
+        let allInput = writeCases + revealCases
+        let inputData = try JSONSerialization.data(withJSONObject: allInput)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        proc.arguments = [oracleScript.path]
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        proc.standardInput = stdinPipe
+        proc.standardOutput = stdoutPipe
+        try proc.run()
+        DispatchQueue.global().async {
+            stdinPipe.fileHandleForWriting.write(inputData)
+            stdinPipe.fileHandleForWriting.closeFile()
+        }
+        let outputData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
+        XCTAssertEqual(proc.terminationStatus, 0)
+
+        let oracleResults = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: outputData) as? [[String: String]]
+        )
+        XCTAssertEqual(oracleResults.count, 2000)
+
+        for i in 0..<1000 {
+            XCTAssertEqual(swiftWriteHex[i], oracleResults[i]["write"], "WriteStatement mismatch at vector \(i)")
+            XCTAssertEqual(swiftRevealHex[i], oracleResults[1000 + i]["reveal"], "RevealDescriptor mismatch at vector \(i)")
+        }
+    }
+
+    func testHPKESecretSealAndOpenRoundTrip() throws {
+        let recipientKey = Curve25519.KeyAgreement.PrivateKey()
+        let recipientPubHex = HexCoding.encode(recipientKey.publicKey.rawRepresentation)
+        let requestID = "RV778899"
+        let challengeHex = String(repeating: "ab", count: 32)
+        let aad = try SEHPKE.revealAAD(
+            requestID: requestID,
+            challengeHex: challengeHex,
+            appEphPubHex: recipientPubHex
+        )
+
+        let secretString = "sk-live-secret-roundtrip-\(UUID().uuidString)"
+        var secretBuf = try SecretBuffer(capacity: 64)
+        try Array(secretString.utf8).withUnsafeBytes { rawPtr in
+            try secretBuf.append(contentsOf: rawPtr)
+        }
+
+        let sealedHex = try SEHPKE.sealSecretToX25519(
+            secretBuf,
+            recipientPubHex: recipientPubHex,
+            aad: aad
+        )
+        let openedBuf = try SEHPKE.openSecretFromX25519(
+            sealedHex: sealedHex,
+            privateKey: recipientKey,
+            aad: aad
+        )
+        let openedString = openedBuf.withUnsafeBytes { String(decoding: $0, as: UTF8.self) }
+        XCTAssertEqual(openedString, secretString)
+
+        // Wrong AAD must fail.
+        let wrongAAD = Data("wrong-aad".utf8)
+        do {
+            _ = try SEHPKE.openSecretFromX25519(
+                sealedHex: sealedHex,
+                privateKey: recipientKey,
+                aad: wrongAAD
+            )
+            XCTFail("Expected wrong AAD to fail HPKE open")
+        } catch {
+            XCTAssertEqual(error, .openFailed)
+        }
+    }
 }
+

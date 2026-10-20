@@ -436,3 +436,376 @@ public struct StandingConfirm: ~Copyable, DaemonMethod {
     }
 }
 
+public struct AppItemsTarget: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppItemsTargetView
+    public static let name = "app.items.target"
+    public let slug: String
+    public let field: String?
+    public let claims: [String]
+    public init(slug: String, field: String? = nil, claims: [String] = []) {
+        self.slug = slug
+        self.field = field
+        self.claims = claims
+    }
+    public var description: String { "[app.items.target]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"slug\":"); try w.string(slug)
+        if let field { try w.raw(",\"field\":"); try w.string(field) }
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppItemsRotate: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = RotatedView
+    public static let name = "app.items.rotate"
+    public let target: String
+    public let sealed_value: String
+    public let digest: String
+    public let signature: String
+    public let claims: [String]
+    public init(target: String, sealed_value: String, digest: String, signature: String, claims: [String] = []) {
+        self.target = target
+        self.sealed_value = sealed_value
+        self.digest = digest
+        self.signature = signature
+        self.claims = claims
+    }
+    public var description: String { "[app.items.rotate]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"target\":"); try w.string(target)
+        try w.raw(",\"sealed_value\":"); try w.string(sealed_value)
+        try w.raw(",\"digest\":"); try w.string(digest)
+        try w.raw(",\"signature\":"); try w.string(signature)
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppItemsRemove: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = RemovedView
+    public static let name = "app.items.remove"
+    public let target: String
+    public let digest: String
+    public let signature: String
+    public let claims: [String]
+    public init(target: String, digest: String, signature: String, claims: [String] = []) {
+        self.target = target
+        self.digest = digest
+        self.signature = signature
+        self.claims = claims
+    }
+    public var description: String { "[app.items.remove]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"target\":"); try w.string(target)
+        try w.raw(",\"digest\":"); try w.string(digest)
+        try w.raw(",\"signature\":"); try w.string(signature)
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppUnlockerAdd: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppUnlockerAddedView
+    public static let name = "app.unlocker.add"
+    public let label: String
+    public let unlock_pub: String
+    public let approve_pub: String
+    public let nonce: String
+    public let digest: String
+    public let signature: String
+    public let created_secs: UInt64
+    public let claims: [String]
+    public init(label: String, unlock_pub: String, approve_pub: String, nonce: String,
+                digest: String, signature: String, created_secs: UInt64 = 0, claims: [String] = []) {
+        self.label = label
+        self.unlock_pub = unlock_pub
+        self.approve_pub = approve_pub
+        self.nonce = nonce
+        self.digest = digest
+        self.signature = signature
+        self.created_secs = created_secs
+        self.claims = claims
+    }
+    public var description: String { "[app.unlocker.add]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"label\":"); try w.string(label)
+        try w.raw(",\"unlock_pub\":"); try w.string(unlock_pub)
+        try w.raw(",\"approve_pub\":"); try w.string(approve_pub)
+        try w.raw(",\"nonce\":"); try w.string(nonce)
+        try w.raw(",\"digest\":"); try w.string(digest)
+        try w.raw(",\"signature\":"); try w.string(signature)
+        if created_secs > 0 { try w.raw(",\"created_secs\":" + String(created_secs)) }
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppUnlockerRemove: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppUnlockerRemovedView
+    public static let name = "app.unlocker.remove"
+    public let unlocker: String
+    public let nonce: String
+    public let digest: String
+    public let signature: String
+    public let created_secs: UInt64
+    public let claims: [String]
+    public init(unlocker: String, nonce: String, digest: String, signature: String,
+                created_secs: UInt64 = 0, claims: [String] = []) {
+        self.unlocker = unlocker
+        self.nonce = nonce
+        self.digest = digest
+        self.signature = signature
+        self.created_secs = created_secs
+        self.claims = claims
+    }
+    public var description: String { "[app.unlocker.remove]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"unlocker\":"); try w.string(unlocker)
+        try w.raw(",\"nonce\":"); try w.string(nonce)
+        try w.raw(",\"digest\":"); try w.string(digest)
+        try w.raw(",\"signature\":"); try w.string(signature)
+        if created_secs > 0 { try w.raw(",\"created_secs\":" + String(created_secs)) }
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppRevealBegin: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = RevealDescriptor
+    public static let name = "app.reveal.begin"
+    public let requestID: String?
+    public let slug: String?
+    public let field: String?
+    public let claims: [String]
+    public init(request: String? = nil, slug: String? = nil, field: String? = nil, claims: [String] = []) {
+        self.requestID = request
+        self.slug = slug
+        self.field = field
+        self.claims = claims
+    }
+    public var description: String { "[app.reveal.begin]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        var comma = false
+        if let requestID {
+            try w.raw("\"request\":"); try w.string(requestID)
+            comma = true
+        }
+        if let slug {
+            if comma { try w.raw(",") }
+            try w.raw("\"slug\":"); try w.string(slug)
+            comma = true
+        }
+        if let field {
+            if comma { try w.raw(",") }
+            try w.raw("\"field\":"); try w.string(field)
+            comma = true
+        }
+        if !claims.isEmpty {
+            if comma { try w.raw(",") }
+            try w.raw("\"claims\":"); try w.strings(claims)
+        }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppReveal: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppRevealView
+    public static let name = "app.reveal"
+    public let requestID: String
+    public let digest: String
+    public let signature: String
+    public let app_eph_pub: String
+    public let claims: [String]
+    public init(request: String, digest: String, signature: String, app_eph_pub: String, claims: [String] = []) {
+        self.requestID = request
+        self.digest = digest
+        self.signature = signature
+        self.app_eph_pub = app_eph_pub
+        self.claims = claims
+    }
+    public var description: String { "[app.reveal]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"request\":"); try w.string(requestID)
+        try w.raw(",\"digest\":"); try w.string(digest)
+        try w.raw(",\"signature\":"); try w.string(signature)
+        try w.raw(",\"app_eph_pub\":"); try w.string(app_eph_pub)
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppPasteBegin: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppPasteBeginView
+    public static let name = "app.paste.begin"
+    public let claims: [String]
+    public init(claims: [String] = []) { self.claims = claims }
+    public var description: String { "[app.paste.begin]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        if !claims.isEmpty { try w.raw("\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppPasteInspect: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppPasteInspectView
+    public static let name = "app.paste.inspect"
+    public let stage: String
+    public let sealed: String
+    public let claims: [String]
+    public init(stage: String, sealed: String, claims: [String] = []) {
+        self.stage = stage
+        self.sealed = sealed
+        self.claims = claims
+    }
+    public var description: String { "[app.paste.inspect]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"stage\":"); try w.string(stage)
+        try w.raw(",\"sealed\":"); try w.string(sealed)
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppPaste: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AddedView
+    public static let name = "app.paste"
+    public let stage: String
+    public let slug: String?
+    public let provider: String?
+    public let field: String?
+    public let account: String?
+    public let env_hint: String?
+    public let allow_short: Bool
+    public let ask: String?
+    public let claims: [String]
+    public init(stage: String, slug: String? = nil, provider: String? = nil, field: String? = nil,
+                account: String? = nil, env_hint: String? = nil, allow_short: Bool = false,
+                ask: String? = nil, claims: [String] = []) {
+        self.stage = stage
+        self.slug = slug
+        self.provider = provider
+        self.field = field
+        self.account = account
+        self.env_hint = env_hint
+        self.allow_short = allow_short
+        self.ask = ask
+        self.claims = claims
+    }
+    public var description: String { "[app.paste]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"stage\":"); try w.string(stage)
+        if let slug { try w.raw(",\"slug\":"); try w.string(slug) }
+        if let provider { try w.raw(",\"provider\":"); try w.string(provider) }
+        if let field { try w.raw(",\"field\":"); try w.string(field) }
+        if let account { try w.raw(",\"account\":"); try w.string(account) }
+        if let env_hint { try w.raw(",\"env_hint\":"); try w.string(env_hint) }
+        if allow_short { try w.raw(",\"allow_short\":true") }
+        if let ask { try w.raw(",\"ask\":"); try w.string(ask) }
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppAsksList: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppAsksListView
+    public static let name = "app.asks.list"
+    public let claims: [String]
+    public init(claims: [String] = []) { self.claims = claims }
+    public var description: String { "[app.asks.list]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        if !claims.isEmpty { try w.raw("\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+public struct AppAsksDecline: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppAskDeclinedView
+    public static let name = "app.asks.decline"
+    public let ask: String
+    public let claims: [String]
+    public init(ask: String, claims: [String] = []) {
+        self.ask = ask
+        self.claims = claims
+    }
+    public var description: String { "[app.asks.decline]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"ask\":"); try w.string(ask)
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
+
+

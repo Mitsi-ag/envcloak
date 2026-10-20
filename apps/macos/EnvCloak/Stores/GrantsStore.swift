@@ -9,10 +9,12 @@ import Observation
     private var fetchedAt = ContinuousClock.now
     private var standingFetchedAt = ContinuousClock.now
     private var pendingFetchedAt = ContinuousClock.now
+    private var asksFetchedAt = ContinuousClock.now
     private(set) var rows: [GrantView] = []
     private(set) var standing: [StandingView] = []
     private(set) var policyEpochUnverified = false
     private(set) var pending: [AppPendingView] = []
+    private(set) var asks: [AskSummary] = []
     private(set) var failure: EnvCloakError?
     private(set) var pendingFailure: EnvCloakError?
 
@@ -26,6 +28,7 @@ import Observation
         standing = []
         policyEpochUnverified = false
         pending = []
+        asks = []
         failure = nil
         pendingFailure = nil
         dirty = true
@@ -45,6 +48,12 @@ import Observation
 
     func remainingPending(_ item: AppPendingView) -> UInt64 {
         let elapsed = pendingFetchedAt.duration(to: .now).components.seconds
+        let seconds = UInt64(max(0, elapsed))
+        return item.expires_in_secs > seconds ? item.expires_in_secs - seconds : 0
+    }
+
+    func remainingAsk(_ item: AskSummary) -> UInt64 {
+        let elapsed = asksFetchedAt.duration(to: .now).components.seconds
         let seconds = UInt64(max(0, elapsed))
         return item.expires_in_secs > seconds ? item.expires_in_secs - seconds : 0
     }
@@ -111,6 +120,23 @@ import Observation
                 guard captured == revision else { return }
                 pendingFailure = .protocolError
             }
+
+            let asksRequestedAt = ContinuousClock.now
+            do {
+                let asksResult = try await client.call(AppAsksList())
+                guard captured == revision, !Task.isCancelled else { return }
+                asks = asksResult.asks
+                asksFetchedAt = asksRequestedAt
+            } catch let error as EnvCloakError {
+                guard captured == revision else { return }
+                switch error {
+                case .daemonUnavailable, .daemonUnverified, .rpc(.vaultLocked, _), .rpc(.vaultTampered, _):
+                    asks = []
+                    failure = error
+                default:
+                    break
+                }
+            } catch {}
         }
     }
 }

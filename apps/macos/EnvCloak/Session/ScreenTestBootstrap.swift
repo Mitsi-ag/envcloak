@@ -44,7 +44,14 @@ import AppKit
                let home = ProcessInfo.processInfo.environment["ENVCLOAK_TEST_HOME"], home.hasPrefix("/tmp/ec05-") {
                 runner = CLIRunner(executable: executable, home: home, timeout: .seconds(30))
             } else { runner = nil }
-            return VaultSession(client: SocketWorkspaceClient(client: DaemonClient(directory: directory)), folders: folders, runner: runner)
+            let enrolled = ProcessInfo.processInfo.environment["ENVCLOAK_TEST_ENROLLED_TOUCH_ID"] == "1"
+            return VaultSession(
+                client: SocketWorkspaceClient(client: DaemonClient(directory: directory)),
+                folders: folders,
+                runner: runner,
+                enrolledTouchID: enrolled
+            )
+
         } catch {
             let session = VaultSession(client: nil)
             session.state = .unavailable

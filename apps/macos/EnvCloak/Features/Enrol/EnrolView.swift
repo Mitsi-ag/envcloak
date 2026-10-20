@@ -4,6 +4,7 @@ import SwiftUI
 
 struct EnrolView: View {
     let session: VaultSession
+    @State private var showPassphraseSheet = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -15,6 +16,38 @@ struct EnrolView: View {
                     Text("Touch ID added")
                         .foregroundStyle(ECToken.text.color)
                         .accessibilityIdentifier("enrol.completed")
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Require Touch ID. Your login password will no longer approve.")
+                        .font(.subheadline)
+                        .foregroundStyle(ECToken.secondary.color)
+                        .accessibilityIdentifier("enrol.touchIDOnly.caption")
+                    if session.touchIDOnlyEnabled {
+                        Text("Touch ID only is enabled.")
+                            .font(.subheadline)
+                            .foregroundStyle(ECToken.success.color)
+                            .accessibilityIdentifier("enrol.touchIDOnly.enabled")
+                    } else {
+                        Button("Require Touch ID only") {
+                            Task { _ = await session.enrollTouchIDOnlyUnlocker() }
+                        }
+                        .disabled(session.actionInProgress || session.state != .ready)
+                        .accessibilityIdentifier("enrol.touchIDOnly.enable")
+                    }
+                }
+
+                if session.passphraseUnlockerRemoved {
+                    Text("Passphrase unlocker removed. Touch ID and the Recovery Kit remain.")
+                        .font(.subheadline)
+                        .foregroundStyle(ECToken.secondary.color)
+                        .accessibilityIdentifier("enrol.passphrase.removed")
+                } else {
+                    Button("Remove passphrase unlocker…") {
+                        showPassphraseSheet = true
+                    }
+                    .disabled(session.actionInProgress || session.state != .ready)
+                    .accessibilityIdentifier("enrol.passphrase.remove")
                 }
             } else if let pendingId = session.enrolmentPendingId {
                 let commandText = session.enrolmentCommand ?? ("envcloak approve " + pendingId.escaped)
@@ -54,7 +87,36 @@ struct EnrolView: View {
                 .accessibilityIdentifier("enrol.begin")
             }
         }
+        .sheet(isPresented: $showPassphraseSheet) {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Remove passphrase unlocker?")
+                    .font(.title3)
+                    .foregroundStyle(ECToken.text.color)
+                Text("Touch ID and your Recovery Kit remain. Terminal approvals with your passphrase stop working.")
+                    .font(.subheadline)
+                    .foregroundStyle(ECToken.secondary.color)
+                    .accessibilityIdentifier("enrol.passphrase.facts")
+                HStack {
+                    Button("Cancel") { showPassphraseSheet = false }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button(session.removeButtonTitle) {
+                        Task {
+                            if await session.removePassphraseUnlockerWithTouchID() {
+                                showPassphraseSheet = false
+                            }
+                        }
+                    }
+                    .foregroundStyle(ECToken.danger.color)
+                    .disabled(session.actionInProgress || session.state != .ready)
+                    .accessibilityIdentifier("enrol.passphrase.confirm")
+                }
+            }
+            .padding(24)
+            .frame(width: 440)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("enrol.section")
     }
 }
+

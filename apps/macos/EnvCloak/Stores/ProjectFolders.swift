@@ -8,13 +8,23 @@ import Foundation
     private let file: URL
     private(set) var paths: [DaemonText]
     private(set) var scope: DaemonText?
+    private(set) var showMenuBarExtra: Bool
     private var scopeFile: URL { file.appendingPathExtension("scope") }
+    private var menuBarFile: URL { file.appendingPathExtension("menubar") }
     init(file: URL) throws {
         self.file = file
         paths = try Self.read(file)
         let scopes = try Self.read(file.appendingPathExtension("scope"))
         guard scopes.count <= 1 else { throw EnvCloakError.protocolError }
         scope = scopes.first
+        showMenuBarExtra = (try? Self.readBool(file.appendingPathExtension("menubar"))) ?? false
+    }
+    private static func readBool(_ file: URL) throws -> Bool {
+        guard FileManager.default.fileExists(atPath: file.path) else { return false }
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        guard attrs[.type] as? FileAttributeType == .typeRegular,
+              (attrs[.size] as? NSNumber)?.intValue ?? Int.max <= 64 else { throw EnvCloakError.protocolError }
+        return try JSONDecoder().decode(Bool.self, from: Data(contentsOf: file))
     }
     private static func read(_ file: URL) throws -> [DaemonText] {
         guard FileManager.default.fileExists(atPath: file.path) else { return [] }
@@ -37,6 +47,14 @@ import Foundation
     func saveScope(_ scope: DaemonText?) throws {
         try Self.write(scope.map { [$0] } ?? [], to: scopeFile)
         self.scope = scope
+    }
+    func saveMenuBarExtra(_ enabled: Bool) throws {
+        let parent = menuBarFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let data = try JSONEncoder().encode(enabled)
+        try data.write(to: menuBarFile, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: menuBarFile.path)
+        self.showMenuBarExtra = enabled
     }
     private static func write(_ paths: [DaemonText], to file: URL) throws {
         guard paths.count <= 1000, paths.allSatisfy({ MetadataRequest.directoryURL($0) != nil }) else { throw EnvCloakError.protocolError }
