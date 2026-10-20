@@ -490,6 +490,24 @@ pub enum AuditEvent {
         subject: SubjectSummary,
         confirmed: usize,
     },
+    /// A login item was added (`login.add`).
+    LoginAdded {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+        tier: &'static str,
+    },
+    /// A login item's field was replaced with a proof (`items.rotate` on a
+    /// login item), bumping its authorization revision.
+    LoginReplaced {
+        pid: i32,
+        subject: SubjectSummary,
+        item: ItemId,
+        slug: Slug,
+        field: &'static str,
+        revision: u64,
+    },
 }
 
 /// A managed launch's counts, as its audit entries record them.
@@ -863,6 +881,21 @@ impl AuditEvent {
             AuditEvent::StandingConfirmed { pid, confirmed, .. } => {
                 format!("envcloakd: audit: standing confirmed records={confirmed} pid={pid}")
             }
+            AuditEvent::LoginAdded {
+                pid, item, tier, ..
+            } => {
+                format!("envcloakd: audit: login added id={item} tier={tier} pid={pid}")
+            }
+            AuditEvent::LoginReplaced {
+                pid,
+                item,
+                field,
+                revision,
+                ..
+            } => format!(
+                "envcloakd: audit: login replaced id={item} field={field} revision={revision} \
+                 pid={pid}"
+            ),
         })
     }
 
@@ -1528,6 +1561,36 @@ impl AuditEvent {
                     Some(u64::try_from(*confirmed).unwrap_or(u64::MAX)),
                 ),
                 ..AuditRecord::new(AuditKind::StandingConfirm, "confirmed")
+            },
+            AuditEvent::LoginAdded {
+                subject,
+                item,
+                slug,
+                tier,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision("added", Some(tier), Some("login.add"), None),
+                ..AuditRecord::new(AuditKind::LoginAdd, "added")
+            },
+            AuditEvent::LoginReplaced {
+                subject,
+                item,
+                slug,
+                field,
+                revision,
+                ..
+            } => AuditRecord {
+                subject: subject.clone(),
+                items: vec![(*item, slug.clone())],
+                decision: decision(
+                    "replaced",
+                    Some(field),
+                    Some("items.rotate"),
+                    Some(*revision),
+                ),
+                ..AuditRecord::new(AuditKind::LoginReplace, "replaced")
             },
         }
     }

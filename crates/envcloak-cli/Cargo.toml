@@ -24,6 +24,7 @@ envcloak-ipc.workspace = true
 envcloak-mcp.workspace = true
 envcloak-policy.workspace = true
 envcloak-scan.workspace = true
+envcloak-signin.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 serde_json.workspace = true

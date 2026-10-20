@@ -22,10 +22,7 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 
 /// Each registered command or option (the words that select it) and how
 /// its refusal names it.
-const STUBS: &[(&[&str], &str)] = &[
-    (&["login"], "`envcloak login`"),
-    (&["signin"], "`envcloak signin`"),
-];
+const STUBS: &[(&[&str], &str)] = &[(&["signin"], "`envcloak signin`")];
 
 /// Exit code of a stub, as of `run`'s own failures.
 const NOT_IN_THIS_BUILD: i32 = 125;
@@ -231,11 +228,14 @@ fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
         (vec!["items"], false),
         (vec!["items", "list"], false),
         (vec!["standing"], false),
+        (vec!["login"], false),
+        (vec!["login", "list"], false),
     ];
     for c in &cs {
         cases.push((vec!["agents", c.as_str()], false));
         cases.push((vec!["items", c.as_str()], false));
         cases.push((vec!["standing", c.as_str()], false));
+        cases.push((vec!["login", c.as_str()], false));
     }
     for (args, stub) in cases {
         let out = run(&home, &args, &[]);
@@ -295,6 +295,7 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
     assert!(lists(available, &["standing", "confirm"]));
     assert!(lists(available, &["agents", "migrate-mcp"]));
     assert!(lists(available, &["mcp-bridge"]));
+    assert!(lists(available, &["login", "add"]));
     let run = available
         .lines()
         .find(|l| l.trim_start().starts_with("envcloak run "))

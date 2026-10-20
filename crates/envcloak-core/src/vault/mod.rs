@@ -60,8 +60,9 @@ pub use items::{
     ProjectId, ProjectKey, ProjectRecord, Slug,
 };
 pub use login::{
-    AttemptLease, LoginFieldReader, LoginFieldValue, LoginValue, NewLogin, TotpAlgorithm,
-    TotpEnrollment, TotpParams,
+    AttemptLease, DEFAULT_LOGIN_SESSION_LIFETIME_SECS, LoginFieldReader, LoginFieldValue,
+    LoginValue, MAX_LOGIN_SESSION_LIFETIME_SECS, NewLogin, TotpAlgorithm, TotpEnrollment,
+    TotpParams,
 };
 #[cfg(feature = "testing")]
 pub use migrate::BeforeCommit;

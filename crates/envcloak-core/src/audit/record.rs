@@ -140,6 +140,11 @@ pub enum AuditKind {
     /// A session grant was minted from a standing approval, before any value
     /// left the daemon.
     StandingGrant = 34,
+    /// A login item was added (`envcloak login add`).
+    LoginAdd = 35,
+    /// A login field was replaced (`envcloak rotate <slug>#<field>`), with a
+    /// proof, or the proof failed.
+    LoginReplace = 36,
     /// A request against a managed MCP server's project refused before any
     /// pending request: not its registered launch
     /// (`managed_command_mismatch`), a launch that changed
@@ -172,7 +177,7 @@ pub enum AuditKind {
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 39] = [
+    pub const ALL: [AuditKind; 41] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -205,6 +210,8 @@ impl AuditKind {
         AuditKind::StandingCreate,
         AuditKind::StandingRevoke,
         AuditKind::StandingGrant,
+        AuditKind::LoginAdd,
+        AuditKind::LoginReplace,
         AuditKind::ManagedLaunch,
         AuditKind::StandingConfirm,
         AuditKind::UnlockerAdd,
@@ -249,6 +256,8 @@ impl AuditKind {
             AuditKind::StandingCreate => "standing_create",
             AuditKind::StandingRevoke => "standing_revoke",
             AuditKind::StandingGrant => "standing_grant",
+            AuditKind::LoginAdd => "login_add",
+            AuditKind::LoginReplace => "login_replace",
             AuditKind::ManagedLaunch => "managed_launch",
             AuditKind::StandingConfirm => "standing_confirm",
             AuditKind::UnlockerAdd => "unlocker_add",

@@ -52,8 +52,9 @@ use crate::view::{
     ScanMatchView, StatusView, TargetView, UnlockedView, VerifyView,
 };
 use crate::view::{
-    ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
-    StandingConfirmedView, StandingListView, StandingRevokedView,
+    LoginAddedView, LoginTierView, ManagedRegisteredView, ManagedUnregisteredView,
+    ManagedUpdatePlanView, ManagedUpdatedView, StandingConfirmedView, StandingListView,
+    StandingRevokedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -777,6 +778,50 @@ pub struct AddParams {
     /// As [`UnlockParams::claims`], for the audit entry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
+}
+
+/// `login.add`: a new login item with typed `username`, `password`, optional
+/// `totp` (`otpauth://` URI) and optional `adapter_key` fields (SPEC §6.8,
+/// M2b-03). Adding a new login needs no proof, as `items.add` needs none.
+#[derive(Debug)]
+pub struct LoginAdd;
+
+impl Method for LoginAdd {
+    const NAME: &'static str = "login.add";
+    type Params = LoginAddParams;
+    type Output = LoginAddedView;
+}
+
+/// What `envcloak login add` sends: metadata and typed login fields.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginAddParams {
+    pub slug: String,
+    pub classification: ClassificationView,
+    pub tier: LoginTierView,
+    pub session_lifetime_secs: u64,
+    pub username: WireSecret,
+    pub password: WireSecret,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub totp: Option<WireSecret>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_key: Option<WireSecret>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for LoginAddParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoginAddParams")
+            .field("slug", &self.slug)
+            .field("classification", &self.classification)
+            .field("tier", &self.tier)
+            .field("session_lifetime_secs", &self.session_lifetime_secs)
+            .field("totp", &self.totp.is_some())
+            .field("adapter_key", &self.adapter_key.is_some())
+            .field("claims", &self.claims)
+            .finish_non_exhaustive()
+    }
 }
 
 /// `items.target`: the item a `rotate` or `rm` would change, for the
@@ -1866,7 +1911,7 @@ impl core::fmt::Debug for ManagedUpdateParams {
 }
 
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 51] = [
+pub const CLIENT_METHODS: [&str; 52] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1887,6 +1932,7 @@ pub const CLIENT_METHODS: [&str; 51] = [
     ItemsShow::NAME,
     ItemsCheck::NAME,
     ItemsAdd::NAME,
+    LoginAdd::NAME,
     ItemsTarget::NAME,
     ItemsReveal::NAME,
     ItemsRotate::NAME,
@@ -2633,6 +2679,9 @@ pub const REASONS: &[&str] = &[
     // anchored vault had no anchor in the keychain (`keychain_anchor_mismatch`).
     "rolled_back",
     "keychain_anchor_missing",
+    // Login items (`login.add`, `items.rotate` on `#totp`, M2b-03):
+    "invalid_otpauth",
+    "live_dev",
 ];
 
 /// An error response. Built from fixed tokens only.

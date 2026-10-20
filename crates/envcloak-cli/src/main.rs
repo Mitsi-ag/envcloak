@@ -124,8 +124,8 @@ const HELP: &str = "usage:
   envcloak scrub --undo <ID> [--created-by-agent] [--unrecorded] [--passphrase-fd N] [--json]
   envcloak doctor [--json] [--path <path>]... [--git-history] [--report]
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
+  envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak login
   envcloak signin
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
@@ -213,7 +213,6 @@ fn main() -> ExitCode {
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
-        "login" => cmd::login::run(&[]),
         "signin" => cmd::signin::run(&[]),
         _ => return None,
     })

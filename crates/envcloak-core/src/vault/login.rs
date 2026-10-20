@@ -48,6 +48,11 @@ use super::items::{FieldId, FieldKind, ItemDetails, ItemId, LoginMeta, Slug};
 use super::state::item_key;
 use super::values::{open_value, unpack_totp};
 
+/// Default session lifetime for a login item (8 hours, in seconds).
+pub const DEFAULT_LOGIN_SESSION_LIFETIME_SECS: u64 = 8 * 3600;
+/// Maximum session lifetime for a login item (24 hours, in seconds).
+pub const MAX_LOGIN_SESSION_LIFETIME_SECS: u64 = 24 * 3600;
+
 /// The HMAC of a TOTP enrollment (RFC 6238). Part of the sealed enrollment:
 /// never renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -205,6 +210,7 @@ impl core::fmt::Debug for LoginValue {
 /// ```
 /// // The type itself is public: code can name it, and take one.
 /// use envcloak_core::vault::{AttemptLease, FieldKind, LoginFieldReader, LoginValue};
+/// #[allow(clippy::disallowed_methods)]
 /// fn sign_in(r: &LoginFieldReader<'_>, lease: &AttemptLease) -> Option<LoginValue> {
 ///     r.open(lease, FieldKind::Password).ok()
 /// }
@@ -245,6 +251,11 @@ impl AttemptLease {
     pub fn item(&self) -> ItemId {
         self.item
     }
+
+    /// The item row revision this lease is bound to.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 }
 
 /// The one way to open a login field (see the module documentation): it
@@ -255,6 +266,38 @@ pub struct LoginFieldReader<'v> {
 }
 
 impl Vault {
+    /// Issues a lease for one sign-in or TOTP attempt against `item` at its
+    /// current revision. Fails with [`VaultErrorKind::Tampered`] unless the
+    /// vault verified, [`VaultErrorKind::UnknownItem`] if `item` does not
+    /// exist, and [`VaultErrorKind::LoginField`] if `item` is not a login.
+    pub fn issue_attempt_lease(&self, item: ItemId) -> Result<AttemptLease, VaultError> {
+        if self.integrity() != Integrity::Ok {
+            return Err(VaultErrorKind::Tampered.into());
+        }
+        let row = self
+            .state
+            .items
+            .get(&item)
+            .ok_or(VaultErrorKind::UnknownItem)?;
+        if row.class != ItemClass::Login {
+            return Err(VaultErrorKind::LoginField.into());
+        }
+        Ok(AttemptLease {
+            item,
+            revision: row.row_version,
+        })
+    }
+
+    /// Current revision (`row_version`) of a login item, or `None` if `item`
+    /// is missing or not a login.
+    pub fn login_revision(&self, item: ItemId) -> Option<u64> {
+        self.state
+            .items
+            .get(&item)
+            .filter(|r| r.class == ItemClass::Login)
+            .map(|r| r.row_version)
+    }
+
     /// The reader of this vault's login fields.
     pub fn login_fields(&self) -> LoginFieldReader<'_> {
         LoginFieldReader { vault: self }
@@ -328,6 +371,7 @@ fn login_field(v: &Vault, item: ItemId, kind: FieldKind) -> Option<(FieldId, u64
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::crypto::{

@@ -32,7 +32,7 @@ use std::fmt::Write as _;
 use envcloak_ipc::view::{
     AddedView, BackupView, CheckReport, ClassificationView, DeleteReport, EntryStatus,
     EnvFileState, EnvFileView, FileBackupCreatorView, FileChange, ImportItemView, ImportReport,
-    InitReport, ItemClassView, ItemView, ItemsView, LengthClass, RecoveredView,
+    InitReport, ItemClassView, ItemView, ItemsView, LengthClass, LoginAddedView, RecoveredView,
     RecoveryConfirmedView, RefChange, RefEditView, RefStatus, RemovedView, RotatedView, SkipReason,
     TargetView, UndoReport, View,
 };
@@ -444,6 +444,13 @@ impl Render for ItemView {
         }
         let _ = writeln!(o, "  provider: {}", shown_or_dash(self.provider.as_deref()));
         let _ = writeln!(o, "  kind: {}", kind_word(self.classification));
+        if let Some(l) = &self.login {
+            let _ = writeln!(o, "  tier: {}", l.tier.as_str());
+            let _ = writeln!(o, "  session lifetime: {}s", l.session_lifetime_secs);
+            if let Some(rev) = l.authorization_revision {
+                let _ = writeln!(o, "  authorization revision: {rev}");
+            }
+        }
         if let Some(x) = &self.exposed {
             let places: Vec<&str> = x.sources.iter().map(|k| k.words()).collect();
             // The mark stays until every value from before it is replaced.
@@ -574,6 +581,25 @@ impl Render for AddedView {
             shown(var),
             shown(&i.slug)
         );
+        o
+    }
+}
+
+impl Render for LoginAddedView {
+    fn human(&self) -> String {
+        let i = &self.item;
+        let mut o = String::new();
+        let _ = writeln!(o, "Added login {}.", shown(&i.slug));
+        let _ = writeln!(o, "  kind: {}", kind_word(i.classification));
+        if let Some(l) = &i.login {
+            let _ = writeln!(o, "  tier: {}", l.tier.as_str());
+            let _ = writeln!(o, "  session lifetime: {}s", l.session_lifetime_secs);
+            if let Some(rev) = l.authorization_revision {
+                let _ = writeln!(o, "  authorization revision: {rev}");
+            }
+        }
+        let fields: Vec<String> = i.fields.iter().map(|f| shown(&f.name)).collect();
+        let _ = writeln!(o, "  fields: {}", fields.join(", "));
         o
     }
 }
@@ -905,17 +931,25 @@ pub fn rotate_statement(t: &TargetView) -> String {
         shown(field),
         described(i)
     );
-    let _ = writeln!(
-        o,
-        "  The current value becomes the newest prior value; the vault keeps 3 at most ({} now).",
-        prior
-    );
-    let _ = writeln!(
-        o,
-        "  Grants that bind this item stay in force: {}, unless the new value is classified \
-         otherwise (test, live), which ends them.",
-        t.grants
-    );
+    if i.class == ItemClassView::Login {
+        let _ = writeln!(
+            o,
+            "  The current value is replaced and the login's authorization revision increases, \
+             ending its pending statements, authorizations, attempts and sessions."
+        );
+    } else {
+        let _ = writeln!(
+            o,
+            "  The current value becomes the newest prior value; the vault keeps 3 at most ({} now).",
+            prior
+        );
+        let _ = writeln!(
+            o,
+            "  Grants that bind this item stay in force: {}, unless the new value is classified \
+             otherwise (test, live), which ends them.",
+            t.grants
+        );
+    }
     o
 }
 
@@ -1453,6 +1487,7 @@ mod tests {
                 notes: None,
             }),
             exposed: None,
+            login: None,
         }
     }
 

@@ -238,6 +238,8 @@ pub struct State {
     anchored_vaults: BTreeSet<[u8; 16]>,
     /// Last rollback anchor synced for the currently unlocked vault.
     last_synced_anchor: Option<Anchor>,
+    /// Daemon TOTP state across login accounts (M2b-03).
+    totp: crate::totp::TotpState,
 }
 
 impl State {
@@ -249,6 +251,9 @@ impl State {
         } else {
             KeychainAnchorState::Unavailable
         };
+        let start_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         State {
             slot: probe(&paths),
             paths,
@@ -276,6 +281,7 @@ impl State {
             keychain_anchor,
             anchored_vaults: BTreeSet::new(),
             last_synced_anchor: None,
+            totp: crate::totp::TotpState::after_start(start_unix),
         }
     }
 
@@ -365,6 +371,11 @@ impl State {
     /// The passphrase attempt limiter, shared by every proof.
     pub fn limiter(&mut self) -> &mut AttemptLimiter {
         &mut self.limiter
+    }
+
+    /// Daemon TOTP state across login accounts.
+    pub fn totp(&self) -> &crate::totp::TotpState {
+        &self.totp
     }
 
     /// The unlocked vault, for a request that reads its metadata under the
@@ -1249,6 +1260,7 @@ impl State {
         let critical = matches!(
             e,
             AuditEvent::Removed { .. }
+                | AuditEvent::LoginReplaced { .. }
                 | AuditEvent::RecoveryConfirmed { .. }
                 | AuditEvent::UnlockerAdd { .. }
                 | AuditEvent::UnlockerRemove { .. }

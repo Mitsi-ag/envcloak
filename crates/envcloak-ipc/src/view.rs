@@ -79,6 +79,7 @@ views!(
     StandingListView,
     StandingRevokedView,
     StandingConfirmedView,
+    LoginAddedView,
 );
 
 fn is_zero_u32(v: &u32) -> bool {
@@ -778,6 +779,62 @@ pub struct ItemView {
     /// §6.5). Absent for an item never found.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exposed: Option<ExposedView>,
+    /// Login metadata, when `class == ItemClassView::Login` (SPEC §6.8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginView>,
+}
+
+/// Login item metadata (SPEC §6.8): never a username, password, TOTP seed,
+/// TOTP code, or adapter key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginView {
+    pub tier: LoginTierView,
+    pub session_lifetime_secs: u64,
+    pub totp: bool,
+    pub adapter_key: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_revision: Option<u64>,
+}
+
+/// A login item's sign-in tier (SPEC §6.8 "Approval").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginTierView {
+    Dev,
+    Each,
+    #[serde(alias = "never-agent")]
+    NeverAgent,
+}
+
+impl From<envcloak_core::vault::LoginTier> for LoginTierView {
+    fn from(t: envcloak_core::vault::LoginTier) -> Self {
+        match t {
+            envcloak_core::vault::LoginTier::Dev => LoginTierView::Dev,
+            envcloak_core::vault::LoginTier::Each => LoginTierView::Each,
+            envcloak_core::vault::LoginTier::NeverAgent => LoginTierView::NeverAgent,
+        }
+    }
+}
+
+impl From<LoginTierView> for envcloak_core::vault::LoginTier {
+    fn from(t: LoginTierView) -> Self {
+        match t {
+            LoginTierView::Dev => envcloak_core::vault::LoginTier::Dev,
+            LoginTierView::Each => envcloak_core::vault::LoginTier::Each,
+            LoginTierView::NeverAgent => envcloak_core::vault::LoginTier::NeverAgent,
+        }
+    }
+}
+
+impl LoginTierView {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LoginTierView::Dev => "dev",
+            LoginTierView::Each => "each",
+            LoginTierView::NeverAgent => "never-agent",
+        }
+    }
 }
 
 /// That an item's value was found outside the vault: since when, where,
@@ -881,6 +938,19 @@ impl ItemView {
             last_used_secs: d.last_used_at,
             notes: (!d.notes.is_empty()).then(|| d.notes.clone()),
         });
+        let login = m.login.map(|lm| LoginView {
+            tier: LoginTierView::from(lm.tier),
+            session_lifetime_secs: lm.session_lifetime,
+            totp: m
+                .fields
+                .iter()
+                .any(|f| f.kind == envcloak_core::vault::FieldKind::TotpSeed),
+            adapter_key: m
+                .fields
+                .iter()
+                .any(|f| f.kind == envcloak_core::vault::FieldKind::AdapterKey),
+            authorization_revision: None,
+        });
         ItemView {
             id: m.id.to_string(),
             slug: m.slug.as_str().to_owned(),
@@ -919,7 +989,16 @@ impl ItemView {
                     .collect(),
                 count: e.count,
             }),
+            login,
         }
+    }
+
+    /// Attaches the login item's current `authorization_revision`.
+    pub fn with_login_revision(mut self, revision: Option<u64>) -> Self {
+        if let Some(login) = &mut self.login {
+            login.authorization_revision = revision;
+        }
+        self
     }
 }
 
@@ -1057,6 +1136,13 @@ pub struct AddedView {
     /// Several providers' key patterns match the value; name one.
     pub ambiguous: bool,
     pub length: LengthClass,
+}
+
+/// `login.add`: the login item made (`envcloak login add`). Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoginAddedView {
+    pub item: ItemView,
 }
 
 /// `items.target`: what a `rotate` or `rm` would change.

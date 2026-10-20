@@ -351,6 +351,43 @@ pub fn read_secret_fd(fd: i32) -> Result<SecretBytes, InputError> {
     Ok(buf.freeze())
 }
 
+/// Reads one line from the inherited descriptor `fd` (up to [`MAX_VALUE`]
+/// bytes, with no NUL byte), without its line ending, one byte at a time so
+/// nothing past the line is consumed.
+pub fn read_value_fd(fd: i32) -> Result<SecretBytes, InputError> {
+    let mut file = File::from(envcloak_sys::inherited_fd(fd).map_err(|_| InputError::BadFd)?);
+    let mut buf = SecretBuf::with_capacity(MAX_VALUE);
+    let mut b = [0u8; 1];
+    let mut cr = false;
+    loop {
+        match file.read(&mut b) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(InputError::Io),
+        }
+        if b[0] == 0 {
+            b.zeroize();
+            return Err(InputError::NulByte);
+        }
+        if b[0] == b'\n' {
+            break;
+        }
+        if cr {
+            buf.extend(b"\r").map_err(|_| InputError::TooLong)?;
+        }
+        cr = b[0] == b'\r';
+        if !cr {
+            buf.extend(&b).map_err(|_| InputError::TooLong)?;
+        }
+    }
+    b.zeroize();
+    if buf.is_empty() {
+        return Err(InputError::Empty);
+    }
+    Ok(buf.freeze())
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::OwnedFd;

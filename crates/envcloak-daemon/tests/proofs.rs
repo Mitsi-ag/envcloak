@@ -134,6 +134,7 @@ fn a_caller_without_a_terminal_gives_no_proof() {
             account: None,
             detail: None,
             exposed: None,
+            login: None,
         },
         field: Some("value".into()),
         grants: 0,

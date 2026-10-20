@@ -17,6 +17,48 @@ pub enum Algorithm {
     Sha512,
 }
 
+impl Algorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Algorithm::Sha1 => "sha1",
+            Algorithm::Sha256 => "sha256",
+            Algorithm::Sha512 => "sha512",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, ParamsError> {
+        if s.eq_ignore_ascii_case("sha1") {
+            Ok(Algorithm::Sha1)
+        } else if s.eq_ignore_ascii_case("sha256") {
+            Ok(Algorithm::Sha256)
+        } else if s.eq_ignore_ascii_case("sha512") {
+            Ok(Algorithm::Sha512)
+        } else {
+            Err(ParamsError)
+        }
+    }
+}
+
+impl From<Algorithm> for envcloak_core::vault::TotpAlgorithm {
+    fn from(a: Algorithm) -> Self {
+        match a {
+            Algorithm::Sha1 => Self::Sha1,
+            Algorithm::Sha256 => Self::Sha256,
+            Algorithm::Sha512 => Self::Sha512,
+        }
+    }
+}
+
+impl From<envcloak_core::vault::TotpAlgorithm> for Algorithm {
+    fn from(a: envcloak_core::vault::TotpAlgorithm) -> Self {
+        match a {
+            envcloak_core::vault::TotpAlgorithm::Sha1 => Self::Sha1,
+            envcloak_core::vault::TotpAlgorithm::Sha256 => Self::Sha256,
+            envcloak_core::vault::TotpAlgorithm::Sha512 => Self::Sha512,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 /// Positive seconds per step. Construction rejects zero before arithmetic.
 pub struct Period(NonZeroU64);
@@ -63,6 +105,23 @@ impl TotpParams {
     }
     pub fn period(self) -> Period {
         self.period
+    }
+    pub fn to_vault_params(self) -> envcloak_core::vault::TotpParams {
+        envcloak_core::vault::TotpParams::new(
+            self.algorithm.into(),
+            self.digits,
+            self.period.seconds() as u32,
+        )
+        .expect("validated signin TotpParams are within vault TotpParams bounds")
+    }
+    pub fn from_vault_params(
+        params: envcloak_core::vault::TotpParams,
+    ) -> Result<Self, ParamsError> {
+        Self::new(
+            params.algorithm().into(),
+            params.digits(),
+            u64::from(params.period()),
+        )
     }
 }
 
@@ -164,4 +223,38 @@ fn calculate<D: hmac::EagerHash>(seed: &[u8], digits: u8, step: u64) -> Code {
         *binary /= 10;
     }
     Code(SecretBytes::copy_from(&out[..usize::from(digits)]))
+}
+
+/// Counts non-overlapping occurrences of `needle` in `haystack` that fall on
+/// ASCII digit boundaries (neither immediately preceded nor immediately
+/// followed by an ASCII digit `0..=9`). Used by gate b3 (`R-M2b-40`) to search
+/// bounded outputs for 6-digit TOTP codes without colliding with longer
+/// decimal numbers such as timestamps.
+pub fn count_digit_boundary_matches(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            let before_digit = i > 0 && haystack[i - 1].is_ascii_digit();
+            let after_digit =
+                i + needle.len() < haystack.len() && haystack[i + needle.len()].is_ascii_digit();
+            if !before_digit && !after_digit {
+                count += 1;
+                i += needle.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    count
+}
+
+/// Counts digit-boundary occurrences of `code` in `haystack` (`R-M2b-40`).
+#[allow(clippy::disallowed_methods)] // Bounded output search compares against the code's bytes.
+pub fn count_code_matches(haystack: &[u8], code: &Code) -> usize {
+    use secrecy::ExposeSecret;
+    count_digit_boundary_matches(haystack, code.as_secret().expose_secret())
 }

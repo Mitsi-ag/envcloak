@@ -897,6 +897,9 @@ fn respond<'s>(
         ItemsShow::NAME => answer::<ItemsShow>(id, &req, |p| items::show(shared, p)),
         ItemsCheck::NAME => answer::<ItemsCheck>(id, &req, |p| items::check(shared, p)),
         ItemsAdd::NAME => answer::<ItemsAdd>(id, &req, |p| items::add(shared, peer, p)),
+        proto::LoginAdd::NAME => {
+            answer::<proto::LoginAdd>(id, &req, |p| items::login_add(shared, peer, p))
+        }
         ItemsTarget::NAME => {
             answer::<ItemsTarget>(id, &req, |p| items::target_view(shared, peer, p))
         }
