@@ -1834,8 +1834,9 @@ fn step_s12_standing_approval_and_stdio_bridge(w: &mut StoryWorld, launch_id: &s
     );
     assert!(mcp_body.contains("build=v1"), "{mcp_body}");
     assert!(
-        mcp_body.contains("pcomm=envcloak"),
-        "expected daemon-started runner (`envcloak`) as parent of fixture-stdio: {mcp_body}"
+        (mcp_body.contains("pcomm=envcloak") || mcp_body.contains("pcomm=memfd:envcloak-"))
+            && !mcp_body.contains("pcomm=mcp-bridge"),
+        "expected daemon-started runner (`envcloak` or `memfd:envcloak-`) as parent of fixture-stdio: {mcp_body}"
     );
     assert!(
         mcp_body.contains(&format!("sha256={expected_stdio_sha}")),
@@ -2394,7 +2395,11 @@ sys.stdout.write(l2)
             .body,
     );
     assert!(body2.contains("build=v2"), "{body2}");
-    assert!(body2.contains("pcomm=envcloak"), "{body2}");
+    assert!(
+        (body2.contains("pcomm=envcloak") || body2.contains("pcomm=memfd:envcloak-"))
+            && !body2.contains("pcomm=mcp-bridge"),
+        "{body2}"
+    );
     assert!(body2.contains(&format!("sha256={stdio_digest}")), "{body2}");
 }
 
