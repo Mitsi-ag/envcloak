@@ -228,4 +228,6 @@ public enum Reason: String, CaseIterable, Sendable {
     case code_identity
     case rolled_back
     case keychain_anchor_missing
+    case invalid_otpauth
+    case live_dev
 }
