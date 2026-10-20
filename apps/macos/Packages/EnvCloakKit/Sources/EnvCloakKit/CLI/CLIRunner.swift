@@ -65,6 +65,10 @@ public struct CLIRunner: Sendable {
         _ = try await perform(arguments: ["daemon", "install", "--daemon", path], directory: "/", expectsJSON: false)
     }
 
+    public func uninstallDaemon() async throws {
+        _ = try await perform(arguments: ["daemon", "uninstall"], directory: "/", expectsJSON: false)
+    }
+
     /// The opaque receipt never enters JSON or the system UndoManager.
     public func recordBinding(arguments: [String], workingDirectory: String) async throws -> (CLIResult, UndoReceipt) {
         guard arguments.first == "ref", !arguments.contains(where: { $0.hasSuffix("-fd") }),

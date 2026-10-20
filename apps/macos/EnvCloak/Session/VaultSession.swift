@@ -22,10 +22,17 @@ struct Change: OptionSet {
     let items: ItemsStore
     let projects: ProjectsStore
     let grants: GrantsStore
+    let activity: ActivityStore
+    let agents: AgentsStore
+    let loginItem: LoginItemController
+    let cliInstaller: CLIInstaller
     let contextFactory: ContextFactory
     let keyStore: KeyStore
     let notifications: NotificationManager
     private let folders: ProjectFolders?
+    var screenLockMonitor: ScreenLockMonitor?
+    private(set) var cliStatus: CLIInstallStatus
+    private(set) var cliInstallOutcome: CLIInstallOutcome?
     var unlockKey: (any UnlockKeyAgreement)?
     var approvalSigner: (any ApprovalSigner)?
     var enrolledPublicKeysOverride: EnrolledPublicKeys?
@@ -36,6 +43,8 @@ struct Change: OptionSet {
     var enrolledTouchID = false
     var passphraseUnlockerRemoved = false
     var touchIDOnlyEnabled = false
+    var recoveryConfirmed = false
+    var latestDaemonHardeningSummary = "Hardened runtime, no core dumps, no debugger attach"
     var showMenuBarExtra = false
     var enrolmentPendingId: DaemonText?
     var enrolmentCommand: String?
@@ -99,6 +108,24 @@ struct Change: OptionSet {
         enrolledTouchID && !sshSession
     }
 
+    var passphrasePresent: Bool {
+        !passphraseUnlockerRemoved
+    }
+
+    var touchIDOnly: Bool {
+        touchIDOnlyEnabled
+    }
+
+    var daemonIdentitySummary: String {
+        if case .unverified = state {
+            return "unverified in this build"
+        }
+        if enrolledTeamID.isEmpty || enrolledTeamID == "CI00000000" {
+            return "unverified in this build"
+        }
+        return "verified (EnvCloak, Team \(enrolledTeamID))"
+    }
+
     init(
         client: (any WorkspaceClient)?,
         folders: ProjectFolders? = nil,
@@ -109,7 +136,11 @@ struct Change: OptionSet {
         approvalSigner: (any ApprovalSigner)? = nil,
         enrolledPublicKeysOverride: EnrolledPublicKeys? = nil,
         enrolledTouchID: Bool? = nil,
-        notifications: NotificationManager? = nil
+        notifications: NotificationManager? = nil,
+        loginItem: LoginItemController? = nil,
+        cliInstaller: CLIInstaller? = nil,
+        agents: AgentsStore? = nil,
+        lockSignalSource: (any LockSignalSource)? = nil
     ) {
         self.client = client
         self.folders = folders
@@ -124,10 +155,17 @@ struct Change: OptionSet {
         self.showMenuBarExtra = folders?.showMenuBarExtra ?? false
         let resolvedNotifications = notifications ?? NotificationManager()
         self.notifications = resolvedNotifications
+        let resolvedLoginItem = loginItem ?? LoginItemController()
+        self.loginItem = resolvedLoginItem
+        let resolvedCLIInstaller = cliInstaller ?? CLIInstaller()
+        self.cliInstaller = resolvedCLIInstaller
+        self.cliStatus = resolvedCLIInstaller.status()
         bindings = BindingHistory(runner: runner)
         items = ItemsStore(client: client)
         projects = ProjectsStore(client: client, folders: folders)
         grants = GrantsStore(client: client)
+        activity = ActivityStore(client: client)
+        self.agents = agents ?? AgentsStore()
         if let enrolledTouchID {
             self.enrolledTouchID = enrolledTouchID
         } else if unlockKey != nil || approvalSigner != nil || keyStore.hasEnrolledKeys() {
@@ -140,6 +178,10 @@ struct Change: OptionSet {
         resolvedNotifications.onOpenRequest = { [weak self] id in
             guard let self else { return }
             self.openApprovalWindow(for: id)
+        }
+        resolvedLoginItem.checkLaunchStatus()
+        if let lockSignalSource {
+            startScreenLockMonitor(source: lockSignalSource)
         }
     }
 
@@ -220,6 +262,14 @@ struct Change: OptionSet {
             guard captured == generation, !Task.isCancelled else { return }
             if notice == Self.busyNotice { notice = nil }
             proofWait = status.approvals.proof_wait_secs
+            let hardening = status.daemon.hardening
+            if hardening.core_dumps_off && hardening.non_dumpable {
+                latestDaemonHardeningSummary = "Hardened runtime, no core dumps, no debugger attach"
+            } else if hardening.core_dumps_off {
+                latestDaemonHardeningSummary = "Core dumps off"
+            } else {
+                latestDaemonHardeningSummary = "Development process (hardening unverified)"
+            }
             lockReason = switch status.lock.last_reason {
             case .idle: "Locked after \(Self.durationWords(status.lock.idle_limit_secs)) idle"
             case .sleep: "Locked when this Mac slept"
@@ -266,6 +316,10 @@ struct Change: OptionSet {
             guard captured == generation, !Task.isCancelled else { return }
             await grants.refetch(change)
             guard captured == generation, !Task.isCancelled else { return }
+            if !activity.entries.isEmpty {
+                await activity.refetch(change)
+                guard captured == generation, !Task.isCancelled else { return }
+            }
             if change.contains(.pending) {
                 await notifications.reconcile(
                     pending: grants.pending,
@@ -310,7 +364,7 @@ struct Change: OptionSet {
 
     private func clearMetadata() {
         bindings.clear()
-        items.clear(); projects.clear(); grants.clear()
+        items.clear(); projects.clear(); grants.clear(); activity.clear()
         selectedField = nil
         notifications.clear()
     }
@@ -398,6 +452,66 @@ struct Change: OptionSet {
             state = .locked
             lockReason = "Locked by request"
         } catch { fail(error) }
+    }
+
+    /// Sends `app.lock` when a screen-lock, sleep, or session-resign signal fires (`M3-17`, gate g7).
+    func lockForSignal(_ reason: AppLockReason) async {
+        guard let client, !locking else { return }
+        locking = true
+        actionInProgress = true
+        defer {
+            generation += 1
+            lastStatus = nil
+            clearMetadata()
+            pendingCount = 0
+            appRequestsCount = 0
+            proofWait = 0
+            locking = false
+            actionInProgress = false
+        }
+        generation += 1
+        lastStatus = nil
+        clearMetadata()
+        pendingCount = 0
+        appRequestsCount = 0
+        proofWait = 0
+        state = .connecting
+        do {
+            _ = try await client.call(MetadataRequest.appLock(reason))
+            state = .locked
+            lockReason = switch reason {
+            case .screenLock: "Locked when the screen locked"
+            case .sessionResign: "Locked when the user session switched"
+            case .user: "Locked by request"
+            }
+        } catch { fail(error) }
+    }
+
+    func startScreenLockMonitor(source: any LockSignalSource = WorkspaceLockSignalSource()) {
+        screenLockMonitor?.stop()
+        let monitor = ScreenLockMonitor(source: source) { [weak self] reason in
+            await self?.lockForSignal(reason)
+        }
+        screenLockMonitor = monitor
+        monitor.start()
+    }
+
+    func setTouchIDOnly(_ enabled: Bool) async {
+        if enabled {
+            _ = await enrollTouchIDOnlyUnlocker()
+        } else {
+            touchIDOnlyEnabled = false
+        }
+    }
+
+    func installCommandLineTool() {
+        let outcome = cliInstaller.install()
+        cliInstallOutcome = outcome
+        cliStatus = cliInstaller.status()
+    }
+
+    func requestNotificationPermission() async {
+        await notifications.requestAuthorizationIfNeeded()
     }
 
     func revoke(_ id: DaemonText) async {

@@ -64,6 +64,7 @@ architectures) as JSON on standard output, for the independent reader in
 scripts/macos/tests/ to compare.
 """
 
+import ctypes
 import json
 import os
 import plistlib
@@ -293,6 +294,23 @@ def unknown_keys(rel, data, allowed):
             fail("%s: holds %s, a key its source does not set" % (rel, key))
 
 
+def has_quarantine_xattr(path):
+    try:
+        fn = ctypes.CDLL(None).getxattr
+        fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_uint32,
+            ctypes.c_int,
+        ]
+        fn.restype = ctypes.c_ssize_t
+        return fn(os.fsencode(path), b"com.apple.quarantine", None, 0, 0, 0) >= 0
+    except Exception:
+        return False
+
+
 def bundles(app):
     info = read_plist(app, "Contents/Info.plist")
     if info is not None:
@@ -319,6 +337,8 @@ def bundles(app):
                     fail("%s: holds %s, a side door (SPEC §12)" % (rel, key))
     agent = read_plist(app, LAUNCH_AGENT)
     if agent is not None:
+        if has_quarantine_xattr(os.path.join(app, LAUNCH_AGENT)):
+            fail("%s: carries com.apple.quarantine" % LAUNCH_AGENT)
         for key in sorted(set(agent) | set(EXPECTED_AGENT)):
             if key not in EXPECTED_AGENT:
                 fail("%s: holds %s, which the agent's plist does not set" % (LAUNCH_AGENT, key))

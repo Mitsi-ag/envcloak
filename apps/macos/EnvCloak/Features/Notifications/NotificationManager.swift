@@ -174,6 +174,17 @@ struct ApprovalNotificationPayload: Equatable, Sendable {
         }
     }
 
+    func requestAuthorizationIfNeeded() async {
+        #if !ENVCLOAK_SCREEN_TESTS
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        if settings.authorizationStatus == .notDetermined {
+            _ = try? await center.requestAuthorization(options: [.alert, .sound, .badge])
+        }
+        #endif
+    }
+
     static func subjectLabel(_ subject: SubjectSummary) -> String {
         subject.label?.escaped ?? subject.kind.rawValue.capitalized
     }

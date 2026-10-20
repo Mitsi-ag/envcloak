@@ -148,6 +148,12 @@ actor ScriptedClient: WorkspaceClient {
     var lastPastedProvider: String?
     var lastPastedAccount: String?
     func pasteReceipt() -> (provider: String?, account: String?) { (lastPastedProvider, lastPastedAccount) }
+    var appLockReasons: [AppLockReason] = []
+    func recordedAppLockReasons() -> [AppLockReason] { appLockReasons }
+    var auditHasMorePages = false
+    func setAuditHasMorePages(_ enabled: Bool) { auditHasMorePages = enabled }
+    var auditVerifyPayload: [String: Any]?
+    func setAuditVerifyPayload(_ payload: [String: Any]?) { auditVerifyPayload = payload }
     func calls(_ name: String) -> Int { counts[name, default: 0] }
     private func item(_ i: Int) -> [String: Any] {
         var row: [String: Any] = ["id": "item-\(i)", "slug": "fixture-\(i)" + (hostileSlugs ? "\u{202e}\u{1b}[31m" : ""), "class": "secret", "title": "Fixture \(i)" + hostileSuffix,
@@ -518,6 +524,80 @@ actor ScriptedClient: WorkspaceClient {
         case "app.asks.decline":
             if asksCount > 0 { asksCount -= 1 }
             result = ["declined": "ASK0ABCD"]
+        case "app.lock":
+            if let req = method as? AppLock {
+                appLockReasons.append(req.reason)
+                lockReason = req.reason.rawValue
+            }
+            let wasUnlocked = vault == "unlocked"
+            vault = "locked"
+            grants = 0
+            result = ["was_unlocked": wasUnlocked]
+        case "app.audit.list":
+            let req = method as? AppAuditList
+            if let beforeSeq = req?.before_seq, beforeSeq == 2 {
+                result = [
+                    "entries": [
+                        [
+                            "seq": 1,
+                            "time_secs": 900,
+                            "kind": "unlock",
+                            "outcome": "ok",
+                            "subject": NSNull(),
+                            "project_dir": NSNull(),
+                            "slugs": [],
+                            "argv_masked": [],
+                            "reason": "touch_id",
+                            "grant": NSNull(),
+                            "request": NSNull(),
+                        ] as [String: Any]
+                    ],
+                    "next_before_seq": NSNull(),
+                ]
+            } else {
+                result = [
+                    "entries": [
+                        [
+                            "seq": 2,
+                            "time_secs": 1000,
+                            "kind": "delivered",
+                            "outcome": "ok",
+                            "subject": [
+                                "kind": "agent",
+                                "agent": "claude_code" + hostileSuffix,
+                                "pid": 100,
+                                "root_pid": 90,
+                                "root_exe": "/usr/local/bin/claude",
+                            ] as [String: Any],
+                            "project_dir": "/tmp/project" + hostileSuffix,
+                            "slugs": ["stripe/acme-test" + hostileSuffix],
+                            "argv_masked": ["npm", "test" + hostileSuffix, "--token=[REDACTED]"],
+                            "reason": NSNull(),
+                            "grant": "grant-1",
+                            "request": "REQ0ABCD",
+                        ] as [String: Any]
+                    ],
+                    "next_before_seq": auditHasMorePages ? 2 : NSNull(),
+                ]
+            }
+        case "audit.verify":
+            result = auditVerifyPayload ?? [
+                "segments": 1,
+                "entries": 2,
+                "last_seq": 2,
+                "first_problem": NSNull(),
+                "problems": 0,
+                "anchor": [
+                    "state": "matched",
+                    "seq": 2,
+                ] as [String: Any],
+                "unanchored_tail": NSNull(),
+                "torn_tail": false,
+                "torn_bytes": 0,
+                "live_head_matches": true,
+                "queued": 0,
+                "dropped": 0,
+            ]
         case "lock": vault = "locked"; result = ["was_unlocked": true]
         default: throw EnvCloakError.protocolError
         }
@@ -1156,11 +1236,9 @@ final class SessionTests: XCTestCase {
     }
 
     func testUnavailableRoutesNeverAdvertiseShippedFeatures() {
-        XCTAssertNil(Route.approvals.unavailableMessage)
-        for route in [Route.activity, .agents] {
-            XCTAssertEqual(route.unavailableMessage, "Arrives with Touch ID approvals")
+        for route in [Route.approvals, .activity, .agents, .keys(.exposed)] {
+            XCTAssertNil(route.unavailableMessage)
         }
-        XCTAssertNil(Route.keys(.exposed).unavailableMessage)
         XCTAssertEqual(Route.later(.spend).unavailableMessage, "Spend arrives in M4")
         XCTAssertEqual(Route.later(.devices).unavailableMessage, "Devices arrive in M5")
     }
@@ -2056,6 +2134,426 @@ final class SessionTests: XCTestCase {
         session.selectedField = DaemonText("secondary")
         await session.selectKey(DaemonText("fixture-0"))
         XCTAssertNil(session.selectedField)
+    }
+
+    @MainActor func testScreenLockMonitorSendsAppLockDropsGrantsAndHidesRevealedSecret() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(grants: 2, vault: "unlocked")
+        let signer = SoftwareApprovalSigner()
+        let source = FakeLockSignalSource()
+        let session = VaultSession(
+            client: client,
+            approvalSigner: signer,
+            enrolledTouchID: true,
+            lockSignalSource: source
+        )
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(session.grants.rows.count, 2)
+
+        let item = try XCTUnwrap(session.items.rows.first)
+        let sightModel = KeySightModel(slug: item.slug, field: DaemonText("value"))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 360),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let sheet = RevealSheet(
+            session: session,
+            item: item,
+            field: DaemonText("value"),
+            model: sightModel
+        )
+        let host = NSHostingView(rootView: sheet)
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil); window.contentView = nil }
+        host.layoutSubtreeIfNeeded()
+
+        await sightModel.performSight(session)
+        XCTAssertTrue(sightModel.isShown)
+        XCTAssertTrue(sightModel.hasSecretBuffer)
+
+        source.emit(.screenLocked)
+        for _ in 0..<40 where session.state != .locked {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertTrue(session.grants.rows.isEmpty)
+        XCTAssertFalse(sightModel.isShown)
+        XCTAssertFalse(sightModel.hasSecretBuffer)
+        let reasonsAfterLock = await client.recordedAppLockReasons()
+        XCTAssertEqual(reasonsAfterLock, [.screenLock])
+
+        await client.configure(grants: 1, vault: "unlocked")
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        source.emit(.screensDidSleep)
+        for _ in 0..<40 where session.state != .locked {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(session.state, .locked)
+        let reasonsAfterSleep = await client.recordedAppLockReasons()
+        XCTAssertEqual(reasonsAfterSleep, [.screenLock, .screenLock])
+
+        await client.configure(grants: 1, vault: "unlocked")
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        source.emit(.sessionDidResign)
+        for _ in 0..<40 where session.state != .locked {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(session.state, .locked)
+        let reasonsAfterSwitch = await client.recordedAppLockReasons()
+        XCTAssertEqual(reasonsAfterSwitch, [.screenLock, .screenLock, .sessionResign])
+    }
+
+    func testGuaranteesTableEqualsSpecSection1_1() throws {
+        let testFile = URL(fileURLWithPath: #filePath)
+        let repoRoot = testFile
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repoSpecURL = repoRoot.appendingPathComponent("docs/SPEC.md")
+        let tmpCopyURL = URL(fileURLWithPath: "/tmp/ec-spec-copy.md")
+        let specURL = (repoSpecURL.path.hasPrefix("/Volumes/") && FileManager.default.fileExists(atPath: tmpCopyURL.path))
+            ? tmpCopyURL
+            : repoSpecURL
+        let specMarkdown = try String(contentsOf: specURL, encoding: .utf8)
+        let parsedRows = GuaranteesTable.parse(specMarkdown: specMarkdown)
+        XCTAssertEqual(parsedRows.count, 6)
+        XCTAssertEqual(GuaranteesTable.rows, parsedRows)
+        let unshippedModes = GuaranteesTable.rows.filter { !$0.isAvailableInThisRelease }.map(\.mode)
+        XCTAssertEqual(
+            unshippedModes,
+            [
+                "Proxy (HTTPS APIs; M6)",
+                "Native credential helpers (AWS, git, Docker, kube; M9)",
+                "Dev sign-in (own apps and test accounts; M2b)",
+            ]
+        )
+    }
+
+    @MainActor func testActivityStorePagingVerifyAndFilterTokens() async throws {
+        let client = ScriptedClient()
+        await client.hostileMetadata()
+        await client.setAuditHasMorePages(true)
+        let store = ActivityStore(client: client)
+
+        await store.refetch(.all)
+        XCTAssertEqual(store.entries.count, 1)
+        let first = try XCTUnwrap(store.entries.first)
+        XCTAssertEqual(first.seq, 2)
+        XCTAssertEqual(store.nextBeforeSeq, 2)
+        XCTAssertTrue(store.hasMore)
+        XCTAssertEqual(
+            ActivityEventPresentation.escapedCommandLine(first),
+            "npm test\\u{202e}\\u{1b}[31m --token=[REDACTED]"
+        )
+
+        await store.loadMore()
+        XCTAssertEqual(store.entries.map(\.seq), [2, 1])
+        XCTAssertFalse(store.hasMore)
+
+        await store.verifyLog()
+        XCTAssertEqual(
+            store.verifySummary,
+            "All 2 entries check out. The last one is anchored in the vault."
+        )
+        XCTAssertEqual(store.verifyIsOK, true)
+    }
+
+    @MainActor func testLoginItemMigrationUninstallsCLIBeforeRegisteringAndNeverRunsBoth() async {
+        var operations: [String] = []
+        var cliPresent = true
+        let fakeService = FakeLoginItemService(
+            onRegisterAgent: {
+                XCTAssertFalse(cliPresent, "SMAppService.agent must never be registered while CLI LaunchAgent is still installed")
+                operations.append("register_agent")
+            }
+        )
+        let controller = LoginItemController(
+            service: fakeService,
+            cliAgentDetector: { cliPresent },
+            cliDaemonUninstaller: {
+                operations.append("uninstall_cli")
+                cliPresent = false
+            },
+            bundlePathProvider: { "/Applications/EnvCloak.app" }
+        )
+
+        let ok = await controller.registerBackgroundAgent()
+        XCTAssertTrue(ok)
+        XCTAssertEqual(operations, ["uninstall_cli", "register_agent"])
+        XCTAssertEqual(controller.agentStatus, .enabled)
+
+        // When CLI daemon uninstall fails, SMAppService.agent must NEVER be registered.
+        operations.removeAll()
+        cliPresent = true
+        fakeService.currentAgentStatus = .notRegistered
+        let failingController = LoginItemController(
+            service: fakeService,
+            cliAgentDetector: { cliPresent },
+            cliDaemonUninstaller: {
+                operations.append("uninstall_cli_failed")
+                throw CLIError.failed(1)
+            },
+            bundlePathProvider: { "/Applications/EnvCloak.app" }
+        )
+        let failedResult = await failingController.registerBackgroundAgent()
+        XCTAssertFalse(failedResult)
+        XCTAssertEqual(operations, ["uninstall_cli_failed"])
+        XCTAssertEqual(failingController.agentStatus, .notRegistered)
+    }
+
+    @MainActor func testLoginItemCheckAtLaunchShowsRequiresApprovalBannerAndReRegistersOnMove() {
+        var operations: [String] = []
+        let fakeService = FakeLoginItemService(
+            initialAgentStatus: .requiresApproval,
+            onRegisterAgent: { operations.append("register_agent") },
+            onUnregisterAgent: { operations.append("unregister_agent") }
+        )
+        let controller = LoginItemController(
+            service: fakeService,
+            cliAgentDetector: { false },
+            cliDaemonUninstaller: {},
+            bundlePathProvider: { fakeService.currentBundlePath }
+        )
+        controller.lastRegisteredBundlePath = "/Applications/EnvCloak.app"
+
+        controller.checkStatusOnLaunch()
+        XCTAssertEqual(controller.agentStatus, .requiresApproval)
+        XCTAssertEqual(controller.banner, "Background item disabled in Login Items")
+        XCTAssertTrue(controller.showsApprovalBanner)
+        XCTAssertTrue(operations.isEmpty)
+
+        // Moving the app bundle triggers unregister + re-register on launch check.
+        fakeService.currentBundlePath = "/Users/Shared/EnvCloak.app"
+        controller.checkStatusOnLaunch()
+        XCTAssertEqual(operations, ["unregister_agent", "register_agent"])
+        XCTAssertEqual(controller.lastRegisteredBundlePath, "/Users/Shared/EnvCloak.app")
+    }
+
+    func testCLIInstallerLinksFirstWritableCandidateWarnsOnShadowAndFallsBackToManualLn() throws {
+        let root = URL(fileURLWithPath: "/tmp/ec-cli-install-" + UUID().uuidString.prefix(8))
+        let shadowDir = root.appendingPathComponent("shadow-bin")
+        let writableDir = root.appendingPathComponent("writable-bin")
+        let bundledBinary = root.appendingPathComponent("EnvCloak.app/Contents/MacOS/envcloak")
+        try FileManager.default.createDirectory(at: shadowDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: writableDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: bundledBinary.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("#!/bin/sh\n".utf8).write(to: bundledBinary)
+        let shadowBinary = shadowDir.appendingPathComponent("envcloak")
+        try Data("#!/bin/sh\n".utf8).write(to: shadowBinary)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let installer = CLIInstaller(
+            bundledCLIPath: bundledBinary.path,
+            candidateDirectories: ["/nonexistent/unwritable/bin", writableDir.path],
+            searchDirectories: [shadowDir.path, writableDir.path]
+        )
+        let outcome = installer.install()
+        let expectedLink = writableDir.appendingPathComponent("envcloak").path
+        XCTAssertEqual(
+            outcome,
+            .installed(
+                linkPath: expectedLink,
+                targetPath: bundledBinary.path,
+                shadowedBy: shadowBinary.path
+            )
+        )
+        let status = installer.status()
+        XCTAssertTrue(status.isInstalled)
+        XCTAssertEqual(status.installedLinkPath, expectedLink)
+        XCTAssertEqual(status.shadowedBy, shadowBinary.path)
+
+        let unwritableInstaller = CLIInstaller(
+            bundledCLIPath: "/Applications/EnvCloak.app/Contents/MacOS/envcloak",
+            candidateDirectories: ["/nonexistent/unwritable/bin"]
+        )
+        let fallback = unwritableInstaller.install()
+        if case .manualCommand(let command, _) = fallback {
+            XCTAssertEqual(
+                command,
+                "ln -sf '/Applications/EnvCloak.app/Contents/MacOS/envcloak' '/nonexistent/unwritable/bin/envcloak'"
+            )
+        } else {
+            XCTFail("Expected manualCommand fallback, got \(fallback)")
+        }
+    }
+
+    @MainActor func testAgentsCoverageNeverShowsActiveWhenDegradedAndSortsFailedProbesFirst() async throws {
+        let statusJSON = """
+        {
+          "agents": [
+            {
+              "agent": "claude_code",
+              "name": "Claude Code",
+              "tier": 1,
+              "version": "1.2.3",
+              "exe": "/usr/local/bin/claude",
+              "surfaces": [
+                {
+                  "surface": "prompt_to_model",
+                  "state": "active",
+                  "reasons": [],
+                  "probe": "passed",
+                  "skipped": []
+                },
+                {
+                  "surface": "shell",
+                  "state": "degraded",
+                  "reasons": ["hook_missing"],
+                  "probe": "failed",
+                  "skipped": []
+                }
+              ],
+              "envcloak_server": {
+                "availability": "active",
+                "reasons": [],
+                "probe": "passed",
+                "sentinel": "not_run"
+              }
+            }
+          ]
+        }
+        """
+        let installPreviewJSON = """
+        {
+          "hosts": [
+            {
+              "host": "claude_code",
+              "version": "1.2.3",
+              "found": "/usr/local/bin/claude",
+              "changes": [
+                {
+                  "path": "/tmp/.claude/settings.json",
+                  "what": "install PreToolUse hook"
+                }
+              ]
+            }
+          ],
+          "project": null,
+          "applied": false,
+          "complete": true
+        }
+        """
+        let installAppliedJSON = installPreviewJSON.replacingOccurrences(of: "\"applied\": false", with: "\"applied\": true")
+
+        let decoded = try JSONDecoder().decode(AgentStatusReport.self, from: Data(statusJSON.utf8))
+        let row = try XCTUnwrap(decoded.agents.first)
+        XCTAssertEqual(row.sortedSurfaces.map(\.surface), [.shell, .promptToModel])
+
+        let shellSurface = try XCTUnwrap(row.surfaces.first { $0.surface == .shell })
+        XCTAssertEqual(shellSurface.state, .degraded)
+        XCTAssertEqual(shellSurface.displayedState, .degraded)
+        XCTAssertNotEqual(shellSurface.displayedState, .active)
+        XCTAssertEqual(shellSurface.formattedLine, "degraded (hook_missing; probe=failed)")
+        XCTAssertEqual(
+            shellSurface.humanReasonSummary,
+            "EnvCloak hook is missing from the host configuration"
+        )
+
+        final class CLIRecorder: @unchecked Sendable {
+            var invocations: [[String]] = []
+        }
+        let recorder = CLIRecorder()
+        let store = AgentsStore { args in
+            recorder.invocations.append(args)
+            if args.contains("status") {
+                return CLIOutput(exitCode: 0, json: statusJSON, errorText: "")
+            }
+            if args.contains("--yes") {
+                return CLIOutput(exitCode: 0, json: installAppliedJSON, errorText: "")
+            }
+            return CLIOutput(exitCode: 0, json: installPreviewJSON, errorText: "")
+        }
+
+        await store.refresh()
+        XCTAssertEqual(store.agents.first?.surfaces.map(\.surface), [.shell, .promptToModel])
+
+        await store.prepareInstall(for: "claude_code")
+        XCTAssertEqual(
+            recorder.invocations.last,
+            ["agents", "install", "--json", "--agent", "claude_code"]
+        )
+        XCTAssertEqual(store.pendingInstallPlan?.plannedFilePaths, ["/tmp/.claude/settings.json"])
+
+        await store.confirmInstall()
+        XCTAssertTrue(
+            recorder.invocations.contains(["agents", "install", "--yes", "--json", "--agent", "claude_code"])
+        )
+        XCTAssertNil(store.pendingInstallPlan)
+        XCTAssertEqual(store.notice, "Updated integration files: /tmp/.claude/settings.json.")
+    }
+}
+
+@MainActor final class FakeLockSignalSource: LockSignalSource {
+    private var handler: (@MainActor (LockSignal) -> Void)?
+
+    func start(handler: @escaping @MainActor (LockSignal) -> Void) {
+        self.handler = handler
+    }
+
+    func stop() {
+        handler = nil
+    }
+
+    func emit(_ signal: LockSignal) {
+        handler?(signal)
+    }
+}
+
+final class FakeLoginItemService: LoginItemService, @unchecked Sendable {
+    var currentAgentStatus: LoginItemStatus
+    var currentMainAppStatus: LoginItemStatus
+    var currentBundlePath = "/Applications/EnvCloak.app"
+    var onRegisterAgent: (() -> Void)?
+    var onUnregisterAgent: (() -> Void)?
+    var openedSettingsCount = 0
+
+    init(
+        initialAgentStatus: LoginItemStatus = .notRegistered,
+        initialMainAppStatus: LoginItemStatus = .notRegistered,
+        onRegisterAgent: (() -> Void)? = nil,
+        onUnregisterAgent: (() -> Void)? = nil
+    ) {
+        self.currentAgentStatus = initialAgentStatus
+        self.currentMainAppStatus = initialMainAppStatus
+        self.onRegisterAgent = onRegisterAgent
+        self.onUnregisterAgent = onUnregisterAgent
+    }
+
+    func agentStatus() -> LoginItemStatus {
+        currentAgentStatus
+    }
+
+    func registerAgent() throws {
+        onRegisterAgent?()
+        currentAgentStatus = .enabled
+    }
+
+    func unregisterAgent() throws {
+        onUnregisterAgent?()
+        currentAgentStatus = .notRegistered
+    }
+
+    func mainAppStatus() -> LoginItemStatus {
+        currentMainAppStatus
+    }
+
+    func setMainAppEnabled(_ enabled: Bool) throws {
+        currentMainAppStatus = enabled ? .enabled : .notRegistered
+    }
+
+    func openSystemSettingsLoginItems() {
+        openedSettingsCount += 1
     }
 }
 

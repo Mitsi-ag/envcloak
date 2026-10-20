@@ -55,8 +55,12 @@ struct MainView: View {
                     .tag(Route.approvals)
                     .accessibilityElement(children: .contain)
                     .accessibilityIdentifier("sidebar.Approvals")
-                    unavailableRow(.activity, icon: "clock.arrow.circlepath")
-                    unavailableRow(.agents, icon: "terminal")
+                    Label("Activity", systemImage: "clock.arrow.circlepath")
+                        .tag(Route.activity)
+                        .accessibilityIdentifier("sidebar.Activity")
+                    Label("Agents", systemImage: "terminal")
+                        .tag(Route.agents)
+                        .accessibilityIdentifier("sidebar.Agents")
                     Label("Settings", systemImage: "gearshape").tag(Route.settings)
                 }
                 Section("Later") {
@@ -68,6 +72,19 @@ struct MainView: View {
         } detail: {
             ZStack(alignment: .top) {
                 VStack(spacing: 0) {
+                    if session.loginItem.showsApprovalBanner {
+                        HStack {
+                            Text(LoginItemController.approvalBannerText)
+                            Spacer()
+                            Button(LoginItemController.openLoginItemsTitle) {
+                                session.loginItem.openSystemSettings()
+                            }
+                            .accessibilityIdentifier("main.loginItem.open")
+                        }
+                        .padding(12)
+                        .background(ECToken.raised.color)
+                        .accessibilityIdentifier("main.loginItem.banner")
+                    }
                     if let notice = session.notice {
                         HStack { Text(notice); Spacer(); Button("Dismiss") { session.notice = nil } }.padding(12)
                             .background(ECToken.raised.color).accessibilityIdentifier("session.notice")
@@ -274,32 +291,12 @@ struct MainView: View {
             case .keys(let filter): KeysView(session: session, filter: filter, query: query, scope: scope, grouping: $grouping, selectedKey: $selectedKey)
             case .key(let slug): KeyInspector(session: session, slug: slug, route: $route, bind: { binding = $0 })
             case .approvals: ApprovalsView(session: session, scope: scope)
-            case .settings:
-                VStack(alignment: .leading, spacing: 16) {
-                    DevelopmentBanner()
-                    EnrolView(session: session)
-                    Toggle(
-                        "Show EnvCloak in the menu bar",
-                        isOn: Binding(
-                            get: { session.showMenuBarExtra },
-                            set: { session.setShowMenuBarExtra($0) }
-                        )
-                    )
-                    .accessibilityIdentifier("settings.menuBar")
-                    Text("Unlock in Terminal with envcloak unlock. Touch ID, Recovery Kit settings and agent integrations arrive in later builds.")
-                    Text("Policies and the idle limit cannot be edited in this build.")
-                    Spacer()
-                }.padding()
+            case .activity: ActivityView(session: session, scope: scope, query: query)
+            case .agents: AgentsView(session: session)
+            case .settings: SettingsView(session: session)
             default: EmptyView()
             }
         }
-    }
-    private func unavailableRow(_ route: Route, icon: String) -> some View {
-        VStack(alignment: .leading) {
-            Label(route.title, systemImage: icon)
-            Text(route.unavailableMessage ?? "").font(.caption).foregroundStyle(ECToken.secondary.color)
-        }.tag(route).accessibilityElement(children: .contain)
-            .accessibilityIdentifier("sidebar." + route.title)
     }
 }
 

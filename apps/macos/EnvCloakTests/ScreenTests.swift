@@ -455,16 +455,11 @@ import XCTest
         await session.openProject(DaemonText("/tmp/project"))
         let window = host(MainView(session: session, initialRoute: .settings))
         await assertVisible("project\\u{202e}\\u{1b}[31m", in: window)
-        for title in ["Activity", "Agents"] {
-            await assertScoped("Arrives with Touch ID approvals", identifier: "sidebar." + title, in: window)
-        }
         await assertVisible("Spend · M4", in: window)
         await assertVisible("Devices · M5", in: window)
         window.close()
         for (route, expected) in [
-            (Route.activity, "Activity. Arrives with Touch ID approvals"),
-            (.agents, "Agents. Arrives with Touch ID approvals"),
-            (.later(.spend), "Spend. Spend arrives in M4"),
+            (Route.later(.spend), "Spend. Spend arrives in M4"),
             (.later(.devices), "Devices. Devices arrive in M5"),
             (.later(.dashboard), "Dashboard. Spend arrives in M4"),
         ] {
@@ -477,6 +472,14 @@ import XCTest
         await assertVisible("Nothing waiting. Requests from Claude Code, Codex and other agents appear here.", in: approvals)
         XCTAssertTrue(identified("feature.unavailable", in: approvals, accessibilityOnly: true).isEmpty)
         approvals.close()
+        let activity = host(MainView(session: session, initialRoute: .activity))
+        await assertVisible("Verify log", in: activity)
+        XCTAssertTrue(identified("feature.unavailable", in: activity, accessibilityOnly: true).isEmpty)
+        activity.close()
+        let agents = host(MainView(session: session, initialRoute: .agents))
+        await assertVisible("Run checks again", in: agents)
+        XCTAssertTrue(identified("feature.unavailable", in: agents, accessibilityOnly: true).isEmpty)
+        agents.close()
         let exposed = host(MainView(session: session, initialRoute: .keys(.exposed)))
         await assertVisible("No exposed keys.", in: exposed)
         XCTAssertTrue(identified("feature.unavailable", in: exposed, accessibilityOnly: true).isEmpty)
@@ -727,4 +730,188 @@ import XCTest
         measurement.lifetime = .keepAlways
         add(measurement)
     }
+
+    func testActivityScreenRendersEntriesEscapesHostileArgvAndVerifiesLog() async {
+        let client = ScriptedClient()
+        await client.hostileMetadata()
+        await client.setAuditHasMorePages(true)
+        let session = VaultSession(client: client)
+        await session.poll()
+        await session.activity.refetch(.all)
+
+        let window = host(ActivityView(session: session, scope: nil, query: ""))
+        await assertVisible("Delivered", in: window)
+        await assertVisible("claude_code\\u{202e}\\u{1b}[31m", in: window)
+        await assertVisible("npm test\\u{202e}\\u{1b}[31m --token=[REDACTED]", in: window)
+        await assertVisible("Load earlier entries", in: window)
+        await assertVisible("Verify log", in: window)
+        XCTAssertFalse(labels(window).contains { $0.contains("\u{202e}") || $0.contains("\u{1b}") })
+
+        await session.activity.verifyLog()
+        await assertVisible("All 2 entries check out. The last one is anchored in the vault.", in: window)
+        window.close()
+    }
+
+    func testAboutScreenRendersAllGuaranteesAndMarksUnshippedRows() async {
+        let client = ScriptedClient()
+        let session = VaultSession(client: client)
+        session.enrolledTeamID = "TEAM998877"
+        await session.poll()
+
+        let window = host(AboutView(session: session))
+        await assertVisible("What EnvCloak guarantees (SPEC §1.1)", in: window)
+        await assertVisible("Daemon identity: verified (EnvCloak, Team TEAM998877)", in: window)
+        for row in GuaranteesTable.rows {
+            await assertVisible(row.mode, in: window)
+            await assertVisible("EnvCloak guarantees: \(row.guarantees)", in: window)
+            await assertVisible("EnvCloak does not guarantee: \(row.doesNotGuarantee)", in: window)
+        }
+        let unshippedCount = labels(window).filter { $0 == GuaranteesTable.unshippedBadge }.count
+        XCTAssertEqual(unshippedCount, 3)
+        window.close()
+    }
+
+    func testSettingsScreenRendersAllTenSectionsAndTouchIDOnlyWarning() async {
+        let client = ScriptedClient()
+        let session = VaultSession(client: client, enrolledTouchID: true)
+        await session.poll()
+
+        let window = host(SettingsView(session: session))
+        await assertVisible("Unlock", in: window)
+        await assertVisible("Require Touch ID. Your login password will no longer approve.", in: window)
+        await assertVisible("Recovery Kit", in: window)
+        await assertVisible("Locking", in: window)
+        await assertVisible("Approvals", in: window)
+        await assertVisible("Standing approvals can last up to 30 days for test keys only, and require your password in Terminal.", in: window)
+        await assertVisible("Project policies", in: window)
+        await assertVisible("Menu bar", in: window)
+        await assertVisible("Command-line tool", in: window)
+        await assertVisible("Background item", in: window)
+        await assertVisible("Launch at login", in: window)
+        await assertVisible("About and limits", in: window)
+        window.close()
+    }
+
+    func testLoginItemRequiresApprovalBannerRendersInWorkspaceAndWelcomeSteps() async {
+        let client = ScriptedClient()
+        let fakeService = FakeLoginItemService(initialAgentStatus: .requiresApproval)
+        let controller = LoginItemController(
+            service: fakeService,
+            cliAgentDetector: { true },
+            cliDaemonUninstaller: {},
+            bundlePathProvider: { "/Applications/EnvCloak.app" }
+        )
+        let session = VaultSession(client: client, loginItem: controller)
+        await session.poll()
+
+        let mainWindow = host(MainView(session: session, initialRoute: .projects))
+        await assertVisible("Background item disabled in Login Items", in: mainWindow)
+        await assertVisible("Open Login Items", in: mainWindow)
+        mainWindow.close()
+
+        let welcomeBg = host(WelcomeView(session: session, initialStep: .backgroundItem))
+        await assertVisible("Background item, step 2 of 6", in: welcomeBg)
+        await assertVisible("Background item disabled in Login Items", in: welcomeBg)
+        await assertVisible("An existing command-line LaunchAgent (ai.envcloak.envcloakd) was detected. Enabling the app's background item removes it first so both never run at once.", in: welcomeBg)
+        welcomeBg.close()
+
+        let welcomeCLI = host(WelcomeView(session: session, initialStep: .cliTool))
+        await assertVisible("Command-line tool, step 4 of 6", in: welcomeCLI)
+        await assertVisible("Install command-line tool", in: welcomeCLI)
+        welcomeCLI.close()
+    }
+
+    func testAgentsScreenRendersDegradedNeverAsActiveAndShowsInstallConfirmation() async throws {
+        let statusJSON = """
+        {
+          "agents": [
+            {
+              "agent": "claude_code",
+              "name": "Claude Code",
+              "tier": 1,
+              "version": "1.0.0",
+              "exe": "/usr/local/bin/claude",
+              "probed": "yes",
+              "identified_by": "path",
+              "surfaces": [
+                {
+                  "surface": "prompt_to_model",
+                  "state": "active",
+                  "reasons": [],
+                  "probe": "passed",
+                  "skipped": []
+                },
+                {
+                  "surface": "shell",
+                  "state": "degraded",
+                  "reasons": ["hook_missing"],
+                  "probe": "failed",
+                  "skipped": []
+                }
+              ],
+              "envcloak_server": {
+                "availability": "ready",
+                "reasons": [],
+                "probe": "passed",
+                "sentinel": "verified"
+              }
+            }
+          ]
+        }
+        """
+        let installPreviewJSON = """
+        {
+          "hosts": [
+            {
+              "host": "claude_code",
+              "version": "1.0.0",
+              "found": "yes",
+              "changes": [
+                {
+                  "path": "~/.claude/settings.json",
+                  "what": "add PreToolUse hook"
+                }
+              ]
+            }
+          ],
+          "applied": false,
+          "complete": true
+        }
+        """
+        let agentsStore = AgentsStore(runCLI: { args in
+            if args.starts(with: ["agents", "status"]) {
+                return CLIOutput(exitCode: 0, json: statusJSON, errorText: "")
+            }
+            if args.starts(with: ["agents", "install"]) {
+                return CLIOutput(exitCode: 0, json: installPreviewJSON, errorText: "")
+            }
+            return CLIOutput(exitCode: 1, json: "", errorText: "unexpected")
+        })
+        let client = ScriptedClient()
+        let session = VaultSession(client: client, agents: agentsStore)
+        await session.poll()
+        await session.agents.refresh()
+
+        let window = host(AgentsView(session: session))
+        await assertVisible("Claude Code", in: window)
+        await assertVisible("degraded (hook_missing; probe=failed)", in: window)
+        await assertVisible("active (probe=passed)", in: window)
+        await assertVisible("EnvCloak hook is missing from the host configuration", in: window)
+        let allLabels = labels(window)
+        XCTAssertFalse(allLabels.contains { $0.contains("active (hook_missing") })
+        if let shellIdx = allLabels.firstIndex(of: "degraded (hook_missing; probe=failed)"),
+           let promptIdx = allLabels.firstIndex(of: "active (probe=passed)") {
+            XCTAssertLessThan(shellIdx, promptIdx, "Failed probe surface must be listed first")
+        } else {
+            XCTFail("Expected both degraded shell and active prompt-to-model surface lines in AgentsView")
+        }
+
+        await session.agents.prepareInstall(for: "claude_code")
+        await assertVisible("Install EnvCloak agent integration", in: window)
+        await assertVisible("~/.claude/settings.json", in: window)
+        await assertVisible("Write changes", in: window)
+        window.close()
+    }
 }
+
+

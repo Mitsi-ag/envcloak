@@ -508,6 +508,13 @@ class SignCheck(unittest.TestCase):
         os.remove(b.path(DAEMON_EXE))
         self.refused(b, "BundleProgram names a file the bundle lacks")
 
+    def test_a_quarantined_launch_agent_is_refused(self):
+        b = Bundle()
+        p = run(["xattr", "-w", "com.apple.quarantine", "0081;00000000;Test;", b.path(AGENT_PLIST)])
+        self.assertEqual(p.returncode, 0, p.stderr.decode())
+        b.sign()
+        self.refused(b, AGENT_PLIST + ": carries com.apple.quarantine")
+
 
 class CaseClashes(unittest.TestCase):
     """Names that differ only in case cannot both exist on this Mac's

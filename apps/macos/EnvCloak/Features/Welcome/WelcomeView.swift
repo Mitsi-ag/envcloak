@@ -25,10 +25,12 @@ enum WelcomeStep: Int, CaseIterable, Identifiable {
 }
 
 struct WelcomeView: View {
-    let session: VaultSession
+    @Bindable var session: VaultSession
     @State private var step: WelcomeStep
     @State private var scanModel: FirstRunScanModel
+    @State private var notifyWhenAgentAsks = false
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
 
     init(session: VaultSession, initialStep: WelcomeStep = .welcome, scanModel: FirstRunScanModel? = nil) {
         self.session = session
@@ -56,64 +58,15 @@ struct WelcomeView: View {
 
             switch step {
             case .welcome:
-                VStack(alignment: .leading, spacing: 16) {
-                    ECReveal(module: 8)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 32)
-                        .background(ECToken.plate.color)
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("Your AI agents use your API keys. They never see them.")
-                            .font(.title2)
-                            .foregroundStyle(ECToken.text.color)
-                        Text("Fully true in proxy mode for HTTPS APIs. In inject mode, the command you approve holds the key while it runs.")
-                            .foregroundStyle(ECToken.secondary.color)
-                        Spacer()
-                        HStack {
-                            Spacer()
-                            Button("Continue") { step = .backgroundItem }
-                                .buttonStyle(.borderedProminent)
-                        }
-                    }
-                    .padding(24)
-                }
+                welcomeStepView
             case .backgroundItem:
-                stepContainer(
-                    title: "Background process",
-                    bodyText: "EnvCloak keeps your vault in a background process that starts when you log in. It holds the vault key while it is unlocked, and nothing else does.",
-                    next: .vault
-                )
+                backgroundItemStepView
             case .vault:
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("Vault")
-                        .font(.title2)
-                        .foregroundStyle(ECToken.text.color)
-                    Text(session.state == .noVault
-                        ? "Create one in Terminal with envcloak vault create."
-                        : "Found your vault. Add Touch ID to it.")
-                        .foregroundStyle(ECToken.text.color)
-                    if session.state != .noVault {
-                        EnrolView(session: session)
-                    }
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        Button("Continue") { step = .cliTool }
-                            .buttonStyle(.borderedProminent)
-                    }
-                }
-                .padding(24)
+                vaultStepView
             case .cliTool:
-                stepContainer(
-                    title: "Command-line tool",
-                    bodyText: "Agents and your terminal use the envcloak command.",
-                    next: .menuAndNotifications
-                )
+                cliToolStepView
             case .menuAndNotifications:
-                stepContainer(
-                    title: "Menu bar and notifications",
-                    bodyText: "Show EnvCloak in the menu bar and get notified when an agent asks for a key.",
-                    next: .firstRunScan
-                )
+                menuAndNotificationsStepView
             case .firstRunScan:
                 FirstRunScanView(
                     model: scanModel,
@@ -124,20 +77,231 @@ struct WelcomeView: View {
         }
         .frame(minWidth: 720, minHeight: 540)
         .background(ECToken.background.color)
+        .task {
+            session.loginItem.refreshStatus()
+        }
     }
 
-    private func stepContainer(title: String, bodyText: String, next: WelcomeStep) -> some View {
+    private var welcomeStepView: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text(title)
+            ECReveal(module: 8)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 32)
+                .background(ECToken.plate.color)
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Your AI agents use your API keys. They never see them.")
+                    .font(.title2)
+                    .foregroundStyle(ECToken.text.color)
+                Text("Fully true in proxy mode for HTTPS APIs. In inject mode, the command you approve holds the key while it runs.")
+                    .foregroundStyle(ECToken.secondary.color)
+                Button("What EnvCloak does and does not guarantee.") {
+                    openWindow(id: WindowID.about)
+                }
+                .buttonStyle(.link)
+                .accessibilityIdentifier("welcome.guarantees")
+                Spacer()
+                HStack {
+                    Spacer()
+                    Button("Continue") { step = .backgroundItem }
+                        .buttonStyle(.borderedProminent)
+                        .accessibilityIdentifier("welcome.continue")
+                }
+            }
+            .padding(24)
+        }
+    }
+
+    private var backgroundItemStepView: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Background item, step 2 of 6")
                 .font(.title2)
                 .foregroundStyle(ECToken.text.color)
-            Text(bodyText)
+                .accessibilityIdentifier("welcome.background.heading")
+            Text("EnvCloak keeps your vault in a background process that starts when you log in. It holds the vault key while it is unlocked, and nothing else does.")
                 .foregroundStyle(ECToken.text.color)
+
+            if let banner = session.loginItem.banner {
+                HStack(spacing: 12) {
+                    Text(banner)
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(ECToken.warning.color)
+                    Spacer()
+                    Button("Open Login Items") {
+                        session.loginItem.openLoginItemsSettings()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("welcome.background.openLoginItems")
+                }
+                .padding(12)
+                .background(ECToken.raised.color)
+                .accessibilityIdentifier("welcome.background.banner")
+            }
+
+            if session.loginItem.cliLaunchAgentPresent {
+                HStack {
+                    Text("An existing command-line LaunchAgent (ai.envcloak.envcloakd) was detected. Enabling the app's background item removes it first so both never run at once.")
+                        .font(.caption)
+                        .foregroundStyle(ECToken.warning.color)
+                        .accessibilityIdentifier("welcome.background.cliMigrationNotice")
+                    Spacer()
+                    Button("Replace command-line background process") {
+                        Task { await session.loginItem.registerBackgroundAgent() }
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("welcome.background.migrateCLI")
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button("Turn on") {
+                    Task { await session.loginItem.registerBackgroundAgent() }
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("welcome.background.turnOn")
+
+                if session.loginItem.agentStatus == .enabled {
+                    Text("Background item enabled.")
+                        .font(.caption)
+                        .foregroundStyle(ECToken.success.color)
+                        .accessibilityIdentifier("welcome.background.enabled")
+                }
+            }
+
+            if let notice = session.loginItem.notice {
+                Text(notice)
+                    .font(.caption)
+                    .foregroundStyle(ECToken.secondary.color)
+                    .accessibilityIdentifier("welcome.background.notice")
+            }
+
             Spacer()
             HStack {
                 Spacer()
-                Button("Continue") { step = next }
+                Button("Continue") { step = .vault }
                     .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("welcome.background.continue")
+            }
+        }
+        .padding(24)
+    }
+
+    private var vaultStepView: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Vault")
+                .font(.title2)
+                .foregroundStyle(ECToken.text.color)
+            Text(session.state == .noVault
+                ? "Create one in Terminal with envcloak vault create."
+                : "Found your vault. Add Touch ID to it.")
+                .foregroundStyle(ECToken.text.color)
+            if session.state != .noVault {
+                EnrolView(session: session)
+            }
+            Spacer()
+            HStack {
+                Spacer()
+                Button("Continue") { step = .cliTool }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("welcome.vault.continue")
+            }
+        }
+        .padding(24)
+    }
+
+    private var cliToolStepView: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Command-line tool, step 4 of 6")
+                .font(.title2)
+                .foregroundStyle(ECToken.text.color)
+                .accessibilityIdentifier("welcome.cli.heading")
+            Text("Agents and your terminal use the envcloak command.")
+                .foregroundStyle(ECToken.text.color)
+
+            if let installed = session.cliStatus.installedLinkPath {
+                Text("Installed at \(Escape.display(installed))")
+                    .font(ECFont.martianMono(size: 11))
+                    .foregroundStyle(ECToken.success.color)
+                    .accessibilityIdentifier("welcome.cli.installed")
+            } else {
+                Button("Install command-line tool") {
+                    session.installCommandLineTool()
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("welcome.cli.install")
+            }
+
+            if let shadow = session.cliStatus.shadowedBy {
+                Text("Another envcloak earlier on PATH (\(Escape.display(shadow))) would shadow this link.")
+                    .font(.caption)
+                    .foregroundStyle(ECToken.warning.color)
+                    .accessibilityIdentifier("welcome.cli.shadowWarning")
+            }
+
+            if case .manualCommand(let command, let reason) = session.cliInstallOutcome {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(ECToken.secondary.color)
+                    Text(command)
+                        .font(ECFont.martianMono(size: 11))
+                        .foregroundStyle(ECToken.text.color)
+                        .textSelection(.enabled)
+                        .accessibilityIdentifier("welcome.cli.manualCommand")
+                }
+            }
+
+            Spacer()
+            HStack {
+                Button("Skip") { step = .menuAndNotifications }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button("Continue") { step = .menuAndNotifications }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("welcome.cli.continue")
+            }
+        }
+        .padding(24)
+    }
+
+    private var menuAndNotificationsStepView: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Menu bar and notifications")
+                .font(.title2)
+                .foregroundStyle(ECToken.text.color)
+            Text("Show EnvCloak in the menu bar and get notified when an agent asks for a key.")
+                .foregroundStyle(ECToken.text.color)
+
+            Toggle(
+                "Show EnvCloak in the menu bar",
+                isOn: Binding(
+                    get: { session.showMenuBarExtra },
+                    set: { session.setShowMenuBarExtra($0) }
+                )
+            )
+            .accessibilityIdentifier("welcome.menuBar")
+
+            Toggle(
+                "Tell me when an agent asks for a key",
+                isOn: Binding(
+                    get: { notifyWhenAgentAsks },
+                    set: { enabled in
+                        notifyWhenAgentAsks = enabled
+                        if enabled {
+                            Task { await session.requestNotificationPermission() }
+                        }
+                    }
+                )
+            )
+            .accessibilityIdentifier("welcome.notifications")
+
+            Spacer()
+            HStack {
+                Button("Skip") { step = .firstRunScan }
+                    .buttonStyle(.bordered)
+                Spacer()
+                Button("Continue") { step = .firstRunScan }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("welcome.menu.continue")
             }
         }
         .padding(24)

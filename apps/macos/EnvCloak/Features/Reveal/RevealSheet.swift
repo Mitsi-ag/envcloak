@@ -231,6 +231,9 @@ struct RevealSheet: View {
         .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.sessionDidResignActiveNotification)) { _ in
             model.hideNow()
         }
+        .onReceive(NotificationCenter.default.publisher(for: ScreenLockMonitor.didLockNotification)) { _ in
+            model.hideNow()
+        }
         .onChange(of: session.state) { _, state in
             if state != .ready {
                 model.hideNow()
