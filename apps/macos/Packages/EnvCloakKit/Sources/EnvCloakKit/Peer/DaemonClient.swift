@@ -42,7 +42,7 @@ public actor DaemonClient {
     }
 
     public func call<M: DaemonMethod & ~Copyable>(_ method: consuming M) async throws(EnvCloakError) -> M.Output {
-        let slot = M.name == "lock" ? 1 : 0
+        let slot = (M.name == "lock" || M.name == "app.lock") ? 1 : 0
         if slot == 1 { cancelPending() }
         let captured = generation
         if busy[slot] {

@@ -808,4 +808,91 @@ public struct AppAsksDecline: DaemonMethod, CustomStringConvertible, CustomDebug
     }
 }
 
+public struct AppLock: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = LockedView
+    public static let name = "app.lock"
+    public let reason: AppLockReason
+    public let claims: [String]
+    public init(reason: AppLockReason, claims: [String] = []) {
+        self.reason = reason
+        self.claims = claims
+    }
+    public var description: String { "[app.lock]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        try w.raw("\"reason\":"); try w.string(reason.rawValue)
+        if !claims.isEmpty { try w.raw(",\"claims\":"); try w.strings(claims) }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}
 
+public struct AppAuditList: DaemonMethod, CustomStringConvertible, CustomDebugStringConvertible {
+    public typealias Output = AppAuditListView
+    public static let name = "app.audit.list"
+    public let before_seq: UInt64?
+    public let limit: UInt64?
+    public let project: String?
+    public let item: String?
+    public let agent: String?
+    public let kinds: [String]
+    public let claims: [String]
+    public init(before_seq: UInt64? = nil, limit: UInt64? = nil, project: String? = nil,
+                item: String? = nil, agent: String? = nil, kinds: [String] = [], claims: [String] = []) {
+        self.before_seq = before_seq
+        self.limit = limit
+        self.project = project
+        self.item = item
+        self.agent = agent
+        self.kinds = kinds
+        self.claims = claims
+    }
+    public var description: String { "[app.audit.list]" }
+    public var debugDescription: String { description }
+    public func request(id: UInt64) throws -> Frame {
+        var w = try requestWriter(id: id, name: Self.name)
+        var comma = false
+        if let before_seq {
+            try w.raw("\"before_seq\":" + String(before_seq))
+            comma = true
+        }
+        if let limit {
+            if comma { try w.raw(",") }
+            try w.raw("\"limit\":" + String(limit))
+            comma = true
+        }
+        if let project {
+            if comma { try w.raw(",") }
+            try w.raw("\"project\":"); try w.string(project)
+            comma = true
+        }
+        if let item {
+            if comma { try w.raw(",") }
+            try w.raw("\"item\":"); try w.string(item)
+            comma = true
+        }
+        if let agent {
+            if comma { try w.raw(",") }
+            try w.raw("\"agent\":"); try w.string(agent)
+            comma = true
+        }
+        if !kinds.isEmpty {
+            if comma { try w.raw(",") }
+            try w.raw("\"kinds\":"); try w.strings(kinds)
+            comma = true
+        }
+        if !claims.isEmpty {
+            if comma { try w.raw(",") }
+            try w.raw("\"claims\":"); try w.strings(claims)
+        }
+        try w.raw("}}")
+        return w.frame()
+    }
+    public static func response(_ frame: borrowing Frame, id: UInt64) throws -> Output {
+        try frame.response(id: id)
+    }
+}

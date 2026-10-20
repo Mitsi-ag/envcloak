@@ -87,6 +87,71 @@ final class MethodTests: XCTestCase {
         let standingRevoke = try params(StandingRevoke(id: "01JSTAND", all: false))
         XCTAssertEqual(standingRevoke["id"] as? String, "01JSTAND")
         XCTAssertEqual(standingRevoke["all"] as? Bool, false)
+
+        for reason in [AppLockReason.screenLock, .sessionResign, .user] {
+            let lockParams = try params(AppLock(reason: reason, claims: ["ui"]))
+            XCTAssertEqual(lockParams["reason"] as? String, reason.rawValue)
+            XCTAssertEqual(lockParams["claims"] as? [String], ["ui"])
+        }
+
+        let auditParams = try params(
+            AppAuditList(
+                before_seq: 500,
+                limit: 200,
+                project: "/tmp/project",
+                item: "stripe/acme",
+                agent: "cursor",
+                kinds: ["run", "lock"],
+                claims: ["ui"]
+            )
+        )
+        XCTAssertEqual((auditParams["before_seq"] as? NSNumber)?.uint64Value, 500)
+        XCTAssertEqual((auditParams["limit"] as? NSNumber)?.uint64Value, 200)
+        XCTAssertEqual(auditParams["project"] as? String, "/tmp/project")
+        XCTAssertEqual(auditParams["item"] as? String, "stripe/acme")
+        XCTAssertEqual(auditParams["agent"] as? String, "cursor")
+        XCTAssertEqual(auditParams["kinds"] as? [String], ["run", "lock"])
+        XCTAssertEqual(auditParams["claims"] as? [String], ["ui"])
+
+        let auditReplyObject: [String: Any] = [
+            "entries": [
+                [
+                    "seq": 42,
+                    "time_secs": 1700000000,
+                    "kind": "run",
+                    "outcome": "covered",
+                    "subject": [
+                        "kind": "agent",
+                        "agent": "cursor\u{202e}",
+                        "pid": 123,
+                        "root_pid": 100,
+                        "root_exe": "/usr/local/bin/cursor",
+                    ],
+                    "project_dir": "/tmp/project\u{202e}",
+                    "slugs": ["stripe/acme"],
+                    "argv_masked": ["node", "index.js\u{202e}"],
+                    "grant": "01JGRANT",
+                    "request": "REQ0ABCD",
+                ],
+                [
+                    "seq": 41,
+                    "time_secs": 1699999990,
+                    "kind": "lock",
+                    "outcome": "locked",
+                    "reason": "screen_lock",
+                ],
+            ],
+            "next_before_seq": 41,
+        ]
+        let auditReplyBytes = try JSONSerialization.data(withJSONObject: ["jsonrpc": "2.0", "id": 1, "result": auditReplyObject])
+        let auditListView: AppAuditListView = try Frame(text: String(decoding: auditReplyBytes, as: UTF8.self)).response(id: 1)
+        XCTAssertEqual(auditListView.entries.count, 2)
+        XCTAssertEqual(auditListView.next_before_seq, 41)
+        XCTAssertEqual(auditListView.entries[0].subject?.agent?.escaped, "cursor\\u{202e}")
+        XCTAssertEqual(auditListView.entries[0].argv_masked.last?.escaped, "index.js\\u{202e}")
+        XCTAssertEqual(auditListView.entries[1].reason?.escaped, "screen_lock")
+        XCTAssertTrue(auditListView.entries[1].slugs.isEmpty)
+        XCTAssertTrue(auditListView.entries[1].argv_masked.isEmpty)
     }
 
     func testStatusSanitizesBothUntrustedStringsAndRejectsNestedExtras() throws {

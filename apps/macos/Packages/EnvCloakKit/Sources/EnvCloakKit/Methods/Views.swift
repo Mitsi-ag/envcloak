@@ -395,17 +395,20 @@ public struct RevokedView: Sendable, WireDecodable, CustomStringConvertible, Cus
     }
 }
 
-public struct LockedView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct LockedView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `was_unlocked`: Bool
     public var description: String { "[LockedView]" }
     public var debugDescription: String { description }
+    public init(was_unlocked: Bool) {
+        self.was_unlocked = was_unlocked
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["was_unlocked"])
         self.`was_unlocked` = try o.decode("was_unlocked")
     }
 }
 
-public struct AuditVerifyView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct AuditVerifyView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `segments`: UInt64
     public let `entries`: UInt64
     public let `last_seq`: UInt64
@@ -420,6 +423,23 @@ public struct AuditVerifyView: Sendable, WireDecodable, CustomStringConvertible,
     public let `dropped`: UInt64
     public var description: String { "[AuditVerifyView]" }
     public var debugDescription: String { description }
+    public init(segments: UInt64, entries: UInt64, last_seq: UInt64, first_problem: AuditProblemView? = nil,
+                problems: UInt64 = 0, anchor: AnchorView, unanchored_tail: SeqRange? = nil,
+                torn_tail: Bool = false, torn_bytes: UInt64 = 0, live_head_matches: Bool? = true,
+                queued: UInt64 = 0, dropped: UInt64 = 0) {
+        self.segments = segments
+        self.entries = entries
+        self.last_seq = last_seq
+        self.first_problem = first_problem
+        self.problems = problems
+        self.anchor = anchor
+        self.unanchored_tail = unanchored_tail
+        self.torn_tail = torn_tail
+        self.torn_bytes = torn_bytes
+        self.live_head_matches = live_head_matches
+        self.queued = queued
+        self.dropped = dropped
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["segments", "entries", "last_seq", "first_problem", "problems", "anchor", "unanchored_tail", "torn_tail", "torn_bytes", "live_head_matches", "queued", "dropped"])
         self.`segments` = try o.decode("segments")
@@ -437,11 +457,15 @@ public struct AuditVerifyView: Sendable, WireDecodable, CustomStringConvertible,
     }
 }
 
-public struct AuditProblemView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct AuditProblemView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `seq`: UInt64
     public let `kind`: AuditProblemKind
     public var description: String { "[AuditProblemView]" }
     public var debugDescription: String { description }
+    public init(seq: UInt64, kind: AuditProblemKind) {
+        self.seq = seq
+        self.kind = kind
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["seq", "kind"])
         self.`seq` = try o.decode("seq")
@@ -449,11 +473,15 @@ public struct AuditProblemView: Sendable, WireDecodable, CustomStringConvertible
     }
 }
 
-public struct AnchorView: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct AnchorView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `state`: AnchorState
     public let `seq`: UInt64?
     public var description: String { "[AnchorView]" }
     public var debugDescription: String { description }
+    public init(state: AnchorState, seq: UInt64? = nil) {
+        self.state = state
+        self.seq = seq
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["state", "seq"])
         self.`state` = try o.decode("state")
@@ -461,11 +489,15 @@ public struct AnchorView: Sendable, WireDecodable, CustomStringConvertible, Cust
     }
 }
 
-public struct SeqRange: Sendable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+public struct SeqRange: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
     public let `first`: UInt64
     public let `last`: UInt64
     public var description: String { "[SeqRange]" }
     public var debugDescription: String { description }
+    public init(first: UInt64, last: UInt64) {
+        self.first = first
+        self.last = last
+    }
     init(wire: WireReader) throws {
         let o = try wire.object(["first", "last"])
         self.`first` = try o.decode("first")
@@ -1743,3 +1775,99 @@ public struct AppAskDeclinedView: Sendable, Equatable, WireDecodable, CustomStri
     }
 }
 
+public enum AppLockReason: String, Sendable, Equatable, WireDecodable {
+    case `screenLock` = "screen_lock"
+    case `sessionResign` = "session_resign"
+    case `user` = "user"
+    init(wire: WireReader) throws {
+        guard let value = Self(rawValue: try wire.string()) else { throw EnvCloakError.protocolError }
+        self = value
+    }
+}
+
+public struct AppAuditSubjectView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `kind`: SubjectKind?
+    public let `agent`: DaemonText?
+    public let `pid`: Int32
+    public let `root_pid`: Int32?
+    public let `root_exe`: DaemonText?
+    public var description: String { "[AppAuditSubjectView]" }
+    public var debugDescription: String { description }
+    public init(kind: SubjectKind? = nil, agent: DaemonText? = nil, pid: Int32, root_pid: Int32? = nil, root_exe: DaemonText? = nil) {
+        self.kind = kind
+        self.agent = agent
+        self.pid = pid
+        self.root_pid = root_pid
+        self.root_exe = root_exe
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["kind", "agent", "pid", "root_pid", "root_exe"])
+        self.`kind` = try o.optional("kind")
+        self.`agent` = try o.optional("agent")
+        self.`pid` = try o.decode("pid")
+        self.`root_pid` = try o.optional("root_pid")
+        self.`root_exe` = try o.optional("root_exe")
+    }
+}
+
+public struct AppAuditEntryView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `seq`: UInt64
+    public let `time_secs`: UInt64
+    public let `kind`: DaemonText
+    public let `outcome`: DaemonText
+    public let `subject`: AppAuditSubjectView?
+    public let `project_dir`: DaemonText?
+    public let `slugs`: [DaemonText]
+    public let `argv_masked`: [DaemonText]
+    public let `reason`: DaemonText?
+    public let `grant`: DaemonText?
+    public let `request`: DaemonText?
+    public var description: String { "[AppAuditEntryView]" }
+    public var debugDescription: String { description }
+    public init(seq: UInt64, time_secs: UInt64, kind: DaemonText, outcome: DaemonText,
+                subject: AppAuditSubjectView? = nil, project_dir: DaemonText? = nil,
+                slugs: [DaemonText] = [], argv_masked: [DaemonText] = [],
+                reason: DaemonText? = nil, grant: DaemonText? = nil, request: DaemonText? = nil) {
+        self.seq = seq
+        self.time_secs = time_secs
+        self.kind = kind
+        self.outcome = outcome
+        self.subject = subject
+        self.project_dir = project_dir
+        self.slugs = slugs
+        self.argv_masked = argv_masked
+        self.reason = reason
+        self.grant = grant
+        self.request = request
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["seq", "time_secs", "kind", "outcome", "subject", "project_dir", "slugs", "argv_masked", "reason", "grant", "request"])
+        self.`seq` = try o.decode("seq")
+        self.`time_secs` = try o.decode("time_secs")
+        self.`kind` = try o.decode("kind")
+        self.`outcome` = try o.decode("outcome")
+        self.`subject` = try o.optional("subject")
+        self.`project_dir` = try o.optional("project_dir")
+        self.`slugs` = try o.optional("slugs") ?? []
+        self.`argv_masked` = try o.optional("argv_masked") ?? []
+        self.`reason` = try o.optional("reason")
+        self.`grant` = try o.optional("grant")
+        self.`request` = try o.optional("request")
+    }
+}
+
+public struct AppAuditListView: Sendable, Equatable, WireDecodable, CustomStringConvertible, CustomDebugStringConvertible {
+    public let `entries`: [AppAuditEntryView]
+    public let `next_before_seq`: UInt64?
+    public var description: String { "[AppAuditListView]" }
+    public var debugDescription: String { description }
+    public init(entries: [AppAuditEntryView], next_before_seq: UInt64? = nil) {
+        self.entries = entries
+        self.next_before_seq = next_before_seq
+    }
+    init(wire: WireReader) throws {
+        let o = try wire.object(["entries", "next_before_seq"])
+        self.`entries` = try o.decode("entries")
+        self.`next_before_seq` = try o.optional("next_before_seq")
+    }
+}

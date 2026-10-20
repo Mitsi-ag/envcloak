@@ -212,6 +212,26 @@ enum MetadataRequest {
     static func asksDecline(_ ask: DaemonText) -> AppAsksDecline {
         AppAsksDecline(ask: ask.unescaped)
     }
+    static func appLock(_ reason: AppLockReason) -> AppLock {
+        AppLock(reason: reason)
+    }
+    static func auditList(
+        limit: Int = 200,
+        beforeSeq: UInt64? = nil,
+        project: String? = nil,
+        slug: String? = nil,
+        agent: String? = nil,
+        event: String? = nil
+    ) -> AppAuditList {
+        AppAuditList(
+            before_seq: beforeSeq,
+            limit: UInt64(max(0, limit)),
+            project: project,
+            item: slug,
+            agent: agent,
+            kinds: event.map { [$0] } ?? []
+        )
+    }
     static func referenceString(slug: DaemonText, field: DaemonText? = nil) -> String {
         if let field, !field.unescaped.isEmpty, field.unescaped != "value" {
             return "envcloak://\(slug.unescaped)#\(field.unescaped)"

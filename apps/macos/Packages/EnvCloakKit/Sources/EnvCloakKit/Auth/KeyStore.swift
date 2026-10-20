@@ -106,6 +106,7 @@ public struct DataProtectionKeychainBlobStorage: KeyBlobStorage {
 public struct KeyStore: Sendable {
     public static let unlockAccount = "unlock"
     public static let approveAccount = "approve"
+    public static let touchIDOnlyAccount = "touch_id_only"
 
     private let storage: any KeyBlobStorage
 
@@ -123,6 +124,14 @@ public struct KeyStore: Sendable {
             return false
         }
         return !unlock.isEmpty && !approve.isEmpty
+    }
+
+    public func isTouchIDOnlyEnrolled() -> Bool {
+        guard let blob = try? storage.readBlob(account: Self.touchIDOnlyAccount),
+              let flag = blob.first else {
+            return false
+        }
+        return flag == 1
     }
 
     public static func makeAccessControl(touchIDOnly: Bool = false) throws(KeyStoreError) -> SecAccessControl {
@@ -164,6 +173,7 @@ public struct KeyStore: Sendable {
         }
         try storage.writeBlob(unlockKey.dataRepresentation, account: Self.unlockAccount)
         try storage.writeBlob(approveKey.dataRepresentation, account: Self.approveAccount)
+        try storage.writeBlob(Data([touchIDOnly ? 1 : 0]), account: Self.touchIDOnlyAccount)
         return EnrolledPublicKeys(
             unlockPublicKeyHex: HexCoding.encode(unlockKey.publicKey.x963Representation),
             approvePublicKeyHex: HexCoding.encode(approveKey.publicKey.x963Representation)
@@ -206,11 +216,13 @@ public struct KeyStore: Sendable {
         public let keys: EnrolledPublicKeys
         public let unlockBlob: Data
         public let approveBlob: Data
+        public let touchIDOnly: Bool
 
-        public init(keys: EnrolledPublicKeys, unlockBlob: Data, approveBlob: Data) {
+        public init(keys: EnrolledPublicKeys, unlockBlob: Data, approveBlob: Data, touchIDOnly: Bool = false) {
             self.keys = keys
             self.unlockBlob = unlockBlob
             self.approveBlob = approveBlob
+            self.touchIDOnly = touchIDOnly
         }
     }
 
@@ -230,18 +242,21 @@ public struct KeyStore: Sendable {
         return StagedKeyPair(
             keys: keys,
             unlockBlob: unlockKey.dataRepresentation,
-            approveBlob: approveKey.dataRepresentation
+            approveBlob: approveKey.dataRepresentation,
+            touchIDOnly: touchIDOnly
         )
     }
 
     public func commitStagedKeys(_ staged: StagedKeyPair) throws(KeyStoreError) {
         try storage.writeBlob(staged.unlockBlob, account: Self.unlockAccount)
         try storage.writeBlob(staged.approveBlob, account: Self.approveAccount)
+        try storage.writeBlob(Data([staged.touchIDOnly ? 1 : 0]), account: Self.touchIDOnlyAccount)
     }
 
     public func deleteKeys() throws(KeyStoreError) {
         try storage.deleteBlob(account: Self.unlockAccount)
         try storage.deleteBlob(account: Self.approveAccount)
+        try storage.deleteBlob(account: Self.touchIDOnlyAccount)
     }
 }
 
