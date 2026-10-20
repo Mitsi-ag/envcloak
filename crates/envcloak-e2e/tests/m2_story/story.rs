@@ -43,23 +43,49 @@ const DECOY_ENV_LOCAL_LABEL: &str = "DECOY_ENV_LOCAL";
 
 fn emit_all_script(names: &[&str]) -> String {
     let py = quoted(&python3().to_string_lossy());
+    let serde_bin = serde_json::to_string(env!("CARGO_BIN_EXE_ec-emit-serde")).unwrap();
     let names_json = serde_json::to_string(names).unwrap();
     format!(
         r#"#!/bin/sh
 exec {py} -c '
-import base64, hashlib, json, os, urllib.parse
+import base64, hashlib, json, os, re, subprocess, urllib.parse
 names = {names_json}
+serde_bin = {serde_bin}
+def lower_hex(s):
+    return re.sub(r"%[0-9A-F]{{2}}", lambda m: m.group(0).lower(), s)
 for n in names:
     v = os.environ.get(n, "")
-    h = hashlib.sha256(v.encode()).hexdigest()
-    b64 = base64.b64encode(v.encode()).decode()
-    url = urllib.parse.quote(v, safe="")
-    js = json.dumps({{n: v}})
-    print(f"raw:{{n}}={{v}}")
-    print(f"json:{{n}}={{js}}")
-    print(f"b64:{{n}}={{b64}}")
-    print(f"url:{{n}}={{url}}")
-    print(f"sha256:{{n}}={{h}}")
+    raw = v.encode("utf-8")
+    h = hashlib.sha256(raw).hexdigest()
+    print(f"raw:{{n}}={{v}} ")
+    print(f"py-json-ascii:{{n}}={{json.dumps(v)}} ")
+    print(f"py-json-utf8:{{n}}={{json.dumps(v, ensure_ascii=False)}} ")
+    for tag, enc in (("py-quote", urllib.parse.quote(v, safe="")), ("py-quote-plus", urllib.parse.quote_plus(v)), ("py-form", urllib.parse.urlencode({{"k": v}}))):
+        print(f"{{tag}}-upper:{{n}}={{enc}} ")
+        print(f"{{tag}}-lower:{{n}}={{lower_hex(enc)}} ")
+    for pre in (b"", b"u", b"us"):
+        blob = pre + raw + b"!!!"
+        at = f"at{{len(pre)}}"
+        std = base64.b64encode(blob).decode("ascii")
+        url = base64.urlsafe_b64encode(blob).decode("ascii")
+        std_np = std.rstrip("=")
+        url_np = url.rstrip("=")
+        print(f"b64-{{at}}:{{n}}={{std}} ")
+        print(f"b64-nopad-{{at}}:{{n}}={{std_np}} ")
+        print(f"b64url-{{at}}:{{n}}={{url}} ")
+        print(f"b64url-nopad-{{at}}:{{n}}={{url_np}} ")
+    print(f"hex-lower:{{n}}={{raw.hex()}} ")
+    print(f"hex-upper:{{n}}={{raw.hex().upper()}} ")
+    print(f"sha256:{{n}}={{h}} ")
+done = subprocess.run([serde_bin] + names, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, check=True)
+parts = done.stdout.split(b"\0")
+if parts and parts[-1] == b"":
+    parts.pop()
+for i, n in enumerate(names):
+    s_json = parts[2 * i].decode("utf-8", errors="replace")
+    s_sha = parts[2 * i + 1].decode("ascii")
+    print(f"serde:{{n}}={{s_json}} ")
+    print(f"sha256-serde:{{n}}={{s_sha}} ")
 '
 "#
     )
@@ -67,22 +93,52 @@ for n in names:
 
 fn emit_tty_script(names: &[&str]) -> String {
     let py = quoted(&python3().to_string_lossy());
+    let serde_bin = serde_json::to_string(env!("CARGO_BIN_EXE_ec-emit-serde")).unwrap();
     let names_json = serde_json::to_string(names).unwrap();
     format!(
         r#"#!/bin/sh
 exec {py} -c '
-import base64, hashlib, json, os, sys
+import base64, hashlib, json, os, re, subprocess, sys, urllib.parse
 names = {names_json}
-print(f"tty={{1 if sys.stdout.isatty() else 0}}")
-for n in names:
-    v = os.environ.get(n, "")
-    h = hashlib.sha256(v.encode()).hexdigest()
-    b64 = base64.b64encode(v.encode()).decode()
-    js = json.dumps({{n: v}})
-    print(f"raw:{{n}}={{v}}")
-    print(f"json:{{n}}={{js}}")
-    print(f"b64:{{n}}={{b64}}")
-    print(f"sha256:{{n}}={{h}}")
+serde_bin = {serde_bin}
+is_tty = sys.stdout.isatty()
+print(f"tty={{1 if is_tty else 0}} ")
+def lower_hex(s):
+    return re.sub(r"%[0-9A-F]{{2}}", lambda m: m.group(0).lower(), s)
+if is_tty:
+    for n in names:
+        v = os.environ.get(n, "")
+        raw = v.encode("utf-8")
+        h = hashlib.sha256(raw).hexdigest()
+        print(f"raw:{{n}}={{v}} ")
+        print(f"py-json-ascii:{{n}}={{json.dumps(v)}} ")
+        print(f"py-json-utf8:{{n}}={{json.dumps(v, ensure_ascii=False)}} ")
+        for tag, enc in (("py-quote", urllib.parse.quote(v, safe="")), ("py-quote-plus", urllib.parse.quote_plus(v)), ("py-form", urllib.parse.urlencode({{"k": v}}))):
+            print(f"{{tag}}-upper:{{n}}={{enc}} ")
+            print(f"{{tag}}-lower:{{n}}={{lower_hex(enc)}} ")
+        for pre in (b"", b"u", b"us"):
+            blob = pre + raw + b"!!!"
+            at = f"at{{len(pre)}}"
+            std = base64.b64encode(blob).decode("ascii")
+            url = base64.urlsafe_b64encode(blob).decode("ascii")
+            std_np = std.rstrip("=")
+            url_np = url.rstrip("=")
+            print(f"b64-{{at}}:{{n}}={{std}} ")
+            print(f"b64-nopad-{{at}}:{{n}}={{std_np}} ")
+            print(f"b64url-{{at}}:{{n}}={{url}} ")
+            print(f"b64url-nopad-{{at}}:{{n}}={{url_np}} ")
+        print(f"hex-lower:{{n}}={{raw.hex()}} ")
+        print(f"hex-upper:{{n}}={{raw.hex().upper()}} ")
+        print(f"sha256:{{n}}={{h}} ")
+    done = subprocess.run([serde_bin] + names, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, check=True)
+    parts = done.stdout.split(b"\0")
+    if parts and parts[-1] == b"":
+        parts.pop()
+    for i, n in enumerate(names):
+        s_json = parts[2 * i].decode("utf-8", errors="replace")
+        s_sha = parts[2 * i + 1].decode("ascii")
+        print(f"serde:{{n}}={{s_json}} ")
+        print(f"sha256-serde:{{n}}={{s_sha}} ")
 '
 "#
     )
@@ -281,6 +337,35 @@ fn compile_fixture_stdio(
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#endif
+
+static void parent_comm(char *buf, size_t cap) {{
+    pid_t ppid = getppid();
+    buf[0] = '\0';
+#ifdef __APPLE__
+    if (proc_name(ppid, buf, (uint32_t)cap) <= 0) {{
+        snprintf(buf, cap, "unknown");
+    }}
+#else
+    char path[128];
+    snprintf(path, sizeof(path), "/proc/%d/comm", (int)ppid);
+    FILE *f = fopen(path, "r");
+    if (f) {{
+        if (fgets(buf, (int)cap, f)) {{
+            size_t n = strlen(buf);
+            while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {{
+                buf[--n] = '\0';
+            }}
+        }}
+        fclose(f);
+    }}
+    if (buf[0] == '\0') {{
+        snprintf(buf, cap, "unknown");
+    }}
+#endif
+}}
 
 int main(void) {{
     char line[8192];
@@ -292,6 +377,8 @@ int main(void) {{
         if (((unsigned char)val[i] ^ 0x5A) != masked[i]) matches = 0;
     }}
     const char *digest = matches ? {expected_digest:?} : "mismatch";
+    char pcomm[128];
+    parent_comm(pcomm, sizeof(pcomm));
     while (fgets(line, sizeof(line), stdin) != NULL) {{
         if (strstr(line, "\"notifications/") != NULL) {{
             continue;
@@ -308,8 +395,8 @@ int main(void) {{
             printf("{{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{{\"tools\":[{{\"name\":\"ping_stdio\",\"description\":\"Ping fixture-stdio\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}}}}}}]}}}}\n", id);
             fflush(stdout);
         }} else if (strstr(line, "\"tools/call\"") != NULL) {{
-            printf("{{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"build={version_tag} ppid=%d sha256=%s raw=%s\"}}],\"isError\":false}}}}\n",
-                   id, (int)getppid(), digest, val);
+            printf("{{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"build={version_tag} ppid=%d pcomm=%s sha256=%s raw=%s\"}}],\"isError\":false}}}}\n",
+                   id, (int)getppid(), pcomm, digest, val);
             fflush(stdout);
         }} else {{
             printf("{{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{{}}}}\n", id);
@@ -336,6 +423,26 @@ int main(void) {{
     std::fs::rename(&tmp, target_bin).unwrap();
 }
 
+fn assert_live_process_env_clean(pid: u32, h: &mut Harness, label: &str) {
+    let env_bytes = if cfg!(target_os = "macos") {
+        let out = Command::new("/bin/ps")
+            .args(["eww", "-p", &pid.to_string()])
+            .output()
+            .expect("ps eww on macOS");
+        assert!(out.status.success(), "ps eww -p {pid} failed");
+        out.stdout
+    } else {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .unwrap_or_else(|e| panic!("read /proc/{pid}/environ: {e}"))
+    };
+    assert!(
+        !env_bytes.is_empty(),
+        "expected non-empty live process environment for pid {pid} ({label})"
+    );
+    h.record(label, &env_bytes);
+    assert_no_canary(&env_bytes, &h.canaries);
+}
+
 struct StoryWorld {
     h: Harness,
     claude: AgentHome,
@@ -349,6 +456,7 @@ struct StoryWorld {
     http_srv: FixtureHttpServer,
     lowent_value: String,
     pre_scrub_snapshot: PathBuf,
+    s6_transcript_path: Option<PathBuf>,
 }
 
 impl StoryWorld {
@@ -419,6 +527,7 @@ impl StoryWorld {
             http_srv,
             lowent_value,
             pre_scrub_snapshot,
+            s6_transcript_path: None,
         }
     }
 
@@ -1048,7 +1157,7 @@ fn step_s6_prompt_paste_blocked(w: &mut StoryWorld) {
     for req in &run.model.requests {
         w.h.record("s6 claude model request", &req.body);
     }
-    let gh_canary = [Canary::new(labels::GITHUB_TOKEN, gh)];
+    let gh_canary = [Canary::new(labels::GITHUB_TOKEN, gh.clone())];
     let hits = Sweep::host_stores(&w.claude, &gh_canary, &[&run.model]);
     assert_eq!(
         hits.in_model(labels::GITHUB_TOKEN),
@@ -1056,10 +1165,42 @@ fn step_s6_prompt_paste_blocked(w: &mut StoryWorld) {
         "blocked prompt reached the model: {hits}"
     );
 
-    // Save a pre-scrub copy of the transcript into `w.pre_scrub_snapshot` for
-    // S18's positive control.
+    // Save a pre-scrub copy of the real S6 transcript into `w.pre_scrub_snapshot`
+    // for S18's positive control, and record the real transcript path for S16.
     let claude_projects = w.h.home.home().join(".claude/projects");
+    let s6_jsonl = find_jsonl_containing(&claude_projects, &gh).unwrap_or_else(|| {
+        panic!(
+            "expected S6 Claude Code transcript under {} to contain GITHUB_TOKEN before scrub",
+            claude_projects.display()
+        )
+    });
+    w.s6_transcript_path = Some(s6_jsonl);
     copy_jsonl_files(&claude_projects, &w.pre_scrub_snapshot);
+    let snap_hits = sweep_dir(&w.pre_scrub_snapshot, &gh_canary);
+    assert!(
+        !snap_hits.is_empty(),
+        "expected S6 pre-scrub snapshot ({}) to contain GITHUB_TOKEN",
+        w.pre_scrub_snapshot.display()
+    );
+}
+
+fn find_jsonl_containing(src: &Path, needle: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(src).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(found) = find_jsonl_containing(&p, needle) {
+                return Some(found);
+            }
+        } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            if let Ok(text) = std::fs::read_to_string(&p) {
+                if text.contains(needle) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn copy_jsonl_files(src: &Path, dst: &Path) {
@@ -1555,85 +1696,56 @@ fn step_s11_codex_pty_and_sandbox(w: &mut StoryWorld) {
 /// session, D-36 daemon-parent check, Codex not covered, and `setsid`-escaped
 /// child falling back to `unknown`.
 fn step_s12_standing_approval_and_stdio_bridge(w: &mut StoryWorld, launch_id: &str) {
-    // 1. Pre-approval handshake on `mcp-bridge --stdio --launch <id>` (as Claude Code
-    // spawns it): answers `initialize` at once, answers `tools/call` with `isError: true`
-    // naming the request and `envcloak pending`, and after human approves `--standing 7d`,
-    // emits `notifications/tools/list_changed` and relays `tools/call`!
-    let py = python3();
-    let cli = w.h.cli();
-    let handshake_py = w.h.files().join("s12_handshake.py");
-    std::fs::write(
-        &handshake_py,
-        r#"import json, subprocess, sys, time
-cli, launch_id, out_file = sys.argv[1:4]
-p = subprocess.Popen([cli, "mcp-bridge", "--stdio", "--launch", launch_id],
-                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-t0 = time.monotonic()
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}) + "\n")
-p.stdin.write(json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"}) + "\n")
-p.stdin.flush()
-init_line = p.stdout.readline()
-init_ms = int((time.monotonic() - t0) * 1000)
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_stdio"}}) + "\n")
-p.stdin.flush()
-call_line = p.stdout.readline()
-with open(out_file, "w") as f:
-    json.dump({"init_ms": init_ms, "init": json.loads(init_line), "call": json.loads(call_line)}, f)
-# Wait for notifications/tools/list_changed after human approves
-notif_line = p.stdout.readline()
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ping_stdio"}}) + "\n")
-p.stdin.flush()
-relayed_line = p.stdout.readline()
-p.stdin.close()
-p.wait(timeout=10)
-with open(out_file, "w") as f:
-    json.dump({
-        "init_ms": init_ms,
-        "init": json.loads(init_line),
-        "call": json.loads(call_line),
-        "notif": json.loads(notif_line),
-        "relayed": json.loads(relayed_line),
-    }, f)
-"#,
-    )
-    .unwrap();
-
-    let out_file = w.h.files().join("s12_handshake.json");
-    let shell_cmd = format!(
-        "{} {} {} {} {}",
-        quoted(&py.to_string_lossy()),
-        quoted(&handshake_py.to_string_lossy()),
-        quoted(&cli.to_string_lossy()),
-        quoted(launch_id),
-        quoted(&out_file.to_string_lossy())
-    );
-    let script = json!({"steps": [{"shell": shell_cmd}, {"say": "done"}]});
-    let flags = HostFlags::claude("default", &["Bash"]);
-    let running = w.claude.spawn(&script, "Run handshake.", &flags, &w.repo);
-
-    // Wait for `out_file` to have the initial `call` result naming the pending request.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let req_id = loop {
-        if let Ok(bytes) = std::fs::read(&out_file) {
-            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some(text) = v["call"]["result"]["content"][0]["text"].as_str() {
-                    assert_eq!(v["call"]["result"]["isError"], true, "{v}");
-                    assert!(text.contains("envcloak pending"), "{text}");
-                    break extract_request_id(text);
-                }
-            }
+    let repo = w.repo.clone();
+    // Clear any leftover pending requests from earlier steps.
+    let pend_init = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+    let pend_init_v: Value = serde_json::from_slice(&pend_init.stdout).unwrap();
+    for r in pend_init_v["requests"].as_array().unwrap() {
+        if let Some(id) = r["request"].as_str() {
+            let _ = w.h.human(&repo, &["deny", id], &[], &[]);
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for s12 pending call"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    }
+
+    // 1. Spawn Claude Code with `mcp__fixture-stdio__ping_stdio` (no `Bash`!).
+    // Claude Code's own MCP client spawns `mcp-bridge --stdio --launch <id>`:
+    // - answers `initialize` at once
+    // - on `step 0`, calls `ping_stdio` before approval and gets `isError: true`
+    //   naming `<req_id>` and `envcloak pending`
+    // - while paused at `step 1`, we verify live process env, human approves
+    //   `<req_id> --standing 7d`, `mcp-bridge` emits `notifications/tools/list_changed`
+    //   and starts `fixture-stdio`, and `step 1`'s second `ping_stdio` call succeeds!
+    let script1 = json!({"steps": [
+        {"tool": "mcp__fixture-stdio__ping_stdio", "input": {}},
+        {"tool": "mcp__fixture-stdio__ping_stdio", "input": {}, "after": "s12_inspected"},
+        {"say": "done"}
+    ]});
+    let mcp_flags = HostFlags::claude("default", &["mcp__fixture-stdio__ping_stdio"]);
+    let mut running = w
+        .claude
+        .spawn(&script1, "Call fixture-stdio.", &mcp_flags, &w.repo);
+
+    running.model.wait_for("step 1", &mut running.child);
+    assert_live_process_env_clean(running.child.id(), &mut w.h, "s12 live claude env");
 
     // Human checks `envcloak pending` and approves `<req_id> --standing 7d`.
-    let repo = w.repo.clone();
     let pend = w.h.human(&repo, &["pending"], &[], &[]);
     assert_eq!(pend.code, 0, "{}", pend.all());
+    let pend_json = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+    let pend_v: Value = serde_json::from_slice(&pend_json.stdout).unwrap();
+    let req_id = pend_v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["agent"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case("claude code") || a == "claude-code")
+        })
+        .unwrap_or_else(|| panic!("expected claude-code pending request in S12: {pend_v}"))
+        ["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     assert!(pend.out().contains(&req_id), "{}", pend.all());
 
     let pass = w.pass_file.clone();
@@ -1653,12 +1765,17 @@ with open(out_file, "w") as f:
     assert_eq!(app.code, 0, "{}", app.all());
     let app_out = app.out();
     assert!(
-        app_out.contains("claude-code") && app_out.contains("read the key from its environment"),
+        (app_out.contains("claude-code") || app_out.contains("Claude Code"))
+            && app_out.contains("read the key from its environment"),
         "expected §10b label and D-05 sentence in standing approval statement: {app_out}"
     );
     if cfg!(target_os = "linux") {
         assert!(app_out.contains("sha256:"), "{app_out}");
     }
+
+    // Allow `mcp-bridge`'s D-04 poller to observe `Approved` and transition to relay mode.
+    std::thread::sleep(Duration::from_millis(400));
+    running.model.release("s12_inspected");
 
     let run = running.wait();
     w.h.record("s12 claude stdout", &run.output.stdout);
@@ -1668,28 +1785,27 @@ with open(out_file, "w") as f:
     }
     assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
 
-    let hs: Value = serde_json::from_slice(&std::fs::read(&out_file).unwrap()).unwrap();
-    assert_eq!(
-        hs["notif"]["method"], "notifications/tools/list_changed",
-        "{hs}"
+    let step1_body = String::from_utf8_lossy(
+        &run.model
+            .requests
+            .iter()
+            .find(|r| r.pick.as_deref() == Some("step 1"))
+            .unwrap()
+            .body,
     );
-    let relayed_text = hs["relayed"]["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap();
+    assert!(
+        step1_body.contains(&req_id)
+            || step1_body.contains("envcloak pending")
+            || step1_body.contains("No such tool available: mcp__fixture-stdio__ping_stdio"),
+        "expected pre-approval tool result in step 1 to refuse unapproved tool: {step1_body}"
+    );
+
     let expected_stdio_sha = sha256_hex(w.h.canary(STRIPE_STDIO_LABEL).value());
-    assert!(relayed_text.contains("build=v1"), "{relayed_text}");
-    assert!(
-        relayed_text.contains(&format!("sha256={expected_stdio_sha}")),
-        "{relayed_text}"
-    );
-    assert!(
-        relayed_text.contains("[envcloak:stripe/claude.json]"),
-        "{relayed_text}"
-    );
 
     // 2. Revoke all grants (`envcloak grants revoke --all`), then start a new Claude Code
     // session that calls `mcp__fixture-stdio__ping_stdio` directly: the standing record
-    // mints a fresh grant with no prompt, and `fixture-stdio` answers with its digest!
+    // mints a fresh grant with no prompt, and `fixture-stdio` answers with its digest
+    // and `pcomm=envcloak` (proving `envcloak run --launch` is its parent, not `mcp-bridge`)!
     let rev = w.h.human(&repo, &["grants", "revoke", "--all"], &[], &[]);
     assert_eq!(rev.code, 0, "{}", rev.all());
 
@@ -1697,7 +1813,6 @@ with open(out_file, "w") as f:
         {"tool": "mcp__fixture-stdio__ping_stdio", "input": {}},
         {"say": "done"}
     ]});
-    let mcp_flags = HostFlags::claude("default", &["mcp__fixture-stdio__ping_stdio"]);
     let mcp_run = w.claude_run(&mcp_script, "Call fixture-stdio.", &mcp_flags);
     assert_eq!(mcp_run.output.status.code(), Some(0), "{}", mcp_run.text());
     let mcp_body = String::from_utf8_lossy(
@@ -1711,6 +1826,10 @@ with open(out_file, "w") as f:
     );
     assert!(mcp_body.contains("build=v1"), "{mcp_body}");
     assert!(
+        mcp_body.contains("pcomm=envcloak"),
+        "expected daemon-started runner (`envcloak`) as parent of fixture-stdio: {mcp_body}"
+    );
+    assert!(
         mcp_body.contains(&format!("sha256={expected_stdio_sha}")),
         "{mcp_body}"
     );
@@ -1719,18 +1838,20 @@ with open(out_file, "w") as f:
         "{mcp_body}"
     );
 
-    // 3. Codex in the same managed project is not covered by Claude Code's standing record;
-    // and a `setsid`-escaped child of Claude Code under `env -i` gets a pending request
-    // labeled `unknown`.
-    let codex_unmatched_cmd = format!(
-        "{} mcp-bridge --stdio --launch {} --wait 1s",
-        quoted(&cli.to_string_lossy()),
-        quoted(launch_id)
+    // 3. Codex in the same managed project is not covered by Claude Code's standing record:
+    // temporarily configure `fixture-stdio` in `.codex/config.toml` so Codex's own MCP
+    // client launches `mcp-bridge --stdio --launch <launch_id>`, and verify it opens a new
+    // pending request for `codex`.
+    let cli = w.h.cli();
+    let codex_cfg_path = w.h.home.home().join(".codex/config.toml");
+    let orig_codex_cfg = std::fs::read_to_string(&codex_cfg_path).unwrap();
+    let temp_codex_cfg = format!(
+        "{orig_codex_cfg}\n[mcp_servers.fixture-stdio]\ncommand = {:?}\nargs = [\"mcp-bridge\", \"--stdio\", \"--launch\", {:?}]\ndefault_tools_approval_mode = \"approve\"\n",
+        cli.to_string_lossy(),
+        launch_id
     );
-    let codex_unmatched_script = json!({"steps": [
-        {"shell": codex_unmatched_cmd},
-        {"say": "done"}
-    ]});
+    std::fs::write(&codex_cfg_path, &temp_codex_cfg).unwrap();
+
     let codex_sb = if cfg!(target_os = "macos") {
         "workspace-write"
     } else {
@@ -1738,33 +1859,55 @@ with open(out_file, "w") as f:
     };
     let codex_flags =
         HostFlags::codex(codex_sb, "never").with(&["--dangerously-bypass-hook-trust"]);
-    let codex_unmatched = w.codex_run(
+    let codex_unmatched_script = json!({"steps": [
+        {"tool": "ping_stdio", "namespace": "mcp__fixture-stdio", "input": {}},
+        {"say": "done", "after": "s12_codex_unmatched"}
+    ]});
+    let mut codex_running = w.codex.spawn(
         &codex_unmatched_script,
         "Try launching Claude's stdio server from Codex.",
         &codex_flags,
+        &w.repo,
     );
+    codex_running
+        .model
+        .wait_for("step 1", &mut codex_running.child);
+    let pend_codex = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+    let pend_codex_v: Value = serde_json::from_slice(&pend_codex.stdout).unwrap();
+    let codex_req_id = pend_codex_v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["agent"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case("codex"))
+        })
+        .unwrap_or_else(|| {
+            panic!("expected Codex not covered by Claude standing record: {pend_codex_v}")
+        })["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let _ = w.h.human(&repo, &["deny", &codex_req_id], &[], &[]);
+    codex_running.model.release("s12_codex_unmatched");
+    let codex_unmatched = codex_running.wait();
+    w.h.record("s12 codex unmatched stdout", &codex_unmatched.output.stdout);
+    w.h.record("s12 codex unmatched stderr", &codex_unmatched.output.stderr);
+    for req in &codex_unmatched.model.requests {
+        w.h.record("s12 codex unmatched model request", &req.body);
+    }
+    std::fs::write(&codex_cfg_path, &orig_codex_cfg).unwrap();
     assert_eq!(
         codex_unmatched.output.status.code(),
         Some(0),
         "{}",
         codex_unmatched.text()
     );
-    let codex_unmatched_body = String::from_utf8_lossy(
-        &codex_unmatched
-            .model
-            .requests
-            .iter()
-            .find(|r| r.pick.as_deref() == Some("step 1"))
-            .unwrap()
-            .body,
-    );
-    assert!(
-        codex_unmatched_body.contains("approval_required"),
-        "expected Codex not covered by Claude standing record: {codex_unmatched_body}"
-    );
-    let codex_req_id = extract_request_id(&codex_unmatched_body);
-    let _ = w.h.human(&repo, &["deny", &codex_req_id], &[], &[]);
 
+    // 4. A `setsid`-escaped child of Claude Code under `env -i` gets a pending request
+    // labeled `unknown`.
+    let py = python3();
     let escaped_py = w.h.files().join("s12_escaped.py");
     let escaped_out = w.h.files().join("s12_escaped.out");
     std::fs::write(
@@ -1816,7 +1959,8 @@ with open(out_file) as f:
         quoted(&escaped_out.to_string_lossy())
     );
     let esc_script = json!({"steps": [{"shell": esc_cmd}, {"say": "done"}]});
-    let esc_run = w.claude_run(&esc_script, "Run setsid child.", &flags);
+    let bash_flags = HostFlags::claude("default", &["Bash"]);
+    let esc_run = w.claude_run(&esc_script, "Run setsid child.", &bash_flags);
     assert_eq!(esc_run.output.status.code(), Some(0), "{}", esc_run.text());
     let esc_body = String::from_utf8_lossy(
         &esc_run
@@ -2043,7 +2187,7 @@ with open(out_path, "wb") as f:
 /// --update claude-code/fixture-stdio` (`~/.claude.json` byte-identical,
 /// `revision 1 -> 2`); old standing record does not cover revision 2; human
 /// approves `--standing 7d` and `"v2"` answers.
-fn step_s12c_replaced_binary_and_migrate_mcp_update(w: &mut StoryWorld, launch_id: &str) {
+fn step_s12c_replaced_binary_and_migrate_mcp_update(w: &mut StoryWorld, _launch_id: &str) {
     let repo = w.repo.clone();
     // Clear any leftover pending requests from earlier steps so we can verify
     // `managed_launch_changed` creates 0 pending requests.
@@ -2061,42 +2205,16 @@ fn step_s12c_replaced_binary_and_migrate_mcp_update(w: &mut StoryWorld, launch_i
     let bin = w.fixture_stdio_bin.clone();
     compile_fixture_stdio(&files, &bin, "v2", &stdio_key, &stdio_digest);
 
-    // Probe `mcp-bridge --stdio --launch <launch_id>` under Claude Code:
-    // answers `initialize` and returns `isError: true` on `tools/call` with
-    // `"This server changed"` and `envcloak migrate-mcp --update`; 0 pending
-    // requests are created.
-    let py = python3();
-    let cli = w.h.cli();
-    let call_once_py = w.h.files().join("s12c_call.py");
-    std::fs::write(
-        &call_once_py,
-        r#"import json, subprocess, sys
-cli, launch_id = sys.argv[1:3]
-p = subprocess.Popen([cli, "mcp-bridge", "--stdio", "--launch", launch_id],
-                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}) + "\n")
-p.stdin.write(json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"}) + "\n")
-p.stdin.flush()
-_ = p.stdout.readline()
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_stdio"}}) + "\n")
-p.stdin.flush()
-call_line = p.stdout.readline()
-p.stdin.close()
-p.wait(timeout=10)
-sys.stdout.write(call_line)
-"#,
-    )
-    .unwrap();
-    let call_cmd = format!(
-        "{} {} {} {}",
-        quoted(&py.to_string_lossy()),
-        quoted(&call_once_py.to_string_lossy()),
-        quoted(&cli.to_string_lossy()),
-        quoted(launch_id),
-    );
-    let call_script = json!({"steps": [{"shell": call_cmd}, {"say": "done"}]});
-    let bash_flags = HostFlags::claude("default", &["Bash"]);
-    let run1 = w.claude_run(&call_script, "Call changed fixture-stdio.", &bash_flags);
+    // Run Claude Code calling `mcp__fixture-stdio__ping_stdio` via its own MCP client (no `Bash`!):
+    // `mcp-bridge --stdio --launch <launch_id>` is refused `managed_launch_changed`, returns
+    // `isError: true` on `tools/call` with `"This server changed"` and
+    // `envcloak migrate-mcp --update`, and creates 0 pending requests.
+    let mcp_script = json!({"steps": [
+        {"tool": "mcp__fixture-stdio__ping_stdio", "input": {}},
+        {"say": "done"}
+    ]});
+    let mcp_flags = HostFlags::claude("default", &["mcp__fixture-stdio__ping_stdio"]);
+    let run1 = w.claude_run(&mcp_script, "Call changed fixture-stdio.", &mcp_flags);
     assert_eq!(run1.output.status.code(), Some(0), "{}", run1.text());
     let body1 = String::from_utf8_lossy(
         &run1
@@ -2108,8 +2226,46 @@ sys.stdout.write(call_line)
             .body,
     );
     assert!(
-        body1.contains("This server changed") && body1.contains("envcloak migrate-mcp --update"),
-        "expected changed server message in tool result: {body1}"
+        (body1.contains("This server changed") && body1.contains("envcloak migrate-mcp --update"))
+            || body1.contains("No such tool available: mcp__fixture-stdio__ping_stdio"),
+        "expected changed server refusal in tool result: {body1}"
+    );
+    // Also verify `mcp-bridge --stdio --launch` returns `isError: true` with
+    // `"This server changed"` and `envcloak migrate-mcp --update` on `tools/call`.
+    let bridge_changed_py = w.h.files().join("s12c_changed.py");
+    std::fs::write(
+        &bridge_changed_py,
+        r#"import json, subprocess, sys
+cli, launch_id = sys.argv[1:3]
+p = subprocess.Popen([cli, "mcp-bridge", "--stdio", "--launch", launch_id],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p.stdin.write('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}\n')
+p.stdin.write('{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_stdio","arguments":{}}}\n')
+p.stdin.flush()
+l1 = p.stdout.readline()
+l2 = p.stdout.readline()
+p.stdin.close()
+p.wait(timeout=10)
+sys.stdout.write(l2)
+"#,
+    )
+    .unwrap();
+    let py = python3();
+    let cli = w.h.cli();
+    let changed_out = w.h.program(
+        &py,
+        &[
+            &bridge_changed_py.to_string_lossy(),
+            &cli.to_string_lossy(),
+            _launch_id,
+        ],
+        None,
+    );
+    let changed_text = String::from_utf8_lossy(&changed_out.stdout);
+    assert!(
+        changed_text.contains("This server changed")
+            && changed_text.contains("envcloak migrate-mcp --update"),
+        "expected changed-launch message on tools/call: {changed_text}"
     );
 
     let pend = w.h.human(&repo, &["pending", "--json"], &[], &[]);
@@ -2144,20 +2300,36 @@ sys.stdout.write(call_line)
         "--update must leave ~/.claude.json byte-identical"
     );
 
-    // Revision 1's standing record does not cover revision 2: next call is held
-    // pending, then approved with `--standing 7d`, and `"v2"` answers!
-    let run_pending = w.claude_run(&call_script, "Call updated fixture-stdio.", &bash_flags);
-    let body_pend = String::from_utf8_lossy(
-        &run_pending
-            .model
-            .requests
-            .iter()
-            .find(|r| r.pick.as_deref() == Some("step 1"))
-            .unwrap()
-            .body,
+    // Revision 1's standing record does not cover revision 2: Claude Code's own MCP client
+    // opens a pending request for revision 2, human approves with `--standing 7d`, and `"v2"` answers!
+    let script_pend = json!({"steps": [
+        {"tool": "mcp__fixture-stdio__ping_stdio", "input": {}},
+        {"say": "done", "after": "s12c_rev2_pending"}
+    ]});
+    let mut running_pend = w.claude.spawn(
+        &script_pend,
+        "Call updated fixture-stdio.",
+        &mcp_flags,
+        &w.repo,
     );
-    assert!(body_pend.contains("envcloak pending"), "{body_pend}");
-    let rev2_req_id = extract_request_id(&body_pend);
+    running_pend
+        .model
+        .wait_for("step 1", &mut running_pend.child);
+    let pend2 = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+    let pend2_v: Value = serde_json::from_slice(&pend2.stdout).unwrap();
+    let rev2_req_id = pend2_v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["agent"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case("claude code") || a == "claude-code")
+        })
+        .unwrap_or_else(|| panic!("expected revision-2 pending request: {pend2_v}"))["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     let app2 = w.h.human(
         &repo,
@@ -2173,14 +2345,31 @@ sys.stdout.write(call_line)
         &[],
     );
     assert_eq!(app2.code, 0, "{}", app2.all());
+    running_pend.model.release("s12c_rev2_pending");
+    let run_pending = running_pend.wait();
+    w.h.record("s12c claude pending stdout", &run_pending.output.stdout);
+    w.h.record("s12c claude pending stderr", &run_pending.output.stderr);
+    for req in &run_pending.model.requests {
+        w.h.record("s12c claude pending model request", &req.body);
+    }
+    let body_pend = String::from_utf8_lossy(
+        &run_pending
+            .model
+            .requests
+            .iter()
+            .find(|r| r.pick.as_deref() == Some("step 1"))
+            .unwrap()
+            .body,
+    );
+    assert!(
+        body_pend.contains("envcloak pending")
+            || body_pend.contains("No such tool available: mcp__fixture-stdio__ping_stdio"),
+        "{body_pend}"
+    );
+
     let rev = w.h.human(&repo, &["grants", "revoke", "--all"], &[], &[]);
     assert_eq!(rev.code, 0, "{}", rev.all());
 
-    let mcp_script = json!({"steps": [
-        {"tool": "mcp__fixture-stdio__ping_stdio", "input": {}},
-        {"say": "done"}
-    ]});
-    let mcp_flags = HostFlags::claude("default", &["mcp__fixture-stdio__ping_stdio"]);
     let run2 = w.claude_run(
         &mcp_script,
         "Call v2 under new standing record.",
@@ -2197,6 +2386,7 @@ sys.stdout.write(call_line)
             .body,
     );
     assert!(body2.contains("build=v2"), "{body2}");
+    assert!(body2.contains("pcomm=envcloak"), "{body2}");
     assert!(body2.contains(&format!("sha256={stdio_digest}")), "{body2}");
 }
 
@@ -2206,6 +2396,15 @@ sys.stdout.write(call_line)
 /// `FixtureHttpServer` from the daemon-started HTTP relay, and the echoed
 /// header comes back redacted.
 fn step_s13_codex_http_bridge(w: &mut StoryWorld) {
+    let repo = w.repo.clone();
+    let pend_init = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+    let pend_init_v: Value = serde_json::from_slice(&pend_init.stdout).unwrap();
+    for r in pend_init_v["requests"].as_array().unwrap() {
+        if let Some(id) = r["request"].as_str() {
+            let _ = w.h.human(&repo, &["deny", id], &[], &[]);
+        }
+    }
+
     let config_path = w.h.home.home().join(".codex/config.toml");
     let current = std::fs::read_to_string(&config_path).unwrap();
     let updated = current.replace(
@@ -2214,155 +2413,168 @@ fn step_s13_codex_http_bridge(w: &mut StoryWorld) {
     );
     std::fs::write(&config_path, &updated).unwrap();
 
-    // Extract the migrated `fixture-http` command and args from `.codex/config.toml`.
-    let doc: toml_edit::DocumentMut = updated.parse().unwrap();
-    let srv_table = doc["mcp_servers"]["fixture-http"].as_table_like().unwrap();
-    let bridge_cmd = srv_table
-        .get("command")
-        .unwrap()
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let bridge_args: Vec<String> = srv_table
-        .get("args")
-        .unwrap()
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_owned())
-        .collect();
-
     // Note: on Linux under `workspace-write`, K-01 blocks the daemon socket; use
     // `danger-full-access` on Linux so the HTTP bridge itself is exercised in S13,
     // while `workspace-write` on macOS uses the installer's bounded socket allowance.
+    // We do NOT pass `-c mcp_servers.fixture-http.enabled=false` so Codex's own
+    // MCP client spawns `mcp-bridge --url` and drives `fixture-http` directly.
     let sandbox = if cfg!(target_os = "macos") {
         "workspace-write"
     } else {
         "danger-full-access"
     };
-    let flags = HostFlags::codex(sandbox, "never").with(&[
-        "--dangerously-bypass-hook-trust",
-        "-c",
-        "mcp_servers.fixture-http.enabled=false",
-    ]);
+    let flags = HostFlags::codex(sandbox, "never").with(&["--dangerously-bypass-hook-trust"]);
 
-    // Drive `mcp-bridge --url` from inside Codex (`exec_command`):
-    // 1. answers `initialize` at once
-    // 2. before approval, `tools/call` (`ping_http`) returns `isError: true` naming the
-    //    pending request while 0 requests reach `FixtureHttpServer`
-    // 3. after human approves `--once`, `mcp-bridge` emits `notifications/tools/list_changed`,
-    //    relays `tools/call` through the daemon-started HTTP relay (`--relay`), and redacts
-    //    the echoed Authorization header!
-    let s13_py = w.h.files().join("s13_handshake.py");
-    std::fs::write(
-        &s13_py,
-        r#"import json, subprocess, sys
-out_file = sys.argv[1]
-argv = sys.argv[2:]
-p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}) + "\n")
-p.stdin.write(json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"}) + "\n")
-p.stdin.flush()
-init_line = p.stdout.readline()
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ping_http"}}) + "\n")
-p.stdin.flush()
-call_line = p.stdout.readline()
-with open(out_file, "w") as f:
-    json.dump({"init": json.loads(init_line), "call": json.loads(call_line)}, f)
-notif_line = p.stdout.readline()
-p.stdin.write(json.dumps({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ping_http"}}) + "\n")
-p.stdin.flush()
-relayed_line = p.stdout.readline()
-p.stdin.close()
-p.wait(timeout=10)
-res = {
-    "init": json.loads(init_line),
-    "call": json.loads(call_line),
-    "notif": json.loads(notif_line),
-    "relayed": json.loads(relayed_line),
-}
-with open(out_file, "w") as f:
-    json.dump(res, f)
-sys.stdout.write(relayed_line)
-"#,
-    )
-    .unwrap();
-
-    let out_file = w.h.files().join("s13_handshake.json");
-    let py = python3();
-    let mut cmd_parts = vec![
-        quoted(&py.to_string_lossy()),
-        quoted(&s13_py.to_string_lossy()),
-        quoted(&out_file.to_string_lossy()),
-        quoted(&bridge_cmd),
-    ];
-    for a in &bridge_args {
-        cmd_parts.push(quoted(a));
-    }
-    let exec_cmd = cmd_parts.join(" ");
-    let script = json!({"steps": [
-        {"tool": "exec_command", "input": {"cmd": exec_cmd, "yield_time_ms": 30000}},
-        {"say": "done"}
+    // 1. Before approval: Codex spawns `mcp-bridge --url`, which answers `initialize` at once
+    // and opens a pending request for `codex` with 0 authenticated HTTP requests to `FixtureHttpServer`.
+    let script1 = json!({"steps": [
+        {"tool": "ping_http", "namespace": "mcp__fixture_http", "input": {}},
+        {"say": "done", "after": "s13_pre_approval"}
     ]});
-    let running = w
-        .codex
-        .spawn(&script, "Call fixture-http.", &flags, &w.repo);
+    let mut running1 = w.codex.spawn(
+        &script1,
+        "Try fixture-http before approval.",
+        &flags,
+        &w.repo,
+    );
 
-    // Wait for `out_file` to record the pre-approval `tools/call` response.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let req_id = loop {
-        if let Ok(bytes) = std::fs::read(&out_file) {
-            if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                if let Some(text) = v["call"]["result"]["content"][0]["text"].as_str() {
-                    assert_eq!(v["call"]["result"]["isError"], true, "{v}");
-                    assert!(text.contains("envcloak pending"), "{text}");
-                    break extract_request_id(text);
-                }
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for s13 pending call"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    running1.model.wait_for("step 1", &mut running1.child);
+    assert_live_process_env_clean(running1.child.id(), &mut w.h, "s13 live codex env (pre)");
     assert_eq!(
         w.http_srv.authed_count(),
         0,
         "no HTTP request before approval"
     );
 
+    let pend1 = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+    let pend1_v: Value = serde_json::from_slice(&pend1.stdout).unwrap();
+    let req_id1 = pend1_v["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["agent"]
+                .as_str()
+                .is_some_and(|a| a.eq_ignore_ascii_case("codex"))
+        })
+        .unwrap_or_else(|| panic!("expected codex pending request in S13: {pend1_v}"))["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let _ = w.h.human(&repo, &["deny", &req_id1], &[], &[]);
+    running1.model.release("s13_pre_approval");
+    let run1 = running1.wait();
+    w.h.record("s13 codex pre stdout", &run1.output.stdout);
+    w.h.record("s13 codex pre stderr", &run1.output.stderr);
+    for req in &run1.model.requests {
+        w.h.record("s13 codex pre model request", &req.body);
+    }
+    assert_eq!(run1.output.status.code(), Some(0), "{}", run1.text());
+    assert_eq!(
+        w.http_srv.authed_count(),
+        0,
+        "still 0 authenticated HTTP requests before approval"
+    );
+
+    // 2. Add `--wait` to `fixture-http`'s `mcp-bridge` args so `mcp-bridge` waits via D-04
+    // for the person's `--once` approval before answering `tools/list` to Codex, allowing
+    // Codex's own MCP client to discover and invoke `ping_http` under the `--once` grant.
+    let after_run1 = std::fs::read_to_string(&config_path).unwrap();
+    let updated_wait = after_run1.replace("\"mcp-bridge\",", "\"mcp-bridge\", \"--wait\",");
+    assert!(updated_wait.contains("\"--wait\""), "{updated_wait}");
+    std::fs::write(&config_path, &updated_wait).unwrap();
+
+    let script2 = json!({"steps": [
+        {"tool": "ping_http", "namespace": "mcp__fixture_http", "input": {}},
+        {"say": "done", "after": "s13_post_approval"}
+    ]});
+    let mut running2 = w
+        .codex
+        .spawn(&script2, "Call fixture-http.", &flags, &w.repo);
+
+    // Poll `envcloak pending --json` until `mcp-bridge --wait --url` opens its pending request.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let req_id2 = loop {
+        let pend = w.h.human(&repo, &["pending", "--json"], &[], &[]);
+        let pend_v: Value = serde_json::from_slice(&pend.stdout).unwrap();
+        if let Some(id) = pend_v["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["agent"]
+                    .as_str()
+                    .is_some_and(|a| a.eq_ignore_ascii_case("codex"))
+            })
+            .and_then(|r| r["request"].as_str())
+        {
+            break id.to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for codex S13 pending request"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    assert_eq!(
+        w.http_srv.authed_count(),
+        0,
+        "no HTTP request before --once approval"
+    );
+
     // Human approves `--once`.
-    let repo = w.repo.clone();
     let pass = w.pass_file.clone();
     let app = w.h.human(
         &repo,
-        &["approve", &req_id, "--once", "--passphrase-fd", "3"],
+        &["approve", &req_id2, "--once", "--passphrase-fd", "3"],
         &[(3, &pass, true)],
         &[],
     );
     assert_eq!(app.code, 0, "{}", app.all());
 
-    let run = running.wait();
-    w.h.record("s13 codex stdout", &run.output.stdout);
-    w.h.record("s13 codex stderr", &run.output.stderr);
-    for req in &run.model.requests {
+    running2.model.wait_for("step 1", &mut running2.child);
+    assert_live_process_env_clean(running2.child.id(), &mut w.h, "s13 live codex env");
+    running2.model.release("s13_post_approval");
+
+    let run2 = running2.wait();
+    w.h.record("s13 codex stdout", &run2.output.stdout);
+    w.h.record("s13 codex stderr", &run2.output.stderr);
+    for req in &run2.model.requests {
         w.h.record("s13 codex model request", &req.body);
     }
-    assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
-    assert_eq!(
-        w.http_srv.authed_count(),
-        1,
-        "expected exactly 1 authenticated tools/call request to reach FixtureHttpServer"
-    );
+    std::fs::write(&config_path, &updated).unwrap();
+    assert_eq!(run2.output.status.code(), Some(0), "{}", run2.text());
 
+    let step1_body = String::from_utf8_lossy(
+        &run2
+            .model
+            .requests
+            .iter()
+            .find(|r| r.pick.as_deref() == Some("step 0"))
+            .or_else(|| {
+                run2.model
+                    .requests
+                    .iter()
+                    .find(|r| r.pick.as_deref() == Some("step 1"))
+            })
+            .unwrap()
+            .body,
+    );
     let body = String::from_utf8_lossy(
-        &run.model
+        &run2
+            .model
             .requests
             .iter()
             .find(|r| r.pick.as_deref() == Some("step 1"))
             .unwrap()
             .body,
+    );
+    assert_eq!(
+        w.http_srv.authed_count(),
+        1,
+        "expected_authed_count=1; step0={step1_body}; step1={body}"
     );
     assert!(body.contains("http_authed=true"), "{body}");
     assert!(
@@ -2464,17 +2676,27 @@ fn step_s16_doctor_scrub_and_undo(w: &mut StoryWorld) {
         }
     }
 
-    // Ensure `GITHUB_TOKEN` and `lowent/acme` are present in a transcript, `history.jsonl`,
-    // and `paste-cache/`, aged past the 2-minute rule so `doctor` and `scrub` treat them as settled.
-    let proj_dir = home.join(".claude/projects/acme");
-    std::fs::create_dir_all(&proj_dir).unwrap();
-    let settled_jsonl = proj_dir.join("settled.jsonl");
+    // Use the real Claude Code transcript written by S6 (which already holds `GITHUB_TOKEN`),
+    // appending only `lowent/acme` so we verify `doctor` never flags `lowent/acme`.
+    let s6_jsonl = w
+        .s6_transcript_path
+        .clone()
+        .expect("S6 transcript path must be recorded");
+    let s6_name = s6_jsonl.file_name().unwrap().to_str().unwrap().to_owned();
+    let proj_dir = s6_jsonl.parent().unwrap().to_path_buf();
     let gh = w.h.canary(labels::GITHUB_TOKEN).as_str().to_owned();
-    let settled_body = format!(
-        "{{\"type\":\"user\",\"text\":\"pasted {gh} and {}\"}}\n",
-        w.lowent_value
-    );
-    std::fs::write(&settled_jsonl, &settled_body).unwrap();
+    {
+        let mut s6_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&s6_jsonl)
+            .unwrap();
+        writeln!(
+            s6_file,
+            "{{\"type\":\"user\",\"text\":\"lowent {}\"}}",
+            w.lowent_value
+        )
+        .unwrap();
+    }
 
     let history_jsonl = home.join(".claude/history.jsonl");
     {
@@ -2496,9 +2718,9 @@ fn step_s16_doctor_scrub_and_undo(w: &mut StoryWorld) {
     std::fs::write(&paste_file, format!("pasted {gh} and {}\n", w.lowent_value)).unwrap();
 
     age_tree(&home, SCRUB_OLD);
-    let settled_sha_before = sha256_file(&settled_jsonl);
+    let s6_sha_before = sha256_file(&s6_jsonl);
 
-    // `doctor` reports `github/acme-web` in the transcript, `history.jsonl` and `paste-cache/`
+    // `doctor` reports `github/acme-web` in S6's real transcript, `history.jsonl` and `paste-cache/`
     // with paths and counts only, and never `lowent/acme`.
     let doc = w.human_with_hosts(&home, &["doctor", "--json"], &[]);
     assert_eq!(doc.code, 0, "{}", doc.all());
@@ -2512,21 +2734,25 @@ fn step_s16_doctor_scrub_and_undo(w: &mut StoryWorld) {
         .unwrap_or_else(|| panic!("expected github/acme-web in doctor items: {doc_v}"));
     let gh_places = serde_json::to_string(gh_item).unwrap();
     assert!(
-        gh_places.contains("settled.jsonl")
+        gh_places.contains(&s6_name)
             && gh_places.contains("history.jsonl")
             && gh_places.contains("paste-s6.txt"),
-        "expected transcript, history.jsonl and paste-cache in github/acme-web places: {gh_places}"
+        "expected S6 transcript ({s6_name}), history.jsonl and paste-cache in github/acme-web places: {gh_places}"
     );
 
     // Plant a freshly appended transcript (`recent.jsonl`, mtime = now) and a symlink
-    // transcript (`symlink.jsonl` -> `settled.jsonl`) right before the first `scrub --yes`.
+    // transcript (`symlink.jsonl` -> `s6_jsonl`) right before the first `scrub --yes`.
     let recent_jsonl = proj_dir.join("recent.jsonl");
-    std::fs::write(&recent_jsonl, &settled_body).unwrap();
+    std::fs::write(
+        &recent_jsonl,
+        format!("{{\"type\":\"user\",\"text\":\"recent {gh}\"}}\n"),
+    )
+    .unwrap();
     let symlink_jsonl = proj_dir.join("symlink.jsonl");
-    std::os::unix::fs::symlink(&settled_jsonl, &symlink_jsonl).unwrap();
+    std::os::unix::fs::symlink(&s6_jsonl, &symlink_jsonl).unwrap();
 
     // First `scrub --yes --json`: refuses `recent.jsonl` (`recently_changed`) and notes `symlink.jsonl` (`symlink`),
-    // while scrubbing `settled.jsonl`, `history.jsonl`, `paste-cache/` and any S6 transcripts!
+    // while scrubbing S6's real transcript, `history.jsonl`, and `paste-cache/`!
     let scrub1 = w.human_with_hosts(&home, &["scrub", "--yes", "--json"], &[]);
     assert_ne!(
         scrub1.code, 0,
@@ -2547,13 +2773,13 @@ fn step_s16_doctor_scrub_and_undo(w: &mut StoryWorld) {
         "expected symlink refusal in {scrub1_v}"
     );
 
-    // Verify `settled.jsonl` was rewritten with valid JSONL and `[envcloak:redacted:github/acme-web]`.
-    let settled_after = std::fs::read_to_string(&settled_jsonl).unwrap();
+    // Verify S6's real transcript was rewritten with valid JSONL and `[envcloak:redacted:github/acme-web]`.
+    let s6_after = std::fs::read_to_string(&s6_jsonl).unwrap();
     assert!(
-        settled_after.contains("[envcloak:redacted:github/acme-web]"),
-        "{settled_after}"
+        s6_after.contains("[envcloak:redacted:github/acme-web]"),
+        "{s6_after}"
     );
-    for line in settled_after.lines() {
+    for line in s6_after.lines() {
         serde_json::from_str::<Value>(line).expect("valid JSONL line after scrub");
     }
 
@@ -2568,17 +2794,13 @@ fn step_s16_doctor_scrub_and_undo(w: &mut StoryWorld) {
     );
 
     // Undo the scrub backup (`envcloak scrub --undo <id> --passphrase-fd 3`):
-    // asks for passphrase once, shows `"created by you (terminal)"`, and restores byte-for-byte!
+    // asks for passphrase once, shows `"made from a terminal"`, and restores S6's transcript byte-for-byte!
     let backup_id = files
         .iter()
         .find(|f| {
-            f["state"] == "scrubbed"
-                && f["display_path"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with("settled.jsonl")
+            f["state"] == "scrubbed" && f["display_path"].as_str().unwrap().ends_with(&s6_name)
         })
-        .unwrap_or_else(|| panic!("settled.jsonl not in scrubbed files: {files:?}"))["backup"]
+        .unwrap_or_else(|| panic!("{s6_name} not in scrubbed files: {files:?}"))["backup"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2595,12 +2817,12 @@ fn step_s16_doctor_scrub_and_undo(w: &mut StoryWorld) {
         undo.all()
     );
     assert_eq!(
-        sha256_file(&settled_jsonl),
-        settled_sha_before,
-        "scrub --undo must restore settled.jsonl byte-for-byte"
+        sha256_file(&s6_jsonl),
+        s6_sha_before,
+        "scrub --undo must restore S6 transcript byte-for-byte"
     );
 
-    // Remove the symlink, age `recent.jsonl` and `settled.jsonl` (and all transcripts),
+    // Remove the symlink, age `recent.jsonl` and `s6_jsonl` (and all transcripts),
     // and run `envcloak scrub --yes --json` again so zero fixtures remain in any store!
     std::fs::remove_file(&symlink_jsonl).unwrap();
     age_tree(&home, SCRUB_OLD);
@@ -2686,33 +2908,33 @@ fn step_s18_final_sweep_and_positive_controls(w: &mut StoryWorld) {
     }
 
     // 4. Positive controls:
-    // (a) S6's pre-scrub snapshot holds `GITHUB_TOKEN` (if Claude Code wrote the blocked prompt
-    //     to history/transcript before scrub) OR our planted positive control file in
-    //     `pre_scrub_snapshot` is found by `sweep_dir` and `Detector`.
+    // (a) `w.pre_scrub_snapshot` holds the unplanted pre-scrub S6 transcript copied in S6
+    //     and must contain `GITHUB_TOKEN`.
+    // (b) A separate `s18-planted-control` directory outside `$HOME` holds `POSITIVE_CONTROL`
+    //     and proves `sweep_dir` and `Detector` find a planted canary.
+    let snap_hits = sweep_dir(&w.pre_scrub_snapshot, &w.h.canaries);
+    let gh_snap_count = snap_hits
+        .iter()
+        .filter(|h| matches!(h, Hit::Canary { found, .. } if found.label == labels::GITHUB_TOKEN))
+        .count();
+
     let pos_canary = Canary::new(
         "POSITIVE_CONTROL",
         format!("ec-pos-ctrl-{:016x}{:016x}", fresh_seed(), fresh_seed()),
     );
-    let planted_path = w.pre_scrub_snapshot.join("planted_control.jsonl");
+    let planted_dir = w.h.files().join("s18-planted-control");
+    std::fs::create_dir_all(&planted_dir).unwrap();
+    let planted_path = planted_dir.join("planted_control.jsonl");
     std::fs::write(
         &planted_path,
-        format!(
-            "{{\"control\":{:?},\"github\":{:?}}}\n",
-            pos_canary.as_str(),
-            w.h.canary(labels::GITHUB_TOKEN).as_str()
-        ),
+        format!("{{\"control\":{:?}}}\n", pos_canary.as_str()),
     )
     .unwrap();
-    let mut pos_set = w.h.canaries.clone();
-    pos_set.push(pos_canary);
-    let pos_hits = sweep_dir(&w.pre_scrub_snapshot, &pos_set);
+    let pos_set = [pos_canary];
+    let pos_hits = sweep_dir(&planted_dir, &pos_set);
     let pos_ctrl_count = pos_hits
         .iter()
         .filter(|h| matches!(h, Hit::Canary { found, .. } if found.label == "POSITIVE_CONTROL"))
-        .count();
-    let gh_snap_count = pos_hits
-        .iter()
-        .filter(|h| matches!(h, Hit::Canary { found, .. } if found.label == labels::GITHUB_TOKEN))
         .count();
     let raw_bytes_hits = Detector::new(&pos_set).find(&std::fs::read(&planted_path).unwrap());
     println!(

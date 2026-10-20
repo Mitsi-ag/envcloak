@@ -809,15 +809,13 @@ jobs:
             "$(command -v python3)" -c 'import os, sys; os.setgroups([4242]); os.setgid(4242); os.setuid(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' \
             "$(id -u)" cargo test --locked --offline -p envcloak-e2e $TESTS -- --nocapture --test-threads=1
 
-  # The real-model release check (M2 plan D-13, Q-01): manual and nightly
-  # only, with dedicated low-limit keys from Actions secrets, which pull
-  # requests from forks never get. From V1 (M2-08's instruction block) it
-  # runs the M2 instruction-block prompts against real Claude Code and
-  # Codex models, n = 5 per host and system per night, and records use
-  # rates in docs/COMPAT.md. Until the repository variable
-  # ENVCLOAK_RELEASE_CHECK_MODELS is "on" (set once V1 and the keys
-  # exist), the job is skipped, which no run reads as a pass; once on, a
-  # missing key or a prompt set that is not there yet fails it.
+  # The real-model release check (M2 plan D-13, Q-01; task M2-26): manual and
+  # nightly only, with dedicated low-limit keys from Actions secrets, which pull
+  # requests from forks never get. Runs the M2 instruction-block prompts and
+  # story against the pinned tier-1 hosts (Claude Code and Codex), n = 5 per
+  # host and system per night, and records use rates in docs/COMPAT.md. Until
+  # the repository variable ENVCLOAK_RELEASE_CHECK_MODELS is "on", the job is
+  # skipped, which no run reads as a pass; once on, a missing key fails it.
   release-check-models:
     if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && vars.ENVCLOAK_RELEASE_CHECK_MODELS == 'on'
     name: release-check-models (${{ matrix.os }})
@@ -826,21 +824,43 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
+    env:
+      ENVCLOAK_AGENT_HOSTS: ${{ github.workspace }}/../agent-hosts
+      ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS: "1"
     steps:
       - uses: actions/checkout@v4
-      - name: What runs
+      - name: Require release-check API keys
         env:
           ANTHROPIC_KEY_SET: ${{ secrets.ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY != '' }}
           OPENAI_KEY_SET: ${{ secrets.ENVCLOAK_RELEASE_CHECK_OPENAI_KEY != '' }}
         run: |
           if [ "$ANTHROPIC_KEY_SET" != "true" ] || [ "$OPENAI_KEY_SET" != "true" ]; then
             msg="ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY and ENVCLOAK_RELEASE_CHECK_OPENAI_KEY are not both configured"
-          else
-            msg="the M2 instruction-block prompts land with M2-08 (V1); there is nothing to measure before them"
+            echo "::error title=release-check-models::$msg"
+            echo "release-check-models failed: $msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
           fi
-          echo "::error title=release-check-models::$msg"
-          echo "release-check-models failed: $msg" >> "$GITHUB_STEP_SUMMARY"
-          exit 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-check-models
+      - name: Agent hosts from the cache, keyed by their pins
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/../agent-hosts
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'crates/envcloak-e2e/mcp-client/package*.json', 'scripts/install-agent-hosts.py') }}
+      - name: Install and verify the pinned tier-1 hosts
+        run: |
+          python3 scripts/install-agent-hosts.py --self-test
+          python3 scripts/install-agent-hosts.py --tier 1
+      - name: Build and run M2 release-check trials
+        env:
+          ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY: ${{ secrets.ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY }}
+          ENVCLOAK_RELEASE_CHECK_OPENAI_KEY: ${{ secrets.ENVCLOAK_RELEASE_CHECK_OPENAI_KEY }}
+          ENVCLOAK_RELEASE_CHECK_ITERATIONS: "5"
+        run: |
+          cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
+          cargo test --locked -p envcloak-e2e --test m2_story -- --nocapture --test-threads=1
 
   # The macOS app (M3 plan §5 rule 8, task M3-02; docs/APP.md "CI: the
   # macos-app job"). On pull requests only when ci-paths.py's `app` answer

@@ -60,12 +60,12 @@ Hosts that are not driven by the scripted model in CI (`cursor`, `gemini-cli`, `
 1. **Deterministic CI gates (`gates`, `agents-e2e`, `probes`):**
    - Run on every qualifying pull request and push to `main` using the pinned Claude Code (`2.1.280`) and Codex (`0.159.2`) binaries driven by the local loopback scripted model (`envcloak-testkit::agents::Model`).
    - Verify the §4 M2 acceptance story (`S1` to `S18`, including `S12b` and `S12c`) and its three variants (`Interactive Claude Code`, `Sandboxed Claude Code`, `Five migrated servers`), with a full post-run sweep across all §6.1 encodings and a pre-scrub positive control.
-2. **Nightly and release-check real-model runs (`nightly-models`, `release-check-models`):**
-   - Triggered on the nightly schedule (`0 5 * * *` on `main`) and via `workflow_dispatch` (`release_check = true`) when `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are configured in repository secrets.
-   - Runs 5 iterations per (`host`, `os`) cell (`claude-code` and `codex` on `ubuntu-24.04` and `macos-15`) against live Anthropic and OpenAI models, checking every encoding (raw, JSON-escaped, URL-encoded, base64, base64url, hex, and CR LF variants) and verifying the positive control.
-   - **Release rule (SPEC §15.2 gate 41, M2 plan Q-01):** A milestone release requires at least 20 real-model runs per tier-1 host across the nightly and release-check series in which the host chooses EnvCloak (`envcloak run` or `run_with_secrets`) instead of reading `.env` directly in at least 80% of runs, with 0 fixture hits in every run. Any host below 80% is recorded here as `not reliably used`; a single fixture hit in any run holds the release.
+2. **Nightly and manual real-model release-check runs (`release-check-models`):**
+   - Triggered in `.github/workflows/ci.yml` on the nightly schedule (`17 16 * * *`) and via `workflow_dispatch` when `vars.ENVCLOAK_RELEASE_CHECK_MODELS == 'on'` and `ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY` and `ENVCLOAK_RELEASE_CHECK_OPENAI_KEY` are configured in repository secrets.
+   - Runs 5 iterations per (`host`, `os`) cell (`claude-code` and `codex` on `ubuntu-latest` and `macos-latest`) against live Anthropic and OpenAI models, checking every encoding (raw, JSON-escaped, URL-encoded, base64, base64url, hex, and CR LF variants) and verifying the positive control.
+   - **Release rule (SPEC §15.2 gate 41, M2 plan Q-01):** A milestone release requires at least 20 real-model runs per tier-1 host across the `release-check-models` series in which the host chooses EnvCloak (`envcloak run` or `run_with_secrets`) instead of reading `.env` directly in at least 80% of runs, with 0 fixture hits in every run. Any host below 80% is recorded here as `not reliably used`; a single fixture hit in any run holds the release.
 
-| Host | Pinned version | OS | Scripted-model story (`S1..S18`) | Real-model status (`nightly-models` / `release-check-models`) |
+| Host | Pinned version | OS | Scripted-model story (`S1..S18`) | Real-model status (`release-check-models`) |
 |---|---|---|---|---|
-| `claude-code` | `2.1.280` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | Tracked by `nightly-models` & `release-check-models` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
-| `codex` | `0.159.2` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | Tracked by `nightly-models` & `release-check-models` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
+| `claude-code` | `2.1.280` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | Tracked by `release-check-models` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
+| `codex` | `0.159.2` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | Tracked by `release-check-models` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
