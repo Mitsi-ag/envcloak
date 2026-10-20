@@ -87,6 +87,8 @@ def main():
     )
     parser.add_argument(
         "--pasteboard",
+        "--name",
+        dest="pasteboard",
         default=None,
         help="Optional NSPasteboard name (default: general pasteboard).",
     )

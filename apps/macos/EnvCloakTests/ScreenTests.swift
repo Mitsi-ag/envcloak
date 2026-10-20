@@ -974,5 +974,47 @@ import XCTest
         }
         XCTAssertFalse(identified("approval.evidence", in: approvalWindow).isEmpty)
         approvalWindow.close()
+
+        // 5. KeyInspector value-bar token uses Amber only in dark appearance and Text in light appearance.
+        XCTAssertEqual(KeyInspector.valueBarToken(for: .dark), .amber)
+        XCTAssertEqual(KeyInspector.valueBarToken(for: .light), .text)
+
+        // 6. Reduce Transparency fallbacks replace vibrancy materials with opaque raised surfaces + 1 pt rule.
+        XCTAssertTrue(CommandPalette.usesOpaquePanel(reduceTransparency: true))
+        XCTAssertFalse(CommandPalette.usesOpaquePanel(reduceTransparency: false))
+        XCTAssertTrue(MenuBarPopover.usesOpaqueHeaderStrip(reduceTransparency: true))
+        XCTAssertFalse(MenuBarPopover.usesOpaqueHeaderStrip(reduceTransparency: false))
+
+        // 7. KeySightModel announces "Value hidden" on hide/auto-hide and "Clipboard cleared" on clipboard clear.
+        let keySight = KeySightModel(slug: item.slug, field: nil)
+        let secretBuf = try SecretBuffer(capacity: 8)
+        keySight.receiveSecret(secretBuf, startCountdown: false)
+        XCTAssertTrue(keySight.isShown)
+        keySight.hideNow()
+        XCTAssertFalse(keySight.isShown)
+        XCTAssertEqual(keySight.lastAnnouncement, "Value hidden")
+        keySight.announceClipboardCleared()
+        XCTAssertEqual(keySight.lastAnnouncement, "Clipboard cleared")
+
+        // 8. VaultSession announces "EnvCloak locked" when locking explicitly, on system signal, or on daemon idle lock.
+        await session.lock()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")
+
+        await client.configure(vault: "unlocked")
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        await session.lockForSignal(.screenLock)
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")
+
+        await client.configure(vault: "unlocked")
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        session.notifications.clear()
+        await client.configure(vault: "locked")
+        await session.poll()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")
     }
 }

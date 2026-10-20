@@ -6,13 +6,38 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 
-if [[ "${1:-}" == "--check-peer-code" ]]; then
-  exec scripts/macos/check-peer-code.sh
-fi
+socket_path=""
+app_bundle=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check-peer-code)
+      exec scripts/macos/check-peer-code.sh
+      ;;
+    --socket)
+      socket_path="$2"
+      shift 2
+      ;;
+    --app-bundle)
+      app_bundle="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "usage: scripts/macos/forged-peer.sh [--socket <socket-path>] [--app-bundle <app-path>] | <socket-path> | --check-peer-code" >&2
+      exit 0
+      ;;
+    *)
+      socket_path="$1"
+      shift
+      ;;
+  esac
+done
 
-socket_path="${1:-}"
 if [[ -z "$socket_path" ]]; then
-  echo "usage: scripts/macos/forged-peer.sh <socket-path> | --check-peer-code" >&2
+  echo "usage: scripts/macos/forged-peer.sh [--socket <socket-path>] [--app-bundle <app-path>] | <socket-path> | --check-peer-code" >&2
+  exit 2
+fi
+if [[ -n "$app_bundle" && ! -d "$app_bundle" ]]; then
+  echo "forged-peer: app bundle not found at $app_bundle" >&2
   exit 2
 fi
 

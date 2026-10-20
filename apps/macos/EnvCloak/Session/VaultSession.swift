@@ -314,11 +314,15 @@ struct Change: OptionSet {
                     change.insert(.pending)
                 }
             }
+            let previousState = state
             state = next
             pendingCount = next == .ready ? status.approvals.pending : 0
             appRequestsCount = next == .ready ? status.app_requests : 0
             if !next.canReadMetadata {
                 clearMetadata()
+                if next == .locked && previousState == .ready {
+                    notifications.announce("EnvCloak locked")
+                }
                 lastStatus = status
                 return
             }
@@ -386,13 +390,18 @@ struct Change: OptionSet {
     }
 
     private func fail(_ error: any Error) {
+        let wasReady = state == .ready
         lastStatus = nil
         clearMetadata()
         pendingCount = 0
         appRequestsCount = 0
         switch error as? EnvCloakError {
         case .daemonUnverified(let check): state = .unverified(check)
-        case .rpc(.vaultLocked, _): state = .locked
+        case .rpc(.vaultLocked, _):
+            state = .locked
+            if wasReady {
+                notifications.announce("EnvCloak locked")
+            }
         case .rpc(.vaultTampered, _): state = .readOnly
         case .daemonUnavailable: state = .noDaemon
         default:
@@ -444,6 +453,7 @@ struct Change: OptionSet {
         guard let client, !locking, state != .locked else { return }
         locking = true
         actionInProgress = true
+        var didLock = false
         defer {
             // Lock uses its own client slot. Retire every earlier refresh at
             // completion as well as entry, including failed lock responses.
@@ -455,6 +465,9 @@ struct Change: OptionSet {
             proofWait = 0
             locking = false
             actionInProgress = false
+            if didLock {
+                notifications.announce("EnvCloak locked")
+            }
         }
         generation += 1
         lastStatus = nil
@@ -467,6 +480,7 @@ struct Change: OptionSet {
             _ = try await client.call(Lock())
             state = .locked
             lockReason = "Locked by request"
+            didLock = true
         } catch { fail(error) }
     }
 
@@ -475,6 +489,7 @@ struct Change: OptionSet {
         guard let client, !locking else { return }
         locking = true
         actionInProgress = true
+        var didLock = false
         defer {
             generation += 1
             lastStatus = nil
@@ -484,6 +499,9 @@ struct Change: OptionSet {
             proofWait = 0
             locking = false
             actionInProgress = false
+            if didLock {
+                notifications.announce("EnvCloak locked")
+            }
         }
         generation += 1
         lastStatus = nil
@@ -500,6 +518,7 @@ struct Change: OptionSet {
             case .sessionResign: "Locked when the user session switched"
             case .user: "Locked by request"
             }
+            didLock = true
         } catch { fail(error) }
     }
 

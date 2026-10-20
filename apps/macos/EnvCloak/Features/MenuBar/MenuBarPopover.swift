@@ -174,6 +174,11 @@ struct MenuBarPopover: View {
     @State private var highlightedId: String?
     @FocusState private var searchFocused: Bool
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    static func usesOpaqueHeaderStrip(reduceTransparency: Bool) -> Bool {
+        reduceTransparency
+    }
 
     private var projectTitles: [DaemonText: String] {
         var map: [DaemonText: String] = [:]
@@ -239,7 +244,29 @@ struct MenuBarPopover: View {
         }
     }
 
+    @ViewBuilder
     private var stateRow: some View {
+        if Self.usesOpaqueHeaderStrip(reduceTransparency: reduceTransparency) {
+            stateRowContent
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(ECToken.raised.color)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .stroke(ECToken.rule.color, lineWidth: 1)
+                        )
+                )
+        } else {
+            GlassEffectContainer {
+                stateRowContent
+                    .padding(8)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+        }
+    }
+
+    private var stateRowContent: some View {
         HStack(spacing: 8) {
             Image(systemName: session.state == .ready ? "lock.open" : "lock")
                 .foregroundStyle(ECToken.secondary.color)

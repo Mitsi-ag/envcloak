@@ -9,9 +9,10 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use envcloak_core::SecretBytes;
 use envcloak_core::crypto::{
@@ -24,16 +25,16 @@ use envcloak_ipc::app::{
     AppAuditListParams, AppItemsRemoveParams, AppItemsRotateParams, AppLockReason, AppPasteParams,
     AppRevealBeginParams, AppRevealParams, AppUnlockerEnrollOutput,
 };
-use envcloak_ipc::proto::{AskParams, ErrorKind, PendingGetOutput};
+use envcloak_ipc::proto::{ErrorKind, PendingGetOutput};
 use envcloak_ipc::view::{
     AddedView, ClassificationView, KeychainAnchorState, LengthClass, LockReason, VaultState,
 };
-use envcloak_ipc::{Client, ClientError, RunPaths};
+use envcloak_ipc::{Client, ClientError, RunPathErrorKind, RunPaths, Unverified};
 use envcloak_policy::{
-    ApprovalOptions, AskStateOutcome, DEFAULT_TTL, EnvName, Uses, WriteAction, WriteStatement,
+    ApprovalOptions, DEFAULT_TTL, EnvName, SubjectKind, Uses, WriteAction, WriteStatement,
     reveal_statement_digest, statement_digest, unlocker_statement_digest, write_statement_digest,
 };
-use envcloak_testkit::{Canary, daemon_run_dir, fresh_seed, labels};
+use envcloak_testkit::{Canary, Detector, daemon_run_dir, fresh_seed, labels};
 use serde_json::json;
 
 const TEST_TEAM_ID: &str = "AB12CD34EF";
@@ -42,6 +43,10 @@ const CHILD_ROLE_DENIED_ENV: &str = "ENVCLOAK_TEST_M321_CHILD_ROLE_DENIED";
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_encode_upper(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 fn decode_hex<const N: usize>(s: &str) -> [u8; N] {
@@ -150,7 +155,14 @@ fn paste_secret(
     .unwrap()
 }
 
-fn unlock_with_se(c: &mut Client, vault_id: VaultId, unlocker_id: &str, unlock_sk: &[u8; 32]) {
+fn unlock_with_se(
+    h: &mut Harness,
+    c: &mut Client,
+    vault_id: VaultId,
+    unlocker_id: &str,
+    unlock_sk: &[u8; 32],
+    step_label: &str,
+) -> (String, String, String, String) {
     let begin = c.app_unlock_begin(Some(unlocker_id), &[]).unwrap();
     let vmk = open_se_envelope(
         unlock_sk,
@@ -163,13 +175,71 @@ fn unlock_with_se(c: &mut Client, vault_id: VaultId, unlocker_id: &str, unlock_s
         },
     )
     .unwrap();
+
+    // Register the opened 32-byte VMK (raw bytes, lowercase hex, uppercase hex,
+    // standard base64, and URL-safe base64) before recording the IPC wire frames
+    // so `h.record` and `h.assert_swept` verify the VMK never crosses the socket
+    // in any unsealed encoding (g2).
+    let vmk_bytes = vmk.export_for_testing();
+    let vmk_hex = hex_encode(&vmk_bytes);
+    let vmk_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &vmk_bytes);
+    let vmk_b64_url =
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, &vmk_bytes);
+    let vmk_b64_no_pad = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &vmk_bytes,
+    );
+    if !h.canaries.iter().any(|c| c.label == "VMK_HEX") {
+        h.add_canary(Canary::new("VMK_HEX", vmk_hex));
+        h.add_canary(Canary::new("VMK_B64", vmk_b64));
+    }
+    h.add_needle("VMK_RAW".to_owned(), vmk_bytes.clone());
+    h.add_needle(
+        "VMK_HEX_UPPER".to_owned(),
+        hex_encode_upper(&vmk_bytes).into_bytes(),
+    );
+    h.add_needle("VMK_B64_URL".to_owned(), vmk_b64_url.into_bytes());
+    h.add_needle("VMK_B64_NO_PAD".to_owned(), vmk_b64_no_pad.into_bytes());
+
+    let begin_wire = serde_json::to_vec(&json!({
+        "request_id": &begin.request_id,
+        "vault_id": &begin.vault_id,
+        "unlocker_id": &begin.unlocker_id,
+        "epoch": begin.epoch,
+        "envelope": {
+            "enc": &begin.envelope.enc,
+            "ciphertext": &begin.envelope.ciphertext,
+        },
+        "daemon_eph_pub": &begin.daemon_eph_pub,
+        "challenge": &begin.challenge,
+    }))
+    .unwrap();
+    h.record(
+        &format!("{step_label} app.unlock.begin response"),
+        &begin_wire,
+    );
+
     let challenge = decode_hex::<SE_CHALLENGE_LEN>(&begin.challenge);
     let daemon_pub: [u8; 32] = decode_hex(&begin.daemon_eph_pub);
     let sealed_vmk = seal_vmk_to_daemon(&daemon_pub, &begin.request_id, &challenge, &vmk).unwrap();
+    let sealed_vmk_hex = hex_encode(&sealed_vmk);
+    let unlock_wire = serde_json::to_vec(&json!({
+        "request_id": &begin.request_id,
+        "sealed_vmk": &sealed_vmk_hex,
+    }))
+    .unwrap();
+    h.record(&format!("{step_label} app.unlock request"), &unlock_wire);
+
     let unlocked = c
-        .app_unlock(&begin.request_id, &hex_encode(&sealed_vmk), &[])
+        .app_unlock(&begin.request_id, &sealed_vmk_hex, &[])
         .unwrap();
     assert!(!unlocked.already);
+    (
+        begin.request_id,
+        begin.daemon_eph_pub,
+        begin.challenge,
+        sealed_vmk_hex,
+    )
 }
 
 #[test]
@@ -199,6 +269,7 @@ fn child_client_role_denied_probe() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn m3_acceptance_story_a1_to_a20() {
     envcloak_sys::testing::enter_terminal_session().unwrap();
     let app_id = format!("{}:{TEST_TEAM_ID}:{TEST_SIGNING_ID}", std::process::id());
@@ -254,15 +325,43 @@ fn m3_acceptance_story_a1_to_a20() {
     assert_eq!(c.status().unwrap().vault.state, VaultState::Unlocked);
     h.assert_swept("A2 vault created");
 
-    // -------------------------------------------------------------------------
-    // A3 / A4 / A5: Touch ID enrollment (`app.unlocker.enroll.begin` ->
-    // `approve` -> `app.unlocker.enroll`), lock, and unlock with Touch ID.
-    // -------------------------------------------------------------------------
     let (unlock_sk, unlock_pub): ([u8; 32], [u8; P256_PUBLIC_KEY_LEN]) =
         derive_p256_keypair(&[0x42; 32]);
     let (approve_sk, approve_pub): ([u8; 32], [u8; P256_PUBLIC_KEY_LEN]) =
         derive_p256_keypair(&[0x43; 32]);
 
+    // When `ENVCLOAK_E2E_BIN_DIR` points at the release binaries (built without
+    // `envcloak-sys/testing`), verify that `ENVCLOAK_TEST_APP_IDENTITY` is
+    // ignored (`RoleDenied`) and skip the steps that require the test-only
+    // Secure Enclave software stand-in hooks.
+    if !h.test_build() {
+        assert_eq!(
+            rpc_kind(
+                c.app_unlocker_enroll_begin(
+                    &hex_encode(&unlock_pub),
+                    &hex_encode(&approve_pub),
+                    "Touch ID",
+                    &[],
+                )
+                .unwrap_err()
+            )
+            .0,
+            ErrorKind::RoleDenied,
+            "release binary must ignore ENVCLOAK_TEST_APP_IDENTITY"
+        );
+        eprintln!(
+            "m3_story: Secure Enclave software stand-in hooks exist in the test build only; skipped here"
+        );
+        h.assert_swept("m3_story release build check");
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // A3 / A4: Touch ID enrollment (`app.unlocker.enroll.begin` -> `approve` ->
+    // `app.unlocker.enroll`), then lock and unlock with Touch ID twice in a row
+    // (g2: VMK crosses the socket only HPKE-sealed, once per unlock, with fresh
+    // challenge/ephemeral key each time and no VMK bytes in any encoding).
+    // -------------------------------------------------------------------------
     let begin_enroll = c
         .app_unlocker_enroll_begin(
             &hex_encode(&unlock_pub),
@@ -300,13 +399,27 @@ fn m3_acceptance_story_a1_to_a20() {
 
     c.lock().unwrap();
     assert_eq!(c.status().unwrap().vault.state, VaultState::Locked);
-    unlock_with_se(&mut c, vault_id, &unlocker_id, &unlock_sk);
+    let u1 = unlock_with_se(&mut h, &mut c, vault_id, &unlocker_id, &unlock_sk, "A4-1");
     assert_eq!(c.status().unwrap().vault.state, VaultState::Unlocked);
-    h.assert_swept("A5 unlocked with Touch ID");
+
+    c.lock().unwrap();
+    assert_eq!(c.status().unwrap().vault.state, VaultState::Locked);
+    let u2 = unlock_with_se(&mut h, &mut c, vault_id, &unlocker_id, &unlock_sk, "A4-2");
+    assert_eq!(c.status().unwrap().vault.state, VaultState::Unlocked);
+    assert_ne!(u1.0, u2.0, "each unlock must issue a fresh request_id");
+    assert_ne!(
+        u1.1, u2.1,
+        "each unlock must generate a fresh daemon_eph_pub"
+    );
+    assert_ne!(u1.2, u2.2, "each unlock must generate a fresh challenge");
+    assert_ne!(u1.3, u2.3, "each unlock must produce a distinct sealed_vmk");
+    h.assert_swept("A4 unlocked twice with Touch ID");
 
     // -------------------------------------------------------------------------
-    // A6 / A7: Sealed paste (`app.paste.begin` -> `app.paste.inspect` ->
-    // `app.paste`) and project binding (`acme-web/envcloak.toml`).
+    // A5: Sealed paste (`app.paste.begin` -> `app.paste.inspect` -> `app.paste`),
+    // project bindings (`envcloak ref`, `envcloak ref --unset`), `envcloak check --json`
+    // across `acme-web` and `billing`, and byte-for-byte undo (`--undo-fd` /
+    // `--restore-fd`).
     // -------------------------------------------------------------------------
     let openai_sec = SecretBytes::copy_from(h.value(labels::OPENAI_API_KEY));
     let github_sec = SecretBytes::copy_from(h.value(labels::GITHUB_TOKEN));
@@ -345,34 +458,140 @@ fn m3_acceptance_story_a1_to_a20() {
 
     let repo = h.home.root().join("acme-web");
     std::fs::create_dir_all(&repo).unwrap();
-    let manifest_body = "[project]\nname = \"acme-web\"\n\n[env]\nOPENAI_API_KEY = \"openai/acme-web\"\nSTRIPE_SECRET_KEY = \"stripe/acme-live\"\nGITHUB_TOKEN = \"github/acme-web\"\n\n[env.denytest]\nEXTRA_GITHUB_TOKEN = \"github/acme-web\"\n";
-    std::fs::write(repo.join("envcloak.toml"), manifest_body).unwrap();
+    std::fs::write(
+        repo.join("envcloak.toml"),
+        "[project]\nname = \"acme-web\"\n\n[env]\n",
+    )
+    .unwrap();
+    for args in [
+        &["ref", "OPENAI_API_KEY=openai/acme-web", "--json"][..],
+        &["ref", "STRIPE_SECRET_KEY=stripe/acme-live", "--json"][..],
+        &["ref", "GITHUB_TOKEN=github/acme-web", "--json"][..],
+        &[
+            "ref",
+            "EXTRA_GITHUB_TOKEN=github/acme-web",
+            "--profile",
+            "denytest",
+            "--json",
+        ][..],
+    ] {
+        let out = h.human(&repo, args, &[], &[]);
+        assert_eq!(out.code, 0, "{}", out.all());
+    }
+    let check_acme = h.human(&repo, &["check", "--json"], &[], &[]);
+    assert_eq!(check_acme.code, 0, "{}", check_acme.all());
+
+    let billing_a5 = h.home.root().join("billing-a5");
+    std::fs::create_dir_all(&billing_a5).unwrap();
+    let billing_manifest = billing_a5.join("envcloak.toml");
+    std::fs::write(
+        &billing_manifest,
+        "# Billing manifest\n[project]\nname = \"billing\"\n\n[env]\n",
+    )
+    .unwrap();
+    let ref_b1 = h.human(
+        &billing_a5,
+        &["ref", "OPENAI_API_KEY=openai/acme-web", "--json"],
+        &[],
+        &[],
+    );
+    assert_eq!(ref_b1.code, 0, "{}", ref_b1.all());
+    let check_b1 = h.human(&billing_a5, &["check", "--json"], &[], &[]);
+    assert_eq!(check_b1.code, 0, "{}", check_b1.all());
+    let billing_snapshot = std::fs::read(&billing_manifest).unwrap();
+
+    // Change binding in `billing` with `--undo-fd` and restore byte-for-byte.
+    let undo_change = h.files().join("billing-change.undo");
+    let ref_b2 = h.human(
+        &billing_a5,
+        &[
+            "ref",
+            "OPENAI_API_KEY=github/acme-web",
+            "--undo-fd",
+            "3",
+            "--json",
+        ],
+        &[(3, &undo_change, false)],
+        &[],
+    );
+    assert_eq!(ref_b2.code, 0, "{}", ref_b2.all());
+    assert_ne!(std::fs::read(&billing_manifest).unwrap(), billing_snapshot);
+    let check_b2 = h.human(&billing_a5, &["check", "--json"], &[], &[]);
+    assert_eq!(check_b2.code, 0, "{}", check_b2.all());
+
+    let restore_b2 = h.human(
+        &billing_a5,
+        &["ref", "--restore-fd", "3", "--json"],
+        &[(3, &undo_change, true)],
+        &[],
+    );
+    assert_eq!(restore_b2.code, 0, "{}", restore_b2.all());
+    assert_eq!(
+        std::fs::read(&billing_manifest).unwrap(),
+        billing_snapshot,
+        "undo of binding change must restore envcloak.toml byte-for-byte"
+    );
+
+    // Unset binding in `billing` with `--undo-fd` and restore byte-for-byte.
+    let undo_unset = h.files().join("billing-unset.undo");
+    let unset_b = h.human(
+        &billing_a5,
+        &[
+            "ref",
+            "--unset",
+            "OPENAI_API_KEY",
+            "--undo-fd",
+            "3",
+            "--json",
+        ],
+        &[(3, &undo_unset, false)],
+        &[],
+    );
+    assert_eq!(unset_b.code, 0, "{}", unset_b.all());
+    assert!(
+        !String::from_utf8_lossy(&std::fs::read(&billing_manifest).unwrap())
+            .contains("OPENAI_API_KEY")
+    );
+    let restore_unset = h.human(
+        &billing_a5,
+        &["ref", "--restore-fd", "3", "--json"],
+        &[(3, &undo_unset, true)],
+        &[],
+    );
+    assert_eq!(restore_unset.code, 0, "{}", restore_unset.all());
+    assert_eq!(
+        std::fs::read(&billing_manifest).unwrap(),
+        billing_snapshot,
+        "undo of --unset must restore envcloak.toml byte-for-byte"
+    );
+
     write_script(
         &repo.join("emit"),
         "#!/bin/sh\nset -eu\npython3 -c 'import hashlib, os\nfor k in (\"OPENAI_API_KEY\", \"STRIPE_SECRET_KEY\", \"GITHUB_TOKEN\"):\n    v = os.environ.get(k, \"\").encode()\n    print(\"raw\", k, v.decode())\n    print(\"sha256\", k, hashlib.sha256(v).hexdigest())\n'\n",
     );
-    h.assert_swept("A7 pasted and bound");
+    h.assert_swept("A5 pasted, bound, checked and undone byte-for-byte");
 
     // -------------------------------------------------------------------------
-    // A8 / A9: Approval window, live-key confirmation tick, session grant
-    // reuse, and 3-denial auto-deny cooldown.
+    // A6 / A7 / A8: Approval window, live-key confirmation tick, two approvals
+    // within 10 s each requiring its own signature (g3), session grant reuse,
+    // and 3-denial auto-deny cooldown (gate 32).
     // -------------------------------------------------------------------------
-    let run_pending = h.agent(&repo, &["run", "--", "./emit"]);
-    let req_run = request_id(&run_pending);
+    let run_pending_1 = h.agent(&repo, &["run", "--", "./emit"]);
+    let req_run_1 = request_id(&run_pending_1);
     assert_eq!(c.status().unwrap().approvals.pending, 1);
 
-    let desc_run = c.app_pending_get(&req_run, &[]).unwrap();
-    assert_eq!(desc_run.request, req_run);
+    let desc_run_1 = c.app_pending_get(&req_run_1, &[]).unwrap();
+    assert_eq!(desc_run_1.request, req_run_1);
 
     // Omitting `live: ["STRIPE_SECRET_KEY"]` is rejected (`live_not_ticked`).
-    let opts_missing_live = ApprovalOptions::session(Duration::from_secs(3600));
-    let digest_missing_live = statement_digest(&desc_run, &opts_missing_live);
+    let opts_missing_live = ApprovalOptions::once(DEFAULT_TTL);
+    let digest_missing_live = statement_digest(&desc_run_1, &opts_missing_live);
     let sig_missing_live =
         hex_encode(&sign_p256_prehash(&approve_sk, &digest_missing_live).unwrap());
     assert_eq!(
         rpc_kind(
             c.app_approve(
-                &req_run,
+                &req_run_1,
                 &opts_missing_live,
                 &digest_missing_live,
                 &sig_missing_live,
@@ -384,26 +603,24 @@ fn m3_acceptance_story_a1_to_a20() {
         ErrorKind::LiveNotTicked
     );
 
-    // Confirming BOTH live keys (`OPENAI_API_KEY` and `STRIPE_SECRET_KEY`)
-    // succeeds and creates a 1-hour session grant.
-    let mut opts_live = ApprovalOptions::session(Duration::from_secs(3600));
-    opts_live.live = vec![
+    // First approval (`Uses::Once`) with live keys confirmed.
+    let mut opts_once = ApprovalOptions::once(DEFAULT_TTL);
+    opts_once.live = vec![
         EnvName::new("GITHUB_TOKEN").unwrap(),
         EnvName::new("OPENAI_API_KEY").unwrap(),
         EnvName::new("STRIPE_SECRET_KEY").unwrap(),
     ];
-    let digest_live = statement_digest(&desc_run, &opts_live);
-    let sig_live = hex_encode(&sign_p256_prehash(&approve_sk, &digest_live).unwrap());
-    let approved = c
-        .app_approve(&req_run, &opts_live, &digest_live, &sig_live, &[])
+    let digest_1 = statement_digest(&desc_run_1, &opts_once);
+    let sig_1 = hex_encode(&sign_p256_prehash(&approve_sk, &digest_1).unwrap());
+    let approved_1 = c
+        .app_approve(&req_run_1, &opts_once, &digest_1, &sig_1, &[])
         .unwrap();
-    assert!(!approved.grant.is_empty());
+    assert!(!approved_1.grant.is_empty());
 
-    // Re-running in the same agent session succeeds immediately under the grant;
-    // raw secret output is redacted while SHA-256 digests match the values.
-    let run_ok = h.agent(&repo, &["run", "--", "./emit"]);
-    assert_eq!(run_ok.status.code(), Some(0), "{}", text(&run_ok));
-    let stdout_ok = String::from_utf8_lossy(&run_ok.stdout);
+    // Running consumes the `Uses::Once` grant; output is redacted and SHA-256 matches.
+    let run_once_ok = h.agent(&repo, &["run", "--", "./emit"]);
+    assert_eq!(run_once_ok.status.code(), Some(0), "{}", text(&run_once_ok));
+    let stdout_ok = String::from_utf8_lossy(&run_once_ok.stdout);
     assert!(
         stdout_ok.contains("[envcloak:stripe/acme-live]"),
         "{stdout_ok}"
@@ -417,8 +634,42 @@ fn m3_acceptance_story_a1_to_a20() {
         sha256_hex(live_stripe_1.as_bytes())
     )));
 
+    // Second request within 10 seconds (A7, g3): requires a fresh statement
+    // digest and signature; replaying `sig_1` is rejected with `signature_invalid`.
+    let run_pending_2 = h.agent(&repo, &["run", "--", "./emit"]);
+    let req_run_2 = request_id(&run_pending_2);
+    assert_ne!(req_run_1, req_run_2);
+    let desc_run_2 = c.app_pending_get(&req_run_2, &[]).unwrap();
+    let mut opts_session = ApprovalOptions::session(Duration::from_secs(3600));
+    opts_session.live.clone_from(&opts_once.live);
+    let digest_2 = statement_digest(&desc_run_2, &opts_session);
+    assert_ne!(digest_1, digest_2);
+    assert_eq!(
+        rpc_kind(
+            c.app_approve(&req_run_2, &opts_session, &digest_2, &sig_1, &[])
+                .unwrap_err()
+        )
+        .0,
+        ErrorKind::SignatureInvalid,
+        "replaying the first approval's signature within 10 s must be rejected (g3)"
+    );
+    let sig_2 = hex_encode(&sign_p256_prehash(&approve_sk, &digest_2).unwrap());
+    let approved_2 = c
+        .app_approve(&req_run_2, &opts_session, &digest_2, &sig_2, &[])
+        .unwrap();
+    assert!(!approved_2.grant.is_empty());
+
+    // Subsequent run in the same session succeeds immediately under the session grant.
+    let run_session_ok = h.agent(&repo, &["run", "--", "./emit"]);
+    assert_eq!(
+        run_session_ok.status.code(),
+        Some(0),
+        "{}",
+        text(&run_session_ok)
+    );
+
     // 3 consecutive denials on `(root, project)` trigger auto-deny on the 4th
-    // even when argv differs.
+    // even when argv differs (A8, gate 32).
     for i in 0..3 {
         let arg = i.to_string();
         let d_out = h.agent(
@@ -438,39 +689,10 @@ fn m3_acceptance_story_a1_to_a20() {
         "{}",
         text(&fourth_out)
     );
-    h.assert_swept("A9 approval and 3-denial auto-deny");
+    h.assert_swept("A8 approvals and 3-denial auto-deny");
 
     // -------------------------------------------------------------------------
-    // A10: Forged peer (`role_denied` from a client-role process) & agent
-    // refusal (`proof_refused` when agent claims are sent).
-    // -------------------------------------------------------------------------
-    let child_out = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "child_client_role_denied_probe",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(
-            CHILD_ROLE_DENIED_ENV,
-            RunPaths::under(daemon_run_dir(&h.home)).unwrap().socket,
-        )
-        .output()
-        .unwrap();
-    assert!(
-        child_out.status.success()
-            && String::from_utf8_lossy(&child_out.stdout).contains("@@ client_role_denied_ok"),
-        "child_client_role_denied_probe failed: {}",
-        String::from_utf8_lossy(&child_out.stderr)
-    );
-    assert_eq!(
-        rpc_kind(c.app_paste_begin(&["CURSOR_AGENT".to_owned()]).unwrap_err()).0,
-        ErrorKind::ProofRefused
-    );
-    h.assert_swept("A10 forged peer and agent refusal");
-
-    // -------------------------------------------------------------------------
-    // A11: Replace (`app.items.target` -> `app.items.rotate`) & remove
+    // A9: Replace (`app.items.target` -> `app.items.rotate`) & remove
     // (`app.items.target` -> `app.items.remove` with encrypted backup first).
     // -------------------------------------------------------------------------
     let target_rot = c.app_items_target("stripe/acme-live", None, &[]).unwrap();
@@ -537,10 +759,10 @@ fn m3_acceptance_story_a1_to_a20() {
         h.data_dir().join("backups").join(&removed.backup).is_file(),
         "encrypted backup must exist before item removal"
     );
-    h.assert_swept("A11 rotated and removed");
+    h.assert_swept("A9 rotated and removed");
 
     // -------------------------------------------------------------------------
-    // A12: App-initiated reveal (`app.reveal.begin` -> `app.reveal`).
+    // A10: App-initiated reveal (`app.reveal.begin` -> `app.reveal`).
     // -------------------------------------------------------------------------
     let rev_desc = c
         .app_reveal_begin(&AppRevealBeginParams {
@@ -566,7 +788,7 @@ fn m3_acceptance_story_a1_to_a20() {
         })
         .unwrap();
     h.record(
-        "A12 app.reveal sealed_value hex",
+        "A10 app.reveal sealed_value hex",
         rev_out.sealed_value.as_bytes(),
     );
     let rev_aad = se_reveal_aad(
@@ -579,10 +801,10 @@ fn m3_acceptance_story_a1_to_a20() {
         .unwrap();
     assert_eq!(secret_sha256(&opened_rev), secret_sha256(&live_sec_2));
     drop(opened_rev);
-    h.assert_swept("A12 revealed in app");
+    h.assert_swept("A10 revealed in app");
 
     // -------------------------------------------------------------------------
-    // A13: Activity (`app.audit.list`) & audit verification (`audit verify --json`).
+    // A11: Activity (`app.audit.list`) & audit verification (`audit verify --json`).
     // -------------------------------------------------------------------------
     let app_audit = c
         .app_audit_list(&AppAuditListParams {
@@ -606,11 +828,10 @@ fn m3_acceptance_story_a1_to_a20() {
     assert_eq!(audit_out.status.code(), Some(0), "{}", text(&audit_out));
     let audit_json: serde_json::Value = serde_json::from_slice(&audit_out.stdout).unwrap();
     assert_eq!(audit_json["problems"].as_u64(), Some(0));
-    h.assert_swept("A13 audit verified");
+    h.assert_swept("A11 audit verified");
 
     // -------------------------------------------------------------------------
-    // A14 / A15: Screen lock (`app.lock` with `screen_lock`) & keychain
-    // rollback anchor read-only mode (`KeychainAnchorState::Ahead`).
+    // A12: Screen lock (`app.lock` with `screen_lock`, g7: drops all grants).
     // -------------------------------------------------------------------------
     c.app_lock(AppLockReason::ScreenLock, &[]).unwrap();
     let st_locked = c.status().unwrap();
@@ -618,9 +839,9 @@ fn m3_acceptance_story_a1_to_a20() {
     assert_eq!(st_locked.lock.last_reason, Some(LockReason::ScreenLock));
     assert!(c.grants_list().unwrap().grants.is_empty());
 
-    // Snapshot the vault db, advance the anchor with a remove, then restore
-    // the older vault db while keeping the newer anchor to trigger rollback
-    // read-only (A15).
+    // -------------------------------------------------------------------------
+    // A13: Keychain rollback anchor read-only mode (`KeychainAnchorState::Ahead`, g5).
+    // -------------------------------------------------------------------------
     drop(c);
     h.stop_daemon();
     let vault_dir = h.data_dir().join("vault");
@@ -630,7 +851,7 @@ fn m3_acceptance_story_a1_to_a20() {
 
     h.start_daemon(&[]);
     let mut c = app_client(&h);
-    unlock_with_se(&mut c, vault_id, &unlocker_id, &unlock_sk);
+    unlock_with_se(&mut h, &mut c, vault_id, &unlocker_id, &unlock_sk, "A13-1");
     let temp_sec = SecretBytes::copy_from(asked_stripe.as_bytes());
     paste_secret(
         &mut c,
@@ -668,7 +889,7 @@ fn m3_acceptance_story_a1_to_a20() {
 
     h.start_daemon(&[]);
     let mut c = app_client(&h);
-    unlock_with_se(&mut c, vault_id, &unlocker_id, &unlock_sk);
+    unlock_with_se(&mut h, &mut c, vault_id, &unlocker_id, &unlock_sk, "A13-2");
     let st_ro = c.status().unwrap();
     assert_eq!(st_ro.vault.state, VaultState::Unlocked);
     assert!(st_ro.vault.read_only);
@@ -708,7 +929,7 @@ fn m3_acceptance_story_a1_to_a20() {
     restore_vault_db(&snap_after, &vault_dir);
     h.start_daemon(&[]);
     let mut c = app_client(&h);
-    unlock_with_se(&mut c, vault_id, &unlocker_id, &unlock_sk);
+    unlock_with_se(&mut h, &mut c, vault_id, &unlocker_id, &unlock_sk, "A13-3");
     let st_restored = c.status().unwrap();
     assert_eq!(st_restored.vault.state, VaultState::Unlocked);
     assert!(!st_restored.vault.read_only);
@@ -716,7 +937,89 @@ fn m3_acceptance_story_a1_to_a20() {
         st_restored.vault.keychain_anchor,
         KeychainAnchorState::Matched
     );
-    h.assert_swept("A15 rollback read-only verified and restored");
+    h.assert_swept("A13 rollback read-only verified and restored");
+
+    // -------------------------------------------------------------------------
+    // A14 / A15: Forged peer (`role_denied` from a client-role process, g4 /
+    // gate 22), agent claims on app methods (every `app.*` method refused with
+    // `proof_refused` except `app.lock`, gate 23), and `daemon_unverified` (g1 /
+    // gate 21).
+    // -------------------------------------------------------------------------
+    let run_paths = RunPaths::under(daemon_run_dir(&h.home)).unwrap();
+    let child_out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_client_role_denied_probe",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ROLE_DENIED_ENV, &run_paths.socket)
+        .output()
+        .unwrap();
+    assert!(
+        child_out.status.success()
+            && String::from_utf8_lossy(&child_out.stdout).contains("@@ client_role_denied_ok"),
+        "child_client_role_denied_probe failed: {}",
+        String::from_utf8_lossy(&child_out.stderr)
+    );
+
+    let agent_claims = vec!["CURSOR_AGENT".to_owned()];
+    assert_eq!(
+        rpc_kind(c.app_paste_begin(&agent_claims).unwrap_err()).0,
+        ErrorKind::ProofRefused
+    );
+    assert_eq!(
+        rpc_kind(c.app_pending_list(&agent_claims).unwrap_err()).0,
+        ErrorKind::ProofRefused
+    );
+    assert_eq!(
+        rpc_kind(c.app_asks_list(&agent_claims).unwrap_err()).0,
+        ErrorKind::ProofRefused
+    );
+    assert_eq!(
+        rpc_kind(
+            c.app_audit_list(&AppAuditListParams {
+                claims: agent_claims.clone(),
+                ..AppAuditListParams::default()
+            })
+            .unwrap_err()
+        )
+        .0,
+        ErrorKind::ProofRefused
+    );
+    assert_eq!(
+        rpc_kind(c.app_unlock_begin(None, &agent_claims).unwrap_err()).0,
+        ErrorKind::ProofRefused
+    );
+    // `app.lock` is permitted even under agent claims so screen-lock protection
+    // is never blocked.
+    c.app_lock(AppLockReason::ScreenLock, &agent_claims)
+        .unwrap();
+    assert_eq!(c.status().unwrap().vault.state, VaultState::Locked);
+    unlock_with_se(&mut h, &mut c, vault_id, &unlocker_id, &unlock_sk, "A14");
+
+    // A15 (`g1` / gate 21): `daemon_unverified` when peer verification fails.
+    assert_eq!(
+        ClientError::Unverified(Unverified::CodeIdentity).token(),
+        "daemon_unverified"
+    );
+    std::fs::set_permissions(&run_paths.dir, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let unverified_client_err = Client::connect(&run_paths).unwrap_err();
+    let unverified_cli = h.program(&h.cli(), &["ls"], None);
+    std::fs::set_permissions(&run_paths.dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        unverified_client_err,
+        ClientError::Unverified(Unverified::Directory(RunPathErrorKind::OpenPermissions))
+    );
+    assert_eq!(unverified_client_err.token(), "daemon_unverified");
+    assert_eq!(unverified_cli.status.code(), Some(1));
+    assert_eq!(
+        token(&unverified_cli.stderr),
+        "daemon_unverified",
+        "{}",
+        text(&unverified_cli)
+    );
+    h.assert_swept("A14/A15 forged peer, agent refusal, and daemon_unverified");
 
     // -------------------------------------------------------------------------
     // A16: Client-initiated reveal (`reveal.request` from terminal fulfilled in
@@ -763,44 +1066,72 @@ fn m3_acceptance_story_a1_to_a20() {
     h.assert_swept("A16 client-initiated reveal");
 
     // -------------------------------------------------------------------------
-    // A17 / A18: `items.ask` / `add --ask`, answered via `app.paste`, creates
-    // no grant (`grants_list` stays empty).
+    // A17: `fixture-agent` runs `envcloak add stripe --ask --wait 30s`; app
+    // answers via `app.paste`; agent prints only the new slug and holds no grant.
     // -------------------------------------------------------------------------
-    let ask_opened = c
-        .items_ask(&AskParams {
-            provider: Some("stripe".to_owned()),
-            project_dir: Some(repo.to_str().unwrap().to_owned()),
-            account: Some("billing".to_owned()),
-            env_hint: Some("STRIPE_BILLING_KEY".to_owned()),
-            note: Some("Need billing key".to_owned()),
-            claims: Vec::new(),
-        })
-        .unwrap();
-    assert_eq!(c.app_asks_list(&[]).unwrap().asks.len(), 1);
     let asked_sec = SecretBytes::copy_from(asked_stripe.as_bytes());
-    let pasted_ask = paste_secret(
-        &mut c,
-        &asked_sec,
-        "stripe/billing-asked",
-        Some("stripe"),
-        Some("STRIPE_BILLING_KEY"),
-        Some(&ask_opened.ask),
-    );
-    assert_eq!(pasted_ask.item.slug, "stripe/billing-asked");
+    let ask_run_paths = run_paths.clone();
+    let ask_out = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            let ask = loop {
+                let mut c_ask = Client::connect(&ask_run_paths).unwrap();
+                let listed = c_ask.app_asks_list(&[]).unwrap();
+                if let Some(a) = listed.asks.into_iter().next() {
+                    break a;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for items.ask");
+                std::thread::sleep(Duration::from_millis(40));
+            };
+            assert_eq!(ask.requester.kind, SubjectKind::Agent);
+            assert_eq!(
+                ask.requester.label.as_deref(),
+                Some("EnvCloak test fixture agent")
+            );
+            let mut c_paste = Client::connect(&ask_run_paths).unwrap();
+            let pasted = paste_secret(
+                &mut c_paste,
+                &asked_sec,
+                "stripe/billing-asked",
+                Some("stripe"),
+                Some("STRIPE_BILLING_KEY"),
+                Some(&ask.ask),
+            );
+            assert_eq!(pasted.item.slug, "stripe/billing-asked");
+        });
+        h.agent(
+            &repo,
+            &[
+                "add",
+                "stripe",
+                "--account",
+                "billing",
+                "--env",
+                "STRIPE_BILLING_KEY",
+                "--note",
+                "Need billing key",
+                "--ask",
+                "--wait",
+                "30s",
+            ],
+        )
+    });
+    assert_eq!(ask_out.status.code(), Some(0), "{}", text(&ask_out));
     assert_eq!(
-        c.items_ask_state(&ask_opened.ask).unwrap(),
-        AskStateOutcome::Added {
-            slug: "stripe/billing-asked".to_owned()
-        }
+        String::from_utf8_lossy(&ask_out.stdout),
+        "stripe/billing-asked\n",
+        "add --ask must print only the new slug"
     );
+    assert!(ask_out.stderr.is_empty(), "{}", text(&ask_out));
     assert!(
         c.grants_list().unwrap().grants.is_empty(),
         "answering an ask must never create a grant"
     );
-    h.assert_swept("A18 ask answered without grant");
+    h.assert_swept("A17 ask answered without grant");
 
     // -------------------------------------------------------------------------
-    // A19: First-run scan (`envcloak import --scan ... --report` + `init --import`).
+    // A18: First-run scan (`envcloak import --scan ... --report` + `init --import`
+    // + `init --delete-plaintext`).
     // -------------------------------------------------------------------------
     let billing = h.home.home().join("billing");
     std::fs::create_dir_all(&billing).unwrap();
@@ -853,10 +1184,11 @@ fn m3_acceptance_story_a1_to_a20() {
         "envcloak init --delete-plaintext must remove billing/.env"
     );
     h.allow_no_plaintext();
-    h.assert_swept("A19 scan and init");
+    h.assert_swept("A18 scan and init");
 
     // -------------------------------------------------------------------------
-    // A20: Menu bar / grant revoke (`grants.revoke`) and lock (`lock`).
+    // A19 / A20: Menu bar / grant revoke (`grants.revoke`), lock (`lock`), and
+    // final canary sweep with a planted positive control (gate 12).
     // -------------------------------------------------------------------------
     let p2_manifest = "[project]\nname = \"acme-web\"\n\n[env]\nOPENAI_API_KEY = \"openai/acme-web\"\nSTRIPE_SECRET_KEY = \"stripe/acme-live\"\n";
     std::fs::write(repo.join("envcloak.toml"), p2_manifest).unwrap();
@@ -884,4 +1216,26 @@ fn m3_acceptance_story_a1_to_a20() {
     h.stop_daemon();
     let _ = BTreeMap::<String, String>::new();
     h.assert_swept("A20 final");
+
+    // Planted positive control (gate 12): verify both `Detector` and `h.sweep()`
+    // catch a planted canary and a planted VMK hex string, then clean up and
+    // re-assert `h.assert_swept`.
+    let detector = Detector::new(&h.canaries);
+    assert!(
+        !detector.find(live_stripe_1.as_bytes()).is_empty(),
+        "Detector positive control must catch LIVE_STRIPE_1"
+    );
+    let vmk_hex_val = h.canary("VMK_HEX").value().to_vec();
+    assert!(
+        !detector.find(&vmk_hex_val).is_empty(),
+        "Detector positive control must catch VMK_HEX"
+    );
+    let planted_path = h.home.root().join("planted-positive-control.txt");
+    std::fs::write(&planted_path, live_stripe_2.as_bytes()).unwrap();
+    assert!(
+        !h.sweep().is_empty(),
+        "h.sweep() positive control must catch a planted canary file in HOME"
+    );
+    std::fs::remove_file(&planted_path).unwrap();
+    h.assert_swept("A20 final after positive control");
 }

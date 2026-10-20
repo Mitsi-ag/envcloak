@@ -5,7 +5,26 @@
 # key literals.
 set -euo pipefail
 
-dest="${1:-$(mktemp -d /tmp/ecqa.XXXXXXXX)}"
+dest=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dir)
+      dest="$2"
+      shift 2
+      ;;
+    -h|--help)
+      echo "usage: scripts/macos/qa-fixture.sh [--dir DIR | DIR]" >&2
+      exit 0
+      ;;
+    *)
+      dest="$1"
+      shift
+      ;;
+  esac
+done
+if [[ -z "$dest" ]]; then
+  dest="$(mktemp -d /tmp/ecqa.XXXXXXXX)"
+fi
 mkdir -p "$dest"
 chmod 700 "$dest"
 
@@ -16,6 +35,7 @@ import os
 import pathlib
 import stat
 import sys
+import time
 
 root = pathlib.Path(sys.argv[1]).resolve()
 acme = root / "acme-web"
@@ -41,7 +61,10 @@ stripe_test_prefix = "".join(["s", "k", "_", "test", "_"])
 stripe_test_val = stripe_test_prefix + token_hex(20)
 webhook_val = "whsec_" + token_hex(20)
 
-(acme / ".env").write_text(
+backdated = time.time() - 600.0
+
+acme_env = acme / ".env"
+acme_env.write_text(
     f"OPENAI_API_KEY={openai_val}\n"
     f"GITHUB_TOKEN={gh_val}\n"
     f"DATABASE_URL={db_val}\n"
@@ -49,15 +72,18 @@ webhook_val = "whsec_" + token_hex(20)
     "PORT=3000\n",
     encoding="utf-8",
 )
-os.chmod(acme / ".env", 0o600)
+os.chmod(acme_env, 0o600)
+os.utime(acme_env, (backdated, backdated))
 
-(billing / ".env").write_text(
+billing_env = billing / ".env"
+billing_env.write_text(
     f"STRIPE_SECRET_KEY={stripe_val}\n"
     f"STRIPE_TEST_KEY={stripe_test_val}\n"
     f"BILLING_WEBHOOK_SECRET={webhook_val}\n",
     encoding="utf-8",
 )
-os.chmod(billing / ".env", 0o600)
+os.chmod(billing_env, 0o600)
+os.utime(billing_env, (backdated, backdated))
 
 emit_script = acme / "emit"
 emit_script.write_text(

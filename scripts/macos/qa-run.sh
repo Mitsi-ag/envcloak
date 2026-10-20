@@ -8,6 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 non_interactive=0
+automated_only=0
 output_file=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,16 +16,31 @@ while [[ $# -gt 0 ]]; do
       non_interactive=1
       shift
       ;;
+    --automated-only)
+      automated_only=1
+      shift
+      ;;
     --output)
       output_file="$2"
       shift 2
       ;;
     *)
-      echo "usage: scripts/macos/qa-run.sh [--non-interactive] [--output <path>]" >&2
+      echo "usage: scripts/macos/qa-run.sh [--automated-only] [--non-interactive] [--output <path>]" >&2
       exit 2
       ;;
   esac
 done
+
+if [[ "$automated_only" -eq 1 ]]; then
+  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/Volumes/KeenShiftDev/tmp/envcloak-target}"
+  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-8}"
+  cp docs/SPEC.md /tmp/ec-spec-copy.md
+  nice -n 10 cargo test -p envcloak -p envcloakd -p envcloak-testkit --no-run
+  nice -n 10 cargo test -p envcloak-e2e --test m3_story
+  swift test --package-path apps/macos/Packages/EnvCloakDesign
+  xcodebuild -project apps/macos/EnvCloak.xcodeproj -scheme EnvCloak -destination 'platform=macOS' -derivedDataPath /tmp/ec-m3-20-dd SWIFT_ACTIVE_COMPILATION_CONDITIONS='$(inherited) ENVCLOAK_SCREEN_TESTS' -only-testing:EnvCloakTests test
+  exit 0
+fi
 
 macos_version="$(sw_vers -productVersion)"
 macos_build="$(sw_vers -buildVersion)"

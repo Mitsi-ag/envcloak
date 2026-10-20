@@ -280,19 +280,21 @@ final class TokenTests: XCTestCase {
     ]
 
     static func disallowedAmberUsages(in files: [String: String]) -> [String] {
+        let amberTokenPattern = /\.amber(?:$|[^A-Za-z0-9_])/
+        let approvedDarkGatePattern = /(?:^|[^A-Za-z0-9_])(colorScheme|scheme)\s*==\s*\.dark\s*\?\s*(ECToken)?\.amber(\.color)?\s*:\s*(ECToken)?\.text(\.color)?(?:$|[^A-Za-z0-9_])/
         var violations: [String] = []
         for (relPath, source) in files.sorted(by: { $0.key < $1.key }) {
             let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
             for (index, line) in lines.enumerated() {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.hasPrefix("//") { continue }
-                guard line.contains("ECToken.amber") || line.contains("case amber") == false && line.contains(".amber.") else {
-                    continue
-                }
+                let codeOnly = line.components(separatedBy: "//").first ?? ""
+                let trimmed = codeOnly.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty || trimmed.contains("case amber") { continue }
+                let matches = codeOnly.matches(of: amberTokenPattern)
+                guard !matches.isEmpty else { continue }
                 if !approvedAmberFiles.contains(relPath) {
                     violations.append("\(relPath):\(index + 1): disallowed ECToken.amber usage")
-                } else if !line.contains("colorScheme == .dark") {
-                    violations.append("\(relPath):\(index + 1): ECToken.amber in \(relPath) must be gated on colorScheme == .dark")
+                } else if matches.count != 1 || !codeOnly.contains(approvedDarkGatePattern) {
+                    violations.append("\(relPath):\(index + 1): ECToken.amber in \(relPath) must use approved dark-only ternary")
                 }
             }
         }
@@ -313,9 +315,26 @@ final class TokenTests: XCTestCase {
         let violations = Self.disallowedAmberUsages(in: swiftSources)
         XCTAssertTrue(violations.isEmpty, "Disallowed Amber token usages: \(violations)")
 
-        // Positive control: using ECToken.amber in KeysView.swift or unguarded in KeyInspector.swift is caught.
-        var mutated = swiftSources
-        mutated["Features/Keys/KeysView.swift", default: ""] += "\nlet bad = ECToken.amber.color\n"
-        XCTAssertFalse(Self.disallowedAmberUsages(in: mutated).isEmpty)
+        // Positive control 1: explicit ECToken.amber in KeysView.swift is caught.
+        var mutatedExplicit = swiftSources
+        mutatedExplicit["Features/Keys/KeysView.swift", default: ""] += "\nlet bad = ECToken.amber.color\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedExplicit).isEmpty)
+
+        // Positive control 2: implicit member .amber in KeysView.swift is caught.
+        var mutatedImplicit = swiftSources
+        mutatedImplicit["Features/Keys/KeysView.swift", default: ""] += "\nlet bad: ECToken = .amber\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedImplicit).isEmpty)
+
+        // Positive control 3: inverted ternary in KeyInspector.swift is caught.
+        var mutatedInverted = swiftSources
+        mutatedInverted["Features/Inspector/KeyInspector.swift", default: ""] +=
+            "\nlet inverted = colorScheme == .dark ? ECToken.text.color : ECToken.amber.color\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedInverted).isEmpty)
+
+        // Positive control 4: trailing comment bypass in KeyInspector.swift is caught.
+        var mutatedComment = swiftSources
+        mutatedComment["Features/Inspector/KeyInspector.swift", default: ""] +=
+            "\nlet bypass = ECToken.amber.color // colorScheme == .dark\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedComment).isEmpty)
     }
 }

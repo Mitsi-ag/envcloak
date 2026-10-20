@@ -667,7 +667,7 @@ struct AgentsView: View {
                     }
                     Spacer()
                     if row.sortedSurfaces.contains(where: { $0.probe == .failed }) {
-                        Text("probe failed")
+                        Label("probe failed", systemImage: "xmark.octagon")
                             .font(.caption)
                             .foregroundStyle(ECToken.danger.color)
                     }
@@ -849,7 +849,7 @@ struct AgentsView: View {
                             Text(MetadataRequest.basename(entry.project_dir))
                                 .font(.callout.weight(.medium))
                                 .foregroundStyle(ECToken.text.color)
-                            Text(entry.scopeLabel)
+                            Label(entry.scopeLabel, systemImage: "exclamationmark.triangle")
                                 .font(.caption)
                                 .foregroundStyle(ECToken.warning.color)
                         }
