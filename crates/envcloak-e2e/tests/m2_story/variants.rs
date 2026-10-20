@@ -638,7 +638,7 @@ fn variant_interactive_claude_code() {
 #[test]
 fn variant_sandboxed_claude_code() {
     let claude_found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "native");
-    let Some(claude_inst) = require(claude_found, "M2-26 sandboxed Claude Code") else {
+    let Some(mut claude_inst) = require(claude_found, "M2-26 sandboxed Claude Code") else {
         return;
     };
 
@@ -659,6 +659,14 @@ fn variant_sandboxed_claude_code() {
     h.add_canary(Canary::new("STRIPE_LIVE_KEY", stripe_live));
     h.add_canary(Canary::new("STRIPE_STDIO_KEY", stripe_stdio.clone()));
     h.add_canary(Canary::new("RESEND_API_KEY", resend_val));
+
+    let claude_versions_dir = h.home.home().join(".local/share/claude/versions");
+    std::fs::create_dir_all(&claude_versions_dir).unwrap();
+    let claude_tree_exe = claude_versions_dir.join(&claude_inst.pin.version);
+    std::fs::hard_link(&claude_inst.exe, &claude_tree_exe)
+        .or_else(|_| std::fs::copy(&claude_inst.exe, &claude_tree_exe).map(|_| ()))
+        .unwrap();
+    claude_inst.exe = claude_tree_exe;
 
     let claude = AgentHome::within(&h.home, Host::ClaudeCode, claude_inst);
     let host_bin = h.home.root().join("host-bin");

@@ -460,7 +460,7 @@ struct StoryWorld {
 }
 
 impl StoryWorld {
-    fn new(claude_inst: Installed, codex_inst: Installed) -> Self {
+    fn new(mut claude_inst: Installed, codex_inst: Installed) -> Self {
         let mut h = Harness::start();
         let seed_a = fresh_seed();
         let seed_b = fresh_seed();
@@ -482,6 +482,14 @@ impl StoryWorld {
         h.add_canary(Canary::new(HTTP_AUTH_LABEL, http_auth.clone()));
         h.add_canary(Canary::new(SHORT_TOKEN_LABEL, short_token));
         h.add_canary(Canary::new(DECOY_ENV_LOCAL_LABEL, decoy_local));
+
+        let claude_versions_dir = h.home.home().join(".local/share/claude/versions");
+        std::fs::create_dir_all(&claude_versions_dir).unwrap();
+        let claude_tree_exe = claude_versions_dir.join(&claude_inst.pin.version);
+        std::fs::hard_link(&claude_inst.exe, &claude_tree_exe)
+            .or_else(|_| std::fs::copy(&claude_inst.exe, &claude_tree_exe).map(|_| ()))
+            .unwrap();
+        claude_inst.exe = claude_tree_exe;
 
         let claude = AgentHome::within(&h.home, Host::ClaudeCode, claude_inst);
         let codex = AgentHome::within(&h.home, Host::Codex, codex_inst);
