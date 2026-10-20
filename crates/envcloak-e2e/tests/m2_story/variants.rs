@@ -41,23 +41,49 @@ const SETTLED_MS: u64 = 3000;
 
 fn emit_all_script(names: &[&str]) -> String {
     let py = quoted(&python3().to_string_lossy());
+    let serde_bin = serde_json::to_string(env!("CARGO_BIN_EXE_ec-emit-serde")).unwrap();
     let names_json = serde_json::to_string(names).unwrap();
     format!(
         r#"#!/bin/sh
 exec {py} -c '
-import base64, hashlib, json, os, urllib.parse
+import base64, hashlib, json, os, re, subprocess, urllib.parse
 names = {names_json}
+serde_bin = {serde_bin}
+def lower_hex(s):
+    return re.sub(r"%[0-9A-F]{{2}}", lambda m: m.group(0).lower(), s)
 for n in names:
     v = os.environ.get(n, "")
-    h = hashlib.sha256(v.encode()).hexdigest()
-    b64 = base64.b64encode(v.encode()).decode()
-    url = urllib.parse.quote(v, safe="")
-    js = json.dumps({{n: v}})
-    print(f"raw:{{n}}={{v}}")
-    print(f"json:{{n}}={{js}}")
-    print(f"b64:{{n}}={{b64}}")
-    print(f"url:{{n}}={{url}}")
-    print(f"sha256:{{n}}={{h}}")
+    raw = v.encode("utf-8")
+    h = hashlib.sha256(raw).hexdigest()
+    print(f"raw:{{n}}={{v}} ")
+    print(f"py-json-ascii:{{n}}={{json.dumps(v)}} ")
+    print(f"py-json-utf8:{{n}}={{json.dumps(v, ensure_ascii=False)}} ")
+    for tag, enc in (("py-quote", urllib.parse.quote(v, safe="")), ("py-quote-plus", urllib.parse.quote_plus(v)), ("py-form", urllib.parse.urlencode({{"k": v}}))):
+        print(f"{{tag}}-upper:{{n}}={{enc}} ")
+        print(f"{{tag}}-lower:{{n}}={{lower_hex(enc)}} ")
+    for pre in (b"", b"u", b"us"):
+        blob = pre + raw + b"!!!"
+        at = f"at{{len(pre)}}"
+        std = base64.b64encode(blob).decode("ascii")
+        url = base64.urlsafe_b64encode(blob).decode("ascii")
+        std_np = std.rstrip("=")
+        url_np = url.rstrip("=")
+        print(f"b64-{{at}}:{{n}}={{std}} ")
+        print(f"b64-nopad-{{at}}:{{n}}={{std_np}} ")
+        print(f"b64url-{{at}}:{{n}}={{url}} ")
+        print(f"b64url-nopad-{{at}}:{{n}}={{url_np}} ")
+    print(f"hex-lower:{{n}}={{raw.hex()}} ")
+    print(f"hex-upper:{{n}}={{raw.hex().upper()}} ")
+    print(f"sha256:{{n}}={{h}} ")
+done = subprocess.run([serde_bin] + names, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, check=True)
+parts = done.stdout.split(b"\0")
+if parts and parts[-1] == b"":
+    parts.pop()
+for i, n in enumerate(names):
+    s_json = parts[2 * i].decode("utf-8", errors="replace")
+    s_sha = parts[2 * i + 1].decode("ascii")
+    print(f"serde:{{n}}={{s_json}} ")
+    print(f"sha256-serde:{{n}}={{s_sha}} ")
 '
 "#
     )
@@ -572,13 +598,20 @@ fn variant_interactive_claude_code() {
     );
     assert_eq!(doc.code, 0, "{}", doc.all());
     let doc_v: Value = serde_json::from_slice(&doc.stdout).unwrap();
+    let gh_doc = doc_v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["slug"] == "github/acme-web")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected doctor to report pasted github/acme-web in interactive stores: {doc_v}"
+            )
+        });
+    let gh_places = serde_json::to_string(gh_doc).unwrap();
     assert!(
-        doc_v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|m| m["slug"] == "github/acme-web"),
-        "expected doctor to report pasted github/acme-web in interactive stores: {doc_v}"
+        gh_places.contains("history.jsonl") && gh_places.contains("paste-1.txt"),
+        "expected both history.jsonl (interactive PTY) and paste-cache in doctor places: {gh_places}"
     );
 
     let scrub = human_with_claude(
@@ -605,7 +638,7 @@ fn variant_interactive_claude_code() {
 #[test]
 fn variant_sandboxed_claude_code() {
     let claude_found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "native");
-    let Some(claude_inst) = require(claude_found, "M2-26 sandboxed Claude Code") else {
+    let Some(mut claude_inst) = require(claude_found, "M2-26 sandboxed Claude Code") else {
         return;
     };
 
@@ -622,8 +655,18 @@ fn variant_sandboxed_claude_code() {
         fresh_seed(),
         fresh_seed()
     );
+    let resend_val = format!("re_{:016x}{:016x}", fresh_seed(), fresh_seed());
     h.add_canary(Canary::new("STRIPE_LIVE_KEY", stripe_live));
     h.add_canary(Canary::new("STRIPE_STDIO_KEY", stripe_stdio.clone()));
+    h.add_canary(Canary::new("RESEND_API_KEY", resend_val));
+
+    let claude_versions_dir = h.home.home().join(".local/share/claude/versions");
+    std::fs::create_dir_all(&claude_versions_dir).unwrap();
+    let claude_tree_exe = claude_versions_dir.join(&claude_inst.pin.version);
+    std::fs::hard_link(&claude_inst.exe, &claude_tree_exe)
+        .or_else(|_| std::fs::copy(&claude_inst.exe, &claude_tree_exe).map(|_| ()))
+        .unwrap();
+    claude_inst.exe = claude_tree_exe;
 
     let claude = AgentHome::within(&h.home, Host::ClaudeCode, claude_inst);
     let host_bin = h.home.root().join("host-bin");
@@ -694,7 +737,7 @@ fn variant_sandboxed_claude_code() {
     age(&repo.join(".env.live"), OLD);
     write_script(
         &repo.join("emit"),
-        &emit_all_script(&["OPENAI_API_KEY", "STRIPE_SECRET_KEY"]),
+        &emit_all_script(&["OPENAI_API_KEY", "STRIPE_SECRET_KEY", "RESEND_API_KEY"]),
     );
 
     let init = h.human(&repo, &["init", "--import", "--yes"], &[], &[]);
@@ -839,8 +882,11 @@ fn variant_sandboxed_claude_code() {
     assert!(body2.contains("[envcloak:openai/acme-web]"), "{body2}");
 
     // S9 under sandbox: on macOS, the installer's `allowUnixSockets` lets direct Bash
-    // `envcloak run --profile live -- ./emit` reach the daemon; on Linux (K-01), use
-    // `run_with_secrets` with `profile: "live"`.
+    // `envcloak run --profile live -- ./emit` reach the daemon; on Linux (K-01), verify
+    // `agents status --json` reports `shell` as `unsupported (sandbox_blocks_socket)`,
+    // verify a direct sandboxed `Bash` `envcloak run` fails closed per K-01 without
+    // opening a pending request for `acme-web`, and exercise S9's live-key guard via
+    // `mcp__envcloak__run_with_secrets` with `profile: "live"`.
     if cfg!(target_os = "macos") {
         let cli = quoted(&h.cli().to_string_lossy());
         let s9_cmd = format!("{cli} run --profile live -- ./emit");
@@ -889,6 +935,110 @@ fn variant_sandboxed_claude_code() {
             s9_body2.contains("[envcloak:stripe/acme-live]"),
             "{s9_body2}"
         );
+    } else {
+        let st = human_with_claude(
+            &mut h,
+            &repo,
+            &path_env,
+            &claude_tmp,
+            &["agents", "status", "--json"],
+            &[],
+        );
+        assert_eq!(st.code, 0, "{}", st.all());
+        let st_v: Value = serde_json::from_slice(&st.stdout).unwrap();
+        let claude_st = st_v["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == "claude-code")
+            .unwrap();
+        let shell_surf = claude_st["surfaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["surface"] == "shell")
+            .unwrap();
+        assert_eq!(shell_surf["state"], "unsupported", "{shell_surf}");
+        assert!(
+            serde_json::to_string(shell_surf)
+                .unwrap()
+                .contains("sandbox_blocks_socket"),
+            "{shell_surf}"
+        );
+
+        let cli = quoted(&h.cli().to_string_lossy());
+        let k01_cmd = format!("{cli} run --profile live --wait 1s -- ./emit");
+        let k01_script = json!({"steps": [{"shell": k01_cmd}, {"say": "done"}]});
+        let k01_flags = HostFlags::claude("default", &["Bash"]);
+        let k01_run = claude.run(&k01_script, "Try direct sandboxed run.", &k01_flags, &repo);
+        h.record("sandbox k01 linux stdout", &k01_run.output.stdout);
+        h.record("sandbox k01 linux stderr", &k01_run.output.stderr);
+        let k01_body = String::from_utf8_lossy(
+            &k01_run
+                .model
+                .requests
+                .iter()
+                .find(|r| r.pick.as_deref() == Some("step 1"))
+                .unwrap()
+                .body,
+        );
+        assert!(
+            !k01_body.contains("approval_required"),
+            "Linux sandboxed Bash must not open a pending request: {k01_body}"
+        );
+
+        let s9_call = json!({
+            "project_dir": dir,
+            "profile": "live",
+            "argv": ["./emit"]
+        });
+        let s9_script = json!({"steps": [
+            {"tool": "mcp__envcloak__run_with_secrets", "input": s9_call},
+            {"tool": "mcp__envcloak__run_with_secrets", "input": s9_call, "after": "approved"},
+            {"say": "done"}
+        ]});
+        let mut s9_running = claude.spawn(&s9_script, "Live run via MCP.", &s8_flags, &repo);
+        let s9_held = s9_running.model.wait_for("step 1", &mut s9_running.child);
+        h.record("sandbox s9 linux held body", &s9_held.body);
+        let s9_first: Value =
+            serde_json::from_str(&last_tool_output(&String::from_utf8_lossy(&s9_held.body)))
+                .unwrap();
+        assert_eq!(s9_first["status"], "approval_required", "{s9_first}");
+        let s9_id = s9_first["request"].as_str().unwrap().to_owned();
+        let s9_app = h.human(
+            &repo,
+            &[
+                "approve",
+                &s9_id,
+                "--once",
+                "--live",
+                "STRIPE_SECRET_KEY",
+                "--live",
+                "OPENAI_API_KEY",
+                "--passphrase-fd",
+                "3",
+            ],
+            &[(3, &pass, true)],
+            &[],
+        );
+        assert_eq!(s9_app.code, 0, "{}", s9_app.all());
+        s9_running.model.release("approved");
+        let s9_r2 = s9_running.wait();
+        h.record("sandbox s9 linux r2 stdout", &s9_r2.output.stdout);
+        h.record("sandbox s9 linux r2 stderr", &s9_r2.output.stderr);
+        let s9_body2 = String::from_utf8_lossy(
+            &s9_r2
+                .model
+                .requests
+                .iter()
+                .find(|r| r.pick.as_deref() == Some("step 2"))
+                .unwrap()
+                .body,
+        );
+        assert!(
+            s9_body2.contains("[envcloak:stripe/acme-live]"),
+            "{s9_body2}"
+        );
     }
 
     // S10 under sandbox: `PreToolUse` denies `printenv`.
@@ -907,6 +1057,102 @@ fn variant_sandboxed_claude_code() {
             .body,
     );
     assert!(s10_body.contains("envcloak:"), "{s10_body}");
+
+    // S11 under sandbox: `request_new_secret` (no value argument) -> human adds
+    // `resend/acme-web` -> `add_reference` binds `RESEND_API_KEY` -> `run_with_secrets`
+    // prompts for the newly bound `RESEND_API_KEY` and prints `[envcloak:resend/acme-web]`.
+    let s11_flags = HostFlags::claude(
+        "default",
+        &[
+            "mcp__envcloak__request_new_secret",
+            "mcp__envcloak__add_reference",
+            "mcp__envcloak__run_with_secrets",
+        ],
+    );
+    let s11_req_script = json!({"steps": [
+        {"tool": "mcp__envcloak__request_new_secret", "input": {"provider": "resend"}},
+        {"say": "done"}
+    ]});
+    let s11_req_r = claude.run(&s11_req_script, "Request Resend key.", &s11_flags, &repo);
+    h.record("sandbox s11 req stdout", &s11_req_r.output.stdout);
+    h.record("sandbox s11 req stderr", &s11_req_r.output.stderr);
+    let s11_req_body = String::from_utf8_lossy(
+        &s11_req_r
+            .model
+            .requests
+            .iter()
+            .find(|r| r.pick.as_deref() == Some("step 1"))
+            .unwrap()
+            .body,
+    );
+    assert!(s11_req_body.contains("envcloak add"), "{s11_req_body}");
+
+    let resend_f = h.secret_file("RESEND_API_KEY", true);
+    let add_resend = h.human(
+        &home,
+        &["add", "--slug", "resend/acme-web", "--stdin"],
+        &[(0, &resend_f, true)],
+        &[],
+    );
+    assert_eq!(add_resend.code, 0, "{}", add_resend.all());
+
+    let s11_bind_script = json!({"steps": [
+        {"tool": "mcp__envcloak__add_reference", "input": {
+            "project_dir": dir,
+            "env_name": "RESEND_API_KEY",
+            "slug": "resend/acme-web"
+        }},
+        {"tool": "mcp__envcloak__run_with_secrets", "input": s8_call},
+        {"tool": "mcp__envcloak__run_with_secrets", "input": s8_call, "after": "s11_approved"},
+        {"say": "done"}
+    ]});
+    let mut s11_running = claude.spawn(
+        &s11_bind_script,
+        "Bind Resend and run emit.",
+        &s11_flags,
+        &repo,
+    );
+    let s11_held = s11_running.model.wait_for("step 2", &mut s11_running.child);
+    h.record("sandbox s11 held body", &s11_held.body);
+    let s11_first: Value =
+        serde_json::from_str(&last_tool_output(&String::from_utf8_lossy(&s11_held.body))).unwrap();
+    assert_eq!(s11_first["status"], "approval_required", "{s11_first}");
+    let s11_id = s11_first["request"].as_str().unwrap().to_owned();
+    let s11_app = h.human(
+        &repo,
+        &[
+            "approve",
+            &s11_id,
+            "--for",
+            "1h",
+            "--live",
+            "OPENAI_API_KEY",
+            "--live",
+            "RESEND_API_KEY",
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass, true)],
+        &[],
+    );
+    assert_eq!(s11_app.code, 0, "{}", s11_app.all());
+    s11_running.model.release("s11_approved");
+    let s11_r2 = s11_running.wait();
+    h.record("sandbox s11 r2 stdout", &s11_r2.output.stdout);
+    h.record("sandbox s11 r2 stderr", &s11_r2.output.stderr);
+    let s11_body2 = String::from_utf8_lossy(
+        &s11_r2
+            .model
+            .requests
+            .iter()
+            .find(|r| r.pick.as_deref() == Some("step 3"))
+            .unwrap()
+            .body,
+    );
+    assert!(
+        s11_body2.contains("[envcloak:resend/acme-web]"),
+        "{s11_body2}"
+    );
 
     // S12 under sandbox: `fixture-stdio` is pending in `envcloak pending` -> `--standing 7d` ->
     // `grants revoke --all` -> next session runs `mcp__fixture-stdio__ping_stdio` without prompt!

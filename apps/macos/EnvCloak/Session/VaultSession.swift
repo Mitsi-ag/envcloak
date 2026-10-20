@@ -1,6 +1,8 @@
+import CryptoKit
 import EnvCloakKit
 import Foundation
 import Observation
+import Security
 
 struct Change: OptionSet {
     let rawValue: Int
@@ -23,15 +25,29 @@ struct Change: OptionSet {
     let contextFactory: ContextFactory
     let keyStore: KeyStore
     let notifications: NotificationManager
+    private let folders: ProjectFolders?
     var unlockKey: (any UnlockKeyAgreement)?
     var approvalSigner: (any ApprovalSigner)?
     var enrolledPublicKeysOverride: EnrolledPublicKeys?
+    var enrolledTeamID: String
+    var enrolledSigningID: String
+    var enrolledUnlockerID: DaemonText?
+    var enrolledUnlockerLabel = "This Mac"
     var enrolledTouchID = false
+    var passphraseUnlockerRemoved = false
+    var touchIDOnlyEnabled = false
+    var showMenuBarExtra = false
     var enrolmentPendingId: DaemonText?
     var enrolmentCommand: String?
     var enrolmentCompleted = false
     var activeApprovalRequestId: DaemonText?
+    var activeAsk: AskSummary?
+    var activeRevealRequest: DaemonText?
+    var selectedField: DaemonText?
     var onOpenApprovalWindow: (@MainActor () -> Void)?
+    var onOpenPasteWindow: (@MainActor () -> Void)?
+    var onOpenMainWindow: (@MainActor () -> Void)?
+    var onFocusApprovals: (@MainActor () -> Void)?
     var isFrontmostOverride: Bool?
     var sshSession = false
     var clamshellClosed = false
@@ -46,6 +62,7 @@ struct Change: OptionSet {
     var notice: String?
     var actionInProgress = false
     private(set) var pendingCount: UInt32 = 0
+    private(set) var appRequestsCount: UInt32 = 0
     private(set) var proofWait: UInt64 = 0
 
     static var defaultKeyStore: KeyStore {
@@ -54,6 +71,32 @@ struct Change: OptionSet {
         #else
         KeyStore()
         #endif
+    }
+
+    static func readOwnSigningIdentity() -> (teamID: String, signingID: String) {
+        var code: SecCode?
+        guard SecCodeCopySelf(SecCSFlags(), &code) == errSecSuccess, let code else {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, SecCSFlags(), &staticCode) == errSecSuccess, let staticCode else {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef) == errSecSuccess,
+              let info = infoRef as? [String: Any] else {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        let teamID = (info[kSecCodeInfoTeamIdentifier as String] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "CI00000000"
+        let signingID = (info[kSecCodeInfoIdentifier as String] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "ai.envcloak.app"
+        if signingID.lowercased().contains("xctest") {
+            return ("CI00000000", "ai.envcloak.app")
+        }
+        return (teamID, signingID)
+    }
+
+    var canSignInApp: Bool {
+        enrolledTouchID && !sshSession
     }
 
     init(
@@ -65,22 +108,30 @@ struct Change: OptionSet {
         unlockKey: (any UnlockKeyAgreement)? = nil,
         approvalSigner: (any ApprovalSigner)? = nil,
         enrolledPublicKeysOverride: EnrolledPublicKeys? = nil,
+        enrolledTouchID: Bool? = nil,
         notifications: NotificationManager? = nil
     ) {
         self.client = client
+        self.folders = folders
         self.contextFactory = contextFactory
         self.keyStore = keyStore
         self.unlockKey = unlockKey
         self.approvalSigner = approvalSigner
         self.enrolledPublicKeysOverride = enrolledPublicKeysOverride
+        let ownIdentity = VaultSession.readOwnSigningIdentity()
+        self.enrolledTeamID = ownIdentity.teamID
+        self.enrolledSigningID = ownIdentity.signingID
+        self.showMenuBarExtra = folders?.showMenuBarExtra ?? false
         let resolvedNotifications = notifications ?? NotificationManager()
         self.notifications = resolvedNotifications
         bindings = BindingHistory(runner: runner)
         items = ItemsStore(client: client)
         projects = ProjectsStore(client: client, folders: folders)
         grants = GrantsStore(client: client)
-        if unlockKey != nil || approvalSigner != nil || keyStore.hasEnrolledKeys() {
-            enrolledTouchID = true
+        if let enrolledTouchID {
+            self.enrolledTouchID = enrolledTouchID
+        } else if unlockKey != nil || approvalSigner != nil || keyStore.hasEnrolledKeys() {
+            self.enrolledTouchID = true
         }
         resolvedNotifications.onDeny = { [weak self] id in
             guard let self else { return }
@@ -92,44 +143,46 @@ struct Change: OptionSet {
         }
     }
 
-    var unlockButtonTitle: String {
+    private var effectiveBiometryWording: BiometryWording {
         if clamshellClosed {
-            return "Unlock with password"
+            return .password
         }
         if let override = contextFactory.wordingOverride {
-            return override.unlockButtonTitle
+            return override
         }
         if unlockKey != nil || approvalSigner != nil {
-            return "Unlock with Touch ID"
+            return .touchID
         }
         #if ENVCLOAK_SCREEN_TESTS
-        return "Unlock with Touch ID"
+        return .touchID
         #else
-        if contextFactory.wording() == .password {
-            return "Unlock with password"
-        }
-        return "Unlock with Touch ID"
+        return contextFactory.wording()
         #endif
     }
 
+    var unlockButtonTitle: String {
+        effectiveBiometryWording.unlockButtonTitle
+    }
+
     var approveButtonTitle: String {
-        if clamshellClosed {
-            return "Approve with password"
-        }
-        if let override = contextFactory.wordingOverride {
-            return override.approveButtonTitle
-        }
-        if unlockKey != nil || approvalSigner != nil {
-            return "Approve with Touch ID"
-        }
-        #if ENVCLOAK_SCREEN_TESTS
-        return "Approve with Touch ID"
-        #else
-        if contextFactory.wording() == .password {
-            return "Approve with password"
-        }
-        return "Approve with Touch ID"
-        #endif
+        effectiveBiometryWording.approveButtonTitle
+    }
+
+    var replaceButtonTitle: String {
+        effectiveBiometryWording.replaceButtonTitle
+    }
+
+    var removeButtonTitle: String {
+        effectiveBiometryWording.removeButtonTitle
+    }
+
+    var revealButtonTitle: String {
+        effectiveBiometryWording.revealButtonTitle
+    }
+
+    func setShowMenuBarExtra(_ enabled: Bool) {
+        showMenuBarExtra = enabled
+        try? folders?.saveMenuBarExtra(enabled)
     }
 
     static func live() -> VaultSession {
@@ -190,10 +243,14 @@ struct Change: OptionSet {
             } else {
                 if status.audit.head_seq != lastStatus?.audit.head_seq { change.formUnion(.all) }
                 if status.approvals.grants != lastStatus?.approvals.grants { change.insert(.grants) }
-                if status.approvals.pending != lastStatus?.approvals.pending { change.insert(.pending) }
+                if status.approvals.pending != lastStatus?.approvals.pending
+                    || status.app_requests != lastStatus?.app_requests {
+                    change.insert(.pending)
+                }
             }
             state = next
             pendingCount = next == .ready ? status.approvals.pending : 0
+            appRequestsCount = next == .ready ? status.app_requests : 0
             if !next.canReadMetadata {
                 clearMetadata()
                 lastStatus = status
@@ -212,6 +269,7 @@ struct Change: OptionSet {
             if change.contains(.pending) {
                 await notifications.reconcile(
                     pending: grants.pending,
+                    asksCount: grants.asks.count,
                     isFrontmost: isFrontmostOverride
                 )
             }
@@ -253,6 +311,7 @@ struct Change: OptionSet {
     private func clearMetadata() {
         bindings.clear()
         items.clear(); projects.clear(); grants.clear()
+        selectedField = nil
         notifications.clear()
     }
 
@@ -260,6 +319,7 @@ struct Change: OptionSet {
         lastStatus = nil
         clearMetadata()
         pendingCount = 0
+        appRequestsCount = 0
         switch error as? EnvCloakError {
         case .daemonUnverified(let check): state = .unverified(check)
         case .rpc(.vaultLocked, _): state = .locked
@@ -287,6 +347,9 @@ struct Change: OptionSet {
 
     func selectKey(_ slug: DaemonText?) async {
         guard state.canReadMetadata else { return }
+        if items.selectedSlug != slug {
+            selectedField = nil
+        }
         await items.select(slug)
     }
 
@@ -318,6 +381,7 @@ struct Change: OptionSet {
             lastStatus = nil
             clearMetadata()
             pendingCount = 0
+            appRequestsCount = 0
             proofWait = 0
             locking = false
             actionInProgress = false
@@ -326,6 +390,7 @@ struct Change: OptionSet {
         lastStatus = nil
         clearMetadata()
         pendingCount = 0
+        appRequestsCount = 0
         proofWait = 0
         state = .connecting
         do {
@@ -421,9 +486,10 @@ struct Change: OptionSet {
         actionInProgress = true
         defer { actionInProgress = false }
         do {
-            let begin = try await client.call(MetadataRequest.unlockBegin())
+            let begin = try await client.call(MetadataRequest.unlockBegin(unlockerID: enrolledUnlockerID))
             let sealed = try await key.openAndReseal(begin, reason: ContextFactory.unlockReason)
             _ = try await client.call(MetadataRequest.unlockFinish(requestID: begin.request_id, sealed: sealed))
+            enrolledUnlockerID = begin.unlocker_id
             notice = nil
             await poll()
             return state == .ready || state == .upgradeReadOnly
@@ -488,6 +554,9 @@ struct Change: OptionSet {
             switch output.state {
             case .enrolled:
                 enrolledTouchID = true
+                if let id = output.unlocker_id {
+                    enrolledUnlockerID = id
+                }
                 enrolmentCompleted = true
                 enrolmentPendingId = nil
                 notice = "Touch ID added."
@@ -509,6 +578,11 @@ struct Change: OptionSet {
     func openApprovalWindow(for id: DaemonText? = nil) {
         activeApprovalRequestId = id ?? grants.pending.first?.request
         onOpenApprovalWindow?()
+    }
+
+    func openPasteWindow(for ask: AskSummary? = nil) {
+        activeAsk = ask
+        onOpenPasteWindow?()
     }
 
     func fetchPendingDescriptor(_ id: DaemonText) async throws -> PendingDescriptor {
@@ -534,6 +608,7 @@ struct Change: OptionSet {
         await grants.refetch([.grants, .pending])
         await notifications.reconcile(
             pending: grants.pending,
+            asksCount: grants.asks.count,
             isFrontmost: isFrontmostOverride
         )
         return output
@@ -549,11 +624,405 @@ struct Change: OptionSet {
             await grants.refetch(.pending)
             await notifications.reconcile(
                 pending: grants.pending,
+                asksCount: grants.asks.count,
                 isFrontmost: isFrontmostOverride
             )
             return true
         } catch {
             await grants.refetch(.pending)
+            return false
+        }
+    }
+
+    func beginPasteStage() async throws -> AppPasteBeginView {
+        guard let client, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        return try await client.call(MetadataRequest.pasteBegin())
+    }
+
+    func inspectPasteStage(
+        stage: DaemonText,
+        secret: borrowing SecretBuffer,
+        daemonEphPubHex: String
+    ) async throws -> AppPasteInspectView {
+        guard let client, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        let aad = Data(MetadataRequest.raw(stage).utf8)
+        let sealedHex = try SEHPKE.sealSecretToX25519(
+            secret,
+            recipientPubHex: daemonEphPubHex,
+            aad: aad
+        )
+        return try await client.call(
+            MetadataRequest.pasteInspect(stage: stage, sealedHex: sealedHex)
+        )
+    }
+
+    func commitPasteStage(
+        stage: DaemonText,
+        slug: String? = nil,
+        provider: String? = nil,
+        field: String? = nil,
+        account: String? = nil,
+        envHint: String? = nil,
+        allowShort: Bool = false,
+        ask: DaemonText? = nil
+    ) async throws -> AddedView {
+        guard let client, state == .ready, !actionInProgress else { throw EnvCloakError.daemonUnavailable }
+        actionInProgress = true
+        defer { actionInProgress = false }
+        let captured = generation
+        let added = try await client.call(
+            MetadataRequest.pasteCommit(
+                stage: stage,
+                slug: slug,
+                provider: provider,
+                field: field,
+                account: account,
+                envHint: envHint,
+                allowShort: allowShort,
+                ask: ask
+            )
+        )
+        guard captured == generation, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        await items.refetch(.items)
+        if ask != nil {
+            await grants.refetch(.pending)
+            await notifications.reconcile(
+                pending: grants.pending,
+                asksCount: grants.asks.count,
+                isFrontmost: isFrontmostOverride
+            )
+        }
+        return added
+    }
+
+    @discardableResult
+    func declineAsk(_ ask: DaemonText) async -> Bool {
+        guard let client, state == .ready, !actionInProgress else { return false }
+        actionInProgress = true
+        defer { actionInProgress = false }
+        do {
+            _ = try await client.call(MetadataRequest.asksDecline(ask))
+            if activeAsk?.ask == ask {
+                activeAsk = nil
+            }
+            await grants.refetch(.pending)
+            await notifications.reconcile(
+                pending: grants.pending,
+                asksCount: grants.asks.count,
+                isFrontmost: isFrontmostOverride
+            )
+            return true
+        } catch {
+            await grants.refetch(.pending)
+            return false
+        }
+    }
+
+    func fetchWriteTarget(slug: DaemonText, field: DaemonText? = nil) async throws -> AppItemsTargetView {
+        guard let client, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        return try await client.call(MetadataRequest.itemsTarget(slug: slug, field: field))
+    }
+
+    func rotateItemWithTouchID(
+        target: AppItemsTargetView,
+        newValue: borrowing SecretBuffer
+    ) async throws -> RotatedView {
+        guard let client, state == .ready, !actionInProgress,
+              let field = target.field, let fieldName = target.field_name else {
+            throw EnvCloakError.daemonUnavailable
+        }
+        if sshSession {
+            throw SignerError.notInteractiveSession
+        }
+        actionInProgress = true
+        notice = nil
+        defer { actionInProgress = false }
+
+        let aad = try SEHPKE.resealAAD(
+            requestID: MetadataRequest.raw(target.target),
+            challengeHex: MetadataRequest.raw(target.nonce)
+        )
+        let sealedHex = try SEHPKE.sealSecretToX25519(
+            newValue,
+            recipientPubHex: MetadataRequest.raw(target.daemon_eph_pub),
+            aad: aad
+        )
+        let newValueSHA256 = SEHPKE.secretSHA256Hex(newValue)
+        let stmt = WriteStatement(
+            target: MetadataRequest.raw(target.target),
+            nonce: MetadataRequest.raw(target.nonce),
+            vault_id: MetadataRequest.raw(target.vault_id),
+            action: .rotate(
+                item: MetadataRequest.raw(target.item),
+                slug: MetadataRequest.raw(target.slug),
+                field: MetadataRequest.raw(field),
+                field_name: MetadataRequest.raw(fieldName),
+                classification: target.classification.rawValue,
+                prior_count: target.prior_count,
+                grants: target.grants,
+                new_value_sha256: newValueSHA256
+            )
+        )
+        let stmtBytes = CanonicalStatement.encodeWrite(stmt)
+        let digestHex = CanonicalStatement.writeDigestHex(stmt)
+        let reason = ContextFactory.replaceReason(
+            slug: target.slug.escaped,
+            field: fieldName.escaped
+        )
+        let signature = try await resolvedSigner.sign(stmtBytes, reason: reason)
+        let rotated = try await client.call(
+            MetadataRequest.itemsRotate(
+                target: target.target,
+                sealedValueHex: sealedHex,
+                digestHex: digestHex,
+                signatureHex: signature.hex
+            )
+        )
+        await items.refetch(.items)
+        await grants.refetch(.grants)
+        return rotated
+    }
+
+    func removeItemWithTouchID(target: AppItemsTargetView) async throws -> RemovedView {
+        guard let client, state == .ready, !actionInProgress else {
+            throw EnvCloakError.daemonUnavailable
+        }
+        if sshSession {
+            throw SignerError.notInteractiveSession
+        }
+        actionInProgress = true
+        notice = nil
+        defer { actionInProgress = false }
+
+        let stmt = WriteStatement(
+            target: MetadataRequest.raw(target.target),
+            nonce: MetadataRequest.raw(target.nonce),
+            vault_id: MetadataRequest.raw(target.vault_id),
+            action: .remove(
+                item: MetadataRequest.raw(target.item),
+                slug: MetadataRequest.raw(target.slug),
+                grants: target.grants
+            )
+        )
+        let stmtBytes = CanonicalStatement.encodeWrite(stmt)
+        let digestHex = CanonicalStatement.writeDigestHex(stmt)
+        let reason = ContextFactory.removeReason(slug: target.slug.escaped)
+        let signature = try await resolvedSigner.sign(stmtBytes, reason: reason)
+        let removed = try await client.call(
+            MetadataRequest.itemsRemove(
+                target: target.target,
+                digestHex: digestHex,
+                signatureHex: signature.hex
+            )
+        )
+        if items.selectedSlug == target.slug {
+            await items.select(nil)
+        }
+        await items.refetch(.items)
+        await projects.refetch(.projects)
+        await grants.refetch([.grants, .pending])
+        return removed
+    }
+
+    func beginReveal(slug: DaemonText, field: DaemonText? = nil) async throws -> RevealDescriptor {
+        guard let client, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        return try await client.call(MetadataRequest.revealBegin(slug: slug, field: field))
+    }
+
+    func beginClientReveal(request: DaemonText) async throws -> RevealDescriptor {
+        guard let client, state == .ready else { throw EnvCloakError.daemonUnavailable }
+        return try await client.call(MetadataRequest.revealBegin(request: request))
+    }
+
+    func completeRevealWithTouchID(descriptor: RevealDescriptor) async throws -> SecretBuffer {
+        guard let client, state == .ready, !actionInProgress else {
+            throw EnvCloakError.daemonUnavailable
+        }
+        if sshSession {
+            throw SignerError.notInteractiveSession
+        }
+        actionInProgress = true
+        notice = nil
+        defer { actionInProgress = false }
+
+        let appEphKey = Curve25519.KeyAgreement.PrivateKey()
+        let appEphPubHex = HexCoding.encode(appEphKey.publicKey.rawRepresentation)
+        var signedDescriptor = descriptor
+        signedDescriptor.app_eph_pub = DaemonText(appEphPubHex)
+        let stmtBytes = CanonicalStatement.encodeReveal(signedDescriptor)
+        let digestHex = CanonicalStatement.revealDigestHex(signedDescriptor)
+        let reason = ContextFactory.revealReason(
+            slug: descriptor.slug.escaped,
+            field: descriptor.field_name.escaped
+        )
+        let signature = try await resolvedSigner.sign(stmtBytes, reason: reason)
+        let out = try await client.call(
+            MetadataRequest.revealFinish(
+                request: descriptor.request,
+                digestHex: digestHex,
+                signatureHex: signature.hex,
+                appEphPubHex: appEphPubHex
+            )
+        )
+        let aad = try SEHPKE.revealAAD(
+            requestID: MetadataRequest.raw(descriptor.request),
+            challengeHex: MetadataRequest.raw(descriptor.nonce),
+            appEphPubHex: appEphPubHex
+        )
+        return try SEHPKE.openSecretFromX25519(
+            sealedHex: MetadataRequest.raw(out.sealed_value),
+            privateKey: appEphKey,
+            aad: aad
+        )
+    }
+
+    @discardableResult
+    func removePassphraseUnlockerWithTouchID() async -> Bool {
+        guard let client, state == .ready, !actionInProgress else { return false }
+        if sshSession {
+            notice = "Touch ID cannot be used over SSH."
+            return false
+        }
+        actionInProgress = true
+        defer { actionInProgress = false }
+        do {
+            let target = try await client.call(MetadataRequest.itemsTargetUnlockerRemove())
+            let stmt = WriteStatement(
+                target: "unlocker_remove",
+                nonce: MetadataRequest.raw(target.nonce),
+                vault_id: MetadataRequest.raw(target.vault_id),
+                action: .unlockerRemove(unlocker: .passphrase)
+            )
+            let stmtBytes = CanonicalStatement.encodeWrite(stmt)
+            let digestHex = CanonicalStatement.writeDigestHex(stmt)
+            let signature = try await resolvedSigner.sign(
+                stmtBytes,
+                reason: ContextFactory.unlockerRemoveReason(target: "passphrase")
+            )
+            _ = try await client.call(
+                MetadataRequest.unlockerRemove(
+                    unlocker: "passphrase",
+                    createdSecs: target.created_secs,
+                    nonceHex: MetadataRequest.raw(target.nonce),
+                    digestHex: digestHex,
+                    signatureHex: signature.hex
+                )
+            )
+            passphraseUnlockerRemoved = true
+            notice = "Passphrase unlocker removed. Touch ID and your Recovery Kit remain."
+            return true
+        } catch SignerError.userCancelled, KeyStoreError.userCancelled {
+            notice = "Passphrase removal cancelled."
+            return false
+        } catch {
+            notice = "The passphrase unlocker could not be removed. Keep at least one Touch ID unlocker enrolled."
+            return false
+        }
+    }
+
+    @discardableResult
+    func enrollTouchIDOnlyUnlocker(label: String = "This Mac (Touch ID only)") async -> Bool {
+        guard let client, state == .ready, !actionInProgress else { return false }
+        if sshSession {
+            notice = "Touch ID cannot be used over SSH."
+            return false
+        }
+        actionInProgress = true
+        defer { actionInProgress = false }
+        do {
+            let priorKeys: EnrolledPublicKeys? = enrolledPublicKeysOverride
+                ?? (keyStore.hasEnrolledKeys() ? (try? keyStore.loadOrCreatePublicKeys(touchIDOnly: false)) : nil)
+            let target = try await client.call(MetadataRequest.itemsTargetUnlockerAdd())
+            let unlockHex: String
+            let approveHex: String
+            var stagedPair: KeyStore.StagedKeyPair?
+            if let overrideKeys = enrolledPublicKeysOverride {
+                unlockHex = overrideKeys.unlockPublicKeyHex
+                approveHex = overrideKeys.approvePublicKeyHex
+            } else {
+                let staged = try keyStore.stageNewPublicKeys(touchIDOnly: true)
+                unlockHex = staged.keys.unlockPublicKeyHex
+                approveHex = staged.keys.approvePublicKeyHex
+                stagedPair = staged
+            }
+            let unlockFP = try SEHPKE.p256FingerprintHex(unlockHex)
+            let approveFP = try SEHPKE.p256FingerprintHex(approveHex)
+            let stmt = WriteStatement(
+                target: "unlocker_add",
+                nonce: MetadataRequest.raw(target.nonce),
+                vault_id: MetadataRequest.raw(target.vault_id),
+                action: .unlockerAdd(
+                    label: label,
+                    unlock_pub_sha256: unlockFP,
+                    approve_pub_sha256: approveFP,
+                    team_id: enrolledTeamID,
+                    signing_id: enrolledSigningID
+                )
+            )
+            let stmtBytes = CanonicalStatement.encodeWrite(stmt)
+            let digestHex = CanonicalStatement.writeDigestHex(stmt)
+            let signature = try await resolvedSigner.sign(
+                stmtBytes,
+                reason: ContextFactory.unlockerAddReason(label: label)
+            )
+            let added = try await client.call(
+                MetadataRequest.unlockerAdd(
+                    unlockPublicKeyHex: unlockHex,
+                    approvePublicKeyHex: approveHex,
+                    label: label,
+                    createdSecs: target.created_secs,
+                    nonceHex: MetadataRequest.raw(target.nonce),
+                    digestHex: digestHex,
+                    signatureHex: signature.hex
+                )
+            )
+            if let priorID = enrolledUnlockerID, let priorKeys {
+                let priorUnlockFP = try SEHPKE.p256FingerprintHex(priorKeys.unlockPublicKeyHex)
+                let priorApproveFP = try SEHPKE.p256FingerprintHex(priorKeys.approvePublicKeyHex)
+                let removeTarget = try await client.call(MetadataRequest.itemsTargetUnlockerRemove())
+                let removeStmt = WriteStatement(
+                    target: "unlocker_remove",
+                    nonce: MetadataRequest.raw(removeTarget.nonce),
+                    vault_id: MetadataRequest.raw(removeTarget.vault_id),
+                    action: .unlockerRemove(
+                        unlocker: .secureEnclave(
+                            unlocker_id: MetadataRequest.raw(priorID),
+                            label: enrolledUnlockerLabel,
+                            unlock_pub_sha256: priorUnlockFP,
+                            approve_pub_sha256: priorApproveFP
+                        )
+                    )
+                )
+                let removeBytes = CanonicalStatement.encodeWrite(removeStmt)
+                let removeDigestHex = CanonicalStatement.writeDigestHex(removeStmt)
+                let removeSig = try await resolvedSigner.sign(
+                    removeBytes,
+                    reason: ContextFactory.unlockerRemoveReason(target: enrolledUnlockerLabel)
+                )
+                _ = try await client.call(
+                    MetadataRequest.unlockerRemove(
+                        unlocker: MetadataRequest.raw(priorID),
+                        createdSecs: removeTarget.created_secs,
+                        nonceHex: MetadataRequest.raw(removeTarget.nonce),
+                        digestHex: removeDigestHex,
+                        signatureHex: removeSig.hex
+                    )
+                )
+            }
+            if let stagedPair {
+                try keyStore.commitStagedKeys(stagedPair)
+            }
+            enrolledUnlockerID = added.unlocker_id
+            enrolledUnlockerLabel = label
+            touchIDOnlyEnabled = true
+            enrolledTouchID = true
+            notice = "Touch ID is now required. Your login password will no longer approve."
+            return true
+        } catch SignerError.userCancelled, KeyStoreError.userCancelled {
+            notice = "Touch ID only enrolment cancelled."
+            return false
+        } catch {
+            notice = "Touch ID only unlocker could not be added."
             return false
         }
     }

@@ -103,11 +103,12 @@ private enum MemoryHardening {
 
 #if DEBUG
 // Task-local, so one parallel test never observes another test's buffers.
-final class BufferObserver: Sendable {
-    let callback: @Sendable (UnsafeRawBufferPointer) -> Void
-    init(_ callback: @escaping @Sendable (UnsafeRawBufferPointer) -> Void) { self.callback = callback }
+public final class BufferObserver: Sendable {
+    public let callback: @Sendable (UnsafeRawBufferPointer) -> Void
+    public init(_ callback: @escaping @Sendable (UnsafeRawBufferPointer) -> Void) { self.callback = callback }
 }
-enum BufferProbe {
-    @TaskLocal static var observer: BufferObserver?
+public enum BufferProbe {
+    @TaskLocal public static var observer: BufferObserver?
 }
 #endif
+

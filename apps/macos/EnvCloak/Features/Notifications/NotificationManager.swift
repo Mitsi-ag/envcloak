@@ -118,8 +118,13 @@ struct ApprovalNotificationPayload: Equatable, Sendable {
         self.sink.configureCategories(actionIdentifiers: Self.actionIdentifiers)
     }
 
-    func reconcile(pending: [AppPendingView], isFrontmost frontmostOverride: Bool? = nil) async {
-        let badge = pending.isEmpty ? nil : "\(pending.count)"
+    func reconcile(
+        pending: [AppPendingView],
+        asksCount: Int = 0,
+        isFrontmost frontmostOverride: Bool? = nil
+    ) async {
+        let totalWaiting = pending.count + max(0, asksCount)
+        let badge = totalWaiting == 0 ? nil : "\(totalWaiting)"
         if badge != lastBadge {
             lastBadge = badge
             sink.setDockBadge(badge)

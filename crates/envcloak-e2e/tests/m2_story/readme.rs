@@ -402,7 +402,7 @@ pub fn verify_docs_against_matrix(
         }
     }
 
-    // 6. Verify docs/COMPAT.md and docs/INSTALLERS.md agree with matrix.toml.
+    // 6. Verify docs/COMPAT.md and docs/INSTALLERS.md agree with matrix.toml and .github/workflows/ci.yml.
     let flat_compat = flat_ws(compat);
     let flat_installers = flat_ws(installers);
     for entry in &matrix {
@@ -424,6 +424,39 @@ pub fn verify_docs_against_matrix(
             "docs/COMPAT.md is missing required matrix reasons or the real-model release rule"
                 .to_owned(),
         );
+    }
+
+    let ci_yml = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+        .map_err(|e| format!("read .github/workflows/ci.yml: {e}"))?;
+    let cron_expr = ci_yml
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("- cron: \""))
+        .and_then(|r| r.strip_suffix('"'))
+        .ok_or_else(|| "missing cron schedule in .github/workflows/ci.yml".to_owned())?;
+    if !flat_compat.contains(cron_expr) {
+        return Err(format!(
+            "docs/COMPAT.md does not match .github/workflows/ci.yml cron schedule {cron_expr:?}"
+        ));
+    }
+    if flat_compat.contains("nightly-models") && !ci_yml.contains("  nightly-models:") {
+        return Err(
+            "docs/COMPAT.md references `nightly-models`, which does not exist in .github/workflows/ci.yml"
+                .to_owned(),
+        );
+    }
+    for required_ci_token in [
+        "release-check-models",
+        "ENVCLOAK_RELEASE_CHECK_MODELS",
+        "ENVCLOAK_RELEASE_CHECK_ANTHROPIC_KEY",
+        "ENVCLOAK_RELEASE_CHECK_OPENAI_KEY",
+        "ubuntu-latest",
+        "macos-latest",
+    ] {
+        if !ci_yml.contains(required_ci_token) || !flat_compat.contains(required_ci_token) {
+            return Err(format!(
+                "docs/COMPAT.md and .github/workflows/ci.yml must both contain {required_ci_token:?}"
+            ));
+        }
     }
 
     // 7. No em dashes in README.md or docs/COMPAT.md.
@@ -487,5 +520,13 @@ fn readme_and_compat_match_probe_matrix() {
         verify_docs_against_matrix(&bad_prompt, &compat, &installers, &mcp_doc, &matrix_toml)
             .is_err(),
         "claiming Claude Code prompt_to_model is active must be rejected"
+    );
+
+    // 4. Drifting cron schedule or job name in docs/COMPAT.md must fail.
+    let bad_compat = compat.replace("17 16 * * *", "0 5 * * *");
+    assert!(
+        verify_docs_against_matrix(&readme, &bad_compat, &installers, &mcp_doc, &matrix_toml)
+            .is_err(),
+        "mismatched cron schedule in docs/COMPAT.md must be rejected"
     );
 }
