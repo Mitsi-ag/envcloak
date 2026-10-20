@@ -55,7 +55,36 @@ public struct CLIRunner: Sendable {
         guard let first = arguments.first, ["ref", "check", "agents"].contains(first),
               workingDirectory.hasPrefix("/"), !workingDirectory.utf8.contains(0),
               arguments.allSatisfy({ !$0.utf8.contains(0) }) else { throw CLIError.invalidArguments }
-        return try await perform(arguments: arguments, directory: workingDirectory, expectsJSON: true)
+        let (status, result) = try await perform(arguments: arguments, directory: workingDirectory, expectsJSON: true)
+        guard status == 0 else { throw CLIError.failed(status) }
+        return result
+    }
+
+    /// Runs `envcloak agents ... --json` with a deterministic safe search `PATH`
+    /// derived from fixed system bin folders and `UserPaths.home()`, never the
+    /// app's launch environment, and preserves validated stdout JSON even when
+    /// the child exits non-zero (for example on partial/refused install steps).
+    public func runAgents(arguments: [String], workingDirectory: String? = nil) async throws -> (exitCode: Int32, json: String) {
+        let dir = workingDirectory ?? home
+        guard arguments.first == "agents",
+              dir.hasPrefix("/"), !dir.utf8.contains(0),
+              arguments.allSatisfy({ !$0.utf8.contains(0) }) else { throw CLIError.invalidArguments }
+        let searchPath = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            home + "/.local/bin",
+            home + "/.cargo/bin",
+            "/usr/bin",
+            "/bin"
+        ].joined(separator: ":")
+        let (status, result) = try await perform(
+            arguments: arguments,
+            directory: dir,
+            expectsJSON: true,
+            allowNonZeroJSON: true,
+            path: searchPath
+        )
+        return (status, result.json)
     }
 
     /// Installation emits human text. Only the bounded child's exit status
@@ -75,8 +104,8 @@ public struct CLIRunner: Sendable {
               workingDirectory.hasPrefix("/"), !workingDirectory.utf8.contains(0),
               arguments.allSatisfy({ !$0.utf8.contains(0) }) else { throw CLIError.invalidArguments }
         let receipt = try UndoReceipt()
-        let result = try await perform(arguments: arguments + ["--undo-fd", "3"], directory: workingDirectory,
-                                       expectsJSON: true, receipt: receipt)
+        let (_, result) = try await perform(arguments: arguments + ["--undo-fd", "3"], directory: workingDirectory,
+                                            expectsJSON: true, receipt: receipt)
         return (result, receipt)
     }
 
@@ -86,15 +115,39 @@ public struct CLIRunner: Sendable {
                               expectsJSON: true, receipt: receipt, restoring: true)
     }
 
-    private func perform(arguments: [String], directory: String, expectsJSON: Bool, receipt: UndoReceipt? = nil, restoring: Bool = false) async throws -> CLIResult {
-        let operation: @Sendable () throws -> CLIResult = {
+    private func perform(
+        arguments: [String],
+        directory: String,
+        expectsJSON: Bool,
+        receipt: UndoReceipt? = nil,
+        restoring: Bool = false,
+        allowNonZeroJSON: Bool = false,
+        path: String = "/usr/bin:/bin"
+    ) async throws -> (Int32, CLIResult) {
+        let operation: @Sendable () throws -> (Int32, CLIResult) = {
             if let receipt {
                 return try receipt.use(restoring: restoring) { buffer in
-                    try execute(arguments: arguments, directory: directory, expectsJSON: expectsJSON, undo: &buffer, restoring: restoring)
+                    try execute(
+                        arguments: arguments,
+                        directory: directory,
+                        expectsJSON: expectsJSON,
+                        undo: &buffer,
+                        restoring: restoring,
+                        allowNonZeroJSON: allowNonZeroJSON,
+                        path: path
+                    )
                 }
             }
             var empty = try SecretBuffer()
-            return try execute(arguments: arguments, directory: directory, expectsJSON: expectsJSON, undo: &empty, restoring: nil)
+            return try execute(
+                arguments: arguments,
+                directory: directory,
+                expectsJSON: expectsJSON,
+                undo: &empty,
+                restoring: nil,
+                allowNonZeroJSON: allowNonZeroJSON,
+                path: path
+            )
         }
         #if DEBUG
         let hooks = CLIProbe.hooks
@@ -114,7 +167,15 @@ public struct CLIRunner: Sendable {
         return ContinuousClock.now
     }
 
-    private func execute(arguments: [String], directory: String, expectsJSON: Bool, undo: inout SecretBuffer, restoring: Bool?) throws -> CLIResult {
+    private func execute(
+        arguments: [String],
+        directory: String,
+        expectsJSON: Bool,
+        undo: inout SecretBuffer,
+        restoring: Bool?,
+        allowNonZeroJSON: Bool = false,
+        path: String = "/usr/bin:/bin"
+    ) throws -> (Int32, CLIResult) {
         let deadline = Self.now.advanced(by: timeout)
         var out = [Int32](repeating: -1, count: 2)
         var err = [Int32](repeating: -1, count: 2)
@@ -162,7 +223,7 @@ public struct CLIRunner: Sendable {
             guard posix_spawn_file_actions_adddup2(&actions, childChannel, 3) == 0 else { throw CLIError.unavailable }
         }
         let argv = [executable] + arguments + (expectsJSON && !arguments.contains("--json") ? ["--json"] : [])
-        let environment = ["HOME=" + home, "PATH=/usr/bin:/bin", "LANG=en_US.UTF-8"]
+        let environment = ["HOME=" + home, "PATH=" + path, "LANG=en_US.UTF-8"]
         var args = argv.map { strdup($0) } + [nil]
         var env = environment.map { strdup($0) } + [nil]
         defer { for pointer in args + env { free(pointer) } }
@@ -241,7 +302,9 @@ public struct CLIRunner: Sendable {
             if errno != EINTR { throw CLIError.unavailable }
         }
         reaped = true
-        guard status == 0 else { throw CLIError.failed(status) }
+        if status != 0 && !allowNonZeroJSON {
+            throw CLIError.failed(status)
+        }
         var json = ""
         if expectsJSON {
             do {
@@ -249,14 +312,20 @@ public struct CLIRunner: Sendable {
                     var parser = JSONParser(bytes: bytes)
                     guard case .object = try parser.parse() else { throw CLIError.invalidOutput }
                 }
-            } catch { throw CLIError.invalidOutput }
-            guard let text = String(bytes: output, encoding: .utf8) else { throw CLIError.invalidOutput }
+            } catch {
+                if status != 0 { throw CLIError.failed(status) }
+                throw CLIError.invalidOutput
+            }
+            guard let text = String(bytes: output, encoding: .utf8) else {
+                if status != 0 { throw CLIError.failed(status) }
+                throw CLIError.invalidOutput
+            }
             json = text
         }
         #if DEBUG
         CLIProbe.hooks?.beforeResult()
         #endif
         guard !Task.isCancelled, Self.now < deadline else { throw CLIError.timedOut }
-        return CLIResult(json: json)
+        return (status, CLIResult(json: json))
     }
 }

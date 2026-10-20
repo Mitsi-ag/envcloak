@@ -1743,16 +1743,13 @@ fn init_agents_note_writes_the_projects_block() {
     f.sweep();
 }
 
-/// D-20: every `envcloak <command>` the instruction block names is one
+/// D-20 & M3-J3: every `envcloak <command>` the instruction block names is one
 /// this build ships (dispatched, never `not_in_this_build`), the block
-/// never names `--ask`, and it is the reviewed text.
-///
-/// Mutation checked: `envcloak add --ask <provider>` in the block: the
-/// snapshot and the `--ask` check fail.
+/// includes `envcloak add <provider> --ask` in M3, and it matches the reviewed snapshot.
 #[test]
 fn every_command_the_block_names_is_shipped() {
     let block = blocks::block();
-    assert!(!block.contains("--ask"));
+    assert!(block.contains("envcloak add <provider> --ask"));
     let snapshot =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots/instruction-block.md");
     assert_eq!(
@@ -1780,6 +1777,19 @@ fn every_command_the_block_names_is_shipped() {
             both.contains(&format!("usage: envcloak {cmd} ")),
             "{cmd}: {both}"
         );
+        if cmd == "add" {
+            let mut ask_cmd = Command::new(cli());
+            home.apply(&mut ask_cmd)
+                .args(["add", "--ask"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let ask_out = finish_within(ask_cmd, Duration::from_secs(30));
+            let ask_err = stderr(&ask_out);
+            assert!(
+                ask_err.contains("envcloak add <provider> --ask"),
+                "envcloak add --ask must be recognized by add parser: {ask_err}"
+            );
+        }
     }
 }
 

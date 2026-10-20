@@ -39,14 +39,14 @@ pub const BEGIN: &str = "<!-- envcloak:begin -->";
 /// The line that closes the block.
 pub const END: &str = "<!-- envcloak:end -->";
 
-/// The instructions (D-20, SPEC §7 items 1 to 4 in their M2 form).
+/// The instructions (M3-J3, SPEC §7 items 1 to 4).
 pub const INSTRUCTIONS: &str = "## EnvCloak
 
 This machine keeps API keys and other secrets in EnvCloak, not in files or in the chat.
 
 - Never read `.env` files, never print environment variables, and never ask the person to paste a key into the chat.
 - If the project has an `envcloak.toml`, run anything that needs its secrets as `envcloak run -- <command>`.
-- If a key is missing, run `envcloak ls` (names only) and bind it with `envcloak ref NAME=<slug>`; if it does not exist, ask the person to run `envcloak add <provider>` in their own terminal.
+- If a key is missing, run `envcloak ls` (names only) and bind it with `envcloak ref NAME=<slug>`; if it does not exist, run `envcloak add <provider> --ask` (or ask the person to run `envcloak add <provider>` in their own terminal).
 - If the project has plaintext `.env` files and no `envcloak.toml`, suggest `envcloak init`.";
 
 /// The whole block, markers included, ending with a newline.
@@ -217,8 +217,17 @@ pub enum Change {
 }
 
 /// The blocks earlier versions of EnvCloak wrote, which [`insert`]
-/// replaces and [`remove`] takes out: none before this one.
-const EARLIER: &[&str] = &[];
+/// replaces and [`remove`] takes out (M2's D-20 block before M3-J3 added `--ask`).
+const EARLIER: &[&str] = &[
+    "## EnvCloak
+
+This machine keeps API keys and other secrets in EnvCloak, not in files or in the chat.
+
+- Never read `.env` files, never print environment variables, and never ask the person to paste a key into the chat.
+- If the project has an `envcloak.toml`, run anything that needs its secrets as `envcloak run -- <command>`.
+- If a key is missing, run `envcloak ls` (names only) and bind it with `envcloak ref NAME=<slug>`; if it does not exist, ask the person to run `envcloak add <provider>` in their own terminal.
+- If the project has plaintext `.env` files and no `envcloak.toml`, suggest `envcloak init`.",
+];
 
 /// Whether `found` (a block, markers and final newline included) is one
 /// EnvCloak wrote: this version's or an earlier one's. Line ends do not
@@ -553,7 +562,14 @@ mod tests {
     #[test]
     fn the_block_names_shipped_commands_only() {
         assert_eq!(commands_named(), ["run", "ls", "ref", "add", "init"]);
-        assert!(!INSTRUCTIONS.contains("--ask"));
+        assert!(INSTRUCTIONS.contains("envcloak add <provider> --ask"));
         assert!(!INSTRUCTIONS.contains("<!--"));
+
+        // M2's D-20 block in EARLIER upgrades cleanly in place and removes cleanly.
+        let m2_file = format!("top\n\n{BEGIN}\n{}\n{END}\nbottom\n", EARLIER[0]);
+        let upgraded = new(insert(m2_file.as_bytes()).unwrap_or(Change::Unchanged));
+        assert_eq!(upgraded, format!("top\n\n{}bottom\n", block()));
+        let removed = new(remove(m2_file.as_bytes()).unwrap_or(Change::Unchanged));
+        assert_eq!(removed, "top\n\nbottom\n");
     }
 }

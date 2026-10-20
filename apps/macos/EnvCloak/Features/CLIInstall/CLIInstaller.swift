@@ -74,12 +74,13 @@ struct CLIInstaller: Sendable {
         return CLIInstallStatus(
             installedLinkPath: nil,
             targetPath: bundledCLIPath,
-            shadowedBy: nil
+            shadowedBy: firstShadowingExecutable(beforeDirectory: nil)
         )
     }
 
     func install() -> CLIInstallOutcome {
         let fm = FileManager.default
+        var blockedRegularFilePath: String?
         for candidate in candidateDirectories {
             if candidate.hasSuffix("/.local/bin") && !fm.fileExists(atPath: candidate) {
                 let parent = (candidate as NSString).deletingLastPathComponent
@@ -93,7 +94,13 @@ struct CLIInstaller: Sendable {
             }
             guard fm.isWritableFile(atPath: candidate) else { continue }
             let linkPath = (candidate as NSString).appendingPathComponent("envcloak")
-            if (try? fm.attributesOfItem(atPath: linkPath)) != nil {
+            if let attrs = try? fm.attributesOfItem(atPath: linkPath) {
+                guard attrs[.type] as? FileAttributeType == .typeSymbolicLink else {
+                    if blockedRegularFilePath == nil {
+                        blockedRegularFilePath = linkPath
+                    }
+                    continue
+                }
                 do {
                     try fm.removeItem(atPath: linkPath)
                 } catch {
@@ -112,6 +119,12 @@ struct CLIInstaller: Sendable {
                 continue
             }
         }
+        if let blockedRegularFilePath {
+            return .manualCommand(
+                command: Self.manualSymlinkCommand(targetPath: bundledCLIPath, destinationPath: blockedRegularFilePath),
+                reason: "An existing envcloak binary was found at \(blockedRegularFilePath) and was not overwritten. Replace it manually in Terminal if desired:"
+            )
+        }
         let fallbackDest = candidateDirectories.first.map {
             ($0 as NSString).appendingPathComponent("envcloak")
         } ?? "/usr/local/bin/envcloak"
@@ -121,10 +134,10 @@ struct CLIInstaller: Sendable {
         )
     }
 
-    private func firstShadowingExecutable(beforeDirectory chosenDirectory: String) -> String? {
+    private func firstShadowingExecutable(beforeDirectory chosenDirectory: String?) -> String? {
         let fm = FileManager.default
         for dir in searchDirectories {
-            if dir == chosenDirectory {
+            if let chosenDirectory, dir == chosenDirectory {
                 break
             }
             let candidate = (dir as NSString).appendingPathComponent("envcloak")

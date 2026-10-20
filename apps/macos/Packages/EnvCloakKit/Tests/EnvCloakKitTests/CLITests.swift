@@ -133,4 +133,18 @@ extension CLITests {
         do { try await fixture.runner.undoBinding(receipt, workingDirectory: fixture.root); XCTFail("consumed receipt reused") }
         catch { XCTAssertEqual(error as? CLIError, .invalidArguments) }
     }
+
+    func testRunAgentsUsesDeterministicUserBinPathDefaultsToHomeAndPreservesNonZeroJSON() async throws {
+        let fixture = try fixture("""
+        expected="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.cargo/bin:/usr/bin:/bin"
+        test "$PATH" = "$expected" || exit 11
+        test "$PWD" -ef "$HOME" || exit 12
+        printf '{"applied":true,"complete":false}'
+        exit 1
+        """)
+        defer { try? FileManager.default.removeItem(atPath: fixture.root) }
+        let (exitCode, json) = try await fixture.runner.runAgents(arguments: ["agents", "install", "--yes", "--json"])
+        XCTAssertNotEqual(exitCode, 0)
+        XCTAssertEqual(json, "{\"applied\":true,\"complete\":false}")
+    }
 }

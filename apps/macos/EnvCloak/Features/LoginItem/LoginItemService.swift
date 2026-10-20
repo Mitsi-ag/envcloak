@@ -79,12 +79,20 @@ struct SystemLoginItemService: LoginItemService {
     static let approvalBannerText = requiresApprovalBanner
     static let openLoginItemsTitle = "Open Login Items"
     static let cliAgentPlistRelativePath = "Library/LaunchAgents/ai.envcloak.envcloakd.plist"
+    static let stateFileRelativePath = "Library/Application Support/EnvCloak/app/login-item-bundle-path.json"
 
     private let service: any LoginItemService
     private let cliAgentDetector: @MainActor () -> Bool
     private let cliDaemonUninstaller: @MainActor () async throws -> Void
     private let bundlePathProvider: @MainActor () -> String
-    var lastRegisteredBundlePath: String?
+    private let stateFileURL: URL?
+    var lastRegisteredBundlePath: String? {
+        didSet {
+            if let stateFileURL {
+                ProjectFolders.writeLoginItemBundlePath(lastRegisteredBundlePath, to: stateFileURL)
+            }
+        }
+    }
     var performLaunchStatusCheck = true
     var uninstallCLIBeforeRegister = true
 
@@ -100,6 +108,7 @@ struct SystemLoginItemService: LoginItemService {
         cliAgentDetector: (@MainActor () -> Bool)? = nil,
         cliDaemonUninstaller: (@MainActor () async throws -> Void)? = nil,
         bundlePathProvider: (@MainActor () -> String)? = nil,
+        stateFileURL: URL? = LoginItemController.defaultStateFileURL(),
         runner: CLIRunner? = try? CLIRunner()
     ) {
         self.service = service
@@ -114,6 +123,9 @@ struct SystemLoginItemService: LoginItemService {
         self.bundlePathProvider = bundlePathProvider ?? {
             Bundle.main.bundlePath
         }
+        self.stateFileURL = stateFileURL
+        self.lastRegisteredBundlePath = stateFileURL.flatMap(ProjectFolders.readLoginItemBundlePath)
+        checkStatusOnLaunch()
     }
 
     static func defaultCLILaunchAgentPath() -> String? {
@@ -122,6 +134,24 @@ struct SystemLoginItemService: LoginItemService {
         }
         let home = String(cString: dir)
         return (home as NSString).appendingPathComponent(cliAgentPlistRelativePath)
+    }
+
+    static func defaultStateFileURL() -> URL? {
+        #if ENVCLOAK_SCREEN_TESTS
+        return nil
+        #else
+        guard let record = getpwuid(getuid()), let dir = record.pointee.pw_dir else {
+            return nil
+        }
+        let home = String(cString: dir)
+        return URL(fileURLWithPath: home).appendingPathComponent(stateFileRelativePath)
+        #endif
+    }
+
+    var isInApplicationsFolder: Bool {
+        let path = bundlePathProvider()
+        return path == "/Applications/EnvCloak.app"
+            || (path.hasPrefix("/Applications/") && path.hasSuffix(".app"))
     }
 
     var launchAtLoginEnabled: Bool {
@@ -177,6 +207,12 @@ struct SystemLoginItemService: LoginItemService {
         busy = true
         notice = nil
         defer { busy = false }
+
+        guard isInApplicationsFolder else {
+            refreshStatus()
+            notice = "Move EnvCloak.app to /Applications before enabling the background item."
+            return false
+        }
 
         cliLaunchAgentPresent = cliAgentDetector()
         if cliLaunchAgentPresent && uninstallCLIBeforeRegister {

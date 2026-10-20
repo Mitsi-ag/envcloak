@@ -99,11 +99,11 @@ struct AgentSurfaceReport: Codable, Equatable, Sendable, Identifiable {
     var formattedLine: String {
         let skippedSuffix = skipped.isEmpty
             ? ""
-            : ", " + skipped.map { "\($0) skipped" }.joined(separator: ", ")
+            : ", " + skipped.map { "\(Escape.display($0)) skipped" }.joined(separator: ", ")
         if reasons.isEmpty {
             return "\(displayedState.rawValue) (probe=\(probe.rawValue)\(skippedSuffix))"
         }
-        let reasonList = reasons.joined(separator: ", ")
+        let reasonList = reasons.map(Escape.display).joined(separator: ", ")
         return "\(displayedState.rawValue) (\(reasonList); probe=\(probe.rawValue)\(skippedSuffix))"
     }
 
@@ -154,7 +154,7 @@ struct AgentSurfaceReport: Codable, Equatable, Sendable, Identifiable {
         case "not_drivable":
             "host has no headless CLI probe contract"
         default:
-            token.replacingOccurrences(of: "_", with: " ")
+            Escape.display(token.replacingOccurrences(of: "_", with: " "))
         }
     }
 }
@@ -167,12 +167,13 @@ struct AgentServerReport: Codable, Equatable, Sendable {
     let sentinel: String
 
     var formattedLine: String {
-        let reasonSuffix = reasons.isEmpty ? "" : "; " + reasons.joined(separator: "; ")
+        let escapedAvailability = Escape.display(availability)
+        let reasonSuffix = reasons.isEmpty ? "" : "; " + reasons.map(Escape.display).joined(separator: "; ")
         if sentinel == "not_run" {
-            return "\(availability)\(reasonSuffix) (probe=\(probe.rawValue))"
+            return "\(escapedAvailability)\(reasonSuffix) (probe=\(probe.rawValue))"
         }
-        let sentinelWords = sentinel.replacingOccurrences(of: "_", with: " ")
-        return "\(availability)\(reasonSuffix) (probe=\(probe.rawValue), sentinel \(sentinelWords))"
+        let sentinelWords = Escape.display(sentinel.replacingOccurrences(of: "_", with: " "))
+        return "\(escapedAvailability)\(reasonSuffix) (probe=\(probe.rawValue), sentinel \(sentinelWords))"
     }
 }
 
@@ -316,8 +317,8 @@ final class AgentsStore {
     init(
         runCLI: @escaping @Sendable ([String]) async throws -> CLIOutput = { args in
             do {
-                let result = try await CLIRunner().run(arguments: args, workingDirectory: "/")
-                return CLIOutput(exitCode: 0, json: result.json, errorText: "")
+                let (exitCode, json) = try await CLIRunner().runAgents(arguments: args)
+                return CLIOutput(exitCode: exitCode, json: json, errorText: "")
             } catch CLIError.failed(let code) {
                 return CLIOutput(exitCode: code, json: "", errorText: "")
             }
@@ -436,7 +437,16 @@ final class AgentsStore {
             if let data = output.json.data(using: .utf8),
                let report = try? JSONDecoder().decode(AgentInstallPlan.self, from: data) {
                 let changedFiles = report.plannedFilePaths
-                if changedFiles.isEmpty {
+                if report.complete == false || output.exitCode != 0 {
+                    let details = report.allChanges.map { change in
+                        "\(change.displayPath) (\(change.displayDetail))"
+                    }
+                    if details.isEmpty {
+                        notice = "Integration install did not complete (exit \(output.exitCode))."
+                    } else {
+                        notice = "Integration install incomplete: \(details.joined(separator: "; "))."
+                    }
+                } else if changedFiles.isEmpty {
                     notice = "Integration is already up to date."
                 } else {
                     notice = "Updated integration files: \(changedFiles.joined(separator: ", "))."

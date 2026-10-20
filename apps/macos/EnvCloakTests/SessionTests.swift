@@ -2492,6 +2492,217 @@ final class SessionTests: XCTestCase {
         XCTAssertNil(store.pendingInstallPlan)
         XCTAssertEqual(store.notice, "Updated integration files: /tmp/.claude/settings.json.")
     }
+
+    @MainActor func testM317ReviewRemediationF01ThroughF06() async throws {
+        // F-01: VaultSession.run() activates screenLockMonitor when not already started.
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        let sessionForRun = VaultSession(client: client)
+        XCTAssertFalse(sessionForRun.isScreenLockMonitoringActive)
+        let runTask = Task { await sessionForRun.run() }
+        for _ in 0..<40 where !sessionForRun.isScreenLockMonitoringActive {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(sessionForRun.isScreenLockMonitoringActive)
+        runTask.cancel()
+        await runTask.value
+        sessionForRun.screenLockMonitor?.stop()
+
+        // F-02: AgentsStore.confirmInstall() surfaces partial/refused changes from non-zero JSON exit.
+        let incompleteJSON = """
+        {
+          "hosts": [
+            {
+              "host": "claude_code",
+              "version": "1.2.3",
+              "found": "/usr/local/bin/claude",
+              "changes": [
+                {
+                  "path": "/tmp/.claude/settings.json",
+                  "outcome": "refused",
+                  "message": "malformed settings.json"
+                }
+              ]
+            }
+          ],
+          "project": null,
+          "applied": true,
+          "complete": false
+        }
+        """
+        let incompleteStore = AgentsStore { args in
+            if args.contains("--yes") {
+                return CLIOutput(exitCode: 1, json: incompleteJSON, errorText: "")
+            }
+            return CLIOutput(exitCode: 0, json: "{\"agents\":[]}", errorText: "")
+        }
+        await incompleteStore.confirmInstall()
+        XCTAssertEqual(
+            incompleteStore.notice,
+            "Integration install incomplete: /tmp/.claude/settings.json (refused: malformed settings.json)."
+        )
+
+        // F-03: Toggling Touch ID only off performs a signed unlocker replacement, preserves true on cancel,
+        // and ProjectFolders persists touchIDOnlyEnabled, recoveryConfirmed, and passphraseUnlockerRemoved across launches.
+        let secRoot = URL(fileURLWithPath: "/tmp/ec-sec-state-" + UUID().uuidString.prefix(8))
+        defer { try? FileManager.default.removeItem(at: secRoot) }
+        let secFile = secRoot.appendingPathComponent("project-folders.json")
+        let folders1 = try ProjectFolders(file: secFile)
+        let unlockPub = P256.KeyAgreement.PrivateKey().publicKey
+        let approveKey = P256.Signing.PrivateKey()
+        let enrolledKeys = EnrolledPublicKeys(
+            unlockPublicKeyHex: HexCoding.encode(unlockPub.x963Representation),
+            approvePublicKeyHex: HexCoding.encode(approveKey.publicKey.x963Representation)
+        )
+        let signer = SoftwareApprovalSigner(privateKey: approveKey)
+        let unlockKey = SoftwareUnlockKey()
+        let session1 = VaultSession(
+            client: client,
+            folders: folders1,
+            unlockKey: unlockKey,
+            approvalSigner: signer,
+            enrolledPublicKeysOverride: enrolledKeys,
+            enrolledTouchID: true
+        )
+        await session1.poll()
+        _ = await session1.beginEnrolment()
+        _ = await session1.pollEnrolment()
+        await session1.setTouchIDOnly(true)
+        XCTAssertTrue(session1.touchIDOnlyEnabled)
+
+        // Cancel downgrade -> touchIDOnlyEnabled must remain true!
+        signer.simulatedFailure = SignerError.userCancelled
+        await session1.setTouchIDOnly(false)
+        XCTAssertTrue(session1.touchIDOnlyEnabled, "Cancelled downgrade must leave touchIDOnlyEnabled true")
+        signer.simulatedFailure = nil
+
+        // Succeed downgrade -> replaces unlocker and sets touchIDOnlyEnabled false
+        let addCallsBeforeDowngrade = await client.calls("app.unlocker.add")
+        let removeCallsBeforeDowngrade = await client.calls("app.unlocker.remove")
+        await session1.setTouchIDOnly(false)
+        XCTAssertFalse(session1.touchIDOnlyEnabled)
+        let addCallsAfterDowngrade = await client.calls("app.unlocker.add")
+        let removeCallsAfterDowngrade = await client.calls("app.unlocker.remove")
+        XCTAssertEqual(addCallsAfterDowngrade, addCallsBeforeDowngrade + 1)
+        XCTAssertEqual(removeCallsAfterDowngrade, removeCallsBeforeDowngrade + 1)
+
+        // Re-enable Touch ID only, confirm recovery kit, and remove passphrase unlocker -> verify persistence across launch
+        await session1.setTouchIDOnly(true)
+        session1.markRecoveryConfirmed()
+        let removedPass = await session1.removePassphraseUnlockerWithTouchID()
+        XCTAssertTrue(removedPass)
+
+        let folders2 = try ProjectFolders(file: secFile)
+        let session2 = VaultSession(client: client, folders: folders2, enrolledTouchID: true)
+        XCTAssertTrue(session2.touchIDOnlyEnabled)
+        XCTAssertTrue(session2.recoveryConfirmed)
+        XCTAssertTrue(session2.passphraseUnlockerRemoved)
+        XCTAssertFalse(session2.passphrasePresent)
+
+        // F-04: LoginItemController checks status on init, persists lastRegisteredBundlePath across launches,
+        // and refuses registration outside /Applications before touching CLI LaunchAgent.
+        let stateFile = secRoot.appendingPathComponent("login-item-state.json")
+        var cliPresent = true
+        var cliUninstallCount = 0
+        var registerCount = 0
+        var unregisterCount = 0
+        let fakeLoginService = FakeLoginItemService(
+            initialAgentStatus: .notRegistered,
+            onRegisterAgent: { registerCount += 1 },
+            onUnregisterAgent: { unregisterCount += 1 }
+        )
+        fakeLoginService.currentBundlePath = "/Users/Shared/EnvCloak.app"
+        let outsideController = LoginItemController(
+            service: fakeLoginService,
+            cliAgentDetector: { cliPresent },
+            cliDaemonUninstaller: {
+                cliUninstallCount += 1
+                cliPresent = false
+            },
+            bundlePathProvider: { fakeLoginService.currentBundlePath },
+            stateFileURL: stateFile
+        )
+        XCTAssertFalse(outsideController.isInApplicationsFolder)
+        let outsideRegistered = await outsideController.registerBackgroundAgent()
+        XCTAssertFalse(outsideRegistered)
+        XCTAssertEqual(cliUninstallCount, 0, "Must never uninstall CLI LaunchAgent when app is outside /Applications")
+        XCTAssertEqual(registerCount, 0)
+
+        // Now move to /Applications/EnvCloak.app and register -> persists bundle path to stateFile
+        fakeLoginService.currentBundlePath = "/Applications/EnvCloak.app"
+        XCTAssertTrue(outsideController.isInApplicationsFolder)
+        let insideRegistered = await outsideController.registerBackgroundAgent()
+        XCTAssertTrue(insideRegistered)
+        XCTAssertEqual(cliUninstallCount, 1)
+        XCTAssertEqual(registerCount, 1)
+        XCTAssertEqual(outsideController.lastRegisteredBundlePath, "/Applications/EnvCloak.app")
+
+        // Simulate next app launch after moving bundle to /Applications/Utilities/EnvCloak.app:
+        // init loads stateFile and immediately re-registers on launch.
+        fakeLoginService.currentBundlePath = "/Applications/Utilities/EnvCloak.app"
+        fakeLoginService.currentAgentStatus = .requiresApproval
+        let relaunchedController = LoginItemController(
+            service: fakeLoginService,
+            cliAgentDetector: { false },
+            cliDaemonUninstaller: {},
+            bundlePathProvider: { fakeLoginService.currentBundlePath },
+            stateFileURL: stateFile
+        )
+        XCTAssertEqual(unregisterCount, 1)
+        XCTAssertEqual(registerCount, 2)
+        XCTAssertEqual(relaunchedController.lastRegisteredBundlePath, "/Applications/Utilities/EnvCloak.app")
+
+        // F-05: CLIInstaller refuses to delete an existing regular file binary and status() reports shadowedBy when not installed.
+        let cliRoot = secRoot.appendingPathComponent("cli-f05")
+        let candidateDir = cliRoot.appendingPathComponent("bin")
+        let bundledCLI = cliRoot.appendingPathComponent("EnvCloak.app/Contents/MacOS/envcloak")
+        try FileManager.default.createDirectory(at: candidateDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: bundledCLI.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("#!/bin/sh\n".utf8).write(to: bundledCLI)
+        let existingBinary = candidateDir.appendingPathComponent("envcloak")
+        let standaloneContent = Data("#!/bin/sh\necho standalone\n".utf8)
+        try standaloneContent.write(to: existingBinary)
+
+        let f05Installer = CLIInstaller(
+            bundledCLIPath: bundledCLI.path,
+            candidateDirectories: [candidateDir.path],
+            searchDirectories: [candidateDir.path]
+        )
+        let preInstallStatus = f05Installer.status()
+        XCTAssertFalse(preInstallStatus.isInstalled)
+        XCTAssertEqual(preInstallStatus.shadowedBy, existingBinary.path, "status() must report shadowedBy even when not installed")
+
+        let f05Outcome = f05Installer.install()
+        if case .manualCommand(_, let reason) = f05Outcome {
+            XCTAssertTrue(reason.contains(existingBinary.path))
+        } else {
+            XCTFail("Expected manualCommand when regular file binary exists at candidate, got \(f05Outcome)")
+        }
+        XCTAssertEqual(try Data(contentsOf: existingBinary), standaloneContent, "Existing standalone binary must never be deleted")
+
+        // F-06: AgentSurfaceReport.formattedLine and AgentServerReport.formattedLine escape hostile strings.
+        let hostileSurface = AgentSurfaceReport(
+            surface: .shell,
+            state: .degraded,
+            reasons: ["bad\u{202e}\u{1b}[31mreason"],
+            probe: .failed,
+            skipped: ["skip\u{202e}item"]
+        )
+        XCTAssertEqual(
+            hostileSurface.formattedLine,
+            "degraded (bad\\u{202e}\\u{1b}[31mreason; probe=failed, skip\\u{202e}item skipped)"
+        )
+        let hostileServer = AgentServerReport(
+            availability: "avail\u{202e}",
+            reasons: ["srv\u{1b}[31mreason"],
+            probe: .passed,
+            sentinel: "sent\u{202e}_ok"
+        )
+        XCTAssertEqual(
+            hostileServer.formattedLine,
+            "avail\\u{202e}; srv\\u{1b}[31mreason (probe=passed, sentinel sent\\u{202e} ok)"
+        )
+    }
 }
 
 @MainActor final class FakeLockSignalSource: LockSignalSource {

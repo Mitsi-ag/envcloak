@@ -93,6 +93,15 @@ struct SettingsView: View {
                         .accessibilityIdentifier("settings.unlock.passphraseState")
                 }
                 Spacer()
+                if session.passphrasePresent {
+                    Button("Remove passphrase unlocker") {
+                        Task { _ = await session.removePassphraseUnlockerWithTouchID() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!session.enrolledTouchID || !session.recoveryConfirmed || session.state != .ready)
+                    .accessibilityIdentifier("settings.unlock.removePassphrase")
+                }
             }
 
             Divider().overlay(ECToken.rule.color)
@@ -146,6 +155,12 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    Button("Confirm in app") {
+                        session.markRecoveryConfirmed()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("settings.recoveryKit.markConfirmed")
                 }
             }
         }
@@ -333,6 +348,7 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(!session.loginItem.isInApplicationsFolder)
                     .accessibilityIdentifier("settings.backgroundItem.turnOn")
                 }
             }
@@ -348,6 +364,7 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(!session.loginItem.isInApplicationsFolder)
                     .accessibilityIdentifier("settings.backgroundItem.migrateCLI")
                 }
             }

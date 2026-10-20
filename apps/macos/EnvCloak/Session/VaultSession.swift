@@ -116,6 +116,10 @@ struct Change: OptionSet {
         touchIDOnlyEnabled
     }
 
+    var isScreenLockMonitoringActive: Bool {
+        screenLockMonitor != nil
+    }
+
     var daemonIdentitySummary: String {
         if case .unverified = state {
             return "unverified in this build"
@@ -153,6 +157,9 @@ struct Change: OptionSet {
         self.enrolledTeamID = ownIdentity.teamID
         self.enrolledSigningID = ownIdentity.signingID
         self.showMenuBarExtra = folders?.showMenuBarExtra ?? false
+        self.touchIDOnlyEnabled = (folders?.touchIDOnlyEnabled ?? false) || keyStore.isTouchIDOnlyEnrolled()
+        self.recoveryConfirmed = folders?.recoveryConfirmed ?? false
+        self.passphraseUnlockerRemoved = folders?.passphraseUnlockerRemoved ?? false
         let resolvedNotifications = notifications ?? NotificationManager()
         self.notifications = resolvedNotifications
         let resolvedLoginItem = loginItem ?? LoginItemController()
@@ -228,17 +235,22 @@ struct Change: OptionSet {
     }
 
     static func live() -> VaultSession {
+        let signalSource = WorkspaceLockSignalSource()
         do {
             let client = SocketWorkspaceClient(client: try DaemonClient())
-            do { return VaultSession(client: client, folders: try ProjectFolders.live()) }
-            catch {
-                let session = VaultSession(client: client)
+            do {
+                return VaultSession(
+                    client: client,
+                    folders: try ProjectFolders.live(),
+                    lockSignalSource: signalSource
+                )
+            } catch {
+                let session = VaultSession(client: client, lockSignalSource: signalSource)
                 session.notice = "Saved project folders could not be restored. The adopted project index is still available."
                 return session
             }
-        }
-        catch {
-            let session = VaultSession(client: nil)
+        } catch {
+            let session = VaultSession(client: nil, lockSignalSource: signalSource)
             session.state = .unverified(.path)
             return session
         }
@@ -246,6 +258,10 @@ struct Change: OptionSet {
 
     func run() async {
         guard client != nil else { return }
+        if screenLockMonitor == nil {
+            startScreenLockMonitor()
+        }
+        loginItem.checkStatusOnLaunch()
         while !Task.isCancelled {
             await poll()
             do { try await Task.sleep(for: .seconds(1)) } catch { return }
@@ -500,8 +516,14 @@ struct Change: OptionSet {
         if enabled {
             _ = await enrollTouchIDOnlyUnlocker()
         } else {
-            touchIDOnlyEnabled = false
+            _ = await disableTouchIDOnlyUnlocker()
         }
+    }
+
+    func markRecoveryConfirmed() {
+        recoveryConfirmed = true
+        try? folders?.saveSecurityState(recoveryConfirmed: true)
+        notice = "Recovery Kit confirmed."
     }
 
     func installCommandLineTool() {
@@ -1023,6 +1045,7 @@ struct Change: OptionSet {
                 )
             )
             passphraseUnlockerRemoved = true
+            try? folders?.saveSecurityState(passphraseUnlockerRemoved: true)
             notice = "Passphrase unlocker removed. Touch ID and your Recovery Kit remain."
             return true
         } catch SignerError.userCancelled, KeyStoreError.userCancelled {
@@ -1036,6 +1059,15 @@ struct Change: OptionSet {
 
     @discardableResult
     func enrollTouchIDOnlyUnlocker(label: String = "This Mac (Touch ID only)") async -> Bool {
+        await replaceSecureEnclaveUnlocker(touchIDOnly: true, label: label)
+    }
+
+    @discardableResult
+    func disableTouchIDOnlyUnlocker(label: String = "This Mac") async -> Bool {
+        await replaceSecureEnclaveUnlocker(touchIDOnly: false, label: label)
+    }
+
+    private func replaceSecureEnclaveUnlocker(touchIDOnly: Bool, label: String) async -> Bool {
         guard let client, state == .ready, !actionInProgress else { return false }
         if sshSession {
             notice = "Touch ID cannot be used over SSH."
@@ -1045,7 +1077,7 @@ struct Change: OptionSet {
         defer { actionInProgress = false }
         do {
             let priorKeys: EnrolledPublicKeys? = enrolledPublicKeysOverride
-                ?? (keyStore.hasEnrolledKeys() ? (try? keyStore.loadOrCreatePublicKeys(touchIDOnly: false)) : nil)
+                ?? (keyStore.hasEnrolledKeys() ? (try? keyStore.loadOrCreatePublicKeys(touchIDOnly: !touchIDOnly)) : nil)
             let target = try await client.call(MetadataRequest.itemsTargetUnlockerAdd())
             let unlockHex: String
             let approveHex: String
@@ -1054,7 +1086,7 @@ struct Change: OptionSet {
                 unlockHex = overrideKeys.unlockPublicKeyHex
                 approveHex = overrideKeys.approvePublicKeyHex
             } else {
-                let staged = try keyStore.stageNewPublicKeys(touchIDOnly: true)
+                let staged = try keyStore.stageNewPublicKeys(touchIDOnly: touchIDOnly)
                 unlockHex = staged.keys.unlockPublicKeyHex
                 approveHex = staged.keys.approvePublicKeyHex
                 stagedPair = staged
@@ -1128,15 +1160,22 @@ struct Change: OptionSet {
             }
             enrolledUnlockerID = added.unlocker_id
             enrolledUnlockerLabel = label
-            touchIDOnlyEnabled = true
+            touchIDOnlyEnabled = touchIDOnly
             enrolledTouchID = true
-            notice = "Touch ID is now required. Your login password will no longer approve."
+            try? folders?.saveSecurityState(touchIDOnlyEnabled: touchIDOnly)
+            notice = touchIDOnly
+                ? "Touch ID is now required. Your login password will no longer approve."
+                : "Touch ID or your login password can now approve."
             return true
         } catch SignerError.userCancelled, KeyStoreError.userCancelled {
-            notice = "Touch ID only enrolment cancelled."
+            notice = touchIDOnly
+                ? "Touch ID only enrolment cancelled."
+                : "Touch ID only change cancelled."
             return false
         } catch {
-            notice = "Touch ID only unlocker could not be added."
+            notice = touchIDOnly
+                ? "Touch ID only unlocker could not be added."
+                : "Touch ID only setting could not be changed."
             return false
         }
     }
