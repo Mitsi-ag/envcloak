@@ -27,6 +27,9 @@ impl TotpSpec {
     pub fn issuer(&self) -> Option<&SecretBytes> {
         self.issuer.as_ref()
     }
+    pub fn into_seed_and_params(self) -> (SecretBytes, TotpParams) {
+        (self.seed, self.params)
+    }
 }
 impl fmt::Debug for TotpSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

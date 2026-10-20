@@ -392,8 +392,8 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 32 | `standing_create` | M2-15 | landed | a standing approval created |
 | 33 | `standing_revoke` | M2-15 | landed | standing approvals revoked |
 | 34 | `standing_grant` | M2-15 | landed | a session grant minted from a standing approval, before any value leaves |
-| 35 | `login_add` | M2b-03 | reserved | a login item added |
-| 36 | `login_replace` | M2b-03 | reserved | a login field replaced, with a proof |
+| 35 | `login_add` | M2b-03 | landed | a login item added |
+| 36 | `login_replace` | M2b-03 | landed | a login field replaced, with a proof |
 | 37 | `signin_target` | M2b-05 | reserved | a sign-in target added, edited or removed |
 | 38 | `signin_approve` | M2b-05 | reserved | a sign-in approval and its authorization |
 | 39 | `signin_intent` | M2b-09 | reserved | before any credential use in an attempt |

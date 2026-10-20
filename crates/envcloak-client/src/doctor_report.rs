@@ -1081,6 +1081,7 @@ mod tests {
             account: None,
             detail: None,
             exposed: None,
+            login: None,
         };
         let merged = FirstRunReport::from_doctor(
             &DoctorReport::default(),

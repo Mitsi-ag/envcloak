@@ -71,16 +71,18 @@ use envcloak_core::audit::{AuditKind, SubjectSummary};
 use envcloak_core::crypto::{CryptoErrorKind, ItemClass};
 use envcloak_core::vault::{
     Account, Classification, ExposureSource, FieldId, FieldName, ItemDetails, ItemId, ItemMeta,
-    MAX_FIELD, NewItem, Slug, Vault, VaultError, VaultErrorKind,
+    LoginFieldValue, LoginMeta, LoginTier, MAX_FIELD, MAX_LOGIN_SESSION_LIFETIME_SECS, NewItem,
+    NewLogin, Slug, TotpEnrollment, Vault, VaultError, VaultErrorKind,
 };
 use envcloak_ipc::RpcError;
 use envcloak_ipc::proto::{
-    AddParams, CheckParams, ErrorKind, ListParams, MAX_MARKED, MarkExposedParams, ReclassifyParams,
-    RemoveParams, RotateParams, SlugParams, TargetParams,
+    AddParams, CheckParams, ErrorKind, ListParams, LoginAddParams, MAX_MARKED, MarkExposedParams,
+    ReclassifyParams, RemoveParams, RotateParams, SlugParams, TargetParams,
 };
 use envcloak_ipc::view::{
     AddedView, CheckBindingView, CheckView, ClassificationView, ItemDetail, ItemView, ItemsView,
-    LengthClass, MarkedView, ReclassifiedView, RefStatus, RemovedView, RotatedView, TargetView,
+    LengthClass, LoginAddedView, LoginTierView, MarkedView, ReclassifiedView, RefStatus,
+    RemovedView, RotatedView, TargetView,
 };
 use envcloak_policy::{
     BindErrorKind, Binding, Claims, EnvName, ManifestError, SubjectEvidence, bind_items,
@@ -159,12 +161,12 @@ pub fn list(shared: &Shared, p: ListParams) -> Result<ItemsView, RpcError> {
     } else {
         ItemDetail::Summary
     };
+    let v = s.unlocked()?;
     Ok(ItemsView {
-        items: s
-            .unlocked()?
+        items: v
             .items()
             .iter()
-            .map(|m| ItemView::from_meta(m, detail))
+            .map(|m| ItemView::from_meta(m, detail).with_login_revision(v.login_revision(m.id)))
             .collect(),
     })
 }
@@ -178,8 +180,9 @@ fn find<'v>(v: &'v Vault, slug: &str) -> Result<&'v ItemMeta, RpcError> {
 /// `items.show`.
 pub fn show(shared: &Shared, p: SlugParams) -> Result<ItemView, RpcError> {
     let s = locked(&shared.state);
-    let m = find(s.unlocked()?, &p.slug)?;
-    Ok(ItemView::from_meta(m, ItemDetail::Full))
+    let v = s.unlocked()?;
+    let m = find(v, &p.slug)?;
+    Ok(ItemView::from_meta(m, ItemDetail::Full).with_login_revision(v.login_revision(m.id)))
 }
 
 fn status_of(k: BindErrorKind) -> RefStatus {
@@ -491,12 +494,115 @@ pub fn add(shared: &Shared, peer: &PeerIdentity, p: AddParams) -> Result<AddedVi
     })
 }
 
+fn parse_totp_enrollment(uri: &SecretBytes) -> Result<TotpEnrollment, RpcError> {
+    check_value(uri)?;
+    let spec = envcloak_signin::otpauth::parse(uri).map_err(|_| invalid("invalid_otpauth"))?;
+    let (seed, params) = spec.into_seed_and_params();
+    Ok(TotpEnrollment {
+        params: params.to_vault_params(),
+        seed,
+    })
+}
+
+/// `login.add`. Enrolls a login item (`ItemClass::Login`) with typed
+/// fields (`username`, `password`, optional `totp`, optional `adapter_key`).
+pub fn login_add(
+    shared: &Shared,
+    peer: &PeerIdentity,
+    p: LoginAddParams,
+) -> Result<LoginAddedView, RpcError> {
+    if looks_like_value(shared, &p.slug) {
+        return Err(invalid("looks_like_value"));
+    }
+    let slug = Slug::new(&p.slug).map_err(|_| invalid("invalid_slug"))?;
+    let classification = match p.classification {
+        ClassificationView::Test => Classification::Test,
+        ClassificationView::Live => Classification::Live,
+        ClassificationView::Unknown => Classification::Unknown,
+    };
+    let tier = match p.tier {
+        LoginTierView::Dev => LoginTier::Dev,
+        LoginTierView::Each => LoginTier::Each,
+        LoginTierView::NeverAgent => LoginTier::NeverAgent,
+    };
+    if classification != Classification::Test && tier == LoginTier::Dev {
+        return Err(invalid("live_dev"));
+    }
+    if p.session_lifetime_secs == 0 || p.session_lifetime_secs > MAX_LOGIN_SESSION_LIFETIME_SECS {
+        return Err(RpcError::new(ErrorKind::InvalidParams));
+    }
+    let username = p.username.into_inner();
+    let password = p.password.into_inner();
+    let totp_uri = p.totp.map(|u| u.into_inner());
+    let adapter_key = p.adapter_key.map(|k| k.into_inner());
+    refuse_if_traced()?;
+    let caller = evidence(shared, peer, &p.claims)?;
+    if caller.kind() == envcloak_policy::SubjectKind::Agent {
+        shared.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "login.add",
+            reason: envcloak_policy::ProofRefusal::Agent.token(),
+        });
+        return Err(RpcError::new(ErrorKind::ProofRefused));
+    }
+    check_value(&username)?;
+    check_value(&password)?;
+    if let Some(ref k) = adapter_key {
+        check_value(k)?;
+    }
+    let totp = match totp_uri.as_ref() {
+        Some(uri) => Some(parse_totp_enrollment(uri)?),
+        None => None,
+    };
+
+    let mut s = locked(&shared.state);
+    let v = s.unlocked_mut()?;
+    if v.find(&slug).is_some() {
+        return Err(RpcError::new(ErrorKind::ItemExists));
+    }
+    let details = ItemDetails {
+        title: slug.as_str().to_owned(),
+        classification,
+        ..ItemDetails::default()
+    };
+    let meta = LoginMeta {
+        tier,
+        session_lifetime: p.session_lifetime_secs,
+    };
+    let id = v
+        .transact(|t| {
+            t.create_login(NewLogin {
+                slug: slug.clone(),
+                details,
+                meta,
+                username,
+                password,
+                totp,
+                adapter_key,
+            })
+        })
+        .map_err(|e| write_error(&e))?;
+    let item = v
+        .item(id)
+        .map(|m| ItemView::from_meta(m, ItemDetail::Full).with_login_revision(v.login_revision(id)))
+        .ok_or(RpcError::new(ErrorKind::Internal))?;
+    s.audit(AuditEvent::LoginAdded {
+        pid: peer.pid,
+        subject: subject_summary(peer, &caller),
+        item: id,
+        slug,
+        tier: p.tier.as_str(),
+    });
+    Ok(LoginAddedView { item })
+}
+
 /// What a rotation or removal changes: the item, and the field a rotation
 /// replaces when one is named or the item has only one.
 pub(crate) struct Target {
     pub(crate) item: ItemId,
     pub(crate) slug: Slug,
     pub(crate) field: Option<(FieldId, FieldName)>,
+    pub(crate) login_field: Option<&'static str>,
 }
 
 /// Resolves `slug` (and `field`) to a secret item of `v`. With `expect`,
@@ -533,7 +639,37 @@ pub(crate) fn target(
         item: m.id,
         slug: m.slug.clone(),
         field,
+        login_field: None,
     })
+}
+
+fn target_or_login(
+    v: &Vault,
+    slug: &str,
+    field: Option<&str>,
+    expect: Option<&str>,
+) -> Result<Target, RpcError> {
+    let m = find(v, slug)?;
+    if m.class == ItemClass::Login {
+        if expect.is_some_and(|id| id != m.id.to_string()) {
+            return Err(no_such("item_changed"));
+        }
+        let login_field = match field {
+            Some("username") => Some("username"),
+            Some("password") => Some("password"),
+            Some("totp") => Some("totp"),
+            Some("adapter_key") => Some("adapter_key"),
+            Some(_) => return Err(no_such("unknown_field")),
+            None => None,
+        };
+        return Ok(Target {
+            item: m.id,
+            slug: m.slug.clone(),
+            field: None,
+            login_field,
+        });
+    }
+    target(v, slug, field, expect)
 }
 
 /// `items.target`: for a caller that may give a proof only.
@@ -555,15 +691,20 @@ pub fn target_view(
         "items.target",
     )?;
     let v = s.unlocked()?;
-    let t = target(v, &p.slug, p.field.as_deref(), None)?;
+    let t = target_or_login(v, &p.slug, p.field.as_deref(), None)?;
     let item = v
         .item(t.item)
-        .map(|m| ItemView::from_meta(m, ItemDetail::Long))
+        .map(|m| {
+            ItemView::from_meta(m, ItemDetail::Long).with_login_revision(v.login_revision(t.item))
+        })
         .ok_or(RpcError::new(ErrorKind::Internal))?;
     let grants = s.grants().binding_item(t.item);
     Ok(TargetView {
         item,
-        field: t.field.map(|(_, name)| name.as_str().to_owned()),
+        field: t
+            .field
+            .map(|(_, name)| name.as_str().to_owned())
+            .or_else(|| t.login_field.map(str::to_owned)),
         grants: u64::try_from(grants).unwrap_or(u64::MAX),
     })
 }
@@ -625,6 +766,14 @@ impl Write {
             Write::Reveal => AuditKind::Reveal,
         }
     }
+
+    fn audit_kind_for(self, target: &Target) -> AuditKind {
+        if self == Write::Rotate && target.login_field.is_some() {
+            AuditKind::LoginReplace
+        } else {
+            self.kind()
+        }
+    }
 }
 
 /// A proof that passed, for the write it allows: the state lock, held
@@ -645,7 +794,7 @@ impl Proven<'_> {
         self.s.audit(AuditEvent::ItemWriteFailed {
             pid: peer.pid,
             subject: subject_summary(peer, &self.caller),
-            write: write.kind(),
+            write: write.audit_kind_for(&self.target),
             item: self.target.item,
             slug: self.target.slug.clone(),
             reason: e.reason.unwrap_or_else(|| e.kind.token()),
@@ -674,10 +823,7 @@ pub(crate) fn prove<'s>(
     let (vault, generation, t) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
-        #[cfg(target_os = "linux")]
-        if write == Write::Reveal {
-            refuse_item_prover(&mut s, peer, &caller, &now, write.method())?;
-        }
+        refuse_item_prover(&mut s, peer, &caller, &now, write.method())?;
         // Everything but the passphrase is checked before Argon2id runs.
         let t = resolve(s.unlocked()?)?;
         s.limiter()
@@ -711,9 +857,10 @@ pub(crate) fn prove<'s>(
         }
         Err(e) if e.kind() == VaultErrorKind::Crypto(CryptoErrorKind::Unlock) => {
             s.limiter().failed(&now);
+            let audit_kind = write.audit_kind_for(&t);
             s.audit(AuditEvent::ItemProofFailed {
                 pid: peer.pid,
-                write: write.kind(),
+                write: audit_kind,
                 item: t.item,
                 slug: t.slug,
             });
@@ -740,15 +887,86 @@ pub fn rotate(
     let pass = p.passphrase.into_inner();
     check_value(&value)?;
     let resolve = |v: &Vault| {
-        let t = target(v, &p.slug, p.field.as_deref(), Some(&p.item))?;
-        if t.field.is_none() {
+        let t = target_or_login(v, &p.slug, p.field.as_deref(), Some(&p.item))?;
+        if t.field.is_none() && t.login_field.is_none() {
             return Err(no_such("ambiguous_field"));
         }
         Ok(t)
     };
-    let mut proven = prove(shared, peer, Write::Rotate, &p.claims, pass, &resolve)?;
+    let mut proven = prove(shared, peer, Write::Rotate, &p.claims, pass, &|v| {
+        let t = resolve(v)?;
+        if t.login_field == Some("totp") {
+            let _ = parse_totp_enrollment(&value)?;
+        }
+        Ok(t)
+    })?;
     let length = LengthClass::of(value.len());
+    if proven.target.login_field.is_some() {
+        let written = (|| {
+            // Argon2id ran without the state lock. Recompute the caller and
+            // its origin boundary before replacing the login field.
+            let caller = evidence(shared, peer, &p.claims)?;
+            refuse_item_prover(
+                &mut proven.s,
+                peer,
+                &caller,
+                &now_of(&shared.clocks),
+                Write::Rotate.method(),
+            )?;
+            proven.caller = caller;
+            let v = proven.s.unlocked_mut()?;
+            let t = resolve(v)?;
+            let lf = t.login_field.ok_or(RpcError::new(ErrorKind::Internal))?;
+            let meta = v.item(t.item).ok_or(RpcError::new(ErrorKind::Internal))?;
+            let before = meta.details.classification;
+            let field_val = match lf {
+                "username" => LoginFieldValue::Username(value),
+                "password" => LoginFieldValue::Password(value),
+                "adapter_key" => LoginFieldValue::AdapterKey(value),
+                "totp" => LoginFieldValue::Totp(parse_totp_enrollment(&value)?),
+                _ => return Err(RpcError::new(ErrorKind::Internal)),
+            };
+            v.transact(|txn| txn.replace_login_field(t.item, field_val))
+                .map_err(|e| write_error(&e))?;
+            let new_rev = v
+                .login_revision(t.item)
+                .ok_or(RpcError::new(ErrorKind::Internal))?;
+            Ok((t, lf, before, new_rev))
+        })();
+        let (t, lf, before, new_rev) = match written {
+            Ok(w) => w,
+            Err(e) => return Err(proven.aborted(peer, Write::Rotate, e)),
+        };
+        proven.s.totp().on_login_replaced(t.item, new_rev);
+        let subject = subject_summary(peer, &proven.caller);
+        proven.s.audit(AuditEvent::LoginReplaced {
+            pid: peer.pid,
+            subject,
+            item: t.item,
+            slug: t.slug.clone(),
+            field: lf,
+            revision: new_rev,
+        });
+        return Ok(RotatedView {
+            slug: t.slug.as_str().to_owned(),
+            field: lf.to_owned(),
+            prior_count: 0,
+            length,
+            classification: ClassificationView::from(before),
+            reclassified_from: None,
+            grants_ended: 0,
+        });
+    }
     let written = (|| {
+        let caller = evidence(shared, peer, &p.claims)?;
+        refuse_item_prover(
+            &mut proven.s,
+            peer,
+            &caller,
+            &now_of(&shared.clocks),
+            Write::Rotate.method(),
+        )?;
+        proven.caller = caller;
         let v = proven.s.unlocked_mut()?;
         let t = resolve(v)?;
         let (field, name) = t.field.clone().ok_or(RpcError::new(ErrorKind::Internal))?;

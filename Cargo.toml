@@ -50,6 +50,7 @@ envcloak-policy = { path = "crates/envcloak-policy", version = "0.1.0" }
 envcloak-providers = { path = "crates/envcloak-providers", version = "0.1.0" }
 envcloak-redact = { path = "crates/envcloak-redact", version = "0.1.0" }
 envcloak-scan = { path = "crates/envcloak-scan", version = "0.1.0" }
+envcloak-signin = { path = "crates/envcloak-signin", version = "0.1.0" }
 envcloak-sys = { path = "crates/envcloak-sys", version = "0.1.0" }
 # Test only, never published.
 envcloak-testkit = { path = "crates/envcloak-testkit" }

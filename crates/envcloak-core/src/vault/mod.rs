@@ -60,8 +60,9 @@ pub use items::{
     ProjectId, ProjectKey, ProjectRecord, Slug,
 };
 pub use login::{
-    AttemptLease, LoginFieldReader, LoginFieldValue, LoginValue, NewLogin, TotpAlgorithm,
-    TotpEnrollment, TotpParams,
+    AttemptLease, DEFAULT_LOGIN_SESSION_LIFETIME_SECS, LoginFieldReader, LoginFieldValue,
+    LoginValue, MAX_LOGIN_SESSION_LIFETIME_SECS, NewLogin, TotpAlgorithm, TotpEnrollment,
+    TotpParams,
 };
 #[cfg(feature = "testing")]
 pub use migrate::BeforeCommit;
@@ -554,6 +555,9 @@ impl LockedVault {
             }
         }
         let view = loaded.state.item_list();
+        static NEXT_UNLOCK_EPOCH: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let unlock_epoch = NEXT_UNLOCK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Vault {
             file: self,
             ctx,
@@ -563,6 +567,7 @@ impl LockedVault {
             view,
             integrity: Cell::new(loaded.integrity),
             migration_error,
+            unlock_epoch,
         })
     }
 }
@@ -739,6 +744,7 @@ pub struct Vault {
     view: Vec<ItemMeta>,
     integrity: Cell<Integrity>,
     migration_error: Option<VaultErrorKind>,
+    pub(crate) unlock_epoch: u64,
 }
 
 impl core::fmt::Debug for Vault {

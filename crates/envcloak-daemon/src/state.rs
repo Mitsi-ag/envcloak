@@ -238,6 +238,8 @@ pub struct State {
     anchored_vaults: BTreeSet<[u8; 16]>,
     /// Last rollback anchor synced for the currently unlocked vault.
     last_synced_anchor: Option<Anchor>,
+    /// Daemon TOTP state across login accounts (M2b-03).
+    totp: crate::totp::TotpState,
 }
 
 impl State {
@@ -249,6 +251,9 @@ impl State {
         } else {
             KeychainAnchorState::Unavailable
         };
+        let start_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         State {
             slot: probe(&paths),
             paths,
@@ -276,6 +281,7 @@ impl State {
             keychain_anchor,
             anchored_vaults: BTreeSet::new(),
             last_synced_anchor: None,
+            totp: crate::totp::TotpState::after_start(start_unix),
         }
     }
 
@@ -365,6 +371,11 @@ impl State {
     /// The passphrase attempt limiter, shared by every proof.
     pub fn limiter(&mut self) -> &mut AttemptLimiter {
         &mut self.limiter
+    }
+
+    /// Daemon TOTP state across login accounts.
+    pub fn totp(&self) -> &crate::totp::TotpState {
+        &self.totp
     }
 
     /// The unlocked vault, for a request that reads its metadata under the
@@ -492,6 +503,7 @@ impl State {
         // request (SPEC §5 "Lock"), every backup v2 in progress and every
         // restore lease.
         self.grants.on_lock();
+        self.totp.on_lock();
         self.standing.clear();
         self.epoch_state = EpochState::Verified;
         self.standing_generation_floor = 0;
@@ -1065,6 +1077,7 @@ impl State {
     /// standing approvals are loaded and reconciled with `<data>/policy-epoch`.
     fn start_grants(&mut self, v: &Vault) {
         self.grants.on_lock();
+        self.totp.on_lock();
         self.write_targets.clear();
         self.unlocker_targets.clear();
         self.paste_stages.clear();
@@ -1249,6 +1262,7 @@ impl State {
         let critical = matches!(
             e,
             AuditEvent::Removed { .. }
+                | AuditEvent::LoginReplaced { .. }
                 | AuditEvent::RecoveryConfirmed { .. }
                 | AuditEvent::UnlockerAdd { .. }
                 | AuditEvent::UnlockerRemove { .. }
@@ -3693,5 +3707,107 @@ mod tests {
         assert_eq!(err.kind, ErrorKind::VaultTampered);
         assert_eq!(err.reason, Some("rolled_back"));
         assert!(s.unlocked_any_integrity().is_ok());
+    }
+
+    #[test]
+    fn state_lock_unlock_and_recover_reconcile_totp_state_and_leases() {
+        use crate::totp::TotpError;
+        use envcloak_core::vault::{
+            FieldKind, ItemDetails, LoginFieldValue, LoginMeta, LoginTier, NewLogin, Slug,
+            TotpAlgorithm, TotpEnrollment, TotpParams as VaultTotpParams,
+        };
+
+        let f = fixture();
+        let mut s = State::open(f.paths.clone(), crate::lock::DEFAULT_IDLE, now(&f.clocks));
+        let generation = s.begin_create().unwrap();
+        let kit = RecoveryKit::generate();
+        let v = create_vault_with_kit(
+            &f.paths,
+            &SecretBytes::copy_from(PASS),
+            &kit,
+            KdfParams::minimum(),
+        );
+        s.finish_create(generation, now(&f.clocks), v).unwrap();
+
+        let item = s
+            .unlocked_mut()
+            .unwrap()
+            .transact(|t| {
+                t.create_login(NewLogin {
+                    slug: Slug::new("acme/editor").unwrap(),
+                    details: ItemDetails::default(),
+                    meta: LoginMeta {
+                        tier: LoginTier::Dev,
+                        session_lifetime: 3600,
+                    },
+                    username: SecretBytes::copy_from(b"editor@example.test"),
+                    password: SecretBytes::copy_from(b"password-rev-1-synthetic"),
+                    totp: Some(TotpEnrollment {
+                        params: VaultTotpParams::new(TotpAlgorithm::Sha1, 6, 30).unwrap(),
+                        seed: SecretBytes::copy_from(b"12345678901234567890"),
+                    }),
+                    adapter_key: None,
+                })
+            })
+            .unwrap();
+
+        let backup = s.unlocked().unwrap().create_backup().unwrap().path;
+
+        // Issue a lease before lock/unlock at revision 1.
+        let guard = s.totp().acquire_account(item);
+        let pre_lock_lease = s.totp().issue_lease(s.unlocked().unwrap(), item).unwrap();
+        assert_eq!(pre_lock_lease.revision(), 1);
+
+        // Lock and re-unlock at the same revision 1: pre-lock lease is rejected with LeaseStale.
+        assert!(s.lock(LockReason::Request));
+        unlock(&f, &mut s, PASS).unwrap();
+        assert_eq!(
+            s.totp()
+                .read_field(
+                    &guard,
+                    &pre_lock_lease,
+                    s.unlocked().unwrap(),
+                    FieldKind::Password
+                )
+                .unwrap_err(),
+            TotpError::LeaseStale
+        );
+
+        // Rotate login password to revision 2 and record min_revision = 2 in TotpState.
+        s.unlocked_mut()
+            .unwrap()
+            .transact(|t| {
+                t.replace_login_field(
+                    item,
+                    LoginFieldValue::Password(SecretBytes::copy_from(b"password-rev-2-synthetic")),
+                )
+            })
+            .unwrap();
+        s.totp().on_login_replaced(item, 2);
+
+        // Recover backup from revision 1 via begin_recover + finish_recover.
+        let (generation, was_unlocked) = s.begin_recover().unwrap();
+        assert!(was_unlocked);
+        let new_pass = SecretBytes::copy_from(PASS);
+        let restored = envcloak_core::restore_backup(&f.paths, &backup, &kit, &new_pass);
+        let rec_view = s
+            .finish_recover(generation, now(&f.clocks), restored)
+            .unwrap();
+        assert!(!rec_view.locked);
+        assert_eq!(s.unlocked().unwrap().login_revision(item), Some(1));
+
+        // Restored login item at revision 1 is not wedged by the pre-recover min_revision = 2.
+        let restored_lease = s.totp().issue_lease(s.unlocked().unwrap(), item).unwrap();
+        assert_eq!(restored_lease.revision(), 1);
+        let pw = s
+            .totp()
+            .read_field(
+                &guard,
+                &restored_lease,
+                s.unlocked().unwrap(),
+                FieldKind::Password,
+            )
+            .unwrap();
+        assert!(pw.ct_eq(b"password-rev-1-synthetic"));
     }
 }

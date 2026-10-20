@@ -418,6 +418,8 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `key_shaped` | M2-27 | landed | `invalid_params` from `managed.register`, `managed.update_plan` and `managed.update` for a launch argument, variable value, working directory or `PATH`, or a bridged server's origin or header name, shaped like a key (gate 13 in the daemon, behind the client's own `value_on_argv`) |
 | `invalid_header` | M2-27 | landed | `invalid_params` from `managed.register` for a bridged server whose header name cannot name a binding of its own, or two of whose headers would share one |
 | `header_bindings` | M2-27 | landed | `invalid_params` from `managed.register` for a bridged server whose manifest does not bind exactly the bindings of its headers |
+| `invalid_otpauth` | M2b-03 | landed | `invalid_item` from `login.add` or `items.rotate` for a `#totp` value that is not a valid `otpauth://totp/` URI |
+| `live_dev` | M2b-03 | landed | `invalid_item` from `login.add` for a live login item given the `dev` tier |
 <!-- /reservations -->
 
 **Methods** (client role):
@@ -446,7 +448,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `standing.revoke` | M2-15 | landed | revokes standing approvals; tightening, no proof |
 | `standing.confirm` | M2-15 | landed | re-seals the policy record over every standing record, with a proof |
 | `items.reveal` | M2-21 | landed | terminal reveal on Linux, with a proof |
-| `login.add` | M2b-03 | reserved | adds a login item; its fields cross only from the client |
+| `login.add` | M2b-03 | landed | adds a login item; its fields cross only from the client |
 | `signin.target.add` | M2b-05 | reserved | registers a sign-in target, with a proof |
 | `signin.target.edit` | M2b-05 | reserved | edits a sign-in target, with a proof; bumps its authorization revision |
 | `signin.target.remove` | M2b-05 | reserved | removes a sign-in target |

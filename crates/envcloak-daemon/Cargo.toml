@@ -17,6 +17,7 @@ envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
 envcloak-providers.workspace = true
 envcloak-redact.workspace = true
+envcloak-signin.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 secrecy.workspace = true

@@ -340,6 +340,11 @@ const REASON_TEXTS: &[(&str, &str)] = &[
         "keychain_anchor_missing",
         "the vault's keychain rollback anchor was missing and has been written again",
     ),
+    (
+        "invalid_otpauth",
+        "the TOTP URI is not a valid otpauth://totp/... URI",
+    ),
+    ("live_dev", "a live login item cannot use the dev tier"),
 ];
 
 /// Words for `reason` on an error of `kind`: [`reason_text`], except for

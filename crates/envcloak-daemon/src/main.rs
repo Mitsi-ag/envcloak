@@ -55,6 +55,7 @@ mod server;
 mod spawn_envcloak;
 mod standing;
 mod state;
+mod totp;
 
 use std::io::Write;
 use std::process::ExitCode;

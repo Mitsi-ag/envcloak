@@ -30,4 +30,7 @@ disallowed-methods = [
   { path = "envcloak_sys::child::signal_group", reason = "signals a process group by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34); allowed only in files listed in security/signal-allowlist.txt", allow-invalid = true },
   { path = "nix::sys::signal::kill", reason = "signals a process by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34)", allow-invalid = true },
   { path = "nix::sys::signal::killpg", reason = "signals a process group by number; signal through envcloak_sys::owned::OwnedChild (M2 plan D-34)", allow-invalid = true },
+  { path = "envcloak_core::vault::Vault::login_fields", reason = "opens login fields; allowed only in files listed in security/expose-allowlist.txt", allow-invalid = true },
+  { path = "envcloak_core::vault::Vault::issue_attempt_lease", reason = "issues a login attempt lease; allowed only in files listed in security/expose-allowlist.txt", allow-invalid = true },
+  { path = "envcloak_core::vault::LoginFieldReader::open", reason = "opens a login field; allowed only in files listed in security/expose-allowlist.txt", allow-invalid = true },
 ]

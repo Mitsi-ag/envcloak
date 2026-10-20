@@ -51,10 +51,10 @@ use crate::paths::{RunPathError, RunPathErrorKind, RunPaths};
 use crate::proto::{
     self, AddParams, Approve, ApproveParams, AuditVerify, CheckParams, Deny, GrantsList,
     GrantsRevoke, ItemsAdd, ItemsCheck, ItemsList, ItemsRemove, ItemsRotate, ItemsShow,
-    ItemsTarget, ListParams, Lock, Method, NoParams, PendingGet, PendingGetOutput,
-    PendingGetParams, RemoveParams, RequestParams, ResponseError, RevokeParams, RotateParams,
-    RpcError, RunAnswer, RunRequest, RunRequestParams, SlugParams, Status, TargetParams, Unlock,
-    UnlockParams, VaultCreate, VaultCreateParams,
+    ItemsTarget, ListParams, Lock, LoginAdd, LoginAddParams, Method, NoParams, PendingGet,
+    PendingGetOutput, PendingGetParams, RemoveParams, RequestParams, ResponseError, RevokeParams,
+    RotateParams, RpcError, RunAnswer, RunRequest, RunRequestParams, SlugParams, Status,
+    TargetParams, Unlock, UnlockParams, VaultCreate, VaultCreateParams,
 };
 use crate::proto::{
     BackupBegin, BackupBeginParams, BackupChunk, BackupCommit, BackupIdParams, BackupList,
@@ -75,8 +75,8 @@ use crate::proto::{ItemsMarkExposed, MarkExposedParams, ScanMatch, ScanMatchPara
 use crate::proto::{ItemsReclassify, ReclassifyParams};
 use crate::view::{
     AddedView, ApprovedView, AuditVerifyView, CheckView, CreatedView, DeniedView, GrantsView,
-    ItemView, ItemsView, LockedView, RemovedView, RevokedView, RotatedView, StatusView, TargetView,
-    UnlockedView,
+    ItemView, ItemsView, LockedView, LoginAddedView, RemovedView, RevokedView, RotatedView,
+    StatusView, TargetView, UnlockedView,
 };
 use crate::view::{
     BackupBegunView, BackupCommittedView, BackupListView, BackupPutView, BackupResultView,
@@ -843,6 +843,14 @@ impl Client {
     /// As [`Client::call`].
     pub fn items_add(&mut self, p: &AddParams) -> Result<AddedView, ClientError> {
         self.call::<ItemsAdd>(p)
+    }
+
+    /// `login.add`. The login fields in `p` are wiped with the request frame.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn login_add(&mut self, p: &LoginAddParams) -> Result<LoginAddedView, ClientError> {
+        self.call::<LoginAdd>(p)
     }
 
     /// `items.target` for `slug` (and `field`), with the caller's claims

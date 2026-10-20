@@ -48,6 +48,11 @@ use super::items::{FieldId, FieldKind, ItemDetails, ItemId, LoginMeta, Slug};
 use super::state::item_key;
 use super::values::{open_value, unpack_totp};
 
+/// Default session lifetime for a login item (8 hours, in seconds).
+pub const DEFAULT_LOGIN_SESSION_LIFETIME_SECS: u64 = 8 * 3600;
+/// Maximum session lifetime for a login item (24 hours, in seconds).
+pub const MAX_LOGIN_SESSION_LIFETIME_SECS: u64 = 24 * 3600;
+
 /// The HMAC of a TOTP enrollment (RFC 6238). Part of the sealed enrollment:
 /// never renumber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -205,6 +210,7 @@ impl core::fmt::Debug for LoginValue {
 /// ```
 /// // The type itself is public: code can name it, and take one.
 /// use envcloak_core::vault::{AttemptLease, FieldKind, LoginFieldReader, LoginValue};
+/// #[allow(clippy::disallowed_methods)]
 /// fn sign_in(r: &LoginFieldReader<'_>, lease: &AttemptLease) -> Option<LoginValue> {
 ///     r.open(lease, FieldKind::Password).ok()
 /// }
@@ -229,6 +235,8 @@ impl core::fmt::Debug for LoginValue {
 pub struct AttemptLease {
     item: ItemId,
     revision: u64,
+    unlock_epoch: u64,
+    generation: u64,
 }
 
 impl core::fmt::Debug for AttemptLease {
@@ -236,6 +244,7 @@ impl core::fmt::Debug for AttemptLease {
         f.debug_struct("AttemptLease")
             .field("item", &self.item)
             .field("revision", &self.revision)
+            .field("generation", &self.generation)
             .finish()
     }
 }
@@ -244,6 +253,22 @@ impl AttemptLease {
     /// The login item it opens.
     pub fn item(&self) -> ItemId {
         self.item
+    }
+
+    /// The item row revision this lease is bound to.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The daemon unlock/lock generation this lease is bound to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Binds this lease to a daemon unlock/lock `generation`.
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 }
 
@@ -255,6 +280,40 @@ pub struct LoginFieldReader<'v> {
 }
 
 impl Vault {
+    /// Issues a lease for one sign-in or TOTP attempt against `item` at its
+    /// current revision. Fails with [`VaultErrorKind::Tampered`] unless the
+    /// vault verified, [`VaultErrorKind::UnknownItem`] if `item` does not
+    /// exist, and [`VaultErrorKind::LoginField`] if `item` is not a login.
+    pub fn issue_attempt_lease(&self, item: ItemId) -> Result<AttemptLease, VaultError> {
+        if self.integrity() != Integrity::Ok {
+            return Err(VaultErrorKind::Tampered.into());
+        }
+        let row = self
+            .state
+            .items
+            .get(&item)
+            .ok_or(VaultErrorKind::UnknownItem)?;
+        if row.class != ItemClass::Login {
+            return Err(VaultErrorKind::LoginField.into());
+        }
+        Ok(AttemptLease {
+            item,
+            revision: row.row_version,
+            unlock_epoch: self.unlock_epoch,
+            generation: 0,
+        })
+    }
+
+    /// Current revision (`row_version`) of a login item, or `None` if `item`
+    /// is missing or not a login.
+    pub fn login_revision(&self, item: ItemId) -> Option<u64> {
+        self.state
+            .items
+            .get(&item)
+            .filter(|r| r.class == ItemClass::Login)
+            .map(|r| r.row_version)
+    }
+
     /// The reader of this vault's login fields.
     pub fn login_fields(&self) -> LoginFieldReader<'_> {
         LoginFieldReader { vault: self }
@@ -276,6 +335,9 @@ impl LoginFieldReader<'_> {
         }
         if !kind.is_login() {
             return Err(VaultErrorKind::LoginField.into());
+        }
+        if lease.unlock_epoch != v.unlock_epoch {
+            return Err(VaultErrorKind::LeaseStale.into());
         }
         let row = v
             .state
@@ -328,6 +390,7 @@ fn login_field(v: &Vault, item: ItemId, kind: FieldKind) -> Option<(FieldId, u64
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::crypto::{
@@ -365,6 +428,8 @@ mod tests {
         AttemptLease {
             item,
             revision: v.state.items[&item].row_version,
+            unlock_epoch: v.unlock_epoch,
+            generation: 0,
         }
     }
 
@@ -549,6 +614,34 @@ mod tests {
             r.open(&lease(&v, item), FieldKind::TotpSeed).unwrap(),
             LoginValue::Totp(_)
         ));
+        // Locking and re-unlocking the vault at the same revision invalidates
+        // any pre-lock lease.
+        let before_lock = v.issue_attempt_lease(item).unwrap();
+        let pass = SecretBytes::copy_from(b"unit test passphrase");
+        let v = v
+            .lock()
+            .unlock_with_passphrase(&pass)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        let mut v = v;
+        assert_eq!(
+            v.login_fields()
+                .open(&before_lock, FieldKind::Password)
+                .unwrap_err()
+                .kind(),
+            VaultErrorKind::LeaseStale
+        );
+        let after_unlock = v.issue_attempt_lease(item).unwrap();
+        assert_eq!(after_unlock.revision(), before_lock.revision());
+        assert!(
+            text(
+                v.login_fields()
+                    .open(&after_unlock, FieldKind::Password)
+                    .unwrap()
+            )
+            .ct_eq(b"the new password")
+        );
+
         let last = lease(&v, item);
         v.transact(|t| t.delete_item(item)).unwrap();
         assert_eq!(
