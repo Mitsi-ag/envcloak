@@ -2703,6 +2703,177 @@ final class SessionTests: XCTestCase {
             "avail\\u{202e}; srv\\u{1b}[31mreason (probe=passed, sentinel sent\\u{202e} ok)"
         )
     }
+
+    @MainActor func testM320AnnouncementsAndAccessibilityHelpers() async throws {
+        XCTAssertEqual(
+            ApprovalWindowView.liveTickAccessibilityLabel(envName: "STRIPE_SECRET_KEY", slug: "stripe/acme-live"),
+            "Allow live key STRIPE_SECRET_KEY, stripe slash acme-live"
+        )
+        XCTAssertEqual(
+            ApprovalWindowView.argvAccessibilityLabel(index: 1, text: "test\\u{202e}"),
+            "Argument 1: testbackslash u, 202E"
+        )
+
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(pending: 1)
+        let signer = SoftwareApprovalSigner()
+        let session = VaultSession(client: client, approvalSigner: signer)
+        await session.poll()
+
+        let model = ApprovalWindowModel(session: session)
+        await model.load(requestId: DaemonText("REQ0ABCD"))
+        model.toggleLiveKey("STRIPE_SECRET_KEY", isTicked: true)
+        model.completeGuardPeriodForTesting()
+
+        // User-cancelled Touch ID announces the cancelled outcome.
+        signer.simulatedFailure = SignerError.userCancelled
+        await model.approve()
+        XCTAssertEqual(model.outcome, .cancelled)
+        XCTAssertEqual(
+            session.notifications.lastAnnouncement,
+            "Not approved. The request is still waiting."
+        )
+
+        // Successful approval announces the approved outcome.
+        signer.simulatedFailure = nil
+        await model.approve()
+        XCTAssertEqual(
+            session.notifications.lastAnnouncement,
+            "Approved for 8 hours. claude_code can run in project with 2 keys."
+        )
+
+        // Denial announces the denied outcome.
+        await model.deny()
+        XCTAssertEqual(
+            session.notifications.lastAnnouncement,
+            "Denied. claude_code was told no."
+        )
+
+        // Expiry announces the expired outcome.
+        model.triggerExpiry()
+        XCTAssertEqual(
+            session.notifications.lastAnnouncement,
+            "This request expired. claude_code was told it timed out."
+        )
+    }
+
+    @MainActor func testM321AppAcceptanceStoryEndToEnd() async throws {
+        // A1 / A2: Connection states (noDaemon -> noVault -> locked -> ready).
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        let lockSource = FakeLockSignalSource()
+        let signer = SoftwareApprovalSigner()
+        let unlockKey = SoftwareUnlockKey()
+        let session = VaultSession(
+            client: client,
+            unlockKey: unlockKey,
+            approvalSigner: signer,
+            enrolledTouchID: true,
+            lockSignalSource: lockSource
+        )
+
+        await client.configure(failure: .daemonUnavailable)
+        await session.poll()
+        XCTAssertEqual(session.state, .noDaemon)
+
+        await client.configure(vault: "absent", failure: nil)
+        await session.poll()
+        XCTAssertEqual(session.state, .noVault)
+
+        // A3 / A4 / A5: Enrollment, lock, and Touch ID unlock.
+        await client.configure(vault: "locked", failure: nil)
+        await session.poll()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertTrue(session.enrolledTouchID)
+        let vmk = Data((0..<32).map { UInt8($0 + 1) })
+        let vaultIDHex = "00112233445566778899aabbccddeeff"
+        let unlockerIDHex = "ffeeddccbbaa99887766554433221100"
+        let sealedEnvelope = try SoftwareUnlockKey.sealEnvelope(
+            vmk: vmk,
+            recipientPublicKey: unlockKey.privateKey.publicKey,
+            vaultIDHex: vaultIDHex,
+            unlockerIDHex: unlockerIDHex,
+            epoch: 1
+        )
+        let daemonEphKey = Curve25519.KeyAgreement.PrivateKey()
+        await client.setUnlockBegin([
+            "request_id": "UNLK0001",
+            "unlocker_id": unlockerIDHex,
+            "vault_id": vaultIDHex,
+            "epoch": 1,
+            "challenge": String(repeating: "ab", count: 32),
+            "envelope": [
+                "enc": sealedEnvelope.enc.escaped,
+                "ciphertext": sealedEnvelope.ciphertext.escaped,
+            ],
+            "daemon_eph_pub": HexCoding.encode(daemonEphKey.publicKey.rawRepresentation),
+        ])
+        let unlocked = await session.unlockWithTouchID()
+        XCTAssertTrue(unlocked)
+        XCTAssertEqual(session.state, .ready)
+
+        // A8 / A9: Approval window, live-key tick requirement, and signed approval.
+        await client.configure(grants: 1, pending: 1, vault: "unlocked")
+        await session.poll()
+        let approvalModel = ApprovalWindowModel(session: session)
+        await approvalModel.load(requestId: DaemonText("REQ0ABCD"))
+        approvalModel.completeGuardPeriodForTesting()
+        XCTAssertFalse(approvalModel.canApprove, "Approve must stay disabled until live key is ticked")
+        approvalModel.toggleLiveKey("STRIPE_SECRET_KEY", isTicked: true)
+        approvalModel.completeGuardPeriodForTesting()
+        XCTAssertTrue(approvalModel.canApprove)
+        await approvalModel.approve()
+        if case .approved = approvalModel.outcome {} else {
+            XCTFail("Expected .approved outcome, got \(approvalModel.outcome)")
+        }
+
+        // A11 / A12 / A16: Signed rotate, remove, and reveal via session models.
+        let writeModel = KeyWriteModel(slug: DaemonText("fixture-0"), field: DaemonText("value"))
+        await writeModel.loadTarget(session)
+        var draftSecret = "sk_test_rotated_story_123456"
+        writeModel.receive(&draftSecret)
+        await writeModel.submitRotation(session)
+        XCTAssertTrue(writeModel.completed)
+
+        let sightModel = KeySightModel(slug: DaemonText("fixture-0"), field: DaemonText("value"))
+        await sightModel.performSight(session)
+        XCTAssertTrue(sightModel.isShown)
+        sightModel.hideNow()
+        XCTAssertFalse(sightModel.isShown)
+
+        let removeModel = KeyWriteModel(slug: DaemonText("fixture-0"), field: nil)
+        await removeModel.loadTarget(session)
+        await removeModel.submitRemoval(session)
+        XCTAssertTrue(removeModel.completed)
+
+        // A14: Screen lock immediately locks the vault.
+        lockSource.emit(.screenLocked)
+        try await Task.sleep(for: .milliseconds(50))
+        let lockCalls = await client.calls("app.lock")
+        XCTAssertGreaterThanOrEqual(lockCalls, 1)
+
+        // A15: Rollback / tampered read-only state disables writes.
+        await client.configure(vault: "unlocked", integrity: "tampered", readOnly: true)
+        await session.poll()
+        XCTAssertEqual(session.state, .readOnly)
+        XCTAssertFalse(session.state.canReadMetadata)
+        XCTAssertTrue(session.state.canLock)
+
+        // A20: Menu bar search & actions catalog.
+        await client.configure(grants: 1, pending: 1, vault: "unlocked", integrity: "ok", readOnly: false)
+        await session.poll()
+        let actions = MenuBarCatalog.allActionItems(
+            keys: session.items.rows,
+            projects: session.projects.directories,
+            projectTitles: [:],
+            grants: session.grants.rows,
+            pendingCount: Int(session.pendingCount),
+            exposedCount: 0
+        )
+        XCTAssertTrue(actions.contains { $0.id == "menubar.state.lock" })
+        XCTAssertTrue(actions.contains { $0.id == "menubar.waiting.review" })
+    }
 }
 
 @MainActor final class FakeLockSignalSource: LockSignalSource {

@@ -7,6 +7,7 @@ import SwiftUI
 @Observable @MainActor final class KeySightModel {
     @ObservationIgnored private var secretBuffer: SecretBuffer?
     @ObservationIgnored private var countdownTask: Task<Void, Never>?
+    @ObservationIgnored private var clipboardClearTask: Task<Void, Never>?
     let slug: DaemonText
     var selectedField: DaemonText?
     var clientRequestId: DaemonText?
@@ -16,6 +17,7 @@ import SwiftUI
     var busy = false
     var notice: String?
     var copiedNotice: String?
+    var lastAnnouncement: String?
 
     init(slug: DaemonText, field: DaemonText?, clientRequestId: DaemonText? = nil) {
         self.slug = slug
@@ -83,10 +85,39 @@ import SwiftUI
 
     func copySecret(using writer: ClipboardWriter = ClipboardWriter()) {
         guard let buffer = secretBuffer.take() else { return }
-        writer.copySecret(buffer)
+        clipboardClearTask?.cancel()
+        let clearTask = writer.copySecret(buffer)
         secretBuffer = consume buffer
         let message = "Copied. Cleared in 30 s."
         copiedNotice = message
+        postAnnouncement(message)
+        clipboardClearTask = Task { [weak self] in
+            let cleared = await clearTask.value
+            guard !Task.isCancelled, cleared, let self else { return }
+            self.announceClipboardCleared()
+        }
+    }
+
+    func announceClipboardCleared() {
+        let message = "Clipboard cleared"
+        copiedNotice = message
+        postAnnouncement(message)
+    }
+
+    func hideNow() {
+        let wasShown = isShown
+        countdownTask?.cancel()
+        countdownTask = nil
+        secretBuffer = nil
+        isShown = false
+        secondsRemaining = 0
+        if wasShown {
+            postAnnouncement("Value hidden")
+        }
+    }
+
+    private func postAnnouncement(_ message: String) {
+        lastAnnouncement = message
         NSAccessibility.post(
             element: NSApp as Any,
             notification: .announcementRequested,
@@ -95,14 +126,6 @@ import SwiftUI
                 .priority: NSAccessibilityPriorityLevel.high.rawValue,
             ]
         )
-    }
-
-    func hideNow() {
-        countdownTask?.cancel()
-        countdownTask = nil
-        secretBuffer = nil
-        isShown = false
-        secondsRemaining = 0
     }
 }
 

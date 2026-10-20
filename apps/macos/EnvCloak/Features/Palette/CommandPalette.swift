@@ -89,9 +89,13 @@ struct CommandPalette: View {
             }
     }
 
+    static func usesOpaquePanel(reduceTransparency: Bool) -> Bool {
+        reduceTransparency
+    }
+
     @ViewBuilder
     private var paletteContainer: some View {
-        if reduceTransparency {
+        if Self.usesOpaquePanel(reduceTransparency: reduceTransparency) {
             paletteContent
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)

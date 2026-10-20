@@ -194,4 +194,147 @@ final class TokenTests: XCTestCase {
         XCTAssertTrue(image.isTemplate)
         XCTAssertEqual(image.size, NSSize(width: 18, height: 18))
     }
+
+    static func srgbChannel(_ byte: UInt32) -> Double {
+        let c = Double(byte & 0xFF) / 255.0
+        return c <= 0.04045 ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)
+    }
+
+    static func relativeLuminance(_ rgb: UInt32) -> Double {
+        let r = srgbChannel(rgb >> 16)
+        let g = srgbChannel(rgb >> 8)
+        let b = srgbChannel(rgb)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    static func contrastRatio(_ fg: UInt32, _ bg: UInt32) -> Double {
+        let l1 = relativeLuminance(fg)
+        let l2 = relativeLuminance(bg)
+        return (max(l1, l2) + 0.05) / (min(l1, l2) + 0.05)
+    }
+
+    func testWCAGContrastRatiosAcrossLightDarkAndIncreaseContrast() throws {
+        let rows = try Self.table()
+        let bgLight = try XCTUnwrap(rows["background"]?.light)
+        let bgDark = try XCTUnwrap(rows["background"]?.dark)
+        let raisedLight = try XCTUnwrap(rows["raised"]?.light)
+        let raisedDark = try XCTUnwrap(rows["raised"]?.dark)
+        let plateLight = try XCTUnwrap(rows["plate"]?.light)
+        let plateDark = try XCTUnwrap(rows["plate"]?.dark)
+
+        // Every text and semantic token must meet >= 4.5:1 against both background and raised in light and dark.
+        for token in ["text", "secondary", "success", "warning", "danger", "info"] {
+            let row = try XCTUnwrap(rows[token], token)
+            XCTAssertGreaterThanOrEqual(
+                Self.contrastRatio(row.light, bgLight),
+                4.5,
+                "\(token) on light background must meet WCAG AA 4.5:1"
+            )
+            XCTAssertGreaterThanOrEqual(
+                Self.contrastRatio(row.light, raisedLight),
+                4.5,
+                "\(token) on light raised must meet WCAG AA 4.5:1"
+            )
+            XCTAssertGreaterThanOrEqual(
+                Self.contrastRatio(row.dark, bgDark),
+                4.5,
+                "\(token) on dark background must meet WCAG AA 4.5:1"
+            )
+            XCTAssertGreaterThanOrEqual(
+                Self.contrastRatio(row.dark, raisedDark),
+                4.5,
+                "\(token) on dark raised must meet WCAG AA 4.5:1"
+            )
+        }
+
+        // Amber (#FFB000) is high contrast on Ink plate (light and dark) and dark surfaces,
+        // and fails 4.5:1 on light background/raised (proving why Amber is forbidden on light surfaces).
+        let amber = try XCTUnwrap(rows["amber"])
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(amber.light, plateLight), 4.5, "amber on light plate")
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(amber.dark, plateDark), 4.5, "amber on dark plate")
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(amber.dark, bgDark), 4.5, "amber on dark background")
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(amber.dark, raisedDark), 4.5, "amber on dark raised")
+        XCTAssertLessThan(Self.contrastRatio(amber.light, bgLight), 4.5, "amber must not be used on light background")
+        XCTAssertLessThan(Self.contrastRatio(amber.light, raisedLight), 4.5, "amber must not be used on light raised")
+
+        // Increase Contrast swaps `secondary` -> `text` (>= 7:1 AAA) and `rule` -> `secondary` (>= 4.5:1 AA).
+        let textRow = try XCTUnwrap(rows["text"])
+        let secondaryRow = try XCTUnwrap(rows["secondary"])
+        let secondaryContrastName = try XCTUnwrap(secondaryRow.contrast)
+        let ruleContrastName = try XCTUnwrap(rows["rule"]?.contrast)
+        XCTAssertEqual(secondaryContrastName, "text")
+        XCTAssertEqual(ruleContrastName, "secondary")
+
+        let incSecondary = try XCTUnwrap(rows[secondaryContrastName])
+        let incRule = try XCTUnwrap(rows[ruleContrastName])
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(textRow.light, bgLight), 7.0)
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(textRow.dark, bgDark), 7.0)
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(incSecondary.light, bgLight), 7.0)
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(incSecondary.dark, bgDark), 7.0)
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(incRule.light, bgLight), 4.5)
+        XCTAssertGreaterThanOrEqual(Self.contrastRatio(incRule.dark, bgDark), 4.5)
+    }
+
+    static let approvedAmberFiles: Set<String> = [
+        "Features/Inspector/KeyInspector.swift",
+    ]
+
+    static func disallowedAmberUsages(in files: [String: String]) -> [String] {
+        let amberTokenPattern = /\.amber(?:$|[^A-Za-z0-9_])/
+        let approvedDarkGatePattern = /(?:^|[^A-Za-z0-9_])(colorScheme|scheme)\s*==\s*\.dark\s*\?\s*(ECToken)?\.amber(\.color)?\s*:\s*(ECToken)?\.text(\.color)?(?:$|[^A-Za-z0-9_])/
+        var violations: [String] = []
+        for (relPath, source) in files.sorted(by: { $0.key < $1.key }) {
+            let lines = source.split(separator: "\n", omittingEmptySubsequences: false)
+            for (index, line) in lines.enumerated() {
+                let codeOnly = line.components(separatedBy: "//").first ?? ""
+                let trimmed = codeOnly.trimmingCharacters(in: .whitespaces)
+                if trimmed.isEmpty || trimmed.contains("case amber") { continue }
+                let matches = codeOnly.matches(of: amberTokenPattern)
+                guard !matches.isEmpty else { continue }
+                if !approvedAmberFiles.contains(relPath) {
+                    violations.append("\(relPath):\(index + 1): disallowed ECToken.amber usage")
+                } else if matches.count != 1 || !codeOnly.contains(approvedDarkGatePattern) {
+                    violations.append("\(relPath):\(index + 1): ECToken.amber in \(relPath) must use approved dark-only ternary")
+                }
+            }
+        }
+        return violations
+    }
+
+    func testAmberTokenAppearsOnlyInApprovedCallSites() throws {
+        let appRoot = Self.repo.appendingPathComponent("apps/macos/EnvCloak")
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: appRoot, includingPropertiesForKeys: nil))
+        var swiftSources: [String: String] = [:]
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
+            let relPath = fileURL.path.replacingOccurrences(of: appRoot.path + "/", with: "")
+            swiftSources[relPath] = try String(contentsOf: fileURL, encoding: .utf8)
+        }
+        XCTAssertFalse(swiftSources.isEmpty)
+        XCTAssertNotNil(swiftSources["Features/Keys/KeysView.swift"])
+        XCTAssertNotNil(swiftSources["Features/Inspector/KeyInspector.swift"])
+        let violations = Self.disallowedAmberUsages(in: swiftSources)
+        XCTAssertTrue(violations.isEmpty, "Disallowed Amber token usages: \(violations)")
+
+        // Positive control 1: explicit ECToken.amber in KeysView.swift is caught.
+        var mutatedExplicit = swiftSources
+        mutatedExplicit["Features/Keys/KeysView.swift", default: ""] += "\nlet bad = ECToken.amber.color\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedExplicit).isEmpty)
+
+        // Positive control 2: implicit member .amber in KeysView.swift is caught.
+        var mutatedImplicit = swiftSources
+        mutatedImplicit["Features/Keys/KeysView.swift", default: ""] += "\nlet bad: ECToken = .amber\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedImplicit).isEmpty)
+
+        // Positive control 3: inverted ternary in KeyInspector.swift is caught.
+        var mutatedInverted = swiftSources
+        mutatedInverted["Features/Inspector/KeyInspector.swift", default: ""] +=
+            "\nlet inverted = colorScheme == .dark ? ECToken.text.color : ECToken.amber.color\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedInverted).isEmpty)
+
+        // Positive control 4: trailing comment bypass in KeyInspector.swift is caught.
+        var mutatedComment = swiftSources
+        mutatedComment["Features/Inspector/KeyInspector.swift", default: ""] +=
+            "\nlet bypass = ECToken.amber.color // colorScheme == .dark\n"
+        XCTAssertFalse(Self.disallowedAmberUsages(in: mutatedComment).isEmpty)
+    }
 }

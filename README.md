@@ -67,6 +67,34 @@ OPENAI_API_KEY = "openai/work"
 STRIPE_SECRET_KEY = "stripe/acme-live"
 ```
 
+## macOS app
+
+On macOS 26 or later, EnvCloak ships as `EnvCloak.app` with a bundled background agent (`EnvCloakAgent.app`) and CLI (`envcloak`). Homebrew cask distribution (`brew install --cask envcloak`, notarised and stapled) lands in M7; from a checkout, build and install to `/Applications` with `scripts/macos/build-app.sh --install`.
+
+First launch walks through six steps (`WelcomeView`):
+
+1. **Background item**: enables the `SMAppService` LaunchAgent in `/Applications/EnvCloak.app` and links `/opt/homebrew/bin/envcloak` (or `/usr/local/bin/envcloak`) when no standalone binary is already there.
+2. **Create your vault**: runs `envcloak vault create` in Terminal so your passphrase and Recovery Kit never pass through the app.
+3. **Add Touch ID**: generates Secure Enclave P-256 `unlock` and `approve` keys and approves enrollment once in Terminal with your passphrase.
+4. **Paste or import keys**: seals pasted secrets directly to the daemon's ephemeral X25519 key (`PasteSheet`) or imports `.env` files in Terminal (`envcloak init --import`).
+5. **Install agent hooks**: previews and applies `envcloak agents install` for Claude Code, Codex, Cursor and other detected hosts.
+6. **First-run scan**: watches `<data>/reports/first-run.json` from `envcloak import --scan ~ --machine --report` and shows discovered keys, providers, and any keys that already leaked.
+
+Full app architecture, signing tiers, peer code-signature pins, Accessibility and appearance rules, and gate evidence are in [docs/APP.md](docs/APP.md).
+
+### What EnvCloak guarantees
+
+The headline is fully true in proxy mode, for HTTPS APIs. In inject mode, EnvCloak keeps keys out of files, configs and what reaches the model, but the command you approve holds the key while it runs, and a key pasted into some agents can persist in their local history until `envcloak scrub` (SPEC §7.1). A feature that has not shipped is shown as unavailable, never implied.
+
+| Mode | What the approved process holds | EnvCloak guarantees | EnvCloak does not guarantee |
+|---|---|---|---|
+| Proxy (HTTPS APIs; M6) | A session placeholder, never the key | The key is inserted only into the provider's declared auth slot, only for that item's exact hosts, only over verified TLS, and only while the grant lasts. Key-management and key-minting paths are refused. The placeholder is useless outside the session. | That the agent will not use the key's permissions with that provider during the grant (spend, delete, create). Non-HTTP protocols. Programs that ignore proxy settings fail instead of connecting directly. A program that can read the child's environment can use the session until it ends. |
+| Inject + redact (the default until M6) | The real key, in its environment and memory | Every delivery is approved and audited. There is no plaintext in the repo or agent configs. The exact value and the encodings listed in §6.1 are masked in that command's own stdout and stderr. | Anything a careless, deliberate or prompt-injected process does with a key it holds: transformed output, files, network, child processes. Other programs running as you can read a running process's environment on macOS and Linux. |
+| Native credential helpers (AWS, git, Docker, kube; M9) | A short-lived or scoped credential, in plaintext | The long-lived source credential never leaves EnvCloak. Every delivery is approved, audited and time-bounded. | The delivered credential until it expires. Stopping delivery does not revoke credentials already issued. |
+| Dev sign-in (own apps and test accounts; M2b) | A usable session for a dedicated test account, in a fresh browser context EnvCloak creates and publishes for that grant | The password and TOTP seed are used only by EnvCloak's sign-in worker, only on the target's exact credential-entry origins, and are never returned in a tool result, error, log or audit entry; the agent's browser tools never receive a filled credential form. A one-time code is generated only for an approved attempt. Only the target's declared session state is delivered, and only after the account, tenant and role are verified in the receiving context. | What the agent does with the session: it can use and export it for as long as the app honours it. Browser cookies are not port-scoped, so other services on the same hostname can receive them. Ending access stops EnvCloak and clears its browser context; server-side revocation is reported separately, and only when verified. A page that captures or reflects the password it receives. A process running as you with debugger, memory or file access to the worker (§10). TOTP is not phishing-resistant, and a password stored with its TOTP seed in one unlocked vault is one factor, not two. |
+| Reveal and cards | Nothing: human only | Values appear only in the EnvCloak app after Touch ID, or (secrets only, never cards) on Linux on the terminal after the passphrase; never in CLI stdout or stderr, MCP or agent paths. | Screen capture, an agent that drives the terminal where a value is shown, or someone reading your screen. |
+| Every mode | | The vault is encrypted at rest and unlocks only with the Secure Enclave, your passphrase or your Recovery Kit. Grants are limited to a project, a key list, one process tree and a time window, and need an approval proof that a program cannot produce by itself. | Protection from root, kernel malware or a fully compromised account. Removal of anything already sent to a model provider. On Linux and in builds without EnvCloak's signature: protection from a program running as you that impersonates the daemon or the `envcloak` command to capture your passphrase, or that watches a terminal where you type it. On macOS, your login password is also an approval factor, because Touch ID falls back to it. |
+
 ## Design
 
 The full product and architecture spec, including the threat model, is in [docs/SPEC.md](docs/SPEC.md).
@@ -78,6 +106,7 @@ How `envcloak mcp`, `envcloak mcp-bridge` and `envcloak agents migrate-mcp` serv
 How `envcloak init` and `envcloak import` move `.env` files into the vault, and when they delete them, is in [docs/IMPORT.md](docs/IMPORT.md).
 How `envcloak doctor` and `envcloak scrub` find and remove leaked keys across files, transcripts, shell history and Git history is in [docs/DOCTOR.md](docs/DOCTOR.md).
 What `envcloak agents install` writes for Claude Code and Codex, what its hooks stop and what they do not see, is in [docs/INSTALLERS.md](docs/INSTALLERS.md) and [docs/COMPAT.md](docs/COMPAT.md). On Linux neither host's sandboxed shell can reach EnvCloak in this build, so no sandbox exception is written there: commands that need keys run through EnvCloak's MCP server or with the host's sandbox off. `envcloak agents status --probe` checks, on your machine and in a throwaway probe home, that the hooks act for the host version you have; it probes only the host versions EnvCloak's release was qualified against, and a host that updated since reads `not_qualified` until the next release qualifies it. It needs `envcloak-probe-model` and `envcloak-probe-mcp` beside `envcloak` (a source build has them; the macOS app does not ship them yet, so from the app it answers `probe_unavailable`), and it does not probe a host that has a system or managed configuration on the machine.
+The macOS app architecture, signing tiers, peer code-signature pins, Accessibility and appearance rules, and gate evidence are in [docs/APP.md](docs/APP.md).
 The brand (logo, app icon, colour, type, motion and voice) is in [docs/BRAND.md](docs/BRAND.md), and its files are in [assets/brand/](assets/brand/).
 
 ## Contributing

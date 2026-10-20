@@ -10,6 +10,10 @@ struct KeyInspector: View {
     @Environment(\.colorScheme) private var colorScheme
     @State private var action: InspectorAction?
     @State private var selectedField: DaemonText?
+    static func valueBarToken(for scheme: ColorScheme) -> ECToken {
+        scheme == .dark ? ECToken.amber : ECToken.text
+    }
+
     var body: some View {
         content.task(id: slug) { await session.selectKey(slug) }
             .onChange(of: slug) { _, _ in
@@ -49,7 +53,11 @@ struct KeyInspector: View {
                     Text([item.provider?.escaped, item.classification.rawValue.capitalized].compactMap { $0 }.joined(separator: " · "))
                     HStack {
                         Text((item.env_hint?.escaped ?? "VALUE") + "=").font(ECFont.martianMono(size: 12))
-                        Rectangle().fill(colorScheme == .dark ? ECToken.amber.color : ECToken.text.color).frame(width: 48, height: 14).accessibilityLabel("Value held in the vault")
+                        Rectangle()
+                            .fill(Self.valueBarToken(for: colorScheme).color)
+                            .frame(width: 48, height: 14)
+                            .accessibilityLabel("Value hidden")
+                            .accessibilityIdentifier("inspector.valueBlock")
                     }
                     Text("Stored in the vault. \(item.fields.count) fields, \(item.fields.reduce(0) { $0 + Int($1.prior_count) }) earlier values kept.")
                     if item.fields.count > 1 {
@@ -64,7 +72,7 @@ struct KeyInspector: View {
                             .disabled(session.state != .ready || (!canReplaceInApp && InspectorAction.replace.command(item: item, field: selectedField) == nil))
                     }
                     if !session.canSignInApp, !MetadataRequest.canCopy(item.slug) || selectedField.map({ !MetadataRequest.canCopy($0) }) == true {
-                        Text(TerminalCopy.refusalMessage).foregroundStyle(ECToken.warning.color)
+                        Label(TerminalCopy.refusalMessage, systemImage: "exclamationmark.triangle").foregroundStyle(ECToken.warning.color)
                     }
                     Button("Use in project") { bind(BindingSelection(project: session.projects.scope, key: item)) }
                         .disabled(session.state != .ready || item.class != .secret)

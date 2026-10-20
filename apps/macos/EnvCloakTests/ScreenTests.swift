@@ -912,6 +912,109 @@ import XCTest
         await assertVisible("Write changes", in: window)
         window.close()
     }
+
+    func testM320AccessibilityLabelsStatusPairingsAndApprovalReadingOrder() async throws {
+        let client = ScriptedClient()
+        await client.plainSlugs()
+        await client.configure(pending: 1)
+        let session = VaultSession(client: client)
+        await session.poll()
+        let item = try XCTUnwrap(session.items.rows.first)
+        await session.selectKey(item.slug)
+
+        // 1. KeyInspector value block reads "Value hidden" and never exposes a bullet mask.
+        let inspectorWindow = host(KeyInspector(session: session, slug: item.slug, route: .constant(.keys(.all))))
+        await assertElementLabel("Value hidden", identifier: "inspector.valueBlock", in: inspectorWindow)
+        XCTAssertFalse(labels(inspectorWindow).contains { $0.contains("••••") }, "Value block must never speak bullets")
+        inspectorWindow.close()
+
+        // 2. Class badges pair symbol + word and never use Amber.
+        XCTAssertEqual(KeysView.classBadgeSymbol(.live), "bolt.fill")
+        XCTAssertEqual(KeysView.classBadgeSymbol(.test), "testtube.2")
+        XCTAssertEqual(KeysView.classBadgeSymbol(.unknown), "questionmark.circle")
+        XCTAssertEqual(KeysView.classBadgeToken(.live), .text)
+        XCTAssertEqual(KeysView.classBadgeToken(.test), .secondary)
+        XCTAssertEqual(KeysView.classBadgeToken(.unknown), .secondary)
+        XCTAssertEqual(KeysView.classBadgeAccessibilityLabel(.live), "Live key")
+        XCTAssertEqual(KeysView.classBadgeAccessibilityLabel(.test), "Test key")
+        XCTAssertEqual(KeysView.classBadgeAccessibilityLabel(.unknown), "Unknown kind")
+
+        // 3. Icon-only controls in MenuBarPopover and MainView have explicit accessibility labels.
+        let popoverWindow = host(MenuBarPopover(session: session))
+        await assertVisible("EnvCloak menu", in: popoverWindow)
+        popoverWindow.close()
+
+        let mainWindow = host(MainView(session: session))
+        await assertElementLabel("Add key", identifier: "key.add", in: mainWindow)
+        await assertElementLabel("Add project folder…", identifier: "project.addFolder", in: mainWindow)
+        await assertElementLabel("Lock", identifier: "toolbar.lock", in: mainWindow)
+        mainWindow.close()
+
+        // 4. ApprovalWindowView reading order, mark label, live tick spoken slash label, and argv spoken escape label.
+        XCTAssertEqual(
+            ApprovalWindowView.readingOrderSections,
+            ["header", "command", "project", "keys", "access", "evidence", "footer"]
+        )
+        let model = ApprovalWindowModel(session: session)
+        await model.load()
+        let approvalWindow = host(ApprovalWindowView(model: model))
+        await assertVisible("EnvCloak", in: approvalWindow)
+        await assertElementLabel(
+            "Allow live key STRIPE_SECRET_KEY, stripe slash acme-live",
+            identifier: "approval.live.STRIPE_SECRET_KEY",
+            in: approvalWindow
+        )
+        await assertVisible("Argument 0: npm", in: approvalWindow)
+        await assertVisible("Argument 1: test", in: approvalWindow)
+        for section in ["header", "command", "project", "keys", "access", "footer"] {
+            XCTAssertFalse(
+                identified("approval.section." + section, in: approvalWindow).isEmpty,
+                "Missing approval section identifier approval.section.\(section)"
+            )
+        }
+        XCTAssertFalse(identified("approval.evidence", in: approvalWindow).isEmpty)
+        approvalWindow.close()
+
+        // 5. KeyInspector value-bar token uses Amber only in dark appearance and Text in light appearance.
+        XCTAssertEqual(KeyInspector.valueBarToken(for: .dark), .amber)
+        XCTAssertEqual(KeyInspector.valueBarToken(for: .light), .text)
+
+        // 6. Reduce Transparency fallbacks replace vibrancy materials with opaque raised surfaces + 1 pt rule.
+        XCTAssertTrue(CommandPalette.usesOpaquePanel(reduceTransparency: true))
+        XCTAssertFalse(CommandPalette.usesOpaquePanel(reduceTransparency: false))
+        XCTAssertTrue(MenuBarPopover.usesOpaqueHeaderStrip(reduceTransparency: true))
+        XCTAssertFalse(MenuBarPopover.usesOpaqueHeaderStrip(reduceTransparency: false))
+
+        // 7. KeySightModel announces "Value hidden" on hide/auto-hide and "Clipboard cleared" on clipboard clear.
+        let keySight = KeySightModel(slug: item.slug, field: nil)
+        let secretBuf = try SecretBuffer(capacity: 8)
+        keySight.receiveSecret(secretBuf, startCountdown: false)
+        XCTAssertTrue(keySight.isShown)
+        keySight.hideNow()
+        XCTAssertFalse(keySight.isShown)
+        XCTAssertEqual(keySight.lastAnnouncement, "Value hidden")
+        keySight.announceClipboardCleared()
+        XCTAssertEqual(keySight.lastAnnouncement, "Clipboard cleared")
+
+        // 8. VaultSession announces "EnvCloak locked" when locking explicitly, on system signal, or on daemon idle lock.
+        await session.lock()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")
+
+        await client.configure(vault: "unlocked")
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        await session.lockForSignal(.screenLock)
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")
+
+        await client.configure(vault: "unlocked")
+        await session.poll()
+        XCTAssertEqual(session.state, .ready)
+        session.notifications.clear()
+        await client.configure(vault: "locked")
+        await session.poll()
+        XCTAssertEqual(session.state, .locked)
+        XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")
+    }
 }
-
-

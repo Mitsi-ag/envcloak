@@ -214,7 +214,7 @@ struct FirstRunScanView: View {
                                             .disabled(MetadataRequest.rotateSlugCommand(item.slug) == nil)
                                     }
                                     if MetadataRequest.rotateSlugCommand(item.slug) == nil {
-                                        Text(TerminalCopy.refusalMessage)
+                                        Label(TerminalCopy.refusalMessage, systemImage: "exclamationmark.triangle")
                                             .font(.caption)
                                             .foregroundStyle(ECToken.warning.color)
                                     }
@@ -243,7 +243,7 @@ struct FirstRunScanView: View {
                                             .disabled(MetadataRequest.deletePlaintextCommand(project.dir) == nil)
                                     }
                                     if MetadataRequest.deletePlaintextCommand(project.dir) == nil {
-                                        Text(TerminalCopy.refusalMessage)
+                                        Label(TerminalCopy.refusalMessage, systemImage: "exclamationmark.triangle")
                                             .font(.caption)
                                             .foregroundStyle(ECToken.warning.color)
                                     }

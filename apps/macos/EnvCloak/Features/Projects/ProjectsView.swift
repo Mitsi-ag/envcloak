@@ -74,7 +74,10 @@ struct ProjectDetail: View {
                     if !WorkspaceActions.copyPath(directory) { session.notice = "The folder path could not be copied." }
                 }.disabled(!MetadataRequest.canCopy(directory))
             }
-            if !MetadataRequest.canCopy(directory) { Text(TerminalCopy.refusalMessage).foregroundStyle(ECToken.warning.color) }
+            if !MetadataRequest.canCopy(directory) {
+                Label(TerminalCopy.refusalMessage, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(ECToken.warning.color)
+            }
             if session.projects.openedDirectory != directory {
                 Text("Not checked").foregroundStyle(ECToken.secondary.color); Spacer()
             } else if session.projects.manifestMissing {

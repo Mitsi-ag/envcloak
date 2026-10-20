@@ -138,7 +138,8 @@ struct PasteSheet: View {
                 }
 
                 if let notice = model.notice {
-                    Text(notice).foregroundStyle(ECToken.warning.color)
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(ECToken.warning.color)
                         .accessibilityIdentifier("paste.error")
                 }
                 HStack {
