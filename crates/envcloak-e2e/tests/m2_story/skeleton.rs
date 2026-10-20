@@ -1451,6 +1451,7 @@ fn ci_runs_the_sandboxed_cases_outside_a_user_namespace_as_required_steps() {
         for name in [
             "skeleton::s0_claude_code_sandboxed",
             "skeleton::s0_codex_workspace_write",
+            "variants::variant_sandboxed_claude_code",
         ] {
             assert!(names.contains(&name), "{job}'s step does not run {name}");
         }
@@ -1766,7 +1767,7 @@ fn test_fns(text: &str, module: &str) -> Vec<String> {
 }
 
 /// Every test `m2_story` has, as `--exact` names it: its own,
-/// `skeleton::`'s and `mcp::`'s.
+/// `skeleton::`'s, `mcp::`'s, `readme::`'s, `story::`'s and `variants::`'s.
 fn story_tests() -> Vec<String> {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/m2_story");
     let mut out = Vec::new();
@@ -1774,6 +1775,9 @@ fn story_tests() -> Vec<String> {
         ("main.rs", ""),
         ("skeleton.rs", "skeleton::"),
         ("mcp.rs", "mcp::"),
+        ("readme.rs", "readme::"),
+        ("story.rs", "story::"),
+        ("variants.rs", "variants::"),
     ] {
         out.extend(test_fns(
             &std::fs::read_to_string(dir.join(file)).unwrap(),
