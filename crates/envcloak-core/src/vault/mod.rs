@@ -555,6 +555,9 @@ impl LockedVault {
             }
         }
         let view = loaded.state.item_list();
+        static NEXT_UNLOCK_EPOCH: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let unlock_epoch = NEXT_UNLOCK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Vault {
             file: self,
             ctx,
@@ -564,6 +567,7 @@ impl LockedVault {
             view,
             integrity: Cell::new(loaded.integrity),
             migration_error,
+            unlock_epoch,
         })
     }
 }
@@ -740,6 +744,7 @@ pub struct Vault {
     view: Vec<ItemMeta>,
     integrity: Cell<Integrity>,
     migration_error: Option<VaultErrorKind>,
+    pub(crate) unlock_epoch: u64,
 }
 
 impl core::fmt::Debug for Vault {

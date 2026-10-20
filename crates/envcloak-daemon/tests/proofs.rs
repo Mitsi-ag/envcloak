@@ -24,9 +24,11 @@ use std::time::Duration;
 use common::{client, passphrase, seed_vault, start};
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::{Classification, LockedVault, VaultPaths};
-use envcloak_ipc::ClientError;
-use envcloak_ipc::proto::ErrorKind;
-use envcloak_ipc::view::{ClassificationView, ItemClassView, ItemView, TargetView, VaultState};
+use envcloak_ipc::proto::{ErrorKind, LoginAddParams};
+use envcloak_ipc::view::{
+    ClassificationView, ItemClassView, ItemView, LoginTierView, TargetView, VaultState,
+};
+use envcloak_ipc::{ClientError, WireSecret};
 use envcloak_policy::ApprovalOptions;
 use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 
@@ -156,10 +158,26 @@ fn a_caller_without_a_terminal_gives_no_proof() {
             .unwrap_err();
         assert_eq!(rpc_kind(e), ErrorKind::ProofRefused, "{to:?}");
     }
+    // An agent subject calling `login.add` over IPC is refused (`proof_refused`,
+    // `reason = "agent"`) and audited before the vault is touched.
+    let login_err = c
+        .login_add(&LoginAddParams {
+            slug: "acme/editor".into(),
+            classification: ClassificationView::Test,
+            tier: LoginTierView::Dev,
+            session_lifetime_secs: 3600,
+            username: WireSecret::new(SecretBytes::copy_from(b"editor@example.test")),
+            password: WireSecret::new(SecretBytes::copy_from(b"synthetic-login-password")),
+            totp: None,
+            adapter_key: None,
+            claims: vec!["ENVCLOAK_FIXTURE_AGENT".into()],
+        })
+        .unwrap_err();
+    assert_eq!(rpc_kind(login_err), ErrorKind::ProofRefused);
     assert_eq!(c.status().unwrap().approvals.proof_failures, 0);
     assert!(
         d.wait_for_log(
-            "proof refused method=items.reclassify",
+            "proof refused method=login.add reason=agent",
             Duration::from_secs(5)
         ),
         "{}",
@@ -171,6 +189,7 @@ fn a_caller_without_a_terminal_gives_no_proof() {
         "items.rotate",
         "items.remove",
         "items.reclassify",
+        "login.add",
     ] {
         assert!(refused_in_log(&log, method), "{method}: {log}");
     }

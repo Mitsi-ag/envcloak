@@ -235,6 +235,8 @@ impl core::fmt::Debug for LoginValue {
 pub struct AttemptLease {
     item: ItemId,
     revision: u64,
+    unlock_epoch: u64,
+    generation: u64,
 }
 
 impl core::fmt::Debug for AttemptLease {
@@ -242,6 +244,7 @@ impl core::fmt::Debug for AttemptLease {
         f.debug_struct("AttemptLease")
             .field("item", &self.item)
             .field("revision", &self.revision)
+            .field("generation", &self.generation)
             .finish()
     }
 }
@@ -255,6 +258,17 @@ impl AttemptLease {
     /// The item row revision this lease is bound to.
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// The daemon unlock/lock generation this lease is bound to.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Binds this lease to a daemon unlock/lock `generation`.
+    pub fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 }
 
@@ -285,6 +299,8 @@ impl Vault {
         Ok(AttemptLease {
             item,
             revision: row.row_version,
+            unlock_epoch: self.unlock_epoch,
+            generation: 0,
         })
     }
 
@@ -319,6 +335,9 @@ impl LoginFieldReader<'_> {
         }
         if !kind.is_login() {
             return Err(VaultErrorKind::LoginField.into());
+        }
+        if lease.unlock_epoch != v.unlock_epoch {
+            return Err(VaultErrorKind::LeaseStale.into());
         }
         let row = v
             .state
@@ -409,6 +428,8 @@ mod tests {
         AttemptLease {
             item,
             revision: v.state.items[&item].row_version,
+            unlock_epoch: v.unlock_epoch,
+            generation: 0,
         }
     }
 
@@ -593,6 +614,34 @@ mod tests {
             r.open(&lease(&v, item), FieldKind::TotpSeed).unwrap(),
             LoginValue::Totp(_)
         ));
+        // Locking and re-unlocking the vault at the same revision invalidates
+        // any pre-lock lease.
+        let before_lock = v.issue_attempt_lease(item).unwrap();
+        let pass = SecretBytes::copy_from(b"unit test passphrase");
+        let v = v
+            .lock()
+            .unlock_with_passphrase(&pass)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        let mut v = v;
+        assert_eq!(
+            v.login_fields()
+                .open(&before_lock, FieldKind::Password)
+                .unwrap_err()
+                .kind(),
+            VaultErrorKind::LeaseStale
+        );
+        let after_unlock = v.issue_attempt_lease(item).unwrap();
+        assert_eq!(after_unlock.revision(), before_lock.revision());
+        assert!(
+            text(
+                v.login_fields()
+                    .open(&after_unlock, FieldKind::Password)
+                    .unwrap()
+            )
+            .ct_eq(b"the new password")
+        );
+
         let last = lease(&v, item);
         v.transact(|t| t.delete_item(item)).unwrap();
         assert_eq!(

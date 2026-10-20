@@ -200,7 +200,8 @@ fn login_add_show_ls_and_bounded_6_digit_code_search() {
         stderr(&out)
     );
 
-    // 2. Claimed environment (agent marker) refuses `login add` before reading descriptors.
+    // 2. Claimed environment (agent marker) or agent ancestry (`fixture-agent`)
+    // refuses `login add` with `proof_refused`.
     let mut cmd = on_terminal_command(
         &f.home,
         &[
@@ -216,6 +217,34 @@ fn login_add_show_ls_and_bounded_6_digit_code_search() {
     );
     cmd.env("ENVCLOAK_FIXTURE_AGENT", "1");
     let out = finish_within(cmd, Duration::from_secs(60));
+    f.assert_clean_output(&out);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).starts_with("envcloak: proof_refused:"),
+        "{}",
+        stderr(&out)
+    );
+
+    let fixture_agent = testkit_bin("fixture-agent");
+    let out = finish_within(
+        on_terminal_program(
+            &f.home,
+            &[
+                fixture_agent.as_path(),
+                Path::new("--"),
+                cli(),
+                Path::new("login"),
+                Path::new("add"),
+                Path::new("acme/editor"),
+                Path::new("--username-fd"),
+                Path::new("3"),
+                Path::new("--password-fd"),
+                Path::new("4"),
+            ],
+            &[(3, &f.username, true), (4, &f.password, true)],
+        ),
+        Duration::from_secs(60),
+    );
     f.assert_clean_output(&out);
     assert_eq!(out.status.code(), Some(1));
     assert!(
@@ -570,13 +599,58 @@ fn login_rotate_requires_terminal_proof_and_bumps_revision() {
     );
 
     // 6. Rotating from a terminal that shares a session/terminal with a live pending
-    // agent request is refused (T9-3 / F-70 boundary).
+    // agent request is refused (T9-3 / F-70 boundary), even when calling `items.rotate`
+    // directly over IPC with an unknown item, unknown field, or invalid `#totp` URI.
     {
         let dir = f.home.root().join("overlap");
         std::fs::create_dir_all(&dir).unwrap();
+        let sock = RunPaths::under(daemon_run_dir(&f.home)).unwrap().socket;
+        let ipc_probe = dir.join("ipc_probe.py");
+        std::fs::write(
+            &ipc_probe,
+            format!(
+                r#"import base64, json, socket, struct, sys
+sock_path = {sock:?}
+cases = [
+    ('acme/no-such-login', 'password', 'synthetic-pw'),
+    ('acme/editor', 'no_such_field', 'synthetic-pw'),
+    ('acme/editor', 'totp', 'not-an-otpauth-uri'),
+]
+for i, (slug, field, val) in enumerate(cases, 1):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.connect(sock_path)
+    req = {{
+        'jsonrpc': '2.0',
+        'id': i,
+        'method': 'items.rotate',
+        'params': {{
+            'slug': slug,
+            'field': field,
+            'item': '01K00000000000000000000000',
+            'value': base64.b64encode(val.encode()).decode(),
+            'passphrase': base64.b64encode(b'wrong-passphrase').decode(),
+        }},
+    }}
+    body = json.dumps(req).encode()
+    s.sendall(struct.pack('>I', len(body)) + body)
+    n = struct.unpack('>I', s.recv(4))[0]
+    resp = json.loads(s.recv(n).decode())
+    s.close()
+    data = resp.get('error', {{}}).get('data', {{}})
+    if data.get('kind') != 'proof_refused' or data.get('reason') != 'requester_terminal':
+        print(f'unexpected response for {{slug}}#{{field}}: {{resp}}', file=sys.stderr)
+        sys.exit(1)
+print('ipc_probe_ok')
+"#,
+                sock = sock.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
         let at = |name: &str| quoted(dir.join(name).to_str().unwrap());
         let cli_q = quoted(cli().to_str().unwrap());
         let agent_q = quoted(fixture_agent.to_str().unwrap());
+        let py_q = quoted(common::python3().to_str().unwrap());
+        let probe_q = quoted(ipc_probe.to_str().unwrap());
         let script = format!(
             "set -u\n\
              mkfifo {fifo}\n\
@@ -587,6 +661,8 @@ fn login_rotate_requires_terminal_proof_and_bumps_revision() {
              exec 0<{new_pw} 3<{pass}\n\
              {cli} rotate acme/editor#password --stdin --passphrase-fd 3 >{rot_out} 2>{rot_err}\n\
              echo $? >{rot_code}\n\
+             {py} {probe} >{probe_out} 2>{probe_err}\n\
+             echo $? >{probe_code}\n\
              exec 4>&-\n\
              wait\n",
             fifo = at("fifo"),
@@ -600,6 +676,11 @@ fn login_rotate_requires_terminal_proof_and_bumps_revision() {
             rot_out = at("rot.out"),
             rot_err = at("rot.err"),
             rot_code = at("rot.code"),
+            py = py_q,
+            probe = probe_q,
+            probe_out = at("probe.out"),
+            probe_err = at("probe.err"),
+            probe_code = at("probe.code"),
         );
         let mut cmd = on_terminal_program(
             &f.home,
@@ -612,6 +693,9 @@ fn login_rotate_requires_terminal_proof_and_bumps_revision() {
         let rot_code = std::fs::read_to_string(dir.join("rot.code")).unwrap();
         assert_eq!(rot_code.trim(), "1", "{rot_err}");
         assert!(rot_err.starts_with("envcloak: proof_refused:"), "{rot_err}");
+        let probe_err = std::fs::read_to_string(dir.join("probe.err")).unwrap();
+        let probe_code = std::fs::read_to_string(dir.join("probe.code")).unwrap();
+        assert_eq!(probe_code.trim(), "0", "{probe_err}");
         // Deny the pending request so the rest of the test has no live pending request.
         let run_err = std::fs::read_to_string(dir.join("run.err")).unwrap();
         if let Some(id) = run_err

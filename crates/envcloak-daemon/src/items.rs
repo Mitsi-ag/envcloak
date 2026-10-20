@@ -536,6 +536,15 @@ pub fn login_add(
     let totp_uri = p.totp.map(|u| u.into_inner());
     let adapter_key = p.adapter_key.map(|k| k.into_inner());
     refuse_if_traced()?;
+    let caller = evidence(shared, peer, &p.claims)?;
+    if caller.kind() == envcloak_policy::SubjectKind::Agent {
+        shared.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "login.add",
+            reason: envcloak_policy::ProofRefusal::Agent.token(),
+        });
+        return Err(RpcError::new(ErrorKind::ProofRefused));
+    }
     check_value(&username)?;
     check_value(&password)?;
     if let Some(ref k) = adapter_key {
@@ -545,7 +554,6 @@ pub fn login_add(
         Some(uri) => Some(parse_totp_enrollment(uri)?),
         None => None,
     };
-    let caller = evidence(shared, peer, &p.claims)?;
 
     let mut s = locked(&shared.state);
     let v = s.unlocked_mut()?;
@@ -815,15 +823,9 @@ pub(crate) fn prove<'s>(
     let (vault, generation, t) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
-        #[cfg(target_os = "linux")]
-        if write == Write::Reveal {
-            refuse_item_prover(&mut s, peer, &caller, &now, write.method())?;
-        }
+        refuse_item_prover(&mut s, peer, &caller, &now, write.method())?;
         // Everything but the passphrase is checked before Argon2id runs.
         let t = resolve(s.unlocked()?)?;
-        if t.login_field.is_some() {
-            refuse_item_prover(&mut s, peer, &caller, &now, write.method())?;
-        }
         s.limiter()
             .check(&now)
             .map_err(|_| RpcError::new(ErrorKind::TooManyAttempts))?;
@@ -901,6 +903,17 @@ pub fn rotate(
     let length = LengthClass::of(value.len());
     if proven.target.login_field.is_some() {
         let written = (|| {
+            // Argon2id ran without the state lock. Recompute the caller and
+            // its origin boundary before replacing the login field.
+            let caller = evidence(shared, peer, &p.claims)?;
+            refuse_item_prover(
+                &mut proven.s,
+                peer,
+                &caller,
+                &now_of(&shared.clocks),
+                Write::Rotate.method(),
+            )?;
+            proven.caller = caller;
             let v = proven.s.unlocked_mut()?;
             let t = resolve(v)?;
             let lf = t.login_field.ok_or(RpcError::new(ErrorKind::Internal))?;
@@ -945,6 +958,15 @@ pub fn rotate(
         });
     }
     let written = (|| {
+        let caller = evidence(shared, peer, &p.claims)?;
+        refuse_item_prover(
+            &mut proven.s,
+            peer,
+            &caller,
+            &now_of(&shared.clocks),
+            Write::Rotate.method(),
+        )?;
+        proven.caller = caller;
         let v = proven.s.unlocked_mut()?;
         let t = resolve(v)?;
         let (field, name) = t.field.clone().ok_or(RpcError::new(ErrorKind::Internal))?;

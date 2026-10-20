@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -92,6 +93,7 @@ impl Drop for AttemptGuard {
 #[derive(Debug)]
 pub struct TotpState {
     start_unix: u64,
+    generation: AtomicU64,
     accounts: Mutex<BTreeMap<ItemId, Arc<AccountEntry>>>,
 }
 
@@ -100,12 +102,25 @@ impl TotpState {
     pub fn after_start(start_unix: u64) -> Self {
         TotpState {
             start_unix,
+            generation: AtomicU64::new(1),
             accounts: Mutex::new(BTreeMap::new()),
         }
     }
 
     pub fn start_unix(&self) -> u64 {
         self.start_unix
+    }
+
+    /// Invalidates active `AttemptLease`s across a vault lock, unlock, or
+    /// backup recovery by advancing the lock generation and resetting
+    /// per-account `min_revision` to `0` while preserving `last_submitted_step`.
+    pub fn on_lock(&self) {
+        let map = self.accounts.lock().unwrap_or_else(PoisonError::into_inner);
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        for entry in map.values() {
+            let mut slot = entry.slot.lock().unwrap_or_else(PoisonError::into_inner);
+            slot.min_revision = 0;
+        }
     }
 
     fn entry_for(&self, item: ItemId) -> Arc<AccountEntry> {
@@ -143,11 +158,15 @@ impl TotpState {
     }
 
     /// Issues a vault `AttemptLease` bound to `item`'s current authorization
-    /// revision.
+    /// revision and this `TotpState`'s current unlock/lock generation.
     pub fn issue_lease(&self, vault: &Vault, item: ItemId) -> Result<AttemptLease, TotpError> {
-        let lease = vault.issue_attempt_lease(item).map_err(map_vault_err)?;
         let entry = self.entry_for(item);
         let slot = entry.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        let generation = self.generation.load(Ordering::SeqCst);
+        let lease = vault
+            .issue_attempt_lease(item)
+            .map_err(map_vault_err)?
+            .with_generation(generation);
         if lease.revision() < slot.min_revision {
             return Err(TotpError::LeaseStale);
         }
@@ -175,7 +194,9 @@ impl TotpState {
             if !slot.in_use {
                 return Err(TotpError::AccountMismatch);
             }
-            if lease.revision() < slot.min_revision {
+            if lease.generation() != self.generation.load(Ordering::SeqCst)
+                || lease.revision() < slot.min_revision
+            {
                 return Err(TotpError::LeaseStale);
             }
         }
@@ -231,7 +252,9 @@ impl TotpState {
                 if !slot.in_use {
                     return Err(TotpError::AccountMismatch);
                 }
-                if lease.revision() < slot.min_revision {
+                if lease.generation() != self.generation.load(Ordering::SeqCst)
+                    || lease.revision() < slot.min_revision
+                {
                     return Err(TotpError::LeaseStale);
                 }
                 slot.last_submitted_step
@@ -698,6 +721,116 @@ mod tests {
                 .unwrap_err(),
             TotpError::LeaseStale
         );
+    }
+
+    #[test]
+    fn on_lock_invalidates_pre_lock_lease_resets_min_revision_and_preserves_submitted_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = VaultPaths::under(dir.path().join("data"));
+        let kit = envcloak_core::RecoveryKit::generate();
+        let pass = SecretBytes::copy_from(b"unit test passphrase for totp engine");
+        let mut v = envcloak_core::create_vault_with_kit(&paths, &pass, &kit, KdfParams::minimum())
+            .unwrap();
+        let item = enroll_login(&mut v, "acme/editor", 6, 30);
+        let state = TotpState::after_start(0);
+        let guard = state.acquire_account(item);
+
+        // Take a backup at revision 1 before rotating.
+        let backup = v.create_backup().unwrap().path;
+
+        // Issue a lease at revision 1 and submit step 3 (t = 95).
+        let lease_pre_lock = state.issue_lease(&v, item).unwrap();
+        assert_eq!(lease_pre_lock.revision(), 1);
+        let (_code_s3, s3) = state
+            .next_code(
+                &guard,
+                &lease_pre_lock,
+                &v,
+                &mut || 95,
+                &mut |_| {},
+                &mut |_| true,
+            )
+            .unwrap();
+        assert_eq!(s3, 3);
+        assert_eq!(state.last_submitted_step(item), Some(3));
+
+        // 1. Lock/unlock at the same revision 1: pre-lock lease is invalidated by on_lock.
+        state.on_lock();
+        assert_eq!(
+            state
+                .read_field(&guard, &lease_pre_lock, &v, FieldKind::Password)
+                .unwrap_err(),
+            TotpError::LeaseStale
+        );
+        assert_eq!(
+            state
+                .next_code(
+                    &guard,
+                    &lease_pre_lock,
+                    &v,
+                    &mut || 125,
+                    &mut |_| {},
+                    &mut |_| true,
+                )
+                .unwrap_err(),
+            TotpError::LeaseStale
+        );
+        // Step 3 remains recorded as submitted across on_lock.
+        assert_eq!(state.last_submitted_step(item), Some(3));
+
+        // 2. Rotate login password to revision 2 and record min_revision = 2 in TotpState.
+        v.transact(|t| {
+            t.replace_login_field(
+                item,
+                LoginFieldValue::Password(SecretBytes::copy_from(b"rotated-login-password-v2")),
+            )
+        })
+        .unwrap();
+        assert_eq!(v.login_revision(item), Some(2));
+        state.on_login_replaced(item, 2);
+
+        // 3. Restore backup from revision 1 (`vault.recover` calls `on_lock` during
+        // `begin_recover` and `start_grants`).
+        drop(v);
+        state.on_lock();
+        let (restored, _report) =
+            envcloak_core::restore_backup(&paths, &backup, &kit, &pass).unwrap();
+        assert_eq!(restored.login_revision(item), Some(1));
+        state.on_lock();
+
+        // Restored login item at revision 1 is not wedged by the pre-recover min_revision = 2.
+        let lease_restored = state.issue_lease(&restored, item).unwrap();
+        assert_eq!(lease_restored.revision(), 1);
+        let restored_pw = state
+            .read_field(&guard, &lease_restored, &restored, FieldKind::Password)
+            .unwrap();
+        assert!(restored_pw.ct_eq(b"synthetic-login-password-fixture"));
+
+        // Step 3 replay protection is still preserved after backup recovery.
+        assert_eq!(
+            state
+                .next_code(
+                    &guard,
+                    &lease_restored,
+                    &restored,
+                    &mut || 100,
+                    &mut |_| {},
+                    &mut |_| true,
+                )
+                .unwrap_err(),
+            TotpError::StepAlreadyUsed { step: 3 }
+        );
+        let (_code_s4, s4) = state
+            .next_code(
+                &guard,
+                &lease_restored,
+                &restored,
+                &mut || 125,
+                &mut |_| {},
+                &mut |_| true,
+            )
+            .unwrap();
+        assert_eq!(s4, 4);
     }
 
     #[test]
