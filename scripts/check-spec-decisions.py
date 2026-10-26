@@ -78,7 +78,12 @@ decisions as SPEC v0.4.1 wrote them (M3 plan task M3-01).
   left "Touch ID only" to the keychain, a refusal of signed proofs
   alone, gate 23 and §10a over every proof, and a release clause that
   covers the app.
-- The status line says v0.4.1, and the file holds no em dash.
+- The status line says v0.4.2, and the file holds no em dash.
+- Every decision D4-01 to D4-29 of the M4 plan is listed once, in order,
+  in the same way (SPEC v0.4.2, task M4-01), and the section-scoped wording
+  checks find the poller in §4.4, every new M4 method in §4.3, the proof
+  writes in §10b, no `budget_monthly` in §5, and "hard cap" only in §2a-bis
+  and §15.2.
 
 Runs of whitespace, line breaks included, count as one space in the SPEC
 and in every phrase, so rewrapping a sentence neither hides nor breaks it.
@@ -176,6 +181,121 @@ M3_DECISIONS = [
     ("D3-16", "no edit", "SPEC §1.1 already shows an unshipped feature as unavailable"),
     ("D3-17", "no edit", "docs/IPC.md \"Reserved for M3\": the `projects.list` row (Q3-04)"),
     ("D3-18", "no edit", "docs/APP.md: the founder build"),
+]
+
+# The M4 plan's decisions, in the same form (SPEC v0.4.2, task M4-01).
+M4_DECISIONS = [
+    ("D4-01", "no edit", "M4 plan §1.1's order and §6's schedule; risk verdicts in docs/SPEND.md"),
+    ("D4-02", "no edit", "M4 plan §1.2 provider scope; the fixture providers are named in SPEC §14 by D4-20"),
+    ("D4-03", "edit", [
+        "`envcloak spend-poller`",
+        "started through the `poller` spawn role with daemon-created pipes and a daemon-held lifeline",
+        "From M4 a usage poller (`envcloak spend-poller`, §8) receives one key for one poll over its daemon-created pipe and returns one `PollResultFrame` of typed values.",
+        "and, from M4, of `envcloak spend-poller` (linked into `envcloak`, never into `envcloakd`)",
+    ]),
+    ("D4-04", "edit", [
+        "in both the registry's `allowed_hosts` and the item's allowed-host snapshot",
+        "the `query:<name>` slot is refused by the loader for every `[metrics]`, `[balance]` and builtin request so keys never appear in URLs",
+        "`Accept-Encoding: identity` with any other `Content-Encoding` refused as `malformed` without decoding",
+        "a 256 KiB response body cap",
+    ]),
+    ("D4-05", "edit", [
+        "registry grammar v2 adds a `[metrics]` section",
+        "`balance_infos[currency=USD]` and JSON `null` meaning \"not set\", never zero",
+        "a declared literal (`currency = \"USD\"`, `cap_scope = \"key\"`, `cap_enforced = true`) that must carry a `source` line",
+        "`github_expiry`",
+    ]),
+    ("D4-06", "edit", [
+        "class: secret | card | issuer_credential | usage_credential",
+        "Organization admin and management keys used to read provider usage or spend limits are class `usage_credential` (item class 5, §8).",
+        "Adding an admin-shaped key (`sk-admin-`, `sk-ant-admin01-`, or an OpenRouter key whose poll reads `is_management_key = true`) as a `secret` is refused (`admin_shaped`) unless the person passes `--store-admin-as-secret`",
+        "`providers/openai-admin.toml`",
+    ]),
+    ("D4-07", "edit", [
+        "It says \"hard cap\" only for a provider-enforced cap when all four conditions hold (`hard_cap_words`)",
+        "where \"covers\" is set containment over keys",
+        "(per OpenRouter's documentation)",
+        "Provider cap of <amount> on <scope>; does not enforce this budget",
+    ]),
+    ("D4-08", "edit", [
+        "`Money { minor: i64, scale: u8 (0 to 6), currency: Iso4217 }` (`envcloak-core::money`) represents money as integers, parsed from borrowed JSON number tokens (`serde_json::value::RawValue`) and decimal strings through a hand-written decimal parser without `f64` or `serde_json`'s `arbitrary_precision` feature",
+        "Budgets live in policy records (kind 6), not on `Item`.",
+    ]),
+    ("D4-09", "edit", [
+        "subscriptions, budgets, alert rules, manual facts, control facts, spend snapshots and account links are sealed policy record kinds 5 to 11 (`subscription`, `budget`, `alert_rule`, `manual_fact`, `control_fact`, `spend_snapshot`, `account_link`; kind 4 stays spare)",
+    ]),
+    ("D4-10", "edit", [
+        "belonging to the account and shown on each of its keys as \"shared by N keys\"",
+        "`client_reported` from `spend.ingest` with the subject kind the daemon saw and the tool the client claims, so CodexBar shows as \"reported by a client: CodexBar\", never as a fact",
+        "`admin_matched_by_hint`, `admin_linked_by_person`, `account_wide`, or `manual`",
+    ]),
+    ("D4-11", "edit", [
+        "card entry in the CLI (`envcloak card add`) reads sensitive fields from `/dev/tty` with echo off, never from argv",
+        "Only `CardFieldReader::open` with a `CardLease` constructible in the daemon's card module can open a card field",
+        "a `card`-keyed hash in its own domain (`envcloak/v2/card-number` under the `card` subkey, kept only when the full number is stored, or by stored last four otherwise)",
+        "Item record version 4 adds the card part",
+    ]),
+    ("D4-12", "edit", [
+        "The reveal statement carries the item class and field kind from its first version (`envcloak-reveal-statement/2` is reserved conditionally if `envcloak-reveal-statement/1` shipped without them)",
+    ]),
+    ("D4-13", "edit", [
+        "Polling is off until a person turns it on per provider (`envcloak spend poll enable <provider>` or the app's toggle",
+        "every poll updates the provider's own \"last used\" record for the key (`last_used_at`)",
+        "Every poll writes its `spend_poll` audit entry durably before the key is written to the poller's pipe, and an audit failure skips the poll.",
+        "stops usage polling, drops pending poll jobs, kills any running `envcloak spend-poller` through its owned handle and lifeline",
+        "A program running as you in a detached session with its own pseudo-terminal outside the agent's tree is a terminal subject and can enable usage polling (`spend.poll.enable`, which needs no passphrase, §8).",
+    ]),
+    ("D4-14", "edit", [
+        "turning polling off (`spend.poll.disable`); removing a budget, raising its amount or widening its scope (`budget.remove`, `budget.add`); removing an alert rule, or acknowledging or snoozing an alert (`alerts.ack`, `alerts.snooze`); removing a subscription (`subs.remove`); moving `expires_at` later or clearing it, or changing a key's `account` or any of its `links` (`items.edit`); raising a manual balance (`spend.manual.set`); registering the CodexBar binary path (`spend.codexbar.set_path`); turning the card number opt-in off (`card.optin`, which erases the number, CVV and card hash after an encrypted vault backup) and removing a card (`card.remove`, which also takes an encrypted vault backup first); and re-sealing an item into `usage_credential` (`items.set_class`).",
+        "Before the proof is asked for on any of these M4 writes, a caller with agent evidence is refused (`human_only`) before anything is read or written",
+    ]),
+    ("D4-15", "edit", [
+        "Only `poll` metrics can clear an alert, mark a budget within limits or support a hard-cap label; `manual` and `client_reported` figures can raise an alert or shorten a forecast's runway, never the reverse.",
+        "Changing a key's `account` moves its spend between account-scoped budgets, so it is a proof write (§10b) and budget evaluation treats it as a loosening input: an alert raised before the change stays raised until a poll after the change confirms the budget within limits; `links.*` edits are proof writes too, every link is shown with its host, and a link the person edited is marked \"edited by you\" apart from registry links.",
+    ]),
+    ("D4-16", "edit", [
+        "`spend.ingest` rate-limited to 12 calls per hour per subject root",
+        "`envcloak status`, `envcloak alerts` and `envcloak spend` in the CLI, and in the macOS app the menu bar alerts row and a `spend` notification category with Open and Snooze only",
+        "`status.spend` change counter",
+    ]),
+    ("D4-17", "no edit", "docs/SPEND.md: daily buckets from cumulative counters, `partial` marks, observed-day counts and forecast rules (M4-02, M4-11)"),
+    ("D4-18", "no edit", "SPEC §8 already includes last used and unused 90 days; derived from the audit log in M4-13"),
+    ("D4-19", "no edit", "docs/SPEND.md: OpenAI key hints compared in memory and never stored (M4-20)"),
+    ("D4-20", "edit", [
+        "Adapters show live data for the fixture providers (DeepSeek, OpenRouter, Moonshot and GitHub token expiry, plus OpenAI through a usage credential when the admin-key spike succeeds: in CI against recorded responses on the fixture server under a test-only CA absent from release builds, and in the nightly and pre-release `release-check-spend` job against low-limit keys on `main`)",
+    ]),
+    ("D4-21", "edit", [
+        "`envcloak spend codexbar <slug>` runs CodexBar only from an absolute path configured with `envcloak spend codexbar set-path`",
+        "posts typed numbers to the daemon through `spend.ingest` as `client_reported` with the claimed tool `codexbar`",
+        "client-sent metrics (`spend.ingest`: untrusted, value-free typed numbers and claimed tool metadata, §8)",
+    ]),
+    ("D4-22", "edit", [
+        "in M4 it covers the MCP session's project only: per bound key slug, provider, source, attribution, month-to-date spend, budget state, forecast date, the five control labels with their three columns, and \"last updated\", with no account email, no card field beyond slug, no other project, no balance of an account the project does not bind, and never provider text; `readOnlyHint`",
+        "Under §10a's tightening rule, a caller with agent evidence gets from `spend.summary` and `spend.item` only the view of the project it names (`project_dir` required), with emails, plans and the balances of accounts that project does not bind left out, from `card.list` and `card.show` only slug, brand and last four (cardholder, billing address and expiry refused with `card_refused`), and from `subs.list` only names and amounts of subscriptions linked to that project's keys.",
+    ]),
+    ("D4-23", "edit", [
+        "`envcloak spend [--by provider|account|project] [--json]`, `spend set`, `spend poll enable|disable|now`, `spend link`, `spend codexbar` and `spend codexbar set-path`, `sub add|ls|rm`, `budget add|ls|rm`, `alerts [ack|snooze]`, `card add|ls|show|rm|optin`",
+        "`edit <slug>`, and `set-class <slug> usage`",
+    ]),
+    ("D4-24", "no edit", "M4 plan §1.2 and docs/SPEND.md: out-of-scope items shown as not in this release"),
+    ("D4-25", "edit", [
+        "Hostile provider response during usage polling (M4)",
+        "s1. Card values cannot be opened by run, ref, proxy, helpers, MCP, redaction lists or generic comparisons, enforced by types (compile-fail and runtime).",
+        "s6. Usage credentials are never resolvable and admin-shaped values are not stored as secrets silently; when usage-credential adapters ship, they reach only listed GET paths and templates, and never-list (method, path) pairs cannot load.",
+        "s11. Adapters show live data for the fixture providers (§14 done-when).",
+    ]),
+    ("D4-26", "no edit", "M4 plan §1.2 and §6: lanes R1, R2 and S and .github/CODEOWNERS"),
+    ("D4-27", "edit", [
+        "`envcloak-spend` depends only on `envcloak-core`, `envcloak-poll` depends only on `envcloak-core`, `envcloak-ipc`, `envcloak-providers` and `envcloak-sys`, and `envcloak-daemon` depends on `envcloak-spend` and never on `envcloak-poll` (only `envcloak-cli` depends on `envcloak-poll`).",
+    ]),
+    ("D4-28", "edit", [
+        "Everything, and is not evaluated while the vault is locked or the machine sleeps",
+        "Each control on a budget carries an availability (`Active`, `NotSet`, `Unverified(Why)`, `NoData` when polling is off and nothing is entered, `Stale { since }`, `NotEvaluatedWhileLocked`, or `NotInThisRelease`); a budget whose only data source is off reads \"Alert only: no data, polling off\" rather than \"active\".",
+    ]),
+    ("D4-29", "edit", [
+        "In a usage-credential provider file (`credential = \"usage\"`), a denied entry may carry `methods = [\"POST\", \"PUT\", \"PATCH\", \"DELETE\"]`",
+        "checked against `^[A-Za-z0-9_-]{1,64}$`, and the filled path passes the same denied-path normalisation before it is sent.",
+    ]),
 ]
 
 REQUIRED = {
@@ -489,6 +609,51 @@ REQUIRED = {
         "of `envcloakd` made then, as it starts its own modes of `envcloak` (§6.6); on macOS from "
         "a suspended start whose code directory hash must equal its own."
     ),
+    "§4.4 the poller receives one key for one poll (D4-03, M4-01)": (
+        "From M4 a usage poller (`envcloak spend-poller`, §8) receives one key for one poll over "
+        "its daemon-created pipe and returns one `PollResultFrame` of typed values."
+    ),
+    "§2a-bis the four hard-cap conditions (D4-07, M4-01)": (
+        "It says \"hard cap\" only for a provider-enforced cap when all four conditions hold "
+        "(`hard_cap_words`): (1) the cap's currency equals the budget's; (2) the cap's reset "
+        "period equals the budget's and its amount is at or below the budget's amount, or the cap "
+        "has no reset and its remaining amount is at or below the budget's remaining amount; "
+        "(3) the cap's scope covers every key the budget counts at evaluation time, where "
+        "\"covers\" is set containment over keys (an organization or account cap covers every key "
+        "of that account; a provider-wide cap covers every key of that provider and account; a key "
+        "cap covers only that key, so it covers a key budget for that key, and a provider, account "
+        "or project budget only while that budget counts exactly that one key); and (4) the cap "
+        "was read within 26 hours and its enforcing state is `enforcing` as read from the provider "
+        "(such as OpenAI `enforcement.status`) or as declared by a literal with a cited "
+        "documentation source (such as OpenRouter's 402 behaviour, in which case the label adds "
+        "\"(per OpenRouter's documentation)\"), or for a proxy gate (M6) whose provider adapter "
+        "supplies a conservative per-request cost bound, and only for the traffic that control "
+        "sees."
+    ),
+    "§10b M4 writes that need a proof and the agent refusal in front (D4-14, M4-01)": (
+        "In M4, every write that can silence an alert, hide spend or remove card data: turning "
+        "polling off (`spend.poll.disable`); removing a budget, raising its amount or widening its "
+        "scope (`budget.remove`, `budget.add`); removing an alert rule, or acknowledging or "
+        "snoozing an alert (`alerts.ack`, `alerts.snooze`); removing a subscription "
+        "(`subs.remove`); moving `expires_at` later or clearing it, or changing a key's `account` "
+        "or any of its `links` (`items.edit`); raising a manual balance (`spend.manual.set`); "
+        "registering the CodexBar binary path (`spend.codexbar.set_path`); turning the card number "
+        "opt-in off (`card.optin`, which erases the number, CVV and card hash after an encrypted "
+        "vault backup) and removing a card (`card.remove`, which also takes an encrypted vault "
+        "backup first); and re-sealing an item into `usage_credential` (`items.set_class`). Before "
+        "the proof is asked for on any of these M4 writes, a caller with agent evidence is refused "
+        "(`human_only`) before anything is read or written; writes that only tighten (adding or "
+        "lowering a budget, adding an alert rule, lowering a manual balance, enabling polling) "
+        "need no proof."
+    ),
+    "§4.3 the evidence-tightened views for agents (D4-22, M4-01)": (
+        "Under §10a's tightening rule, a caller with agent evidence gets from `spend.summary` and "
+        "`spend.item` only the view of the project it names (`project_dir` required), with emails, "
+        "plans and the balances of accounts that project does not bind left out, from `card.list` "
+        "and `card.show` only slug, brand and last four (cardholder, billing address and expiry "
+        "refused with `card_refused`), and from `subs.list` only names and amounts of "
+        "subscriptions linked to that project's keys."
+    ),
 }
 
 # The parts of the CR-1 patterns below: who asks for a release, what of its
@@ -586,10 +751,59 @@ FORBIDDEN = {
     "a release clause that covers the app (M3-01)": re.escape(
         "receives any of them, and no release depends on identifying"
     ),
+    # What v0.4.2 replaced (M4 plan, task M4-01).
+    "`budget_monthly` on `Item` (D4-08, M4-01)": r"\bbudget_monthly\b",
+    "polling in the daemon process (D4-03, M4-01)": re.escape(
+        "The daemon polls provider adapters on a schedule (default hourly, jittered, backoff on errors) using the stored keys internally."
+    ),
     "an em dash": "\u2014",
 }
 
-STATUS = "Status: draft v0.4.1 "
+STATUS = "Status: draft v0.4.2 "
+
+M4_CLIENT_AND_APP_METHODS = [
+    "spend.summary",
+    "spend.item",
+    "spend.manual.set",
+    "spend.ingest",
+    "spend.poll.enable",
+    "spend.poll.disable",
+    "spend.poll.now",
+    "spend.link",
+    "spend.codexbar.set_path",
+    "subs.add",
+    "subs.list",
+    "subs.remove",
+    "budget.add",
+    "budget.list",
+    "budget.remove",
+    "alerts.list",
+    "alerts.ack",
+    "alerts.snooze",
+    "items.edit",
+    "items.set_class",
+    "card.add",
+    "card.list",
+    "card.show",
+    "card.remove",
+    "card.optin",
+    "app.card.paste",
+]
+
+M4_PROOF_WRITES_10B = [
+    "spend.poll.disable",
+    "budget.remove",
+    "budget.add",
+    "alerts.ack",
+    "alerts.snooze",
+    "subs.remove",
+    "items.edit",
+    "spend.manual.set",
+    "spend.codexbar.set_path",
+    "card.optin",
+    "card.remove",
+    "items.set_class",
+]
 
 problems = []
 
@@ -604,9 +818,48 @@ def flat(text):
     return re.sub(r"\s+", " ", text)
 
 
+def section_between(raw, start_heading, end_heading):
+    s = raw.find(start_heading)
+    if s < 0:
+        return ""
+    e = raw.find(end_heading, s + len(start_heading))
+    if e < 0:
+        return raw[s:]
+    return raw[s:e]
+
+
+def check_m4_sections(raw):
+    sec_2a_bis = section_between(raw, "## 2a-bis. Money:", "## 2a-quater.")
+    sec_43 = section_between(raw, "### 4.3 Peer identity and roles", "### 4.4 What crosses the socket")
+    sec_44 = section_between(raw, "### 4.4 What crosses the socket", "## 5. Data model")
+    sec_5 = section_between(raw, "## 5. Data model", "## 6. Core flows")
+    sec_10b = section_between(raw, "## 10b. Grants and approvals", "## 11. Crypto and core dependencies")
+    sec_152 = section_between(raw, "### 15.2 Gates", "\n## 16.")
+    if "envcloak spend-poller" not in flat(sec_44) or "one key for one poll" not in flat(sec_44):
+        fail("§4.4 lacks the poller crossing (`envcloak spend-poller`, one key for one poll)")
+    flat_43 = flat(sec_43)
+    for m in M4_CLIENT_AND_APP_METHODS:
+        if f"`{m}`" not in flat_43:
+            fail(f"§4.3 lacks `{m}`")
+    flat_10b = flat(sec_10b)
+    for m in M4_PROOF_WRITES_10B:
+        if f"`{m}`" not in flat_10b:
+            fail(f"§10b lacks proof write `{m}`")
+    if "budget_monthly" in sec_5:
+        fail("§5 still holds `budget_monthly`")
+    outside_hard_cap = raw
+    if sec_2a_bis:
+        outside_hard_cap = outside_hard_cap.replace(sec_2a_bis, "", 1)
+    if sec_152:
+        outside_hard_cap = outside_hard_cap.replace(sec_152, "", 1)
+    if re.search(r"\bhard cap\b", flat(outside_hard_cap), re.IGNORECASE):
+        fail("the SPEC holds 'hard cap' outside §2a-bis and §15.2")
+
+
 def check_spec(text):
+    raw = text
     if not text.startswith("# EnvCloak: product and architecture spec\n\n" + STATUS):
-        fail("the status line does not say draft v0.4.1")
+        fail("the status line does not say draft v0.4.2")
     text = flat(text)
     ids = [d[0] for d in DECISIONS]
     expected = ["D-%02d" % n for n in range(1, 37)]
@@ -615,7 +868,10 @@ def check_spec(text):
     m3_ids = [d[0] for d in M3_DECISIONS]
     if m3_ids != ["D3-%02d" % n for n in range(1, 19)]:
         fail("the M3 decision list is not D3-01 to D3-18, each once and in order")
-    for did, kind, what in DECISIONS + M3_DECISIONS:
+    m4_ids = [d[0] for d in M4_DECISIONS]
+    if m4_ids != ["D4-%02d" % n for n in range(1, 30)]:
+        fail("the M4 decision list is not D4-01 to D4-29, each once and in order")
+    for did, kind, what in DECISIONS + M3_DECISIONS + M4_DECISIONS:
         if kind == "edit":
             if not what:
                 fail("%s is an edit with no phrase to check" % did)
@@ -634,6 +890,7 @@ def check_spec(text):
     for name, pattern in FORBIDDEN.items():
         if re.search(pattern, text, re.IGNORECASE):
             fail("the SPEC still holds %s" % name)
+    check_m4_sections(raw)
 
 
 def check_pr_files(root, base, head):
@@ -675,7 +932,10 @@ def main(argv):
         for p in problems:
             print("check-spec-decisions: " + p, file=sys.stderr)
         return 1
-    print("check-spec-decisions: ok (%d decisions, %d sentences)" % (len(DECISIONS) + len(M3_DECISIONS), len(REQUIRED)))
+    print(
+        "check-spec-decisions: ok (%d decisions, %d sentences)"
+        % (len(DECISIONS) + len(M3_DECISIONS) + len(M4_DECISIONS), len(REQUIRED))
+    )
     return 0
 
 

@@ -188,8 +188,8 @@ fn an_em_dash_fails() {
 #[test]
 fn an_older_spec_version_fails() {
     let t = fixture();
-    edit(&t, "Status: draft v0.4.1 ", "Status: draft v0.4 ");
-    assert_fails(&t.home(), &[], "the status line does not say draft v0.4.1");
+    edit(&t, "Status: draft v0.4.2 ", "Status: draft v0.4.1 ");
+    assert_fails(&t.home(), &[], "the status line does not say draft v0.4.2");
 }
 
 /// The §4.4 sentence on daemon-started recipients (CR-1).
@@ -1386,5 +1386,143 @@ fn the_old_screen_lock_bullet_and_a_lost_m3_edit_fail() {
         &t.home(),
         &[],
         "D3-10: the SPEC lacks '`envcloak-write-statement/1`'",
+    );
+}
+
+// --- SPEC v0.4.2, the M4 build decisions (M4 plan, task M4-01) ------------
+
+/// §4.4: the poller receives one key for one poll over its daemon-created pipe.
+const POLLER_44: &str = "From M4 a usage poller (`envcloak spend-poller`, §8) receives one key for one poll over its daemon-created pipe and returns one `PollResultFrame` of typed values.";
+/// §2a-bis: the four conditions for "hard cap".
+const HARD_CAP_CONDITIONS: &str = "It says \"hard cap\" only for a provider-enforced cap when all four conditions hold (`hard_cap_words`): (1) the cap's currency equals the budget's; (2) the cap's reset period equals the budget's and its amount is at or below the budget's amount, or the cap has no reset and its remaining amount is at or below the budget's remaining amount; (3) the cap's scope covers every key the budget counts at evaluation time, where \"covers\" is set containment over keys (an organization or account cap covers every key of that account; a provider-wide cap covers every key of that provider and account; a key cap covers only that key, so it covers a key budget for that key, and a provider, account or project budget only while that budget counts exactly that one key); and (4) the cap was read within 26 hours and its enforcing state is `enforcing` as read from the provider (such as OpenAI `enforcement.status`) or as declared by a literal with a cited documentation source (such as OpenRouter's 402 behaviour, in which case the label adds \"(per OpenRouter's documentation)\"), or for a proxy gate (M6) whose provider adapter supplies a conservative per-request cost bound, and only for the traffic that control sees.";
+/// §10b: M4 writes that need a proof and the agent refusal in front.
+const M4_PROOF_WRITES: &str = "In M4, every write that can silence an alert, hide spend or remove card data: turning polling off (`spend.poll.disable`); removing a budget, raising its amount or widening its scope (`budget.remove`, `budget.add`); removing an alert rule, or acknowledging or snoozing an alert (`alerts.ack`, `alerts.snooze`); removing a subscription (`subs.remove`); moving `expires_at` later or clearing it, or changing a key's `account` or any of its `links` (`items.edit`); raising a manual balance (`spend.manual.set`); registering the CodexBar binary path (`spend.codexbar.set_path`); turning the card number opt-in off (`card.optin`, which erases the number, CVV and card hash after an encrypted vault backup) and removing a card (`card.remove`, which also takes an encrypted vault backup first); and re-sealing an item into `usage_credential` (`items.set_class`). Before the proof is asked for on any of these M4 writes, a caller with agent evidence is refused (`human_only`) before anything is read or written; writes that only tighten (adding or lowering a budget, adding an alert rule, lowering a manual balance, enabling polling) need no proof.";
+/// §4.3: the evidence-tightened views for callers with agent evidence.
+const M4_AGENT_VIEWS: &str = "Under §10a's tightening rule, a caller with agent evidence gets from `spend.summary` and `spend.item` only the view of the project it names (`project_dir` required), with emails, plans and the balances of accounts that project does not bind left out, from `card.list` and `card.show` only slug, brand and last four (cardholder, billing address and expiry refused with `card_refused`), and from `subs.list` only names and amounts of subscriptions linked to that project's keys.";
+
+/// M4-01's wording mutations: leaving §4.4 without the poller, §4.3 without
+/// `items.set_class` (or any other M4 method), §10b without the proof writes,
+/// §5 with `budget_monthly`, or "hard cap" outside §2a-bis and §15.2 each
+/// fail the check.
+#[test]
+fn m4_section_wording_checks_hold() {
+    assert_each_change_fails(
+        "§4.4 the poller receives one key for one poll (D4-03, M4-01)",
+        POLLER_44,
+        &[
+            ("one key for one poll", "its keys"),
+            ("`envcloak spend-poller`", "`envcloak poll`"),
+        ],
+    );
+    let t = fixture();
+    edit(&t, &format!(" {POLLER_44}"), "");
+    assert_fails(
+        &t.home(),
+        &[],
+        "§4.4 lacks the poller crossing (`envcloak spend-poller`, one key for one poll)",
+    );
+
+    // Leaving §4.3 without `items.set_class` fails the §4.3 method check.
+    let t = fixture();
+    edit(
+        &t,
+        "`alerts.snooze`, `items.edit`, `items.set_class`, `card.add`",
+        "`alerts.snooze`, `items.edit`, `card.add`",
+    );
+    edit(
+        &t,
+        "and `items.set_class` need an approval proof (§10b)",
+        "need an approval proof (§10b)",
+    );
+    assert_fails(&t.home(), &[], "§4.3 lacks `items.set_class`");
+
+    // Leaving §10b without a proof write (`spend.poll.disable`) fails both the
+    // required clause and the §10b proof-write check.
+    let t = fixture();
+    edit(&t, "turning polling off (`spend.poll.disable`); ", "");
+    assert_fails(
+        &t.home(),
+        &[],
+        "§10b lacks proof write `spend.poll.disable`",
+    );
+
+    // Putting `budget_monthly` back into §5's `Item` fails both the forbidden
+    // pattern and the §5 check.
+    let t = fixture();
+    edit(
+        &t,
+        "  expires_at, rotated_at, created_at, last_used_at\n  notes",
+        "  expires_at, rotated_at, created_at, last_used_at\n  budget_monthly: Money?\n  notes",
+    );
+    assert_fails(&t.home(), &[], "§5 still holds `budget_monthly`");
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds `budget_monthly` on `Item` (D4-08, M4-01)",
+    );
+
+    // Putting "hard cap" into §8 (outside §2a-bis and §15.2) fails the
+    // section-scoped check.
+    let t = fixture();
+    edit(&t, "support a hard-cap label;", "support a hard cap label;");
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC holds 'hard cap' outside §2a-bis and §15.2",
+    );
+
+    // Putting back the v0.4.1 §8 sentence that had the daemon polling
+    // internally fails FORBIDDEN.
+    let t = fixture();
+    edit(
+        &t,
+        "Only non-secret metrics are stored (sealed like everything else).",
+        "The daemon polls provider adapters on a schedule (default hourly, jittered, backoff on errors) using the stored keys internally. Only non-secret metrics are stored (sealed like everything else).",
+    );
+    assert_fails(
+        &t.home(),
+        &[],
+        "the SPEC still holds polling in the daemon process (D4-03, M4-01)",
+    );
+}
+
+#[test]
+fn m4_hard_cap_proof_writes_and_agent_views_are_required() {
+    assert_each_change_fails(
+        "§2a-bis the four hard-cap conditions (D4-07, M4-01)",
+        HARD_CAP_CONDITIONS,
+        &[
+            ("(1) the cap's currency equals the budget's; ", ""),
+            (
+                "where \"covers\" is set containment over keys",
+                "where \"covers\" is same provider",
+            ),
+            ("within 26 hours", "within 48 hours"),
+        ],
+    );
+    assert_each_change_fails(
+        "§10b M4 writes that need a proof and the agent refusal in front (D4-14, M4-01)",
+        M4_PROOF_WRITES,
+        &[
+            (
+                "a caller with agent evidence is refused (`human_only`) before anything is read or written",
+                "a caller with agent evidence is asked for a proof",
+            ),
+            (
+                "and removing a card (`card.remove`, which also takes an encrypted vault backup first); ",
+                "",
+            ),
+        ],
+    );
+    assert_each_change_fails(
+        "§4.3 the evidence-tightened views for agents (D4-22, M4-01)",
+        M4_AGENT_VIEWS,
+        &[
+            ("(`project_dir` required)", ""),
+            (
+                "only slug, brand and last four (cardholder, billing address and expiry refused with `card_refused`)",
+                "card metadata",
+            ),
+        ],
     );
 }
