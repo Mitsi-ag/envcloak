@@ -10,15 +10,16 @@ Status: M4 architecture, decision index and gate skeleton, opened by task M4-01 
 
 ## 2. Vault storage and item classes (`D4-06`, `D4-09`, `D4-11`, `K4-16`)
 
-- Vault schema version stays `2` unless `M4-02`'s write-cost measurement fires `K4-04`'s kill criterion (`D4-09`, `K4-16`).
-- Spend state is stored in the `policies` table (`TableTag::Policies` = 3, `FieldTag::Policy` = 7) as seven `PolicyKind` variants (`5` to `11`, `M4-02`):
+- Vault schema version stays `2` (`D4-09`, `K4-04` verdict `held` in §5, `K4-16`).
+- Spend state is stored in the `policies` table (`TableTag::Policies` = 3, `FieldTag::Policy` = 7) as seven `PolicyKind` variants (`5` to `11`, `M4-02`, `crates/envcloak-core/src/vault/policy/`):
   - `5` `subscription` (`SubscriptionRecord`)
   - `6` `budget` (`BudgetRecord`)
   - `7` `alert_rule` (`AlertRuleRecord`)
   - `8` `manual_fact` (`ManualFactRecord`)
   - `9` `control_fact` (`ControlFactRecord`)
-  - `10` `spend_snapshot` (`SpendSnapshot`, 35 daily buckets)
+  - `10` `spend_snapshot` (`SpendSnapshot`, 35 daily buckets, capped at `48 KiB`)
   - `11` `account_link` (`AccountLinkRecord`)
+- **Downgrade behaviour (`D4-09`, `D4-11`):** an M4 vault containing any policy record of kinds `5` to `11` opens read-only (`Integrity::Tampered(TamperKind::RowInconsistent)`) in an older M2 or M3 build because unknown policy kinds are refused like tampering (`VAULT.md` "Policy records"), while still serving secret items and values for owner recovery; an M4 vault holding a `card` item (item record version 4, `D4-11`) does not unlock in an older build at all. Both are stated in the release notes.
 - Usage credentials (`ItemClass::UsageCredential` = 5, `M4-19`, `D4-06`) hold organization or admin read keys. Only the poller job builder opens a `usage_credential` through its typed reader; `run`, `mcp`, `mcp-bridge`, `signin` and `reveal` refuse it at the type boundary (`usage_credential_refused`, gate `s6`).
 - Payment cards use M1's baseline `ItemClass::Card` = 2 with item record version 4 (`FieldTag` 17 `card_meta`, 18 `card_number`, 19 `card_cvv`, and keyed-hash domain `envcloak/v2/card-number` under the `card` subkey when the card number opt-in is on; `M4-15`, `M4-16`, `D4-11`, `K4-16`). By default only metadata is stored; full PAN and CVV require explicit opt-in (`card.optin`), cannot be opened outside the card reveal path (gate `s1`), and are revealed only in the signed macOS app through `app.reveal` (`envcloak-reveal-statement/1`, or `envcloak-reveal-statement/2` if `M4-23` requires it; `D4-12`, gate `s2`).
 
@@ -51,7 +52,7 @@ Status: M4 architecture, decision index and gate skeleton, opened by task M4-01 
 
 | Task | Kill criterion / risk | Status |
 |---|---|---|
-| `M4-02` | `K4-04`, `R-M4-23`: 500-item + 50-account snapshot write-cost measurement (`<= 25 ms` median on macOS/Linux) | placeholder (recorded by `M4-02`) |
+| `M4-02` | `K4-04`, `D4-09`, `R-M4-03`..`R-M4-05`: 500-item + 1/10/50-account snapshot write-cost measurement | **held** (`crates/envcloak-core/tests/spend_write_cost.rs::d4_09_write_cost_measurement_retires_k4_04`, `snapshot_size_stays_under_48_kib_and_oversized_records_are_refused`, `unknown_policy_kind_or_version_opens_vault_read_only`, `sigkill_during_snapshot_overwrite_reopens_at_last_commit`): `1` transaction and `2` rows re-sealed (`1` `policies` row + `1` `header` row) per account update across 1, 10 and 50 accounts; state-digest input hashed per commit with 500 items (`1,001` baseline stamped rows at `58` bytes/row) is `58,116` bytes at 1 account, `58,638` bytes at 10 accounts and `60,958` bytes at 50 accounts (`<= 64 KiB` limit); encoded `SpendSnapshot` is `944` bytes for a 4-key 35-bucket account and `10,164` bytes at the maximum 256 keys and 35 buckets (`<= 48 KiB` limit); schema version stays `2` |
 | `M4-05` | `K4-03`, `R-M4-14`..`R-M4-19`: five-control table, 26 h stale-cap rule and single-currency budget math | placeholder (recorded by `M4-05`) |
 | `M4-06b` | `K4-01`, `K4-05`, `R-M4-01`..`R-M4-05`, `R-M4-09`..`R-M4-11`: `ureq` + `rustls` egress, 256 KiB cap, no redirects, no proxy env | placeholder (recorded by `M4-06b`) |
 | `M4-08` | `K4-02`, `R-M4-12`, `R-M4-13`: OpenAI usage-credential spike and `D4-29` never-list enforcement | placeholder (recorded by `M4-08`) |

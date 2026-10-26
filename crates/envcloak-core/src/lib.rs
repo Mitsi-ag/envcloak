@@ -15,6 +15,8 @@ pub mod backup;
 pub mod crypto;
 pub mod file_backup;
 pub mod file_backup_v2;
+pub mod money;
+pub mod pan;
 pub mod passphrase;
 pub mod recovery;
 pub mod secret;
