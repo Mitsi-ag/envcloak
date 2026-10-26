@@ -869,8 +869,12 @@ impl State {
             .as_ref()
             .is_some_and(|set| set.iter().cloned().collect::<Vec<_>>() == expected);
         if !matches {
-            let worker = self.signin.ops.get(&request).and_then(|m| m.active_worker);
-            if let Some(w) = worker {
+            let supervisor = self
+                .signin
+                .ops
+                .get(&request)
+                .and_then(|m| m.supervisor_pipe.as_ref().map(|p| p.supervisor));
+            if let Some(sup) = supervisor {
                 let effects = {
                     let vault = slot_unlocked(&self.slot);
                     let world = LiveDaemonWorld {
@@ -882,9 +886,9 @@ impl State {
                         auths: &self.signin.auths,
                         overrides: &self.signin.world_overrides,
                     };
-                    let _ = self.signin.store.worker_failed(
+                    let _ = self.signin.store.supervisor_failed(
+                        &Channel::Supervisor(sup),
                         &request,
-                        &w,
                         AttemptFailure::UnsupportedSessionScope,
                         now,
                         &world,
@@ -1528,7 +1532,7 @@ pub fn request(
     write_test_send_log(&s.signin.send_log);
     drop(s_guard);
     maybe_drive_test_stub_supervisor(shared, req_id);
-    if std::env::var_os("ENVCLOAK_TEST_STUB_SIGNIN_DIR").is_some() {
+    if test_stub_signin_dir().is_some() {
         let mut s_guard = locked(&shared.state);
         let s: &mut State = &mut s_guard;
         if let Some(op) = s.signin.store.operation(&req_id) {
@@ -2265,11 +2269,16 @@ pub(crate) fn revoke_grants(
     Ok(usize::from(revoked))
 }
 
+fn test_stub_signin_dir() -> Option<PathBuf> {
+    envcloak_sys::test_hook_vars()
+        .into_iter()
+        .find_map(|(k, v)| (k == "ENVCLOAK_TEST_STUB_SIGNIN_DIR").then(|| PathBuf::from(v)))
+}
+
 fn write_test_send_log(log: &[SendRecord]) {
-    let Some(dir_os) = std::env::var_os("ENVCLOAK_TEST_STUB_SIGNIN_DIR") else {
+    let Some(dir) = test_stub_signin_dir() else {
         return;
     };
-    let dir = PathBuf::from(dir_os);
     let mut out = String::new();
     for rec in log {
         let dest = match rec.destination {
@@ -2289,10 +2298,9 @@ fn write_test_send_log(log: &[SendRecord]) {
 fn maybe_drive_test_stub_supervisor(shared: &Shared, req_id: RequestId) {
     use std::io::Write;
 
-    let Some(dir_os) = std::env::var_os("ENVCLOAK_TEST_STUB_SIGNIN_DIR") else {
+    let Some(dir) = test_stub_signin_dir() else {
         return;
     };
-    let dir = PathBuf::from(dir_os);
 
     let (peer_stream, tool_pipes, default_account, default_tenant, default_role, declared_cookies) = {
         let mut s = locked(&shared.state);

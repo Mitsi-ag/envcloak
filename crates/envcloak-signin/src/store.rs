@@ -815,13 +815,39 @@ impl OperationStore {
         let running = self.ops.get(request).is_some_and(|op| {
             op.stop.is_none()
                 && op.generation == Some(worker.generation())
-                && matches!(op.phase, Phase::AttemptRunning | Phase::Captured)
+                && op.phase == Phase::AttemptRunning
         });
         let done = if running {
             self.stop_op(request, StopReason::AttemptFailed(failure), now);
             Ok(())
         } else {
             Err(Discarded)
+        };
+        self.finish(now, world);
+        done
+    }
+
+    /// The supervisor on `from` reported a post-capture failure for `request`
+    /// (such as imported cookie metadata failing verification). Refused unless
+    /// `from` is `request`'s supervisor for the active generation while the
+    /// operation is in [`Phase::Captured`] and not stopped.
+    pub fn supervisor_failed(
+        &mut self,
+        from: &Channel,
+        request: &RequestId,
+        failure: AttemptFailure,
+        now: &Now,
+        world: &dyn World,
+    ) -> Result<(), ChannelRefused> {
+        self.settle(now, world);
+        let matched = self.ops.get(request).is_some_and(|op| {
+            from_supervisor(from, op) && op.stop.is_none() && op.phase == Phase::Captured
+        });
+        let done = if matched {
+            self.stop_op(request, StopReason::AttemptFailed(failure), now);
+            Ok(())
+        } else {
+            Err(ChannelRefused)
         };
         self.finish(now, world);
         done

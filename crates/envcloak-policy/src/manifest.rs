@@ -95,13 +95,13 @@ impl Serialize for Mode {
 
 impl<'de> Deserialize<'de> for Mode {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let s = <&str>::deserialize(d)?;
-        match s {
+        let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+        match s.as_ref() {
             "inject" => Ok(Mode::Inject),
             "proxy" => Ok(Mode::Proxy),
             "signin" => Ok(Mode::SignIn([0u8; 32])),
-            _ if s.starts_with("signin:") => {
-                let hex = &s["signin:".len()..];
+            raw if raw.starts_with("signin:") => {
+                let hex = &raw["signin:".len()..];
                 if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
                     return Err(serde::de::Error::custom("invalid signin mode fingerprint"));
                 }
@@ -112,8 +112,8 @@ impl<'de> Deserialize<'de> for Mode {
                 }
                 Ok(Mode::SignIn(fp))
             }
-            _ => Err(serde::de::Error::unknown_variant(
-                s,
+            raw => Err(serde::de::Error::unknown_variant(
+                raw,
                 &["inject", "proxy", "signin"],
             )),
         }
