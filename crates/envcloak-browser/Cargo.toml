@@ -8,7 +8,25 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+testing = ["envcloak-sys/testing"]
+
 [lints]
 workspace = true
 
 [dependencies]
+base64.workspace = true
+envcloak-signin.workspace = true
+envcloak-sys.workspace = true
+form_urlencoded.workspace = true
+secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+zeroize = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+envcloak-sys = { workspace = true, features = ["testing"] }
+envcloak-testkit.workspace = true
+proptest.workspace = true
+tempfile.workspace = true

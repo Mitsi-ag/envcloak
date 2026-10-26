@@ -110,6 +110,7 @@ mod relay_io;
 mod session;
 mod signal;
 mod sock;
+pub mod spawn;
 mod sync;
 mod termios;
 #[cfg(feature = "testing")]
@@ -128,7 +129,7 @@ pub use dir::{
 };
 pub use fd::{
     chdir_on_spawn, claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn,
-    inherited_fd, pipe_cloexec,
+    inherited_fd, pipe_cloexec, take_inherited_fd,
 };
 pub use fs::open_beneath;
 pub use fsclock::wait_for_clock_past;
@@ -169,6 +170,10 @@ pub use signal::{
     termination_ends_process, termination_recorded, unblock_termination_on_spawn,
 };
 pub use sock::connect_unix;
+pub use spawn::{
+    MAX_SPAWN_FD, SpawnCommand, SpawnOpts, reap_reparented_children,
+    remove_tree_beneath_and_verify, set_child_subreaper, spawn_with_fds,
+};
 pub use sync::{SyncMethod, sync_file};
 pub use termios::{
     TerminalGuard, TerminalSettings, WindowSize, restore_outer_terminal, set_window_size,
