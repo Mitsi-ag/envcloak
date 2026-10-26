@@ -90,6 +90,8 @@ fn main() -> ExitCode {
             }
         }
         ["internal", "panic"] => envcloak_sys::panic_with_input(),
+        ["--signin-driver"] => signin::driver::main(),
+        ["--signin-reaper"] => signin::reaper::main(),
         ["--foreground", rest @ ..] => match parse_options(rest) {
             Some(cfg) => serve(cfg),
             None => usage(),

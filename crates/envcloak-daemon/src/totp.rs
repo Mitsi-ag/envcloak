@@ -239,6 +239,32 @@ impl TotpState {
         sleep: &mut dyn FnMut(Duration),
         audit: &mut dyn FnMut(u64) -> bool,
     ) -> Result<(Code, u64), TotpError> {
+        self.next_code_with_vault(
+            guard,
+            lease,
+            &mut |f| {
+                f(vault);
+                true
+            },
+            clock,
+            sleep,
+            audit,
+        )
+    }
+
+    /// Generates the next one-time code for `lease`'s login item using a
+    /// scoped `with_vault` callback so the daemon's state mutex is never held
+    /// across `sleep` or `audit` callbacks.
+    #[allow(clippy::type_complexity)]
+    pub fn next_code_with_vault(
+        &self,
+        guard: &AttemptGuard,
+        lease: &AttemptLease,
+        with_vault: &mut dyn FnMut(&mut dyn FnMut(&Vault)) -> bool,
+        clock: &mut dyn FnMut() -> u64,
+        sleep: &mut dyn FnMut(Duration),
+        audit: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<(Code, u64), TotpError> {
         if guard.item != lease.item() {
             return Err(TotpError::AccountMismatch);
         }
@@ -260,11 +286,19 @@ impl TotpState {
                 slot.last_submitted_step
             };
 
-            let enrollment = match vault
-                .login_fields()
-                .open(lease, FieldKind::TotpSeed)
-                .map_err(map_vault_err)?
-            {
+            let mut opened: Option<Result<LoginValue, TotpError>> = None;
+            let vault_ok = with_vault(&mut |vault| {
+                opened = Some(
+                    vault
+                        .login_fields()
+                        .open(lease, FieldKind::TotpSeed)
+                        .map_err(map_vault_err),
+                );
+            });
+            if !vault_ok {
+                return Err(TotpError::VaultLocked);
+            }
+            let enrollment = match opened.ok_or(TotpError::VaultLocked)?? {
                 LoginValue::Totp(e) => e,
                 LoginValue::Text(_) => return Err(TotpError::NoTotpEnrolled),
             };
@@ -312,6 +346,23 @@ impl TotpState {
                 return Err(TotpError::AuditFailed);
             }
 
+            // Re-verify lease freshness after any wait/audit before releasing the code.
+            {
+                let slot = guard
+                    .entry
+                    .slot
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !slot.in_use {
+                    return Err(TotpError::AccountMismatch);
+                }
+                if lease.generation() != self.generation.load(Ordering::SeqCst)
+                    || lease.revision() < slot.min_revision
+                {
+                    return Err(TotpError::LeaseStale);
+                }
+            }
+
             let generated = code(&enrollment.seed, params, step);
             {
                 let mut slot = guard
@@ -332,6 +383,24 @@ fn map_vault_err(e: envcloak_core::vault::VaultError) -> TotpError {
         VaultErrorKind::UnknownField => TotpError::NoTotpEnrolled,
         other => TotpError::Vault(other),
     }
+}
+
+/// Copies a UTF-8 [`SecretBytes`] field into a [`zeroize::Zeroizing<String>`]
+/// for transmission over the private daemon-to-driver control pipe.
+#[allow(clippy::disallowed_methods)]
+pub fn secret_to_zeroizing_utf8(
+    secret: &SecretBytes,
+) -> Result<zeroize::Zeroizing<String>, TotpError> {
+    use secrecy::ExposeSecret;
+    let s = std::str::from_utf8(secret.expose_secret()).map_err(|_| TotpError::InvalidParams)?;
+    Ok(zeroize::Zeroizing::new(s.to_owned()))
+}
+
+/// Copies a generated [`Code`] into a [`zeroize::Zeroizing<String>`] for
+/// transmission over the private daemon-to-driver control pipe.
+#[allow(clippy::disallowed_methods)]
+pub fn code_to_zeroizing_utf8(code: &Code) -> Result<zeroize::Zeroizing<String>, TotpError> {
+    secret_to_zeroizing_utf8(code.as_secret())
 }
 
 #[cfg(test)]

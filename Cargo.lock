@@ -723,6 +723,7 @@ name = "envcloakd"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "envcloak-browser",
  "envcloak-core",
  "envcloak-ipc",
  "envcloak-policy",
@@ -735,6 +736,7 @@ dependencies = [
  "libc",
  "rusqlite",
  "secrecy",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

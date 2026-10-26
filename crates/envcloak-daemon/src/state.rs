@@ -247,7 +247,7 @@ pub struct State {
     /// Last rollback anchor synced for the currently unlocked vault.
     last_synced_anchor: Option<Anchor>,
     /// Daemon TOTP state across login accounts (M2b-03).
-    totp: crate::totp::TotpState,
+    totp: Arc<crate::totp::TotpState>,
     /// Daemon sign-in operations, retry store, and supervisor control pipes (M2b-05).
     pub(crate) signin: crate::signin::ops::SigninState,
 }
@@ -261,10 +261,26 @@ impl State {
         } else {
             KeychainAnchorState::Unavailable
         };
-        let start_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-        State {
+        let start_unix = envcloak_sys::test_hook_vars()
+            .into_iter()
+            .find_map(|(k, v)| {
+                (k == "ENVCLOAK_TEST_TOTP_START_UNIX").then(|| v.to_str()?.parse::<u64>().ok())?
+            })
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            });
+        let totp = Arc::new(crate::totp::TotpState::after_start(start_unix));
+        let boot_id = crate::signin::sweep::BootId::current();
+        let sweep_report = crate::signin::sweep::run(&paths.data_dir, boot_id.clone()).ok();
+        let attempt_supervisor = Arc::new(crate::signin::attempt::AttemptSupervisor::with_totp(
+            paths.data_dir.clone(),
+            Arc::clone(&totp),
+            None,
+            boot_id,
+        ));
+        let mut state = State {
             slot: probe(&paths),
             paths,
             timer: LockTimer::new(idle_limit, now),
@@ -291,9 +307,41 @@ impl State {
             keychain_anchor,
             anchored_vaults: BTreeSet::new(),
             last_synced_anchor: None,
-            totp: crate::totp::TotpState::after_start(start_unix),
-            signin: crate::signin::ops::SigninState::new(),
+            totp,
+            signin: crate::signin::ops::SigninState::with_supervisor(attempt_supervisor),
+        };
+        if let Some(report) = sweep_report {
+            let pid = i32::try_from(std::process::id()).unwrap_or(0);
+            for attempt_id in report.confirmed {
+                state.audit(AuditEvent::SigninCleanup {
+                    pid,
+                    outcome: "confirmed",
+                    attempt: attempt_id,
+                    reason: None,
+                });
+            }
+            for attempt_id in report.unconfirmed {
+                state.audit(AuditEvent::SigninCleanup {
+                    pid,
+                    outcome: "unconfirmed",
+                    attempt: attempt_id,
+                    reason: Some("reaper_teardown_unconfirmed"),
+                });
+            }
+            for attempt_id in report.ended_by_reboot {
+                state.audit(AuditEvent::SigninCleanup {
+                    pid,
+                    outcome: "ended_by_reboot",
+                    attempt: attempt_id,
+                    reason: None,
+                });
+            }
         }
+        state
+    }
+
+    pub(crate) fn data_dir(&self) -> &std::path::Path {
+        &self.paths.data_dir
     }
 
     /// Replaces the rollback anchor store (for tests).
@@ -515,11 +563,7 @@ impl State {
         // restore lease.
         self.grants.on_lock();
         self.totp.on_lock();
-        let lock_now = Now {
-            including_sleep: Duration::ZERO,
-            awake: Duration::ZERO,
-            wall: std::time::SystemTime::now(),
-        };
+        let lock_now = crate::clock::now_of(&crate::clock::SystemClocks);
         if reason == LockReason::Sleep {
             self.signin_on_sleep(&lock_now);
         } else {
@@ -1273,6 +1317,8 @@ impl State {
             } else {
                 0
             },
+            cleanup_unconfirmed: crate::signin::sweep::unconfirmed_count(&self.paths.data_dir)
+                .unwrap_or(0),
         }
     }
 
@@ -1315,6 +1361,32 @@ impl State {
             self.sync_anchor();
         }
         written
+    }
+
+    /// Borrows the unlocked [`Vault`] and a durable `signin_intent` audit writer
+    /// simultaneously without conflicting borrows on `self`.
+    pub(crate) fn with_unlocked_vault_and_intent_audit<R>(
+        &mut self,
+        event: AuditEvent,
+        f: impl FnOnce(&Vault, &mut dyn FnMut() -> bool) -> R,
+    ) -> Result<R, RpcError> {
+        self.unlocked()?;
+        self.audit_open();
+        let Slot::Unlocked(v) = &self.slot else {
+            return Err(RpcError::new(ErrorKind::VaultLocked));
+        };
+        let audit = &mut self.audit;
+        let mut written = false;
+        let mut writer = || {
+            written = Self::write_delivery(audit, event.clone());
+            written
+        };
+        let out = f(v, &mut writer);
+        if written {
+            self.anchor_if_due(None);
+            self.sync_anchor();
+        }
+        Ok(out)
     }
 
     /// The durable append alone, so a provisional project transaction can

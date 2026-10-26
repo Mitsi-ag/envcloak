@@ -158,6 +158,9 @@ pub struct WorldOverrides {
     pub root_alive: Option<bool>,
 }
 
+use crate::signin::attempt::{AttemptSupervisor, Event as AttemptEvent};
+use std::sync::Arc;
+
 /// Daemon sign-in state held inside [`State`].
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -169,6 +172,7 @@ pub struct SigninState {
     browser_generation: u64,
     send_log: Vec<SendRecord>,
     world_overrides: WorldOverrides,
+    attempt_supervisor: Arc<AttemptSupervisor>,
 }
 
 impl Default for SigninState {
@@ -180,6 +184,19 @@ impl Default for SigninState {
 #[allow(dead_code)]
 impl SigninState {
     pub fn new() -> Self {
+        let start_unix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let sup = Arc::new(AttemptSupervisor::new(
+            PathBuf::new(),
+            start_unix,
+            None,
+            None,
+        ));
+        Self::with_supervisor(sup)
+    }
+
+    pub fn with_supervisor(attempt_supervisor: Arc<AttemptSupervisor>) -> Self {
         let mut instance_bytes = [0u8; 16];
         envcloak_core::crypto::fill_random_or_panic(&mut instance_bytes);
         let daemon_instance = DaemonInstance::from_bytes(instance_bytes);
@@ -191,7 +208,16 @@ impl SigninState {
             browser_generation: 1,
             send_log: Vec::new(),
             world_overrides: WorldOverrides::default(),
+            attempt_supervisor,
         }
+    }
+
+    pub fn attempt_supervisor(&self) -> &Arc<AttemptSupervisor> {
+        &self.attempt_supervisor
+    }
+
+    pub fn held_state_count(&self) -> usize {
+        self.attempt_supervisor.held_state_count()
     }
 
     pub fn browser_generation(&self) -> u64 {
@@ -575,6 +601,10 @@ impl State {
     }
 
     pub fn signin_on_lock(&mut self, now: &Now) {
+        self.signin.attempt_supervisor.on_event(AttemptEvent::Lock);
+        for meta in self.signin.ops.values_mut() {
+            meta.captured_state = None;
+        }
         let effects = {
             let vault = slot_unlocked(&self.slot);
             let world = LiveDaemonWorld {
@@ -593,6 +623,7 @@ impl State {
     }
 
     pub fn signin_on_sleep(&mut self, now: &Now) {
+        self.signin.attempt_supervisor.on_event(AttemptEvent::Sleep);
         self.signin_on_lock(now);
     }
 
@@ -662,8 +693,23 @@ impl State {
                     generation,
                     ..
                 } => {
+                    let stop_reason = self
+                        .signin
+                        .store
+                        .operation(&request)
+                        .and_then(|op| op.stop().map(|s| s.reason));
+                    let attempt_ev = match stop_reason {
+                        Some(StopReason::Locked) => AttemptEvent::Lock,
+                        Some(StopReason::RootExited) => AttemptEvent::RootExit { request },
+                        Some(StopReason::AttemptTimedOut) => AttemptEvent::Timeout { request },
+                        _ => AttemptEvent::Cancel { request },
+                    };
+                    self.signin.attempt_supervisor.on_event(attempt_ev);
+
                     if let Some(meta) = self.signin.ops.get_mut(&request) {
-                        meta.captured_state = None;
+                        if meta.captured_state.take().is_some() {
+                            self.signin.attempt_supervisor.note_state_released();
+                        }
                         if meta
                             .active_worker
                             .is_some_and(|w| w.generation() == generation)
@@ -793,6 +839,7 @@ impl State {
         let mut cookies_wire = Vec::new();
         let mut storage_wire = Vec::new();
         if let Some(captured) = meta.captured_state.take() {
+            self.signin.attempt_supervisor.note_state_released();
             for (decl, val) in captured.cookies {
                 let (domain, host_only) = match &decl.domain {
                     envcloak_signin::CookieDomain::HostOnly(h) => (h.to_string(), true),
@@ -1131,11 +1178,6 @@ impl State {
         captured: CapturedBrowserState,
         now: &Now,
     ) -> Result<(), RpcError> {
-        if let Some(meta) = self.signin.ops.get_mut(&request)
-            && meta.active_worker == Some(worker)
-        {
-            meta.captured_state = Some(captured);
-        }
         let (res, effects) = {
             let vault = slot_unlocked(&self.slot);
             let world = LiveDaemonWorld {
@@ -1155,7 +1197,14 @@ impl State {
             (r, eff)
         };
         self.execute_signin_effects(effects, now, None);
-        res.map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "worker_discarded"))
+        res.map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "worker_discarded"))?;
+        if let Some(meta) = self.signin.ops.get_mut(&request)
+            && meta.active_worker == Some(worker)
+            && meta.captured_state.replace(captured).is_none()
+        {
+            self.signin.attempt_supervisor.note_state_held();
+        }
+        Ok(())
     }
 
     /// Reports worker failure on `request` for `worker`.
@@ -1187,6 +1236,34 @@ impl State {
         self.execute_signin_effects(effects, now, None);
         res.map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "worker_discarded"))
     }
+
+    /// Reports worker cleanup result (`cleaned`) on `request` for `worker`.
+    pub fn signin_cleanup_result(
+        &mut self,
+        request: RequestId,
+        worker: WorkerId,
+        cleaned: bool,
+        now: &Now,
+    ) {
+        let effects = {
+            let vault = slot_unlocked(&self.slot);
+            let world = LiveDaemonWorld {
+                daemon: self.signin.daemon_instance,
+                vault,
+                catalog: None,
+                browser_generation: self.signin.browser_generation,
+                ops: &self.signin.ops,
+                auths: &self.signin.auths,
+                overrides: &self.signin.world_overrides,
+            };
+            let _ = self
+                .signin
+                .store
+                .cleanup_result(&request, &worker, cleaned, now, &world);
+            self.signin.store.drain_effects()
+        };
+        self.execute_signin_effects(effects, now, None);
+    }
 }
 
 fn state_token(s: OpState) -> &'static str {
@@ -1209,7 +1286,7 @@ fn cleanup_token(c: Cleanup) -> &'static str {
         Cleanup::NotNeeded => "not_needed",
         Cleanup::Pending => "pending",
         Cleanup::Done => "done",
-        Cleanup::Failed => "failed",
+        Cleanup::Failed => "cleanup_unconfirmed",
     }
 }
 
@@ -1275,10 +1352,18 @@ fn status_view_of(
         delivered_context,
         cleanup: cleanup_token(status.receipt.cleanup).to_owned(),
         revocation: revocation_token(status.receipt.revocation).to_owned(),
-        reason: status
-            .receipt
-            .reason
-            .map(|r| stop_reason_token(r).to_owned()),
+        reason: if status.receipt.cleanup == Cleanup::Failed
+            && matches!(
+                status.receipt.reason,
+                Some(StopReason::AttemptFailed(AttemptFailure::WorkerLost))
+            ) {
+            Some("cleanup_unconfirmed".to_owned())
+        } else {
+            status
+                .receipt
+                .reason
+                .map(|r| stop_reason_token(r).to_owned())
+        },
         shared_loopback_cookie_jar,
         authorization,
     }
@@ -1321,7 +1406,7 @@ pub fn request(
     let root_inst = Instance::from(&caller.root());
     let ev_digest = subject_evidence_digest(&caller);
 
-    let mut s_guard = locked(&shared.state);
+    let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
     s.signin_reconcile_at(&now, Some(&shared.catalog));
@@ -1532,8 +1617,9 @@ pub fn request(
     write_test_send_log(&s.signin.send_log);
     drop(s_guard);
     maybe_drive_test_stub_supervisor(shared, req_id);
-    if test_stub_signin_dir().is_some() {
-        let mut s_guard = locked(&shared.state);
+    maybe_drive_test_worker_spec(shared, req_id);
+    if test_stub_signin_dir().is_some() || test_worker_spec_path().is_some() {
+        let mut s_guard = locked_ready(shared);
         let s: &mut State = &mut s_guard;
         if let Some(op) = s.signin.store.operation(&req_id) {
             return Ok(status_view_of(s, req_id, op.status(), shared_jar));
@@ -1555,7 +1641,7 @@ pub fn status(
     let req_id = parse_signin_req_id(&p.request)?;
     let caller = evidence(shared, peer, &[])?;
     let caller_root = Instance::from(&caller.root());
-    let mut s_guard = locked(&shared.state);
+    let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
     let (res, effects) = {
@@ -1601,7 +1687,7 @@ pub fn cancel(
     let req_id = parse_signin_req_id(&p.request)?;
     let caller = evidence(shared, peer, &[])?;
     let caller_root = Instance::from(&caller.root());
-    let mut s_guard = locked(&shared.state);
+    let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
     let (res, effects) = {
@@ -1638,7 +1724,7 @@ pub fn end(
 ) -> Result<SigninStatusView, RpcError> {
     let caller = evidence(shared, peer, &[])?;
     let caller_root = Instance::from(&caller.root());
-    let mut s_guard = locked(&shared.state);
+    let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
 
@@ -1803,7 +1889,7 @@ pub(crate) fn pending_state(
     let req_id = RequestId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &[])?;
     let caller_root = Instance::from(&caller.root());
-    let mut s_guard = locked(&shared.state);
+    let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
     let (res, effects) = {
@@ -1850,7 +1936,7 @@ pub(crate) fn pending_get(
     let req_id = RequestId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "pending.get")?;
-    let mut s = locked(&shared.state);
+    let mut s = locked_ready(shared);
     s.refuse_if_tampered()?;
     let now = now_of(&shared.clocks);
     let meta_subject = s
@@ -1903,6 +1989,7 @@ pub(crate) fn approve(
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "approve")?;
 
+    let _gate = locked(&shared.proof_gate);
     let (vault, generation, pass, chosen_options) = {
         let mut s = locked(&shared.state);
         let now = now_of(&shared.clocks);
@@ -1951,10 +2038,7 @@ pub(crate) fn approve(
         (vault, generation, pass, chosen_options)
     };
 
-    let verified = {
-        let _gate = locked(&shared.proof_gate);
-        vault.verify_passphrase(&pass)
-    };
+    let verified = vault.verify_passphrase(&pass);
     drop(pass);
 
     {
@@ -1984,10 +2068,11 @@ pub(crate) fn approve(
             }
         }
     }
+    drop(_gate);
 
     envcloak_sys::pause_point("signin.approve.during_proof");
 
-    let mut s = locked(&shared.state);
+    let mut s = locked_ready(shared);
     let now = now_of(&shared.clocks);
     let caller = evidence(shared, peer, &p.claims)?;
     let meta_subject = s
@@ -2016,6 +2101,7 @@ pub(crate) fn approve(
     )?;
     drop(s);
     maybe_drive_test_stub_supervisor(shared, req_id);
+    maybe_drive_test_worker_spec(shared, req_id);
     Ok(res)
 }
 
@@ -2128,7 +2214,7 @@ pub(crate) fn deny(
     p: RequestParams,
 ) -> Result<DeniedView, RpcError> {
     let req_id = RequestId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
-    let mut s_guard = locked(&shared.state);
+    let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
     let (res, effects) = {
@@ -2451,6 +2537,584 @@ fn maybe_drive_test_stub_supervisor(shared: &Shared, req_id: RequestId) {
         if let Some((_from_client, to_client)) = tool_pipes {
             let mut f = std::fs::File::from(to_client);
             let _ = writeln!(f, "published:{}:{}", pub_msg.generation, pub_msg.context);
+        }
+    }
+}
+
+/// Configuration for driving a real supervised sign-in attempt (`envcloakd --signin-driver`
+/// + `envcloakd --signin-reaper` + Chrome for Testing).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SupervisedWorkerRunConfig {
+    pub bootstrap: crate::signin::driver::DriverBootstrap,
+    pub chrome_exe: PathBuf,
+    pub chrome_sha256: String,
+    #[serde(default)]
+    pub host_resolver_rules: Option<String>,
+    #[serde(default)]
+    pub test_ca_spki_sha256: Option<String>,
+    #[serde(default)]
+    pub extra_chrome_args: Vec<String>,
+    #[serde(default)]
+    pub status_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub totp_fixed_unix: Option<u64>,
+    #[serde(default)]
+    pub totp_no_sleep: bool,
+}
+
+/// Snapshot written to `<status_dir>/done.json` and `<status_dir>/<attempt_id>.done.json`
+/// when a supervised sign-in attempt completes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AttemptDoneSnapshot {
+    pub request: String,
+    pub attempt_id: String,
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub cleanup_confirmed: bool,
+    pub held_state_count: usize,
+}
+
+fn write_done_snapshot(status_dir: Option<&std::path::Path>, snap: &AttemptDoneSnapshot) {
+    if let Some(dir) = status_dir {
+        let _ = std::fs::create_dir_all(dir);
+        write_atomic_json(&dir.join("done.json"), snap);
+        write_atomic_json(&dir.join(format!("{}.done.json", snap.attempt_id)), snap);
+    }
+}
+
+fn test_worker_spec_path() -> Option<PathBuf> {
+    envcloak_sys::test_hook_vars()
+        .into_iter()
+        .find_map(|(k, v)| (k == "ENVCLOAK_TEST_SIGNIN_WORKER_SPEC").then(|| PathBuf::from(v)))
+}
+
+fn load_test_worker_spec_for_target(target_name: &str) -> Option<SupervisedWorkerRunConfig> {
+    let base = test_worker_spec_path()?;
+    let candidate = if base.is_dir() {
+        let per_target = base.join(format!("{target_name}.json"));
+        if per_target.exists() {
+            per_target
+        } else {
+            base.join("default.json")
+        }
+    } else {
+        base
+    };
+    let bytes = std::fs::read(&candidate).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_atomic_json(path: &std::path::Path, value: &impl serde::Serialize) {
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+fn locked_ready(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
+    loop {
+        {
+            let s = locked(&shared.state);
+            if !matches!(s.slot, Slot::Busy) {
+                return s;
+            }
+        }
+        let _gate = locked(&shared.proof_gate);
+        let s = locked(&shared.state);
+        if !matches!(s.slot, Slot::Busy) {
+            return s;
+        }
+        drop(s);
+        drop(_gate);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn maybe_drive_test_worker_spec(shared: &Shared, req_id: RequestId) {
+    let target_name = {
+        let s = locked_ready(shared);
+        let Some(meta) = s.signin.ops.get(&req_id) else {
+            return;
+        };
+        if meta.supervisor_pipe.is_some() {
+            return;
+        }
+        let active_or_queued = meta.active_worker.is_some()
+            || s.signin
+                .store
+                .operation(&req_id)
+                .is_some_and(|op| op.stop().is_none() && op.phase() == Phase::Approved);
+        if !active_or_queued {
+            return;
+        }
+        meta.target_name.clone()
+    };
+    let Some(cfg) = load_test_worker_spec_for_target(&target_name) else {
+        return;
+    };
+    run_supervised_signin_attempt(shared, req_id, cfg);
+}
+
+/// Runs a supervised sign-in attempt for `req_id` using [`AttemptSupervisor`],
+/// releasing `shared.state` while waiting on the per-account [`AttemptGuard`]
+/// and while driving the session loop so concurrent RPCs (`cancel`, `lock`,
+/// `status`, `items.rotate`, or parallel attempts on other accounts) are never
+/// blocked.
+pub fn run_supervised_signin_attempt(
+    shared: &Shared,
+    req_id: RequestId,
+    cfg: SupervisedWorkerRunConfig,
+) {
+    use crate::signin::attempt::SupervisedAttemptResult;
+    use std::io::Write;
+
+    let Ok(spec) = cfg.bootstrap.clone().into_spec() else {
+        return;
+    };
+
+    // If `OperationStore::start_ready` queued this approved operation behind
+    // another active attempt for the same account (`Phase::Approved` with
+    // `active_worker == None`), wait without holding `shared.state` until the
+    // prior attempt finishes and `start_ready` assigns `active_worker`.
+    let (
+        supervisor,
+        totp,
+        worker,
+        item,
+        login_slug,
+        peer_pid,
+        subject_summary,
+        auth_str,
+        default_account,
+        default_tenant,
+        default_role,
+        declared_cookies,
+    ) = loop {
+        let mut s = locked_ready(shared);
+        let now = now_of(&shared.clocks);
+        s.signin_reconcile_at(&now, Some(&shared.catalog));
+        let Some(meta) = s.signin.ops.get(&req_id) else {
+            return;
+        };
+        if meta.supervisor_pipe.is_some() {
+            return;
+        }
+        if let Some(worker) = meta.active_worker {
+            let supervisor = Arc::clone(&s.signin.attempt_supervisor);
+            let totp = Arc::clone(supervisor.totp());
+            let item = meta.login_item;
+            let login_slug = meta.login_slug.clone();
+            let peer_pid = meta.peer.pid;
+            let subject_summary = meta.subject_summary.clone();
+            let auth_str = s
+                .signin
+                .store
+                .operation(&req_id)
+                .and_then(|o| o.authorization().map(|a| a.to_string()));
+            let default_account = meta.scope.account().account.as_str().to_owned();
+            let default_tenant = meta
+                .scope
+                .account()
+                .tenant
+                .as_ref()
+                .map(|t| t.as_str().to_owned());
+            let default_role = meta.scope.account().role.as_str().to_owned();
+            let declared_cookies: Vec<DeclaredCookie> = meta
+                .scope
+                .target()
+                .transfer
+                .cookies
+                .iter()
+                .cloned()
+                .collect();
+            break (
+                supervisor,
+                totp,
+                worker,
+                item,
+                login_slug,
+                peer_pid,
+                subject_summary,
+                auth_str,
+                default_account,
+                default_tenant,
+                default_role,
+                declared_cookies,
+            );
+        }
+        let still_queued = s
+            .signin
+            .store
+            .operation(&req_id)
+            .is_some_and(|op| op.stop().is_none() && op.phase() == Phase::Approved);
+        drop(s);
+        if !still_queued {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    // Acquire the per-account serialization guard OUTSIDE shared.state so a
+    // second concurrent attempt for the same account blocks here without
+    // holding the daemon state mutex.
+    let account_guard = totp.acquire_account(item);
+
+    let attempt_id = format!("req-{req_id}-w-{}", worker.generation().get());
+    let start_res = {
+        let mut s = locked_ready(shared);
+        let now = now_of(&shared.clocks);
+        let still_active = s
+            .signin
+            .ops
+            .get(&req_id)
+            .is_some_and(|m| m.active_worker == Some(worker) && m.supervisor_pipe.is_none())
+            && s.signin
+                .store
+                .operation(&req_id)
+                .is_some_and(|op| op.stop().is_none() && op.phase() == Phase::AttemptRunning);
+        if !still_active {
+            return;
+        }
+        let started_wall_secs = now
+            .wall
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+
+        let unconfirmed_at_cap = crate::signin::sweep::unconfirmed_count(s.data_dir()).unwrap_or(0)
+            as usize
+            >= crate::signin::sweep::MAX_TOMBSTONES;
+
+        let chrome_exe = cfg.chrome_exe.clone();
+        let chrome_sha256 = cfg.chrome_sha256.clone();
+        let host_resolver_rules = cfg.host_resolver_rules.clone();
+        let test_ca_spki_sha256 = cfg.test_ca_spki_sha256.clone();
+        let extra_chrome_args = cfg.extra_chrome_args.clone();
+
+        let intent_event = AuditEvent::SigninIntent {
+            pid: peer_pid,
+            subject: subject_summary.clone(),
+            request: req_id.to_string(),
+            authorization: auth_str.clone(),
+            item: (item, login_slug.clone()),
+            worker: worker.generation().get(),
+        };
+
+        let started =
+            s.with_unlocked_vault_and_intent_audit(intent_event, |vault, intent_audit_fn| {
+                supervisor.start_with_guard(
+                    account_guard,
+                    req_id,
+                    worker,
+                    item,
+                    vault,
+                    spec,
+                    chrome_exe,
+                    chrome_sha256,
+                    host_resolver_rules,
+                    test_ca_spki_sha256,
+                    extra_chrome_args,
+                    started_wall_secs,
+                    intent_audit_fn,
+                )
+            });
+
+        match started {
+            Ok(Ok(id)) => Ok(id),
+            Ok(Err(failure)) => {
+                let _ = s.signin_worker_failed(req_id, worker, failure, &now);
+                let out_reason = if unconfirmed_at_cap {
+                    "cleanup_unconfirmed"
+                } else {
+                    stop_reason_token(StopReason::AttemptFailed(failure))
+                };
+                if failure != AttemptFailure::AuditFailed {
+                    if unconfirmed_at_cap {
+                        s.signin_cleanup_result(req_id, worker, false, &now);
+                        s.audit(AuditEvent::SigninCleanup {
+                            pid: peer_pid,
+                            outcome: "unconfirmed",
+                            attempt: attempt_id.clone(),
+                            reason: Some("cleanup_unconfirmed"),
+                        });
+                    }
+                    s.audit(AuditEvent::SigninOutcome {
+                        pid: peer_pid,
+                        subject: subject_summary.clone(),
+                        outcome: "failed",
+                        request: req_id.to_string(),
+                        authorization: auth_str.clone(),
+                        item: (item, login_slug.clone()),
+                        reason: Some(out_reason),
+                        worker: worker.generation().get(),
+                    });
+                }
+                write_done_snapshot(
+                    cfg.status_dir.as_deref(),
+                    &AttemptDoneSnapshot {
+                        request: req_id.to_string(),
+                        attempt_id: attempt_id.clone(),
+                        outcome: "failed".to_owned(),
+                        reason: Some(out_reason.to_owned()),
+                        cleanup_confirmed: !unconfirmed_at_cap,
+                        held_state_count: supervisor.held_state_count(),
+                    },
+                );
+                Err(())
+            }
+            Err(_) => {
+                let _ = s.signin_worker_failed(req_id, worker, AttemptFailure::WorkerLost, &now);
+                write_done_snapshot(
+                    cfg.status_dir.as_deref(),
+                    &AttemptDoneSnapshot {
+                        request: req_id.to_string(),
+                        attempt_id: attempt_id.clone(),
+                        outcome: "failed".to_owned(),
+                        reason: Some("worker_lost".to_owned()),
+                        cleanup_confirmed: false,
+                        held_state_count: supervisor.held_state_count(),
+                    },
+                );
+                Err(())
+            }
+        }
+    };
+
+    if start_res.is_err() {
+        return;
+    }
+
+    if let Some(status_dir) = &cfg.status_dir
+        && let Some(snap) = supervisor.active_snapshot(req_id)
+    {
+        let _ = std::fs::create_dir_all(status_dir);
+        write_atomic_json(&status_dir.join("ready.json"), &snap);
+        write_atomic_json(
+            &status_dir.join(format!("{}.ready.json", snap.attempt_id)),
+            &snap,
+        );
+    }
+
+    let mut with_vault = |cb: &mut dyn FnMut(&Vault)| -> bool {
+        let s = locked_ready(shared);
+        let Ok(v) = s.unlocked() else {
+            return false;
+        };
+        cb(v);
+        true
+    };
+    let totp_fixed_unix = cfg.totp_fixed_unix;
+    let totp_no_sleep = cfg.totp_no_sleep;
+    let mut clock_fn = || -> u64 {
+        let offset_secs = envcloak_sys::test_clock_offset().as_secs();
+        totp_fixed_unix.map_or_else(
+            || {
+                now_of(&shared.clocks)
+                    .wall
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs())
+            },
+            |base| base.saturating_add(offset_secs),
+        )
+    };
+    let mut sleep_fn = |d: Duration| {
+        if !totp_no_sleep {
+            std::thread::sleep(d);
+        }
+    };
+    let mut totp_audit_fn =
+        |_step: u64| -> bool { envcloak_sys::fail_point("signin.totp_audit").is_ok() };
+
+    let result = supervisor.run_attempt_to_completion(
+        req_id,
+        &mut with_vault,
+        &mut clock_fn,
+        &mut sleep_fn,
+        &mut totp_audit_fn,
+    );
+
+    match result {
+        SupervisedAttemptResult::Captured {
+            attempt_id,
+            state,
+            cleanup_confirmed,
+        } => {
+            let (peer_stream, tool_pipes) = {
+                let mut s = locked_ready(shared);
+                let now = now_of(&shared.clocks);
+                s.audit(AuditEvent::SigninOutcome {
+                    pid: peer_pid,
+                    subject: subject_summary.clone(),
+                    outcome: "captured",
+                    request: req_id.to_string(),
+                    authorization: auth_str.clone(),
+                    item: (item, login_slug.clone()),
+                    reason: None,
+                    worker: worker.generation().get(),
+                });
+                s.audit(AuditEvent::SigninCleanup {
+                    pid: peer_pid,
+                    outcome: if cleanup_confirmed {
+                        "confirmed"
+                    } else {
+                        "unconfirmed"
+                    },
+                    attempt: attempt_id.clone(),
+                    reason: (!cleanup_confirmed).then_some("reaper_teardown_unconfirmed"),
+                });
+                if s.signin_worker_captured(req_id, worker, state, &now)
+                    .is_err()
+                {
+                    write_test_send_log(&s.signin.send_log);
+                    write_done_snapshot(
+                        cfg.status_dir.as_deref(),
+                        &AttemptDoneSnapshot {
+                            request: req_id.to_string(),
+                            attempt_id,
+                            outcome: "discarded".to_owned(),
+                            reason: None,
+                            cleanup_confirmed,
+                            held_state_count: supervisor.held_state_count(),
+                        },
+                    );
+                    return;
+                }
+                let tool_pipes = s
+                    .signin
+                    .ops
+                    .get_mut(&req_id)
+                    .and_then(|m| m.tool_pipes.take());
+                let Some(peer_stream) = s
+                    .signin
+                    .ops
+                    .get_mut(&req_id)
+                    .and_then(|m| m.supervisor_pipe.as_mut())
+                    .and_then(|p| p.peer_stream.take())
+                else {
+                    write_test_send_log(&s.signin.send_log);
+                    return;
+                };
+                write_test_send_log(&s.signin.send_log);
+                (peer_stream, tool_pipes)
+            };
+
+            envcloak_sys::pause_point("signin.after_capture");
+
+            let mut s = locked_ready(shared);
+            let now = now_of(&shared.clocks);
+            if s.signin_verify_imported_cookies(req_id, &declared_cookies, &now)
+                .is_err()
+            {
+                write_test_send_log(&s.signin.send_log);
+                return;
+            }
+            if s.signin_inject_over_bound_pipe(req_id, &now).is_err() {
+                write_test_send_log(&s.signin.send_log);
+                return;
+            }
+            write_test_send_log(&s.signin.send_log);
+
+            let Ok(ToSupervisor::InjectState(inj)) = recv_from_supervisor(&peer_stream) else {
+                return;
+            };
+            let id_msg = FromSupervisor::IdentityResponse(SupervisorIdentityResponse {
+                request: inj.request,
+                generation: inj.generation,
+                context: inj.context,
+                account: Some(default_account),
+                tenant: default_tenant,
+                role: Some(default_role),
+            });
+            if send_to_supervisor(&peer_stream, &id_msg).is_err() {
+                return;
+            }
+            let _ = s.signin_poll_supervisor_pipe(req_id, &now);
+            write_test_send_log(&s.signin.send_log);
+
+            if let Ok(ToSupervisor::Publish(pub_msg)) = recv_from_supervisor(&peer_stream)
+                && pub_msg.published
+            {
+                let chk = FromSupervisor::Check(SupervisorCheck {
+                    request: pub_msg.request,
+                    generation: pub_msg.generation,
+                    context: pub_msg.context.clone(),
+                    tool: Some("browser_navigate".into()),
+                    cleaned: None,
+                });
+                if send_to_supervisor(&peer_stream, &chk).is_ok() {
+                    let _ = s.signin_poll_supervisor_pipe(req_id, &now);
+                }
+                if let Some((_from_client, to_client)) = tool_pipes {
+                    let mut f = std::fs::File::from(to_client);
+                    let _ = writeln!(f, "published:{}:{}", pub_msg.generation, pub_msg.context);
+                }
+            }
+            write_done_snapshot(
+                cfg.status_dir.as_deref(),
+                &AttemptDoneSnapshot {
+                    request: req_id.to_string(),
+                    attempt_id,
+                    outcome: "captured".to_owned(),
+                    reason: None,
+                    cleanup_confirmed,
+                    held_state_count: supervisor.held_state_count(),
+                },
+            );
+        }
+        SupervisedAttemptResult::Failed {
+            attempt_id,
+            failure,
+            stop_reason,
+            cleanup_confirmed,
+        } => {
+            let mut s = locked_ready(shared);
+            let now = now_of(&shared.clocks);
+            let reason_tok = if !cleanup_confirmed
+                && stop_reason.is_none()
+                && failure == AttemptFailure::WorkerLost
+            {
+                "cleanup_unconfirmed"
+            } else {
+                stop_reason.map_or_else(
+                    || stop_reason_token(StopReason::AttemptFailed(failure)),
+                    stop_reason_token,
+                )
+            };
+            s.audit(AuditEvent::SigninOutcome {
+                pid: peer_pid,
+                subject: subject_summary.clone(),
+                outcome: "failed",
+                request: req_id.to_string(),
+                authorization: auth_str.clone(),
+                item: (item, login_slug.clone()),
+                reason: Some(reason_tok),
+                worker: worker.generation().get(),
+            });
+            s.audit(AuditEvent::SigninCleanup {
+                pid: peer_pid,
+                outcome: if cleanup_confirmed {
+                    "confirmed"
+                } else {
+                    "unconfirmed"
+                },
+                attempt: attempt_id.clone(),
+                reason: (!cleanup_confirmed).then_some("reaper_teardown_unconfirmed"),
+            });
+            let _ = s.signin_worker_failed(req_id, worker, failure, &now);
+            s.signin_cleanup_result(req_id, worker, cleanup_confirmed, &now);
+            write_test_send_log(&s.signin.send_log);
+            write_done_snapshot(
+                cfg.status_dir.as_deref(),
+                &AttemptDoneSnapshot {
+                    request: req_id.to_string(),
+                    attempt_id,
+                    outcome: "failed".to_owned(),
+                    reason: Some(reason_tok.to_owned()),
+                    cleanup_confirmed,
+                    held_state_count: supervisor.held_state_count(),
+                },
+            );
         }
     }
 }
