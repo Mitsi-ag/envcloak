@@ -1,21 +1,22 @@
-//! Sign-in tools (`SPEC.md` §6.8, §7, D-28, D-31, R-M2b-07, R-M2b-09, M2b-06):
-//! `request_sign_in`, `sign_in_status`, `cancel_sign_in`, and
+//! Sign-in tools (`SPEC.md` §6.8, §7, D-28, D-31, R-M2b-07, R-M2b-09, M2b-06,
+//! M2b-10): `request_sign_in`, `sign_in_status`, `cancel_sign_in`, and
 //! `end_sign_in_session`.
 //!
-//! Registered through [`SignInTools::register`]. In `Server::new()` they are
-//! registered with `listed = false` (`Router::register_unlisted`), so
-//! `tools/list` omits them and `tools/call` returns the same unknown-tool
-//! error as any unknown name without contacting the daemon until M2b-10 flips
-//! `listed` to `true`.
+//! Registered through [`SignInTools::register`]. In `Server::new()` and
+//! `Server::with_browser_relay()` they are registered with `listed = true`, so
+//! `tools/list` exposes all four tools and `tools/call` routes them.
 //!
 //! Every string argument is validated against a closed grammar before any
 //! daemon connection is opened. Arguments shaped like a secret (`value_on_argv`)
 //! or carrying a URL, script, callback, or DevTools address (`invalid_params`)
 //! are refused without echoing any caller input. The caller's `operation_key`
-//! is never echoed in any response or error.
+//! is never echoed in any response or error, and every returned status view is
+//! filtered through [`allowlist_status_view`] so no upstream error text or
+//! credential fragment can cross into tool output.
 
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use envcloak_client::fail::Failure;
 use envcloak_ipc::proto::{FdRole, SigninRequestParams};
@@ -241,18 +242,149 @@ fn status_output_schema() -> Value {
     )
 }
 
-fn status_to_value(v: &SigninStatusView) -> Value {
+/// Closed allowlist of sign-in operation state tokens (`M2b-10`, R-M2b-40).
+pub const ALLOWED_SIGNIN_STATES: &[&str] = &[
+    "requested",
+    "pending_approval",
+    "awaiting_approval",
+    "waiting_for_approval",
+    "approved",
+    "attempt_running",
+    "captured",
+    "publish_decided",
+    "published",
+    "ready",
+    "ended",
+    "cancelled",
+    "failed",
+];
+
+/// Closed allowlist of local cleanup tokens (`M2b-10`, R-M2b-40).
+pub const ALLOWED_SIGNIN_CLEANUP: &[&str] = &[
+    "not_needed",
+    "pending",
+    "done",
+    "confirmed",
+    "cleaned",
+    "cleanup_failed",
+    "cleanup_unconfirmed",
+];
+
+/// Closed allowlist of server revocation tokens (`M2b-10`, R-M2b-40).
+pub const ALLOWED_SIGNIN_REVOCATION: &[&str] = &[
+    "unknown",
+    "not_configured",
+    "pending",
+    "confirmed",
+    "verified",
+    "failed",
+    "server session expiry unknown",
+];
+
+/// Closed allowlist of stop/failure reason tokens (`M2b-10`, R-M2b-40).
+pub const ALLOWED_SIGNIN_REASONS: &[&str] = &[
+    "waiting_for_approval",
+    "cancelled",
+    "cancelled_by_requester",
+    "ended_by_owner",
+    "ended_by_requester",
+    "locked",
+    "root_exited",
+    "epoch_changed",
+    "project_changed",
+    "revision_changed",
+    "limits_changed",
+    "recipient_replaced",
+    "subject_ineligible",
+    "revoked",
+    "statement_expired",
+    "authorization_ended",
+    "attempt_timed_out",
+    "session_expired",
+    "identity_unverified",
+    "credentials_rejected",
+    "code_rejected",
+    "handoff_required",
+    "off_origin",
+    "unsupported_session_scope",
+    "audit_failed",
+    "worker_lost",
+    "cleanup_failed",
+    "cleanup_unconfirmed",
+    "ended_by_reboot",
+];
+
+/// Sanitizes a [`SigninStatusView`] against closed token allowlists so no
+/// upstream error text, password, TOTP seed/code, or `operation_key` can ever
+/// appear in a tool result (`R-M2b-40`, gate `b3`).
+#[must_use]
+pub fn allowlist_status_view(v: &SigninStatusView) -> SigninStatusView {
+    let request = if validate_request_id(&v.request).is_ok() {
+        v.request.clone()
+    } else {
+        "00000000000000000000000000000000".to_owned()
+    };
+    let state = if ALLOWED_SIGNIN_STATES.contains(&v.state.as_str()) {
+        v.state.clone()
+    } else {
+        "failed".to_owned()
+    };
+    let cleanup = if ALLOWED_SIGNIN_CLEANUP.contains(&v.cleanup.as_str()) {
+        v.cleanup.clone()
+    } else {
+        "cleanup_unconfirmed".to_owned()
+    };
+    let revocation = if ALLOWED_SIGNIN_REVOCATION.contains(&v.revocation.as_str()) {
+        v.revocation.clone()
+    } else {
+        "unknown".to_owned()
+    };
+    let reason = v.reason.as_ref().map(|r| {
+        if ALLOWED_SIGNIN_REASONS.contains(&r.as_str()) {
+            r.clone()
+        } else {
+            "worker_lost".to_owned()
+        }
+    });
+    let delivered_context = v
+        .delivered_context
+        .as_ref()
+        .filter(|c| c.starts_with("ctx-") && validate_session_id(c).is_ok())
+        .cloned();
+    let authorization = v
+        .authorization
+        .as_ref()
+        .filter(|a| {
+            validate_operation_key(a).is_ok() && !envcloak_client::render::looks_like_value(a)
+        })
+        .cloned();
+    SigninStatusView {
+        request,
+        revision: v.revision,
+        state,
+        retry_until_secs: v.retry_until_secs,
+        delivered_context,
+        cleanup,
+        revocation,
+        reason,
+        shared_loopback_cookie_jar: v.shared_loopback_cookie_jar,
+        authorization,
+    }
+}
+
+pub fn status_to_value(v: &SigninStatusView) -> Value {
+    let clean = allowlist_status_view(v);
     json!({
-        "request": v.request,
-        "revision": v.revision,
-        "state": v.state,
-        "retry_until_secs": v.retry_until_secs,
-        "delivered_context": v.delivered_context,
-        "cleanup": v.cleanup,
-        "revocation": v.revocation,
-        "reason": v.reason,
-        "shared_loopback_cookie_jar": v.shared_loopback_cookie_jar,
-        "authorization": v.authorization,
+        "request": clean.request,
+        "revision": clean.revision,
+        "state": clean.state,
+        "retry_until_secs": clean.retry_until_secs,
+        "delivered_context": clean.delivered_context,
+        "cleanup": clean.cleanup,
+        "revocation": clean.revocation,
+        "reason": clean.reason,
+        "shared_loopback_cookie_jar": clean.shared_loopback_cookie_jar,
+        "authorization": clean.authorization,
     })
 }
 
@@ -375,7 +507,15 @@ pub mod request_sign_in {
             )
         })?;
 
-        let _ = call.deadline(ctx.wait);
+        let wait = ctx.effective_wait();
+        let deadline = call.deadline(wait);
+        let poll_deadline = if wait > Duration::from_millis(250) {
+            deadline
+                .checked_sub(Duration::from_millis(120))
+                .unwrap_or(deadline)
+        } else {
+            deadline
+        };
         let mut client = ctx.connect_for_fds()?;
         let (sup_in, sup_out) = UnixStream::pair()
             .map_err(|_| Failure::new("internal", "an internal error occurred"))?;
@@ -387,9 +527,52 @@ pub mod request_sign_in {
             claims: envcloak_client::claims(),
             fds: vec![FdRole::Stdin, FdRole::Stdout],
         };
-        let view = client
+        let mut view = client
             .signin_request_with_fds(&params, &[sup_in.as_fd(), sup_out.as_fd()])
             .map_err(Failure::from)?;
+        drop(client);
+        drop(sup_in);
+        drop(sup_out);
+
+        while matches!(
+            view.state.as_str(),
+            "requested"
+                | "pending_approval"
+                | "approved"
+                | "attempt_running"
+                | "captured"
+                | "publish_decided"
+        ) {
+            if call.cancelled() {
+                break;
+            }
+            let now = Instant::now();
+            if now >= poll_deadline {
+                break;
+            }
+            let sleep_dur =
+                Duration::from_millis(25).min(poll_deadline.saturating_duration_since(now));
+            std::thread::sleep(sleep_dur);
+            if call.cancelled() || Instant::now() >= poll_deadline {
+                break;
+            }
+            let Ok(mut poll_client) = ctx.connect_by(deadline) else {
+                continue;
+            };
+            let Ok(next) = poll_client.signin_status(&view.request) else {
+                continue;
+            };
+            view = next;
+        }
+
+        if !call.cancelled() && matches!(view.state.as_str(), "requested" | "pending_approval") {
+            view.state = "waiting_for_approval".to_owned();
+        }
+        if matches!(view.state.as_str(), "published" | "ready")
+            && let Some(relay) = ctx.browser_relay()
+        {
+            relay.with_supervisor_mut(|sup| sup.set_lease_active(true));
+        }
         Ok(status_to_value(&view))
     }
 }
@@ -518,9 +701,18 @@ pub mod cancel_sign_in {
             return Err(invalid());
         }
 
-        let deadline = call.deadline(ctx.wait);
+        let deadline = call.deadline(ctx.effective_wait());
         let mut client = ctx.connect_by(deadline)?;
         let view = client.signin_cancel(request).map_err(Failure::from)?;
+        if let Some(relay) = ctx.browser_relay() {
+            let gen_id = view
+                .delivered_context
+                .clone()
+                .unwrap_or_else(|| view.request.clone());
+            relay.with_supervisor_mut(|sup| {
+                let _ = crate::browser::end_session(sup, &gen_id, true, false);
+            });
+        }
         Ok(status_to_value(&view))
     }
 }
@@ -584,9 +776,18 @@ pub mod end_sign_in_session {
             return Err(invalid());
         }
 
-        let deadline = call.deadline(ctx.wait);
+        let deadline = call.deadline(ctx.effective_wait());
         let mut client = ctx.connect_by(deadline)?;
         let view = client.signin_end(session).map_err(Failure::from)?;
+        if let Some(relay) = ctx.browser_relay() {
+            let gen_id = view
+                .delivered_context
+                .clone()
+                .unwrap_or_else(|| session.to_owned());
+            relay.with_supervisor_mut(|sup| {
+                let _ = crate::browser::end_session(sup, &gen_id, true, false);
+            });
+        }
         Ok(status_to_value(&view))
     }
 }

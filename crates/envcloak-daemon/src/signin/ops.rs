@@ -126,6 +126,7 @@ pub struct SigninOperationMeta {
     pub created_awake: Duration,
     pub captured_state: Option<CapturedBrowserState>,
     pub active_worker: Option<WorkerId>,
+    pub attempt_driver_claimed: bool,
     pub supervisor_pipe: Option<SupervisorPipe>,
     pub tool_pipes: Option<(OwnedFd, OwnedFd)>,
     pub publish_audited: bool,
@@ -671,6 +672,7 @@ impl State {
                 } => {
                     if let Some(meta) = self.signin.ops.get_mut(&request) {
                         meta.active_worker = Some(worker);
+                        meta.attempt_driver_claimed = false;
                     }
                 }
                 Effect::StartSupervisor {
@@ -1541,6 +1543,7 @@ pub fn request(
                 created_awake: now.awake,
                 captured_state: None,
                 active_worker: None,
+                attempt_driver_claimed: false,
                 supervisor_pipe: None,
                 tool_pipes: None,
                 publish_audited: false,
@@ -2634,14 +2637,12 @@ fn locked_ready(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
 
 fn maybe_drive_test_worker_spec(shared: &Shared, req_id: RequestId) {
     let target_name = {
-        let s = locked_ready(shared);
-        let Some(meta) = s.signin.ops.get(&req_id) else {
-            return;
-        };
-        if meta.supervisor_pipe.is_some() {
-            return;
-        }
-        let active_or_queued = meta.active_worker.is_some()
+        let mut s = locked_ready(shared);
+        let active_or_queued = s
+            .signin
+            .ops
+            .get(&req_id)
+            .is_some_and(|m| m.active_worker.is_some())
             || s.signin
                 .store
                 .operation(&req_id)
@@ -2649,9 +2650,20 @@ fn maybe_drive_test_worker_spec(shared: &Shared, req_id: RequestId) {
         if !active_or_queued {
             return;
         }
+        let Some(meta) = s.signin.ops.get_mut(&req_id) else {
+            return;
+        };
+        if meta.supervisor_pipe.is_some() || meta.attempt_driver_claimed {
+            return;
+        }
+        meta.attempt_driver_claimed = true;
         meta.target_name.clone()
     };
     let Some(cfg) = load_test_worker_spec_for_target(&target_name) else {
+        let mut s = locked_ready(shared);
+        if let Some(meta) = s.signin.ops.get_mut(&req_id) {
+            meta.attempt_driver_claimed = false;
+        }
         return;
     };
     run_supervised_signin_attempt(shared, req_id, cfg);

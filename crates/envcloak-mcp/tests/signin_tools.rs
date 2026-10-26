@@ -22,8 +22,8 @@ use envcloak_ipc::proto::{
 };
 use envcloak_ipc::view::SigninStatusView;
 use envcloak_mcp::tools::signin::{
-    is_forbidden_signin_arg, validate_operation_key, validate_request_id, validate_role,
-    validate_session_id, validate_target,
+    allowlist_status_view, is_forbidden_signin_arg, validate_operation_key, validate_request_id,
+    validate_role, validate_session_id, validate_target,
 };
 use envcloak_mcp::{Ctx, RegisterError, Router, Server, SignInTools, ToolSchema};
 use envcloak_testkit::signin::{
@@ -307,9 +307,15 @@ fn unlisted_signin_tools_return_same_unknown_tool_error_and_never_contact_daemon
         }
     });
 
+    let mut unlisted_router = Router::new();
+    for tool in envcloak_mcp::tools::m2_tools() {
+        unlisted_router.register(tool).unwrap();
+    }
+    SignInTools::register(&mut unlisted_router, false).unwrap();
+
     let ctx = Ctx::new("/nonexistent/envcloak".into(), None, Duration::from_secs(2))
         .with_run_paths(paths);
-    let mut r = Running::start(Server::new(), ctx);
+    let mut r = Running::start(Server::with_router(unlisted_router), ctx);
     r.initialize();
 
     r.send(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
@@ -1185,4 +1191,297 @@ async function checkCase(envSetup, handlerOpts) {
         !all_text.contains(&origins.adapter_key),
         "adapter_key leaked in middleware output"
     );
+}
+
+#[test]
+fn server_new_and_with_browser_relay_list_all_four_signin_tools() {
+    let srv = Server::new();
+    let names: Vec<&str> = srv.tools().iter().map(|t| t.name).collect();
+    assert_eq!(
+        names,
+        [
+            "list_secrets",
+            "project_status",
+            "add_reference",
+            "run_with_secrets",
+            "request_new_secret",
+            "request_sign_in",
+            "sign_in_status",
+            "cancel_sign_in",
+            "end_sign_in_session",
+        ]
+    );
+
+    let relay_srv = Server::with_browser_relay(envcloak_mcp::browser::BrowserRelay::new());
+    let relay_names: Vec<&str> = relay_srv.tools().iter().map(|t| t.name).collect();
+    for signin_name in [
+        "request_sign_in",
+        "sign_in_status",
+        "cancel_sign_in",
+        "end_sign_in_session",
+    ] {
+        assert!(
+            relay_names.contains(&signin_name),
+            "missing {signin_name} in Server::with_browser_relay"
+        );
+    }
+}
+
+/// R-M2b-40 / gate b3 mutation check: `allowlist_status_view` strips any
+/// non-allowlisted upstream error text, credential fragment, or `operation_key`
+/// from `SigninStatusView` fields before serializing to MCP tool output.
+#[test]
+fn allowlist_status_view_strips_upstream_error_text_and_unknown_tokens() {
+    let cs = canaries(fresh_seed());
+    let pw_canary = cs[0].as_str();
+    let op_key_canary = "opkey-upstream-leak-attempt-99";
+    let tainted = SigninStatusView {
+        request: format!("bad-req-{pw_canary}"),
+        revision: 3,
+        state: format!("upstream_state:{pw_canary}"),
+        retry_until_secs: 100,
+        delivered_context: Some(format!("ctx-{op_key_canary}")),
+        cleanup: format!("cleanup_err:{pw_canary}"),
+        revocation: format!("revocation_err:{op_key_canary}"),
+        reason: Some(format!(
+            "Upstream HTTP 500 error: invalid password {pw_canary} for {op_key_canary}"
+        )),
+        shared_loopback_cookie_jar: false,
+        authorization: Some(pw_canary.to_owned()),
+    };
+    let clean = allowlist_status_view(&tainted);
+    assert_eq!(clean.request, "00000000000000000000000000000000");
+    assert_eq!(clean.state, "failed");
+    assert_eq!(clean.cleanup, "cleanup_unconfirmed");
+    assert_eq!(clean.revocation, "unknown");
+    assert_eq!(clean.reason.as_deref(), Some("worker_lost"));
+    assert_eq!(clean.delivered_context, None);
+    assert_eq!(clean.authorization, None);
+
+    let json_bytes = serde_json::to_vec(&clean).unwrap();
+    assert_no_canary(&json_bytes, &cs);
+    let json_str = String::from_utf8_lossy(&json_bytes);
+    assert!(!json_str.contains(op_key_canary));
+}
+
+/// M2b-10 wait bound, per-host cutoffs (`claude-code` and `codex`), `K-08`
+/// fallback (`with_timeout_lifts_cutoff(false)` -> 8s < 10s cutoff), and
+/// transport cancellation (`notifications/cancelled`) detaching only the wait
+/// while `cancel_sign_in` tears down the owned operation (including any
+/// session published in a race on `BrowserRelay`).
+#[test]
+fn wait_bound_per_host_cutoffs_k08_fallback_and_transport_cancel_detach() {
+    use envcloak_agents::tool_timeouts::{
+        HOSTS, MARGIN, UNKNOWN_CUTOFF, cutoff, cutoff_for, default_wait, default_wait_for,
+    };
+
+    // 1. Per-host cutoff and K-08 fallback verification.
+    for h in HOSTS {
+        let wait_lifted = default_wait(Some(h.id));
+        let cut_lifted = cutoff(Some(h.id));
+        assert_eq!(wait_lifted, Duration::from_secs(20), "{}", h.id);
+        assert!(wait_lifted + MARGIN <= cut_lifted, "{}", h.id);
+
+        // K-08 signal: when per-server timeout does not lift the 10s cutoff,
+        // wait drops to 8s (< 10s UNKNOWN_CUTOFF). Mutation check: defaulting
+        // Claude Code to 20s unconditionally fails this assertion.
+        let wait_k08 = default_wait_for(Some(h.id), false);
+        let cut_k08 = cutoff_for(Some(h.id), false);
+        assert_eq!(cut_k08, UNKNOWN_CUTOFF, "{}", h.id);
+        assert_eq!(wait_k08, Duration::from_secs(8), "{}", h.id);
+        assert!(
+            wait_k08 + MARGIN <= cut_k08,
+            "K-08 wait {wait_k08:?} must end at least {MARGIN:?} before {cut_k08:?}"
+        );
+        let ctx_k08 = Ctx::new(
+            "/nonexistent/envcloak".into(),
+            Some(h.id.to_owned()),
+            wait_lifted,
+        )
+        .with_timeout_lifts_cutoff(false);
+        assert_eq!(ctx_k08.effective_wait(), Duration::from_secs(8));
+    }
+
+    // 2. Slow approval wait bound -> returns `waiting_for_approval` within budget;
+    //    transport cancellation detaches wait without sending `signin.cancel`.
+    let (_tmp, paths) = make_isolated_run_paths();
+    let listener = UnixListener::bind(&paths.socket).unwrap();
+
+    let project_tmp = tempfile::Builder::new()
+        .prefix("ec-proj-wait-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    std::fs::write(
+        project_tmp.path().join("envcloak.toml"),
+        "[project]\nname = \"acme-web\"\n[env]\n",
+    )
+    .unwrap();
+    let project_dir_str = project_tmp.path().to_string_lossy().into_owned();
+
+    let cancel_rpcs = Arc::new(AtomicUsize::new(0));
+    let cancel_rpcs_bg = Arc::clone(&cancel_rpcs);
+    let status_rpcs = Arc::new(AtomicUsize::new(0));
+    let status_rpcs_bg = Arc::clone(&status_rpcs);
+    let stop_daemon = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_daemon_bg = Arc::clone(&stop_daemon);
+    let req_id = "abcdef0123456789abcdef0123456789";
+
+    listener.set_nonblocking(true).unwrap();
+    let daemon_thread = std::thread::spawn(move || {
+        struct FdReader<'a> {
+            stream: &'a std::os::unix::net::UnixStream,
+            fds: Vec<std::os::fd::OwnedFd>,
+        }
+        impl Read for FdReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                envcloak_sys::fdpass::recv_with_fds(self.stream.as_fd(), buf, &mut self.fds)
+            }
+        }
+
+        while !stop_daemon_bg.load(Ordering::Relaxed) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = FdReader {
+                stream: &stream,
+                fds: Vec::new(),
+            };
+            let Ok(frame) = Frame::read_from(&mut reader) else {
+                continue;
+            };
+            let req = IncomingRequest::parse(&frame).unwrap();
+            let reply = match req.method {
+                SigninRequest::NAME => {
+                    let view = SigninStatusView {
+                        request: req_id.to_owned(),
+                        revision: 1,
+                        state: "pending_approval".to_owned(),
+                        retry_until_secs: 1_700_000_900,
+                        delivered_context: None,
+                        cleanup: "not_needed".to_owned(),
+                        revocation: "unknown".to_owned(),
+                        reason: None,
+                        shared_loopback_cookie_jar: false,
+                        authorization: None,
+                    };
+                    result_frame(req.id, &view).unwrap()
+                }
+                SigninStatus::NAME => {
+                    status_rpcs_bg.fetch_add(1, Ordering::SeqCst);
+                    let view = SigninStatusView {
+                        request: req_id.to_owned(),
+                        revision: 1,
+                        state: "pending_approval".to_owned(),
+                        retry_until_secs: 1_700_000_900,
+                        delivered_context: None,
+                        cleanup: "not_needed".to_owned(),
+                        revocation: "unknown".to_owned(),
+                        reason: None,
+                        shared_loopback_cookie_jar: false,
+                        authorization: None,
+                    };
+                    result_frame(req.id, &view).unwrap()
+                }
+                SigninCancel::NAME => {
+                    cancel_rpcs_bg.fetch_add(1, Ordering::SeqCst);
+                    let view = SigninStatusView {
+                        request: req_id.to_owned(),
+                        revision: 2,
+                        state: "cancelled".to_owned(),
+                        retry_until_secs: 0,
+                        delivered_context: None,
+                        cleanup: "done".to_owned(),
+                        revocation: "unknown".to_owned(),
+                        reason: Some("cancelled".to_owned()),
+                        shared_loopback_cookie_jar: false,
+                        authorization: None,
+                    };
+                    result_frame(req.id, &view).unwrap()
+                }
+                other => panic!("unexpected method {other}"),
+            };
+            let _ = reply.write_to(&mut stream);
+        }
+    });
+
+    let ctx = Ctx::new(
+        "/nonexistent/envcloak".into(),
+        Some("claude-code".into()),
+        Duration::from_millis(600),
+    )
+    .with_run_paths(paths);
+    let mut r = Running::start(Server::new(), ctx);
+    r.initialize();
+
+    let t0 = std::time::Instant::now();
+    let ans = r.call(
+        1,
+        "request_sign_in",
+        json!({
+            "target": "acme/local",
+            "operation_key": "op-wait-bound-1",
+            "project_dir": project_dir_str,
+        }),
+    );
+    let elapsed = t0.elapsed();
+    assert_eq!(ans["result"]["isError"], false, "{ans}");
+    assert_eq!(
+        ans["result"]["structuredContent"]["state"],
+        "waiting_for_approval"
+    );
+    assert_eq!(ans["result"]["structuredContent"]["request"], req_id);
+    assert!(
+        elapsed >= Duration::from_millis(400) && elapsed < Duration::from_secs(2),
+        "unexpected wait elapsed {elapsed:?}"
+    );
+    assert!(
+        status_rpcs.load(Ordering::SeqCst) >= 1,
+        "expected request_sign_in to poll signin.status during wait"
+    );
+
+    // Transport cancellation (`notifications/cancelled`) detaches the wait
+    // without calling `signin.cancel` on the daemon.
+    r.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "request_sign_in",
+            "arguments": {
+                "target": "acme/local",
+                "operation_key": "op-wait-bound-1",
+                "project_dir": project_dir_str,
+            }
+        }
+    }));
+    std::thread::sleep(Duration::from_millis(80));
+    r.send(&json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/cancelled",
+        "params": { "requestId": 2 }
+    }));
+    // Call `sign_in_status` (id 3): operation is still `pending_approval` and
+    // `cancel_rpcs` is still 0.
+    let st = r.call(3, "sign_in_status", json!({"request": req_id}));
+    assert_eq!(st["id"], 3);
+    assert_eq!(
+        st["result"]["structuredContent"]["state"],
+        "pending_approval"
+    );
+    assert_eq!(
+        cancel_rpcs.load(Ordering::SeqCst),
+        0,
+        "transport cancellation must never call signin.cancel"
+    );
+
+    // Explicit `cancel_sign_in` ends the operation.
+    let can = r.call(4, "cancel_sign_in", json!({"request": req_id}));
+    assert_eq!(can["result"]["structuredContent"]["state"], "cancelled");
+    assert_eq!(cancel_rpcs.load(Ordering::SeqCst), 1);
+
+    let _ = r.end();
+    stop_daemon.store(true, Ordering::Relaxed);
+    daemon_thread.join().unwrap();
 }

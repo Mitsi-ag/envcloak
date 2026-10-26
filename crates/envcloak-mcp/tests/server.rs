@@ -288,7 +288,11 @@ fn only_listed_tools_are_shown_and_called() {
             "project_status",
             "add_reference",
             "run_with_secrets",
-            "request_new_secret"
+            "request_new_secret",
+            "request_sign_in",
+            "sign_in_status",
+            "cancel_sign_in",
+            "end_sign_in_session",
         ]
     );
     r.end();

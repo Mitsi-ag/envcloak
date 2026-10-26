@@ -81,20 +81,37 @@ pub fn host(id: &str) -> Option<&'static McpHost> {
     HOSTS.iter().find(|h| h.id == id)
 }
 
-/// How long `host` waits for an EnvCloak tool call: its installed tool
-/// timeout, or [`UNKNOWN_CUTOFF`] for a host not in [`HOSTS`] or none.
-pub fn cutoff(host_id: Option<&str>) -> Duration {
+/// How long `host` waits for an EnvCloak tool call when `per_server_timeout_lifts_cutoff`
+/// indicates whether the host's per-server timeout lifts [`UNKNOWN_CUTOFF`] (`K-08`).
+pub fn cutoff_for(host_id: Option<&str>, per_server_timeout_lifts_cutoff: bool) -> Duration {
+    if !per_server_timeout_lifts_cutoff {
+        return UNKNOWN_CUTOFF;
+    }
     host_id
         .and_then(host)
         .map_or(UNKNOWN_CUTOFF, |h| h.tool_timeout)
 }
 
+/// How long `host` waits for an EnvCloak tool call: its installed tool
+/// timeout, or [`UNKNOWN_CUTOFF`] for a host not in [`HOSTS`] or none.
+pub fn cutoff(host_id: Option<&str>) -> Duration {
+    cutoff_for(host_id, true)
+}
+
+/// How long a tool may wait for a person under `host` when
+/// `per_server_timeout_lifts_cutoff` indicates whether the host's per-server
+/// timeout lifts the 10 s cutoff (`K-08`): [`cutoff_for`] less [`MARGIN`],
+/// from [`MIN_WAIT`] to [`MAX_WAIT`].
+pub fn default_wait_for(host_id: Option<&str>, per_server_timeout_lifts_cutoff: bool) -> Duration {
+    cutoff_for(host_id, per_server_timeout_lifts_cutoff)
+        .saturating_sub(MARGIN)
+        .clamp(MIN_WAIT, MAX_WAIT)
+}
+
 /// How long a tool may wait for a person under `host`: [`cutoff`] less
 /// [`MARGIN`], from [`MIN_WAIT`] to [`MAX_WAIT`].
 pub fn default_wait(host_id: Option<&str>) -> Duration {
-    cutoff(host_id)
-        .saturating_sub(MARGIN)
-        .clamp(MIN_WAIT, MAX_WAIT)
+    default_wait_for(host_id, true)
 }
 
 #[cfg(test)]

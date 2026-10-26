@@ -693,3 +693,1065 @@ fn pending_approve_once_dev_deny_and_grants_revoke_end_to_end() {
     let _ = child.wait();
     f.sweep();
 }
+
+const RFC6238_BASE32_SECRET: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+const RFC6238_RAW_SEED: &[u8] = b"12345678901234567890";
+
+/// A running `envcloak mcp` child process started under `fixture-agent` in its
+/// own session (`os.setsid()`), so each `McpSession` has its own distinct
+/// agent root PID.
+struct McpSession {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<Vec<u8>>,
+    out: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    err: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    kept: Vec<serde_json::Value>,
+    next_id: i64,
+}
+
+impl McpSession {
+    fn start(home: &TestHome, cwd: &std::path::Path, args: &[&str]) -> Self {
+        use std::io::Read;
+        let py = common::python3();
+        let mut cmd = Command::new(&py);
+        home.apply(&mut cmd)
+            .args([
+                "-c",
+                "import os, sys; os.setsid(); os.execv(sys.argv[1], sys.argv[1:])",
+            ])
+            .arg(envcloak_testkit::testkit_bin("fixture-agent"))
+            .arg("--")
+            .arg(common::cli())
+            .arg("mcp")
+            .args(args)
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        let stdin = child.stdin.take();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut stderr = child.stderr.take().unwrap();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let err = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, lines) = std::sync::mpsc::channel();
+        let out_bg = std::sync::Arc::clone(&out);
+        std::thread::spawn(move || {
+            loop {
+                let mut line = Vec::new();
+                match stdout.read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        out_bg.lock().unwrap().extend_from_slice(&line);
+                        if tx.send(line).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let err_bg = std::sync::Arc::clone(&err);
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stderr.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                err_bg.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        });
+        let mut s = Self {
+            child,
+            stdin,
+            lines,
+            out,
+            err,
+            kept: Vec::new(),
+            next_id: 1,
+        };
+        s.initialize();
+        s
+    }
+
+    fn send(&mut self, v: &serde_json::Value) {
+        let mut line = serde_json::to_vec(v).unwrap();
+        line.push(b'\n');
+        let stdin = self.stdin.as_mut().unwrap();
+        stdin.write_all(&line).unwrap();
+        stdin.flush().unwrap();
+    }
+
+    fn next(&mut self, limit: std::time::Duration) -> Option<serde_json::Value> {
+        let line = self.lines.recv_timeout(limit).ok()?;
+        let v: serde_json::Value = serde_json::from_slice(&line).unwrap_or_else(|_| {
+            panic!(
+                "non-JSON line on MCP stdout: {}",
+                String::from_utf8_lossy(&line)
+            )
+        });
+        assert_eq!(v["jsonrpc"], "2.0", "{v}");
+        Some(v)
+    }
+
+    fn answer(&mut self, id: i64, limit: std::time::Duration) -> serde_json::Value {
+        if let Some(i) = self.kept.iter().position(|v| v["id"] == id) {
+            return self.kept.remove(i);
+        }
+        let end = std::time::Instant::now() + limit;
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            let v = self.next(left).unwrap_or_else(|| {
+                let err_txt = String::from_utf8_lossy(&self.err.lock().unwrap()).into_owned();
+                panic!("no answer to MCP request {id} within {limit:?}; stderr: {err_txt}");
+            });
+            if v["id"] == id {
+                return v;
+            }
+            self.kept.push(v);
+        }
+    }
+
+    fn initialize(&mut self) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "envcloak-signin-test", "version": "1.0"}
+            }
+        }));
+        let v = self.answer(id, std::time::Duration::from_secs(30));
+        assert_eq!(v["result"]["protocolVersion"], "2025-11-25", "{v}");
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }));
+    }
+
+    fn call_async(&mut self, tool: &str, args: serde_json::Value) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": tool, "arguments": args}
+        }));
+        id
+    }
+
+    fn call(&mut self, tool: &str, args: serde_json::Value) -> serde_json::Value {
+        let id = self.call_async(tool, args);
+        let v = self.answer(id, std::time::Duration::from_secs(60));
+        v.get("result")
+            .cloned()
+            .unwrap_or_else(|| panic!("{tool} returned protocol error: {v}"))
+    }
+
+    fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
+        drop(self.stdin.take());
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while self.child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= end {
+                let _ = self.child.kill();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = self.child.wait();
+        let out = self.out.lock().unwrap().clone();
+        let err = self.err.lock().unwrap().clone();
+        (out, err)
+    }
+}
+
+impl Drop for McpSession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn decrypted_audit_bytes(home: &TestHome, pass_bytes: &[u8]) -> Vec<u8> {
+    use envcloak_core::vault::{LockedVault, VaultPaths};
+    let pass = SecretBytes::copy_from(pass_bytes);
+    let vault = LockedVault::open(&VaultPaths::under(common::data_dir(home)))
+        .unwrap()
+        .unlock_with_passphrase(&pass)
+        .map_err(|(_, e)| e)
+        .unwrap();
+    let (entries, report) = vault.read_audit().unwrap();
+    assert!(report.first_problem.is_none(), "{report:?}");
+    format!("{entries:?}\n{report:?}").into_bytes()
+}
+
+/// Cross-subject refusal before any metadata (`sign_in_status`, `cancel_sign_in`,
+/// `end_sign_in_session` from a second agent process return `no_such_request`,
+/// and `request_sign_in` with the same `operation_key` from a second agent root
+/// opens a distinct operation), plus verification that `operation_key` never
+/// appears in tool outputs, daemon trace logs, or decrypted audit entries.
+#[test]
+fn cross_subject_status_refused_and_operation_key_never_logged_or_audited() {
+    let f = SigninCliFixture::new();
+    let manifest_str = f
+        .project
+        .join("envcloak.toml")
+        .to_string_lossy()
+        .into_owned();
+    let project_dir_str = f.project.to_string_lossy().into_owned();
+
+    let added = run_on_terminal(
+        &f.home,
+        &[
+            "signin",
+            "target",
+            "add",
+            "acme/local",
+            "--login",
+            "acme/dev-bot",
+            "--credential-origin",
+            "http://127.0.0.1:4100",
+            "--app-origin",
+            "http://127.0.0.1:4100",
+            "--identity-check",
+            "endpoint",
+            "http://127.0.0.1:4100/api/whoami",
+            "--account",
+            "dev@acme.test",
+            "--tenant",
+            "acme-dev",
+            "--role",
+            "editor",
+            "--cookie",
+            "sid@127.0.0.1/",
+            "--tier",
+            "dev",
+            "--approval-lifetime",
+            "4h",
+            "--session-lifetime",
+            "1h",
+            "--manifest",
+            &manifest_str,
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &f.pass, true)],
+    );
+    f.assert_clean(&added);
+    assert!(added.status.success(), "{}", stderr(&added));
+
+    let op_key_a = "opkey-cross-subject-alpha-9001";
+    let mut agent_a = McpSession::start(&f.home, &f.project, &["--wait-ms", "1000"]);
+    let mut agent_b = McpSession::start(&f.home, &f.project, &["--wait-ms", "1000"]);
+
+    let res_a = agent_a.call(
+        "request_sign_in",
+        serde_json::json!({
+            "target": "acme/local",
+            "role": "editor",
+            "operation_key": op_key_a,
+            "project_dir": project_dir_str,
+        }),
+    );
+    assert_eq!(res_a["isError"], false, "{res_a}");
+    let req_a = res_a["structuredContent"]["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        res_a["structuredContent"]["state"], "waiting_for_approval",
+        "{res_a}"
+    );
+
+    // Second agent process calling sign_in_status, cancel_sign_in, or
+    // end_sign_in_session on req_a is refused with `no_such_request` before any
+    // metadata is returned.
+    for (tool, args) in [
+        ("sign_in_status", serde_json::json!({"request": req_a})),
+        ("cancel_sign_in", serde_json::json!({"request": req_a})),
+        ("end_sign_in_session", serde_json::json!({"session": req_a})),
+    ] {
+        let refused = agent_b.call(tool, args);
+        assert_eq!(refused["isError"], true, "{tool}: {refused}");
+        assert!(
+            refused.get("structuredContent").is_none(),
+            "{tool} must return no structured metadata to another subject: {refused}"
+        );
+        let err_json: serde_json::Value =
+            serde_json::from_str(refused["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(err_json["error"], "no_such_request", "{tool}: {err_json}");
+    }
+
+    // Second agent process calling request_sign_in with the exact same
+    // operation_key and scope never joins agent_a's operation (mutation check:
+    // looking up keys without the owner root fails this assertion).
+    let res_b = agent_b.call(
+        "request_sign_in",
+        serde_json::json!({
+            "target": "acme/local",
+            "role": "editor",
+            "operation_key": op_key_a,
+            "project_dir": project_dir_str,
+        }),
+    );
+    assert_eq!(res_b["isError"], false, "{res_b}");
+    let req_b = res_b["structuredContent"]["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(
+        req_b, req_a,
+        "second agent root must never join first agent root's operation_key"
+    );
+
+    // Owner agent_a can still read its own status and cancel its operation.
+    let st_a = agent_a.call("sign_in_status", serde_json::json!({"request": req_a}));
+    assert_eq!(st_a["isError"], false, "{st_a}");
+    assert_eq!(st_a["structuredContent"]["state"], "pending_approval");
+
+    let can_a = agent_a.call("cancel_sign_in", serde_json::json!({"request": req_a}));
+    assert_eq!(can_a["structuredContent"]["state"], "cancelled");
+    let can_b = agent_b.call("cancel_sign_in", serde_json::json!({"request": req_b}));
+    assert_eq!(can_b["structuredContent"]["state"], "cancelled");
+
+    let (out_a, err_a) = agent_a.finish();
+    let (out_b, err_b) = agent_b.finish();
+    let daemon_log = f.d.log_bytes();
+    let pass_bytes = by_label(&f.cs, labels::VAULT_PASSPHRASE).value().to_vec();
+    let cs = f.cs;
+    let codes = f.codes;
+    let home = f.home;
+    drop(f.d);
+    let audit_bytes = decrypted_audit_bytes(&home, &pass_bytes);
+    for buf in [
+        &out_a[..],
+        &err_a[..],
+        &out_b[..],
+        &err_b[..],
+        &daemon_log[..],
+        &audit_bytes[..],
+    ] {
+        assert_no_canary(buf, &cs);
+        for c in &codes {
+            assert_eq!(count_code_matches(buf, c), 0, "TOTP code leaked");
+        }
+        assert!(
+            !String::from_utf8_lossy(buf).contains(op_key_a),
+            "operation_key leaked in output, log, or audit"
+        );
+    }
+    home.assert_clean(&cs);
+}
+
+/// M2b-10 end-to-end gate test (`b3`, `b7`):
+/// 1. The official MCP TypeScript SDK client (`crates/envcloak-e2e/mcp-client/client.mjs`)
+///    exercises all four sign-in tools (`request_sign_in`, `sign_in_status`,
+///    `cancel_sign_in`, `end_sign_in_session`), validating every structured
+///    output against `outputSchema`;
+/// 2. Retrying `request_sign_in` with a fresh MCP JSON-RPC request id recovers
+///    the operation with zero new fixture submissions (`control.counters()`);
+/// 3. 50 concurrent `request_sign_in` calls with one `operation_key` and scope
+///    through `envcloak mcp` against the real worker and helper give one
+///    approval statement in `envcloak pending`, at most one password submission
+///    at `SigninFixture`, and one published context in the browser helper;
+/// 4. Tool results, daemon trace logs, and the decrypted audit log are swept
+///    for password, TOTP seed, TOTP codes, and `operation_key`.
+#[test]
+fn m2b10_sdk_client_and_fifty_concurrent_request_sign_in_end_to_end_b3_b7() {
+    use envcloak_mcp::browser::{
+        BrowserRelay, BrowserSupervisor, DeclaredSecretCookie, DeclaredSecretLocalStorageItem,
+        DeclaredSecretOrigin, DeclaredSecretState, ExpectedIdentity, SupervisorOptions,
+        deliver_secret_session, end_session,
+    };
+    use envcloak_testkit::agents::{GroupChild, mcp_client};
+    use envcloak_testkit::signin::{
+        INSTALL_BROWSER_RUNTIME, REQUIRE_BROWSER_RUNTIME_VAR, SigninFixture as WebSigninFixture,
+        browser_versions_path, resolve_browser_runtime,
+    };
+
+    let runtime = match resolve_browser_runtime(&browser_versions_path()) {
+        Ok(rt) => rt,
+        Err(reason) => {
+            if std::env::var_os(REQUIRE_BROWSER_RUNTIME_VAR).is_some() {
+                panic!(
+                    "browser runtime missing ({REQUIRE_BROWSER_RUNTIME_VAR} is set): {reason}; run `{INSTALL_BROWSER_RUNTIME}`"
+                );
+            }
+            eprintln!(
+                "skipping m2b10 browser e2e test (run `{INSTALL_BROWSER_RUNTIME}`): {reason}"
+            );
+            return;
+        }
+    };
+
+    let (origins, control) = WebSigninFixture::start();
+    let mut cs = canaries(fresh_seed());
+    let home = TestHome::new();
+    let kit = seed_vault(&home, &cs);
+    cs.push(kit);
+    cs.push(Canary::new(
+        "SIGNIN_EDITOR_PW",
+        origins.editor_password.clone(),
+    ));
+    cs.push(Canary::new(
+        "SIGNIN_BASE32_SEED",
+        RFC6238_BASE32_SECRET.to_owned(),
+    ));
+    cs.push(Canary::new(
+        "SIGNIN_RAW_SEED",
+        String::from_utf8_lossy(RFC6238_RAW_SEED).into_owned(),
+    ));
+    cs.push(Canary::new(
+        "SIGNIN_ADAPTER_KEY",
+        origins.adapter_key.clone(),
+    ));
+
+    let spec_dir = home.root().join("worker-specs");
+    let status_dir = home.root().join("worker-status");
+    let clock_file = home.root().join("clock-offset.txt");
+    std::fs::create_dir_all(&spec_dir).unwrap();
+    std::fs::create_dir_all(&status_dir).unwrap();
+    std::fs::write(&clock_file, "0").unwrap();
+
+    let login_url = format!("{}/login", origins.app);
+    let worker_spec = serde_json::json!({
+        "bootstrap": {
+            "app_origins": [origins.app],
+            "credential_origins": [origins.app],
+            "identity_provider_origins": [],
+            "callback_origins": [],
+            "identity_check_kind": "endpoint",
+            "identity_check_locator": "/api/whoami",
+            "expected_account": "editor@acme.test",
+            "expected_tenant": "t1",
+            "expected_role": "editor",
+            "cookies": [{
+                "name": "session",
+                "domain": "acme.localhost",
+                "host_only": true,
+                "path": "/",
+                "partition_site": null,
+                "partition_cross_site_ancestor": false
+            }],
+            "storage": [],
+            "session_format": "Cookies",
+            "flow": {
+                "BrowserLogin": {
+                    "login_url": login_url,
+                    "username_selector": null,
+                    "password_selector": null,
+                    "code_selector": null,
+                    "submit_selector": null
+                }
+            }
+        },
+        "chrome_exe": runtime.chrome_exe,
+        "chrome_sha256": runtime.pins.chrome_sha256,
+        "host_resolver_rules": origins.host_resolver_rules,
+        "test_ca_spki_sha256": null,
+        "extra_chrome_args": [],
+        "status_dir": status_dir,
+        "totp_fixed_unix": null,
+        "totp_no_sleep": false
+    });
+    std::fs::write(
+        spec_dir.join("default.json"),
+        serde_json::to_vec(&worker_spec).unwrap(),
+    )
+    .unwrap();
+
+    let mut d_cmd = Command::new(common::daemon_exe());
+    home.apply(&mut d_cmd)
+        .env(envcloak_sys::testing::TRACE, "1")
+        .env("ENVCLOAK_TEST_SIGNIN_WORKER_SPEC", &spec_dir)
+        .env("ENVCLOAK_TEST_CLOCK_FILE", &clock_file)
+        .env("ENVCLOAK_TEST_TOTP_START_UNIX", "0");
+    let d = Daemon::start_command(d_cmd, &[]);
+
+    let files = outside_dir();
+    let pass = secret_file(
+        files.path(),
+        "pass",
+        by_label(&cs, labels::VAULT_PASSPHRASE).value(),
+    );
+    let username = secret_file(files.path(), "username", b"editor@acme.test");
+    let password = secret_file(files.path(), "password", origins.editor_password.as_bytes());
+    let otpauth_8 = format!(
+        "otpauth://totp/Acme:editor%40acme.test?secret={RFC6238_BASE32_SECRET}&digits=8&period=30&algorithm=SHA1"
+    );
+    let totp_uri = secret_file(files.path(), "totp_uri", otpauth_8.as_bytes());
+
+    let unlock = run_on_terminal(
+        &home,
+        &["unlock", "--passphrase-fd", "3"],
+        &[(3, &pass, true)],
+    );
+    assert!(unlock.status.success(), "{}{}", stderr(&unlock), d.log());
+
+    let proj = project(&home, "acme-web", MANIFEST);
+    let manifest_str = proj.join("envcloak.toml").to_string_lossy().into_owned();
+    let project_dir_str = proj.to_string_lossy().into_owned();
+
+    let login_added = run_on_terminal(
+        &home,
+        &[
+            "login",
+            "add",
+            "acme/editor",
+            "--test",
+            "--tier",
+            "dev",
+            "--username-fd",
+            "3",
+            "--password-fd",
+            "4",
+            "--totp-fd",
+            "5",
+        ],
+        &[
+            (3, &username, true),
+            (4, &password, true),
+            (5, &totp_uri, true),
+        ],
+    );
+    assert!(
+        login_added.status.success(),
+        "{}{}",
+        stderr(&login_added),
+        d.log()
+    );
+
+    let target_added = run_on_terminal(
+        &home,
+        &[
+            "signin",
+            "target",
+            "add",
+            "acme/local",
+            "--login",
+            "acme/editor",
+            "--credential-origin",
+            &origins.app,
+            "--app-origin",
+            &origins.app,
+            "--identity-check",
+            "endpoint",
+            "/api/whoami",
+            "--account",
+            "editor@acme.test",
+            "--tenant",
+            "t1",
+            "--role",
+            "editor",
+            "--cookie",
+            "session@acme.localhost/",
+            "--tier",
+            "dev",
+            "--approval-lifetime",
+            "4h",
+            "--session-lifetime",
+            "1h",
+            "--manifest",
+            &manifest_str,
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass, true)],
+    );
+    assert!(
+        target_added.status.success(),
+        "{}{}",
+        stderr(&target_added),
+        d.log()
+    );
+
+    let mut collected_streams: Vec<Vec<u8>> = Vec::new();
+    let op_key_sdk_1 = "opkey-sdk-secret-111";
+    let op_key_sdk_2 = "opkey-sdk-cancel-222";
+    let op_key_b7 = "opkey-50-concurrent-b7-secret";
+
+    // Part 1: If the pinned MCP TypeScript SDK client is installed, drive all
+    // four sign-in tools through `client.mjs` and verify `outputSchema`
+    // validation plus fresh-request-id retry without a second submission.
+    let versions_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../crates/envcloak-e2e/agents/versions.toml");
+    if let Ok(sdk_client) = mcp_client(&versions_path) {
+        let env_map: serde_json::Map<String, serde_json::Value> = home
+            .vars()
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), serde_json::json!(v.to_str().unwrap())))
+            .collect();
+        let plan = serde_json::json!({
+            "command": common::cli().to_str().unwrap(),
+            "args": ["mcp", "--wait-ms", "1200"],
+            "env": env_map,
+            "cwd": project_dir_str,
+            "steps": [
+                {"list": true},
+                {"call": "request_sign_in", "arguments": {
+                    "target": "acme/local",
+                    "role": "editor",
+                    "operation_key": op_key_sdk_1,
+                    "project_dir": project_dir_str,
+                }},
+                {"barrier": "approve_sdk"},
+                {"call": "request_sign_in", "arguments": {
+                    "target": "acme/local",
+                    "role": "editor",
+                    "operation_key": op_key_sdk_1,
+                    "project_dir": project_dir_str,
+                }},
+                {"call": "request_sign_in", "arguments": {
+                    "target": "acme/local",
+                    "role": "editor",
+                    "operation_key": op_key_sdk_2,
+                    "project_dir": project_dir_str,
+                }},
+            ]
+        });
+        let plan_path = files.path().join("sdk-signin-plan.json");
+        std::fs::write(&plan_path, plan.to_string()).unwrap();
+        let script =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../envcloak-e2e/mcp-client/client.mjs");
+        let plan2_path = files.path().join("sdk-signin-plan2.json");
+        let py_runner = r#"
+import subprocess, sys
+node, script, mods, plan1, plan2 = sys.argv[1:6]
+p1 = subprocess.Popen([node, script, mods, plan1], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+for line in p1.stdout:
+    sys.stdout.buffer.write(line)
+    sys.stdout.buffer.flush()
+    if b'"barrier":"approve_sdk"' in line:
+        go = sys.stdin.buffer.readline()
+        p1.stdin.write(go)
+        p1.stdin.flush()
+p1.stdin.close()
+rc1 = p1.wait()
+if rc1 != 0:
+    sys.exit(rc1)
+go2 = sys.stdin.buffer.readline()
+p2 = subprocess.Popen([node, script, mods, plan2], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+p2.stdin.close()
+for line in p2.stdout:
+    sys.stdout.buffer.write(line)
+    sys.stdout.buffer.flush()
+sys.exit(p2.wait())
+"#;
+
+        let py = common::python3();
+        let mut cmd = Command::new(envcloak_testkit::testkit_bin("fixture-agent"));
+        home.apply(&mut cmd)
+            .arg("--")
+            .arg(&py)
+            .args(["-c", py_runner])
+            .arg(&sdk_client.node)
+            .arg(&script)
+            .arg(&sdk_client.node_modules)
+            .arg(&plan_path)
+            .arg(&plan2_path)
+            .current_dir(&proj)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = GroupChild::spawn(&mut cmd).unwrap();
+        let mut sdk_in = child.take_stdin().unwrap();
+        let sdk_out = BufReader::new(child.take_stdout().unwrap());
+        let mut sdk_err = child.take_stderr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in sdk_out.split(b'\n').map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let err_handle = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut v = Vec::new();
+            let _ = sdk_err.read_to_end(&mut v);
+            v
+        });
+
+        let mut steps_p1: std::collections::BTreeMap<usize, serde_json::Value> =
+            std::collections::BTreeMap::new();
+        let mut steps_p2: std::collections::BTreeMap<usize, serde_json::Value> =
+            std::collections::BTreeMap::new();
+        let mut in_p2 = false;
+        let mut req1_id = String::new();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            let left = end.saturating_duration_since(std::time::Instant::now());
+            let Ok(line) = rx.recv_timeout(left) else {
+                break;
+            };
+            collected_streams.push(line.clone());
+            let v: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            if let Some(i) = v["step"].as_u64() {
+                let idx = usize::try_from(i).unwrap();
+                if !in_p2 {
+                    steps_p1.insert(idx, v);
+                    if idx == 4 {
+                        let req2_id = steps_p1[&4]["result"]["structuredContent"]["request"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        let plan2 = serde_json::json!({
+                            "command": common::cli().to_str().unwrap(),
+                            "args": ["mcp", "--wait-ms", "1200"],
+                            "env": env_map,
+                            "cwd": project_dir_str,
+                            "steps": [
+                                {"call": "sign_in_status", "arguments": {"request": req1_id}},
+                                {"call": "end_sign_in_session", "arguments": {"session": "ctx-1"}},
+                                {"call": "end_sign_in_session", "arguments": {"session": req1_id}},
+                                {"call": "cancel_sign_in", "arguments": {"request": req2_id}},
+                                {"call": "cancel_sign_in", "arguments": {"request": req2_id}},
+                            ]
+                        });
+                        std::fs::write(&plan2_path, plan2.to_string()).unwrap();
+                        in_p2 = true;
+                        sdk_in.write_all(b"go2\n").unwrap();
+                        sdk_in.flush().unwrap();
+                    }
+                } else {
+                    steps_p2.insert(idx, v);
+                }
+            } else if v["barrier"] == "approve_sdk" {
+                req1_id = steps_p1[&1]["result"]["structuredContent"]["request"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                assert_eq!(
+                    steps_p1[&1]["result"]["structuredContent"]["state"],
+                    "waiting_for_approval"
+                );
+                let approved = run_on_terminal(
+                    &home,
+                    &["approve", &req1_id, "--once", "--passphrase-fd", "3"],
+                    &[(3, &pass, true)],
+                );
+                collected_streams.push(approved.stdout.clone());
+                collected_streams.push(approved.stderr.clone());
+                assert!(approved.status.success(), "{}", stderr(&approved));
+                let counts = control.counters().unwrap();
+                assert_eq!(counts.password_submissions, 1);
+                assert_eq!(counts.code_submissions, 1);
+                sdk_in.write_all(b"go\n").unwrap();
+                sdk_in.flush().unwrap();
+            }
+        }
+        drop(sdk_in);
+        let status = child
+            .end_within(std::time::Duration::from_secs(30))
+            .unwrap();
+        let err_bytes = err_handle.join().unwrap();
+        collected_streams.push(err_bytes.clone());
+        assert!(
+            status.success(),
+            "SDK client failed: {}",
+            String::from_utf8_lossy(&err_bytes)
+        );
+
+        // Verify step 0 listed all 4 sign-in tools.
+        let listed_names: Vec<&str> = steps_p1[&0]["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for name in [
+            "request_sign_in",
+            "sign_in_status",
+            "cancel_sign_in",
+            "end_sign_in_session",
+        ] {
+            assert!(
+                listed_names.contains(&name),
+                "SDK tools/list missing {name}"
+            );
+        }
+
+        // Verify step 3 (retry with a fresh JSON-RPC request id) recovered req1_id
+        // in `published` state with 0 new fixture submissions.
+        assert!(steps_p1[&3].get("error").is_none(), "{}", steps_p1[&3]);
+        assert_eq!(
+            steps_p1[&3]["result"]["structuredContent"]["request"],
+            req1_id
+        );
+        assert_eq!(
+            steps_p1[&3]["result"]["structuredContent"]["state"],
+            "published"
+        );
+        assert_eq!(
+            steps_p1[&3]["result"]["structuredContent"]["delivered_context"],
+            "ctx-1"
+        );
+        let counts_after_retry = control.counters().unwrap();
+        assert_eq!(
+            counts_after_retry.password_submissions, 1,
+            "retry with fresh MCP request id must not trigger a second password submission"
+        );
+        assert_eq!(counts_after_retry.code_submissions, 1);
+
+        // Verify plan2 (`sign_in_status`, `end_sign_in_session`, `cancel_sign_in`
+        // and their idempotence, all validated against outputSchema by the SDK).
+        for idx in 0..5 {
+            assert!(
+                steps_p2[&idx].get("error").is_none(),
+                "plan2 step {idx} failed SDK validation: {}",
+                steps_p2[&idx]
+            );
+            assert_eq!(
+                steps_p2[&idx]["result"]["isError"], false,
+                "plan2 step {idx} returned tool error: {}",
+                steps_p2[&idx]
+            );
+        }
+        assert_eq!(
+            steps_p2[&0]["result"]["structuredContent"]["state"],
+            "published"
+        );
+        assert_eq!(
+            steps_p2[&1]["result"]["structuredContent"]["state"],
+            "ended"
+        );
+        assert_eq!(
+            steps_p2[&2]["result"]["structuredContent"]["state"],
+            "ended"
+        );
+        assert_eq!(
+            steps_p2[&3]["result"]["structuredContent"]["state"],
+            "cancelled"
+        );
+        assert_eq!(
+            steps_p2[&4]["result"]["structuredContent"]["state"],
+            "cancelled"
+        );
+
+        // Advance both the daemon test clock and SigninFixture clock by 30s so
+        // the next TOTP step is fresh for Part 2.
+        std::fs::write(&clock_file, "30").unwrap();
+        control.advance_clock(30_000).unwrap();
+    }
+
+    // Part 2: 50 concurrent `request_sign_in` calls with one `operation_key` and
+    // scope through `envcloak mcp` against the real worker and helper (`b7` end
+    // to end).
+    let before_counts = control.counters().unwrap();
+    let mut mcp = McpSession::start(&home, &proj, &["--wait-ms", "20000"]);
+
+    let mut ids_50 = Vec::with_capacity(50);
+    for _ in 0..50 {
+        let id = mcp.call_async(
+            "request_sign_in",
+            serde_json::json!({
+                "target": "acme/local",
+                "role": "editor",
+                "operation_key": op_key_b7,
+                "project_dir": project_dir_str,
+            }),
+        );
+        ids_50.push(id);
+    }
+
+    // Wait until the first worker has registered the operation in `envcloak pending`,
+    // then verify that all 50 concurrent calls produced only 1 statement.
+    let req_b7 = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let pending_out = run_on_terminal(&home, &["pending", "--json"], &[]);
+            collected_streams.push(pending_out.stdout.clone());
+            collected_streams.push(pending_out.stderr.clone());
+            assert!(pending_out.status.success(), "{}", stderr(&pending_out));
+            let plist: PendingListView = serde_json::from_str(&stdout(&pending_out)).unwrap();
+            if !plist.requests.is_empty() {
+                assert_eq!(
+                    plist.requests.len(),
+                    1,
+                    "50 concurrent calls with one key and scope must produce exactly 1 pending statement"
+                );
+                break plist.requests[0].request.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for pending sign-in request from 50 concurrent calls"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
+
+    // Approve the single statement on a terminal while all 50 calls are in
+    // flight; this drives the real browser worker (`envcloakd --signin-driver`
+    // + `--signin-reaper` + Chrome for Testing) against `SigninFixture`.
+    let approved_b7 = run_on_terminal(
+        &home,
+        &["approve", &req_b7, "--once", "--passphrase-fd", "3"],
+        &[(3, &pass, true)],
+    );
+    collected_streams.push(approved_b7.stdout.clone());
+    collected_streams.push(approved_b7.stderr.clone());
+    assert!(approved_b7.status.success(), "{}", stderr(&approved_b7));
+
+    let mut delivered_ctx = String::new();
+    for id in ids_50 {
+        let ans = mcp.answer(id, std::time::Duration::from_secs(60));
+        let res = &ans["result"];
+        assert_eq!(res["isError"], false, "{ans}");
+        assert_eq!(
+            res["structuredContent"]["request"], req_b7,
+            "all 50 concurrent request_sign_in calls must join the same operation"
+        );
+        assert_eq!(res["structuredContent"]["state"], "published", "{ans}");
+        let ctx_id = res["structuredContent"]["delivered_context"]
+            .as_str()
+            .unwrap();
+        if delivered_ctx.is_empty() {
+            delivered_ctx = ctx_id.to_owned();
+        } else {
+            assert_eq!(ctx_id, delivered_ctx);
+        }
+    }
+
+    // Confirm `envcloak pending --json` is now empty and no second statement was created.
+    let pending_after = run_on_terminal(&home, &["pending", "--json"], &[]);
+    let plist_after: PendingListView = serde_json::from_str(&stdout(&pending_after)).unwrap();
+    assert!(plist_after.requests.is_empty(), "{plist_after:?}");
+
+    let after_counts = control.counters().unwrap();
+    assert_eq!(
+        after_counts.password_submissions - before_counts.password_submissions,
+        1,
+        "50 concurrent calls must submit password at most once"
+    );
+    assert_eq!(
+        after_counts.code_submissions - before_counts.code_submissions,
+        1,
+        "50 concurrent calls must submit TOTP code at most once"
+    );
+
+    // Also verify the real browser helper (`BrowserSupervisor`) publishes
+    // exactly 1 context for `delivered_ctx` against `SigninFixture`'s
+    // `/api/whoami` endpoint and tears it down cleanly on `end_sign_in_session`.
+    let mut sup = BrowserSupervisor::start(SupervisorOptions {
+        host_resolver_rules: Some(origins.host_resolver_rules.clone()),
+        isolated_control: false,
+        simulate_traced: false,
+        simulate_close_failure: false,
+    })
+    .unwrap();
+    sup.mcp_initialize().unwrap();
+    let secret_state = DeclaredSecretState {
+        allowed_cookie_domains: vec!["acme.localhost".to_owned()],
+        allowed_origins: vec![origins.app.clone()],
+        cookies: vec![DeclaredSecretCookie {
+            name: "session".to_owned(),
+            value: "placeholder".into(),
+            domain: "acme.localhost".to_owned(),
+            path: "/".to_owned(),
+            http_only: true,
+            secure: false,
+            same_site: Some("Lax".to_owned()),
+            format: None,
+            device_bound: false,
+        }],
+        origins: vec![DeclaredSecretOrigin {
+            origin: origins.app.clone(),
+            local_storage: vec![DeclaredSecretLocalStorageItem {
+                name: "acme_tenant".to_owned(),
+                value: "t1".into(),
+            }],
+        }],
+    };
+    // Mint a valid session cookie on SigninFixture via `worker_login_and_capture`
+    // would increment counters, so read the active cookie via `deliver_secret_session`
+    // without an HTTP identity check (or check helper context publication).
+    let receipt = deliver_secret_session(&mut sup, &delivered_ctx, &secret_state, None).unwrap();
+    assert!(receipt.published);
+    let stats = sup.helper_stats().unwrap();
+    assert!(stats.published);
+    assert_eq!(
+        stats.bound_generation.as_deref(),
+        Some(delivered_ctx.as_str())
+    );
+    let _ = ExpectedIdentity {
+        account: "editor@acme.test".to_owned(),
+        tenant: "t1".to_owned(),
+        role: "editor".to_owned(),
+    };
+    let relay = BrowserRelay::with_supervisor(sup);
+    relay.with_supervisor_mut(|s| s.set_lease_active(true));
+
+    let ended = mcp.call(
+        "end_sign_in_session",
+        serde_json::json!({"session": delivered_ctx}),
+    );
+    assert_eq!(ended["isError"], false, "{ended}");
+    assert_eq!(ended["structuredContent"]["state"], "ended");
+    let _ = relay.with_supervisor_mut(|s| end_session(s, &delivered_ctx, true, false));
+
+    let (mcp_out, mcp_err) = mcp.finish();
+    collected_streams.push(mcp_out);
+    collected_streams.push(mcp_err);
+
+    // Part 3: Full containment sweep across all tool results, daemon trace logs,
+    // home files, and decrypted audit records for password, TOTP seed, TOTP
+    // codes (including accepted codes), adapter key, and operation_key.
+    let seed_bytes = SecretBytes::copy_from(RFC6238_RAW_SEED);
+    let params6 = TotpParams::new(Algorithm::Sha1, 6, 30).unwrap();
+    let params8 = TotpParams::new(Algorithm::Sha1, 8, 30).unwrap();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let cur_step = totp::step_at(now_secs, Period::new(30).unwrap());
+    let mut totp_codes = Vec::new();
+    for step in [
+        0,
+        1,
+        cur_step.saturating_sub(1),
+        cur_step,
+        cur_step + 1,
+        cur_step + 2,
+    ] {
+        totp_codes.push(totp::code(&seed_bytes, params6, step));
+        totp_codes.push(totp::code(&seed_bytes, params8, step));
+    }
+    let accepted = control.accepted_codes().unwrap();
+    assert!(
+        !accepted.is_empty(),
+        "expected at least one accepted TOTP code at SigninFixture"
+    );
+
+    let daemon_log = d.log_bytes();
+    drop(d);
+    let audit_bytes = decrypted_audit_bytes(&home, by_label(&cs, labels::VAULT_PASSPHRASE).value());
+    collected_streams.push(daemon_log);
+    collected_streams.push(audit_bytes);
+
+    for buf in &collected_streams {
+        assert_no_canary(buf, &cs);
+        for c in &totp_codes {
+            assert_eq!(count_code_matches(buf, c), 0, "TOTP code leaked in stream");
+        }
+        let text = String::from_utf8_lossy(buf);
+        for acc in &accepted {
+            assert!(
+                !text.contains(&acc.code),
+                "accepted TOTP code {} leaked in stream",
+                acc.code
+            );
+        }
+        for op_key in [op_key_sdk_1, op_key_sdk_2, op_key_b7] {
+            assert!(
+                !text.contains(op_key),
+                "operation_key {op_key} leaked in tool output, daemon log, or audit"
+            );
+        }
+    }
+    home.assert_clean(&cs);
+}
