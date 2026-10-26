@@ -10,7 +10,6 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::thread;
 
-use envcloak_mcp::Router;
 use envcloak_mcp::browser::{
     ALLOWED_BROWSER_TOOLS, BrokerStopOutcome, BrowserRelay, BrowserSupervisor,
     CONTEXT_NOT_PUBLISHED, CleanupOutcome, DeclaredSecretCookie, DeclaredSecretLocalStorageItem,
@@ -22,6 +21,7 @@ use envcloak_mcp::browser::{
     resolve_browser_runtime, run_browser_supervisor, verify_started_by_daemon,
     verify_started_by_daemon_fd,
 };
+use envcloak_mcp::{Router, Server};
 use envcloak_testkit::signin::{SigninFixture, http_request, require_browser_runtime};
 use secrecy::SecretString;
 use serde_json::{Map, Value, json};
@@ -98,6 +98,12 @@ fn d30_allowlist_and_router_registration_enforce_tool_and_arg_filters() {
     let mut router = Router::new();
     let relay = BrowserRelay::new();
     register_browser_tools(&mut router, relay.clone()).expect("register_browser_tools");
+
+    let srv = Server::with_browser_relay(relay.clone());
+    assert!(
+        srv.tools().iter().any(|t| t.name == "browser_find"),
+        "Server::with_browser_relay must list browser_find and the D-30 browser tools"
+    );
 
     let listed: Vec<Value> = router.list().into_iter().map(|s| s.to_json()).collect();
     for &tool_name in ALLOWED_BROWSER_TOOLS {
@@ -282,13 +288,27 @@ fn cycle342_all_five_cookie_path_cases_verified_against_live_browser_helper() {
             "case {name}: expected 1 captured cookie from {url}"
         );
 
+        // Also verify direct cookie import with the exact declared path (without
+        // trimming or normalizing interior spaces) so `/part one` is refused by
+        // `inject_state`'s post-`addCookies` re-read (`cycle342`).
+        let direct_path = match name {
+            "plain" | "header-trailing-space" | "header-leading-space" => "/part-one",
+            "encoded-space" => "/part%20one",
+            "interior-space" => "/part one",
+            _ => "/",
+        };
+        let mut direct_cookie = captured[0].clone();
+        if let Some(obj) = direct_cookie.as_object_mut() {
+            obj.insert("path".to_owned(), json!(direct_path));
+        }
+
         let generation = format!("gen-{name}");
         sup.create_context(&generation).expect("create_context");
         let inject_res = sup.inject_state(
             &generation,
             json!({
                 "allowed_cookie_domains": ["acme.localhost"],
-                "cookies": captured,
+                "cookies": [direct_cookie],
             }),
         );
 
