@@ -231,6 +231,19 @@ fn tool_allowlist_snapshot_and_refusals() {
     );
 }
 
+fn fresh_totp_secs() -> u64 {
+    loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now % 30 < 25 {
+            return now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 #[test]
 fn all_nineteen_mcp_context_observations_and_generation_isolation() {
     let Some(_runtime) = require_browser_runtime() else {
@@ -304,10 +317,7 @@ fn all_nineteen_mcp_context_observations_and_generation_isolation() {
     let totp_editor = control
         .verify_totp(
             &origins.editor_totp_secret_hex,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            fresh_totp_secs(),
             8,
             "SHA1",
             "00000000",
@@ -467,10 +477,7 @@ fn all_nineteen_mcp_context_observations_and_generation_isolation() {
     let totp_admin = control
         .verify_totp(
             &origins.admin_totp_secret_hex,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            fresh_totp_secs(),
             8,
             "SHA1",
             "00000000",
@@ -1039,10 +1046,7 @@ fn fixture_totp_rfc_6238_vectors_and_controls() {
     let code_now = control
         .verify_totp(
             &origins.editor_totp_secret_hex,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            fresh_totp_secs(),
             8,
             "SHA1",
             "00000000",
