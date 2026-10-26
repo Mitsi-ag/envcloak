@@ -1,12 +1,12 @@
 //! `envcloak signin target add|edit|rm|ls` (SPEC §6.8, M2b-05) and
-//! `envcloak signin setup` (stub until M2b-08).
+//! `envcloak signin setup` (M2b-08).
 //!
 //! - `target add`, `target edit` and `target rm` require a passphrase proof
 //!   from a terminal session with no agent in it (binding a login item to
 //!   origins is what makes the credential usable there).
 //! - `target ls` lists registered sign-in targets (metadata only).
-//! - `setup` is registered ahead of M2b-08 and exits 125 with
-//!   `not_in_this_build`.
+//! - `setup` verifies the pinned sign-in browser runtime (Node,
+//!   `@playwright/mcp` + `playwright-core`, and Chrome for Testing).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -57,7 +57,7 @@ const USAGE_TEXT: &str = "envcloak signin target add <name> --login <slug> \
     envcloak signin target rm <name> [--role <role>] [--manifest <path>] \
     [--passphrase-fd N] [--json]\n       \
     envcloak signin target ls [--json]\n       \
-    envcloak signin setup (not in this build)";
+    envcloak signin setup [--versions <path>] [--json]";
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -749,8 +749,8 @@ fn parse_remove(args: &[&str]) -> Result<Option<Action>, Failure> {
 }
 
 pub fn run(args: &[&str]) -> ExitCode {
-    if matches!(args, ["setup", ..]) {
-        return super::not_in_this_build("`envcloak signin setup`");
+    if let Some(rest) = args.strip_prefix(&["setup"]) {
+        return run_setup(rest);
     }
     if matches!(
         args,
@@ -784,6 +784,56 @@ pub fn run(args: &[&str]) -> ExitCode {
         Action::List { json } => target_list(json),
     };
     res.unwrap_or_else(|f| f.report(FAILURE))
+}
+
+fn run_setup(args: &[&str]) -> ExitCode {
+    if matches!(args, ["--help"] | ["-h"]) {
+        println!("usage: {USAGE_TEXT}");
+        return ExitCode::SUCCESS;
+    }
+    let mut json = false;
+    let mut versions_path: Option<std::path::PathBuf> = None;
+    let mut it = args.iter();
+    while let Some(&flag) = it.next() {
+        match flag {
+            "--json" if !json => json = true,
+            "--versions" if versions_path.is_none() => {
+                let Some(&v) = it.next() else {
+                    return usage(USAGE_TEXT);
+                };
+                versions_path = Some(std::path::PathBuf::from(v));
+            }
+            _ => return usage(USAGE_TEXT),
+        }
+    }
+    if let Err(f) = refuse_if_traced() {
+        return f.report(FAILURE);
+    }
+    let vpath = versions_path.unwrap_or_else(envcloak_mcp::browser::browser_versions_path);
+    match envcloak_mcp::browser::resolve_browser_runtime(&vpath) {
+        Ok(rt) => {
+            if json {
+                println!(
+                    "{{\"status\":\"ready\",\"node_version\":{},\"helper_version\":{},\"playwright_version\":{},\"chrome_version\":{},\"chrome_revision\":{}}}",
+                    json_text(&rt.pins.node_version),
+                    json_text(&rt.pins.helper_version),
+                    json_text(&rt.pins.playwright_version),
+                    json_text(&rt.pins.chrome_version),
+                    json_text(&rt.pins.chrome_revision),
+                );
+            } else {
+                println!(
+                    "sign-in browser runtime verified (node {}, @playwright/mcp {}, Chrome for Testing {} r{})",
+                    escape_for_display(&rt.pins.node_version),
+                    escape_for_display(&rt.pins.helper_version),
+                    escape_for_display(&rt.pins.chrome_version),
+                    escape_for_display(&rt.pins.chrome_revision),
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(why) => Failure::new("check_failed", why).report(FAILURE),
+    }
 }
 
 fn read_proof_passphrase(

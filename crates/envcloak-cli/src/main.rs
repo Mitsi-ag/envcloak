@@ -126,8 +126,7 @@ const HELP: &str = "usage:
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
   envcloak signin target add|edit|rm|ls ...
-Not in this build (each exits 125 with not_in_this_build):
-  envcloak signin setup
+  envcloak signin setup [--versions PATH] [--json]
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
@@ -212,11 +211,8 @@ fn main() -> ExitCode {
 /// by the words that select it; `None` for any other command line. No
 /// other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
-    let word = |i: usize| args.get(i).and_then(|a| a.to_str());
-    Some(match word(0)? {
-        "signin" if word(1)? == "setup" => cmd::signin::run(&["setup"]),
-        _ => return None,
-    })
+    let _ = args;
+    None
 }
 
 fn internal_hardening(hold: bool) -> ExitCode {

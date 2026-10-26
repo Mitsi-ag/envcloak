@@ -584,8 +584,11 @@ dependencies = [
  "libc",
  "rustls",
  "secrecy",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "toml_edit",
  "ureq",
  "zeroize",
 ]
