@@ -662,21 +662,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: agents
-      # No setup-node: the installer puts the Node.js versions.toml pins
-      # (version, archive and binary SHA-256) in the host cache, runs npm
-      # with it, and the harness runs every node host with it. The Chrome
-      # for Testing cache M2-04's CI scope also lists is deferred to M2b-02,
-      # which pins the browser (integrations/browser/versions.toml) and is
-      # the first task to run one; no job before it starts a browser.
-      - name: Agent hosts from the cache, keyed by their pins
+      # No setup-node: the installers put the Node.js versions.toml pins
+      # (version, archive and binary SHA-256) in the host cache, run npm
+      # with it, and the harness runs every node host and the sign-in
+      # browser helper (M2b-02: integrations/browser/versions.toml) with it.
+      - name: Agent hosts and sign-in browser runtime from the cache, keyed by their pins
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/../agent-hosts
-          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'crates/envcloak-e2e/mcp-client/package*.json', 'scripts/install-agent-hosts.py') }}
-      - name: Install and verify the pinned hosts (tier 1 and tier 2)
+          key: agent-hosts-${{ runner.os }}-${{ hashFiles('crates/envcloak-e2e/agents/**', 'crates/envcloak-e2e/mcp-client/package*.json', 'scripts/install-agent-hosts.py', 'integrations/browser/versions.toml', 'integrations/browser-helper/package*.json', 'scripts/install-browser-runtime.py') }}
+      - name: Install and verify the pinned hosts (tier 1 and tier 2) and sign-in browser runtime
         run: |
           python3 scripts/install-agent-hosts.py --self-test
           python3 scripts/install-agent-hosts.py --tier all --mcp-client
+          python3 scripts/install-browser-runtime.py --self-test
+          python3 scripts/install-browser-runtime.py
       # Claude Code's Bash sandbox needs bubblewrap and socat on Linux
       # (https://code.claude.com/docs/en/sandboxing); without them the
       # sandbox measurements read "the host did not run".
@@ -692,7 +692,7 @@ jobs:
       - name: Build
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
-          cargo test --locked -p envcloak-e2e $TESTS --no-run
+          cargo test --locked -p envcloak-e2e $TESTS --test browser_helper_smoke --no-run
       # The positive control: --exact runs nothing for a name no test has,
       # and passes, so the step also requires that the one test ran and passed.
       - name: The network outside the isolation is open
@@ -749,6 +749,19 @@ jobs:
              the_network_is_what_ci_says" 2>&1 | tee "$RUNNER_TEMP/sentinels-outside.log"
           grep -qx 'running 3 tests' "$RUNNER_TEMP/sentinels-outside.log"
           grep -q '^test result: ok. 3 passed; 0 failed' "$RUNNER_TEMP/sentinels-outside.log"
+      # M2b-02's sign-in browser helper smoke test against the pinned
+      # @playwright/mcp, playwright-core and Chrome for Testing outside a
+      # mapped-root user namespace (Chromium refuses euid 0 without
+      # --no-sandbox), loopback only.
+      - name: Sign-in browser helper smoke outside a user namespace, loopback only (Linux)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          ENVCLOAK_REQUIRE_BROWSER_RUNTIME: "1"
+          ENVCLOAK_TEST_NETWORK: loopback-only
+        run: |
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-e2e --test browser_helper_smoke -- --nocapture --test-threads=1"
       # S0's sandboxed cases the same way (the gates job runs them on pull
       # requests), on main, nightly and manual runs.
       - name: Story steps, sandboxed cases outside a user namespace, loopback only (Linux)
@@ -802,12 +815,13 @@ jobs:
       - name: Agent hosts, loopback only (macOS)
         if: runner.os == 'macOS'
         env:
+          ENVCLOAK_REQUIRE_BROWSER_RUNTIME: "1"
           ENVCLOAK_TEST_NETWORK: loopback-only
         run: |
           sudo -E env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID \
             "PATH=$PATH" "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" \
             "$(command -v python3)" -c 'import os, sys; os.setgroups([4242]); os.setgid(4242); os.setuid(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' \
-            "$(id -u)" cargo test --locked --offline -p envcloak-e2e $TESTS -- --nocapture --test-threads=1
+            "$(id -u)" cargo test --locked --offline -p envcloak-e2e $TESTS --test browser_helper_smoke -- --nocapture --test-threads=1
 
   # The real-model release check (M2 plan D-13, Q-01; task M2-26): manual and
   # nightly only, with dedicated low-limit keys from Actions secrets, which pull
