@@ -54,10 +54,16 @@ fn browser_runtime_or_skip() -> Option<VerifiedBrowserRuntime> {
 }
 
 fn fixture_totp_code(control: &Control, secret_hex: &str, step_offset: i64) -> String {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now_secs = loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now % 30 < 25 {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let ts = if step_offset >= 0 {
         now_secs.saturating_add((step_offset as u64) * 30)
     } else {
