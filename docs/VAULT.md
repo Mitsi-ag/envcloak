@@ -396,13 +396,13 @@ M2 and M2b change the vault format once: schema version 2, written by M2-07, hol
 | 36 | `login_replace` | M2b-03 | landed | a login field replaced, with a proof |
 | 37 | `signin_target` | M2b-05 | landed | a sign-in target added, edited or removed |
 | 38 | `signin_approve` | M2b-05 | landed | a sign-in approval and its authorization |
-| 39 | `signin_intent` | M2b-09 | reserved | before any credential use in an attempt |
-| 40 | `signin_outcome` | M2b-09 | reserved | after an attempt, with its result class |
+| 39 | `signin_intent` | M2b-09 | landed | before any credential use in an attempt |
+| 40 | `signin_outcome` | M2b-09 | landed | after an attempt, with its result class |
 | 41 | `signin_publish` | M2b-05 | landed | the publication decision for an operation |
 | 42 | `signin_end` | M2b-05 | landed | an operation cancelled or its session ended |
 | 43 | `managed_launch` | M2-27 | landed | a managed launch check that refused, with the old and new identity metadata |
 | 44 | `standing_confirm` | M2-15 | landed | `envcloak standing confirm`, with a proof |
-| 45 | `signin_cleanup` | M2b-09 | reserved | a worker teardown confirmed, left unconfirmed, or cleared by a reboot |
+| 45 | `signin_cleanup` | M2b-09 | landed | a worker teardown confirmed, left unconfirmed, or cleared by a reboot |
 <!-- /reservations -->
 
 **Item classes** (`items.class` and the associated data's `item_class`):

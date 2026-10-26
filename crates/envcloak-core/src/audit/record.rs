@@ -151,6 +151,10 @@ pub enum AuditKind {
     /// A sign-in request was approved into an authorization, with a proof, or
     /// the proof failed.
     SigninApprove = 38,
+    /// A sign-in attempt is about to start and open login credentials.
+    SigninIntent = 39,
+    /// A sign-in attempt finished with its result class.
+    SigninOutcome = 40,
     /// The publication decision for a sign-in operation (`published` or
     /// `refused`).
     SigninPublish = 41,
@@ -167,6 +171,9 @@ pub enum AuditKind {
     ManagedLaunch = 43,
     /// `envcloak standing confirm`, with a proof, or the proof failed.
     StandingConfirm = 44,
+    /// A sign-in worker teardown confirmed, left unconfirmed, or cleared by a
+    /// reboot (`confirmed`, `unconfirmed`, or `ended_by_reboot`).
+    SigninCleanup = 45,
     /// A Secure Enclave unlocker enrolled (approved with the passphrase, or
     /// later signed in the app), with its label and both public keys'
     /// fingerprints.
@@ -189,7 +196,7 @@ pub enum AuditKind {
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 45] = [
+    pub const ALL: [AuditKind; 48] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -226,10 +233,13 @@ impl AuditKind {
         AuditKind::LoginReplace,
         AuditKind::SigninTarget,
         AuditKind::SigninApprove,
+        AuditKind::SigninIntent,
+        AuditKind::SigninOutcome,
         AuditKind::SigninPublish,
         AuditKind::SigninEnd,
         AuditKind::ManagedLaunch,
         AuditKind::StandingConfirm,
+        AuditKind::SigninCleanup,
         AuditKind::UnlockerAdd,
         AuditKind::UnlockerRemove,
         AuditKind::RevealApp,
@@ -276,10 +286,13 @@ impl AuditKind {
             AuditKind::LoginReplace => "login_replace",
             AuditKind::SigninTarget => "signin_target",
             AuditKind::SigninApprove => "signin_approve",
+            AuditKind::SigninIntent => "signin_intent",
+            AuditKind::SigninOutcome => "signin_outcome",
             AuditKind::SigninPublish => "signin_publish",
             AuditKind::SigninEnd => "signin_end",
             AuditKind::ManagedLaunch => "managed_launch",
             AuditKind::StandingConfirm => "standing_confirm",
+            AuditKind::SigninCleanup => "signin_cleanup",
             AuditKind::UnlockerAdd => "unlocker_add",
             AuditKind::UnlockerRemove => "unlocker_remove",
             AuditKind::RevealApp => "reveal_app",

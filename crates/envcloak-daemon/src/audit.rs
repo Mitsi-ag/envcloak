@@ -553,6 +553,37 @@ pub enum AuditEvent {
         method: Option<&'static str>,
         reason: Option<&'static str>,
     },
+    /// A sign-in attempt was started (`signin_intent`), recorded durably
+    /// before any login credential field is decrypted or worker started.
+    SigninIntent {
+        pid: i32,
+        subject: SubjectSummary,
+        request: String,
+        authorization: Option<String>,
+        item: (ItemId, Slug),
+        worker: u64,
+    },
+    /// A sign-in attempt finished (`signin_outcome`), with its result class
+    /// (`captured` or `failed`) and stop reason.
+    SigninOutcome {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        request: String,
+        authorization: Option<String>,
+        item: (ItemId, Slug),
+        reason: Option<&'static str>,
+        worker: u64,
+    },
+    /// A sign-in worker's teardown was confirmed (`confirmed`), left
+    /// unconfirmed (`unconfirmed`), or cleared after a reboot
+    /// (`ended_by_reboot`).
+    SigninCleanup {
+        pid: i32,
+        outcome: &'static str,
+        attempt: String,
+        reason: Option<&'static str>,
+    },
 }
 
 /// A managed launch's counts, as its audit entries record them.
@@ -984,6 +1015,40 @@ impl AuditEvent {
                 ..
             } => format!(
                 "envcloakd: audit: signin {outcome} request={request} reason={} pid={pid}",
+                reason.unwrap_or("none")
+            ),
+            AuditEvent::SigninIntent {
+                pid,
+                request,
+                authorization,
+                worker,
+                ..
+            } => format!(
+                "envcloakd: audit: signin intent started request={request} authorization={} \
+                 worker={worker} pid={pid}",
+                authorization.as_deref().unwrap_or("none")
+            ),
+            AuditEvent::SigninOutcome {
+                pid,
+                outcome,
+                request,
+                authorization,
+                reason,
+                worker,
+                ..
+            } => format!(
+                "envcloakd: audit: signin outcome {outcome} request={request} authorization={} \
+                 reason={} worker={worker} pid={pid}",
+                authorization.as_deref().unwrap_or("none"),
+                reason.unwrap_or("none")
+            ),
+            AuditEvent::SigninCleanup {
+                pid,
+                outcome,
+                attempt,
+                reason,
+            } => format!(
+                "envcloakd: audit: signin cleanup {outcome} attempt={attempt} reason={} pid={pid}",
                 reason.unwrap_or("none")
             ),
         })
@@ -1745,6 +1810,49 @@ impl AuditEvent {
                 subject: subject.clone(),
                 decision: decision(outcome, *reason, *method, None),
                 ..AuditRecord::new(AuditKind::SigninEnd, outcome)
+            },
+            AuditEvent::SigninIntent {
+                subject,
+                request,
+                authorization,
+                item,
+                worker,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                grant_id: authorization.clone(),
+                subject: subject.clone(),
+                items: vec![item.clone()],
+                decision: decision("started", None, Some("signin.attempt"), Some(*worker)),
+                ..AuditRecord::new(AuditKind::SigninIntent, "started")
+            },
+            AuditEvent::SigninOutcome {
+                subject,
+                outcome,
+                request,
+                authorization,
+                item,
+                reason,
+                worker,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                grant_id: authorization.clone(),
+                subject: subject.clone(),
+                items: vec![item.clone()],
+                decision: decision(outcome, *reason, Some("signin.attempt"), Some(*worker)),
+                ..AuditRecord::new(AuditKind::SigninOutcome, outcome)
+            },
+            AuditEvent::SigninCleanup {
+                pid,
+                outcome,
+                attempt,
+                reason,
+            } => AuditRecord {
+                request_id: Some(attempt.clone()),
+                subject: subject(*pid),
+                decision: decision(outcome, *reason, Some("signin.cleanup"), None),
+                ..AuditRecord::new(AuditKind::SigninCleanup, outcome)
             },
         }
     }

@@ -342,6 +342,7 @@ pub fn run_daemon(cfg: DaemonConfig) -> Result<(), DaemonError> {
         }
     };
     let state = State::open(vault_paths, cfg.idle_limit, Reading::now(&clocks));
+    let _ = state.signin().attempt_supervisor().ensure_anchor();
     log_line!(
         "envcloakd: listening on {} (pid {}, version {})",
         run.socket.display(),

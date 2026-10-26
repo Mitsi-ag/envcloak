@@ -188,6 +188,12 @@ fn print_human(s: &StatusView, identity: DaemonIdentity, cli: &HardeningView) {
             duration(s.approvals.proof_wait_secs)
         );
     }
+    if s.cleanup_unconfirmed > 0 {
+        println!(
+            "signin cleanup: {} cleanup_unconfirmed",
+            s.cleanup_unconfirmed
+        );
+    }
     if s.daemon.runtime_dir_fallback {
         if let Ok(p) = run_paths() {
             println!(
@@ -278,6 +284,7 @@ mod tests {
                 dropped: 0,
             },
             app_requests: 0,
+            cleanup_unconfirmed: 0,
         };
         let text = status_json(&s, DaemonIdentity::Unverified, &hardening());
         assert!(text.ends_with('\n'), "{text:?}");

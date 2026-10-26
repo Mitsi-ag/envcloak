@@ -40,9 +40,20 @@ pub struct Reading {
 impl Reading {
     pub fn now(c: &dyn Clocks) -> Self {
         let offset = envcloak_sys::test_clock_offset();
+        let sleep_gap = envcloak_sys::test_hook_vars()
+            .into_iter()
+            .find_map(|(k, v)| {
+                (k == "ENVCLOAK_TEST_SLEEP_TRIGGER_FILE").then(|| std::fs::remove_file(v).is_ok())
+            })
+            .unwrap_or(false);
+        let extra = if sleep_gap {
+            SLEEP_GAP + Duration::from_secs(1)
+        } else {
+            Duration::ZERO
+        };
         Reading {
             awake: c.awake() + offset,
-            including_sleep: c.including_sleep() + offset,
+            including_sleep: c.including_sleep() + offset + extra,
         }
     }
 }

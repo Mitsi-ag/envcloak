@@ -945,6 +945,12 @@ pub fn rotate(
             Err(e) => return Err(proven.aborted(peer, Write::Rotate, e)),
         };
         proven.s.totp().on_login_replaced(t.item, new_rev);
+        proven.s.signin().attempt_supervisor().on_event(
+            crate::signin::attempt::Event::RevisionChange {
+                item: t.item,
+                new_revision: new_rev,
+            },
+        );
         let ended = proven.s.signin_reconcile(shared);
         let subject = subject_summary(peer, &proven.caller);
         proven.s.audit(AuditEvent::LoginReplaced {

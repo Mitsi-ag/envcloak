@@ -12,6 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+envcloak-browser = { path = "../envcloak-browser", version = "0.1.0" }
 envcloak-core.workspace = true
 envcloak-ipc.workspace = true
 envcloak-policy.workspace = true
@@ -21,6 +22,8 @@ envcloak-signin.workspace = true
 envcloak-sys.workspace = true
 libc.workspace = true
 secrecy.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 # The import plan's digest (`import.plan`, `import.commit`).
 sha2.workspace = true
 # Read the daemon's bounded Codex log_dir setting for scrub backup admission.
@@ -29,6 +32,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+envcloak-browser = { path = "../envcloak-browser", version = "0.1.0", features = ["testing"] }
 envcloak-core = { workspace = true, features = ["testing"] }
 envcloak-ipc = { workspace = true, features = ["testing"] }
 # A backup v2 restore writes files back as a client does (R-M2-73).
@@ -37,7 +41,6 @@ envcloak-sys = { workspace = true, features = ["testing"] }
 envcloak-testkit.workspace = true
 # The grant tests tamper with a vault file directly, as the core's do.
 rusqlite.workspace = true
-serde_json.workspace = true
 # Gate 28 checks the audited manifest hash against the file's bytes.
 sha2.workspace = true
 tempfile.workspace = true

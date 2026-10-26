@@ -104,6 +104,9 @@ pub struct StatusView {
     /// How many asks and reveal requests wait for the app (`status.app_requests`, M3-14).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub app_requests: u32,
+    /// How many sign-in attempts have unconfirmed cleanup tombstones (`cleanup_unconfirmed`, M2b-09).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub cleanup_unconfirmed: u32,
 }
 
 impl StatusView {
