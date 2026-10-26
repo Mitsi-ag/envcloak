@@ -155,7 +155,7 @@ impl Fx {
             hosts: hosts.to_vec(),
             global,
             project: project.then_some(proj),
-            consent_sockets: false,
+            ..Options::default()
         };
         let (mut journal, mut backups) = (Kept, Kept);
         let mut w = Writer {
@@ -324,6 +324,10 @@ fn install_and_uninstall_round_trip_for_all_tier_2_and_tier_3_hosts() {
             .unwrap();
     assert_eq!(copilot_mcp["mcpServers"]["envcloak"]["type"], "local");
     assert_eq!(copilot_mcp["mcpServers"]["envcloak"]["tools"], json!(["*"]));
+    assert_eq!(
+        copilot_mcp["mcpServers"]["envcloak"]["timeout"],
+        json!(60000)
+    );
 
     // Verify OpenCode files:
     assert!(
@@ -339,6 +343,7 @@ fn install_and_uninstall_round_trip_for_all_tier_2_and_tier_3_hosts() {
     )
     .unwrap();
     assert_eq!(oc_json["mcp"]["envcloak"]["type"], "local");
+    assert_eq!(oc_json["mcp"]["envcloak"]["timeout"], json!(60000));
 
     // Verify Kimi Code files:
     assert!(
@@ -348,6 +353,13 @@ fn install_and_uninstall_round_trip_for_all_tier_2_and_tier_3_hosts() {
     );
     let kimi_toml = std::fs::read_to_string(fx.home().join(".kimi-code/config.toml")).unwrap();
     assert!(kimi_toml.contains("hook --host kimi --event PreToolUse"));
+    let kimi_mcp: Value =
+        serde_json::from_slice(&std::fs::read(fx.home().join(".kimi-code/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        kimi_mcp["mcpServers"]["envcloak"]["toolTimeoutMs"],
+        json!(60000)
+    );
     assert!(!fx.home().join(".kimi").exists());
 
     // Verify Qwen files:
@@ -511,8 +523,7 @@ fn gemini_never_writes_gemini_md_when_context_file_name_names_agents_md() {
     let opts = Options {
         hosts: vec![Host::Gemini],
         global: true,
-        project: None,
-        consent_sockets: false,
+        ..Options::default()
     };
     let plan = install::plan(&ctx, &opts);
     // Now change settings.json before apply so context.fileName points to CUSTOM.md.
@@ -1190,4 +1201,235 @@ fn review_round1_regressions_f01_through_f07() {
     );
     assert_eq!(cs_partial.hooks.tools, HookState::Missing);
     assert_eq!(cs_partial.hooks.mcp, HookState::Missing);
+}
+
+#[test]
+fn signin_installer_and_apply_signin_across_hosts() {
+    let mut fx = Fx::new();
+    fx.add_fake_exe("claude", "echo '2.1.280 (Claude Code)'");
+    fx.add_fake_exe("codex", "echo 'codex-cli 0.159.2'");
+    fx.add_all_tier2_and_tier3_exes(kimi::KimiProduct::Code);
+
+    // Pre-populate another server in Claude Code and Codex so we can verify
+    // `apply_signin` leaves other servers and their approvals byte-for-byte intact.
+    let pre_claude_settings = br#"{
+  "permissions": {
+    "allow": [
+      "mcp__other__lookup"
+    ],
+    "deny": [
+      "Read(./secrets/**)"
+    ]
+  }
+}
+"#;
+    let pre_codex_toml = b"[mcp_servers.other]\ncommand = \"/usr/bin/true\"\ndefault_tools_approval_mode = \"approve\"\n\n[mcp_servers.other.tools.lookup]\napproval_mode = \"approve\"\n";
+    fx.write_home(".claude/settings.json", pre_claude_settings);
+    fx.write_home(".codex/config.toml", pre_codex_toml);
+
+    // 1. Call `Installer::apply_signin(host, false)` (without consent) for all hosts.
+    for host in Host::ALL {
+        let root = fx.root.clone();
+        let bin = fx.bin.clone();
+        let vars = fx.vars.clone();
+        let env = move |k: &str| vars.get(k).cloned();
+        let ctx = Context {
+            locations: Locations::new(&env)
+                .unwrap()
+                .with_system_dirs(root.join("etc-codex"), root.join("prefs")),
+            envcloak: root.join("envcloak"),
+            data_dir: root.join("data"),
+            socket: root.join("socket"),
+            path: bin.into_os_string(),
+            env: &env,
+        };
+        let (mut journal, mut backups) = (Kept, Kept);
+        let mut w = Writer {
+            state: &mut fx.state,
+            journal: &mut journal,
+            backups: &mut backups,
+            now: SystemTime::now(),
+        };
+        let mut installer = install::Installer::new(&ctx, &mut w);
+        let rep = installer.apply_signin(host, false);
+        assert!(rep.complete(), "{host:?}: {rep:?}");
+    }
+
+    // Every global instruction file carries the exact byte-identical SIGNIN_LINE.
+    for rel in [
+        ".claude/CLAUDE.md",
+        ".codex/AGENTS.md",
+        ".gemini/GEMINI.md",
+        ".copilot/instructions/envcloak.instructions.md",
+        ".kimi-code/AGENTS.md",
+        ".qwen/QWEN.md",
+        ".config/goose/.goosehints",
+        ".agents/AGENTS.md",
+    ] {
+        let text = std::fs::read_to_string(fx.home().join(rel)).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l == envcloak_agents::blocks::SIGNIN_LINE),
+            "{rel} missing SIGNIN_LINE: {text}"
+        );
+    }
+
+    // Without consent, no sign-in approval rule was written to Claude Code or Codex.
+    let claude_settings: Value =
+        serde_json::from_slice(&std::fs::read(fx.home().join(".claude/settings.json")).unwrap())
+            .unwrap();
+    let allow = claude_settings["permissions"]["allow"].as_array().unwrap();
+    assert_eq!(allow, &[json!("mcp__other__lookup")], "{claude_settings}");
+    let codex_toml = std::fs::read_to_string(fx.home().join(".codex/config.toml")).unwrap();
+    assert!(
+        !codex_toml.contains("[mcp_servers.envcloak.tools"),
+        "{codex_toml}"
+    );
+    assert!(
+        codex_toml.contains("[mcp_servers.other.tools.lookup]"),
+        "{codex_toml}"
+    );
+
+    // 2. Call `Installer::apply_signin(host, true)` (with consent) for Claude Code, Codex, Gemini, Qwen.
+    for host in [Host::ClaudeCode, Host::Codex, Host::Gemini, Host::Qwen] {
+        let root = fx.root.clone();
+        let bin = fx.bin.clone();
+        let vars = fx.vars.clone();
+        let env = move |k: &str| vars.get(k).cloned();
+        let ctx = Context {
+            locations: Locations::new(&env)
+                .unwrap()
+                .with_system_dirs(root.join("etc-codex"), root.join("prefs")),
+            envcloak: root.join("envcloak"),
+            data_dir: root.join("data"),
+            socket: root.join("socket"),
+            path: bin.into_os_string(),
+            env: &env,
+        };
+        let (mut journal, mut backups) = (Kept, Kept);
+        let mut w = Writer {
+            state: &mut fx.state,
+            journal: &mut journal,
+            backups: &mut backups,
+            now: SystemTime::now(),
+        };
+        let mut installer = install::Installer::new(&ctx, &mut w);
+        let rep = installer.apply_signin(host, true);
+        assert!(rep.complete(), "{host:?}: {rep:?}");
+    }
+
+    // With consent, Claude Code has the 4 sign-in tool allow rules (and no others),
+    // Codex has the 4 sign-in tool approval_mode = "approve" entries (and no others),
+    // and Gemini/Qwen still never set `trust`.
+    let claude_settings: Value =
+        serde_json::from_slice(&std::fs::read(fx.home().join(".claude/settings.json")).unwrap())
+            .unwrap();
+    let allow: Vec<&str> = claude_settings["permissions"]["allow"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        allow,
+        vec![
+            "mcp__other__lookup",
+            "mcp__envcloak__request_sign_in",
+            "mcp__envcloak__sign_in_status",
+            "mcp__envcloak__cancel_sign_in",
+            "mcp__envcloak__end_sign_in_session",
+        ]
+    );
+    let codex_toml = std::fs::read_to_string(fx.home().join(".codex/config.toml")).unwrap();
+    for tool in [
+        "request_sign_in",
+        "sign_in_status",
+        "cancel_sign_in",
+        "end_sign_in_session",
+    ] {
+        assert!(
+            codex_toml.contains(&format!(
+                "[mcp_servers.envcloak.tools.{tool}]\napproval_mode = \"approve\""
+            )),
+            "missing {tool} in {codex_toml}"
+        );
+    }
+    for forbidden in [
+        "run_with_secrets",
+        "add_reference",
+        "list_secrets",
+        "project_status",
+        "request_new_secret",
+        "browser_",
+    ] {
+        assert!(
+            !codex_toml.contains(forbidden),
+            "{forbidden} in {codex_toml}"
+        );
+    }
+    let gemini_settings: Value =
+        serde_json::from_slice(&std::fs::read(fx.home().join(".gemini/settings.json")).unwrap())
+            .unwrap();
+    assert!(
+        gemini_settings["mcpServers"]["envcloak"]
+            .get("trust")
+            .is_none()
+    );
+    let qwen_settings: Value =
+        serde_json::from_slice(&std::fs::read(fx.home().join(".qwen/settings.json")).unwrap())
+            .unwrap();
+    assert!(
+        qwen_settings["mcpServers"]["envcloak"]
+            .get("trust")
+            .is_none()
+    );
+
+    // 3. Re-running `apply_signin(host, false)` removes the 4 sign-in tool approvals
+    // and reports `signin_approvals_removed`.
+    for host in [Host::ClaudeCode, Host::Codex] {
+        let root = fx.root.clone();
+        let bin = fx.bin.clone();
+        let vars = fx.vars.clone();
+        let env = move |k: &str| vars.get(k).cloned();
+        let ctx = Context {
+            locations: Locations::new(&env)
+                .unwrap()
+                .with_system_dirs(root.join("etc-codex"), root.join("prefs")),
+            envcloak: root.join("envcloak"),
+            data_dir: root.join("data"),
+            socket: root.join("socket"),
+            path: bin.into_os_string(),
+            env: &env,
+        };
+        let (mut journal, mut backups) = (Kept, Kept);
+        let mut w = Writer {
+            state: &mut fx.state,
+            journal: &mut journal,
+            backups: &mut backups,
+            now: SystemTime::now(),
+        };
+        let mut installer = install::Installer::new(&ctx, &mut w);
+        let rep = installer.apply_signin(host, false);
+        assert!(rep.complete(), "{host:?}: {rep:?}");
+        assert!(
+            rep.hosts[0]
+                .notes
+                .iter()
+                .any(|n| n.name == "signin_approvals_removed"),
+            "{host:?} missing signin_approvals_removed note: {:?}",
+            rep.hosts[0].notes
+        );
+    }
+
+    // 4. Uninstall restores pre-existing files byte for byte.
+    let u = fx.run(&Host::ALL, true, false, true);
+    assert!(u.complete(), "{u:?}");
+    assert_eq!(
+        std::fs::read(fx.home().join(".claude/settings.json")).unwrap(),
+        pre_claude_settings
+    );
+    assert_eq!(
+        std::fs::read(fx.home().join(".codex/config.toml")).unwrap(),
+        pre_codex_toml
+    );
 }

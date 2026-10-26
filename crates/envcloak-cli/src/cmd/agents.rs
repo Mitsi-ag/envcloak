@@ -105,7 +105,7 @@ use serde_json::{Value, json};
 
 use super::{fd_number, require_unlocked};
 
-const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+const USAGE_TEXT: &str = "envcloak agents install [--global] [--project] [--agent ID]... [--signin] [--consent-approval-mode] [--consent-sandbox-sockets] [--yes] [--json]
        envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
        envcloak agents status [--json]
        envcloak agents status --probe [--agent ID]... [--json]
@@ -134,6 +134,12 @@ fn parse(args: &[&str], install: bool) -> Option<Args> {
                     return None;
                 }
                 a.opts.hosts.push(h);
+            }
+            "--signin" if install && !a.opts.signin => {
+                a.opts.signin = true;
+            }
+            "--consent-approval-mode" if install && !a.opts.consent_approval_mode => {
+                a.opts.consent_approval_mode = true;
             }
             "--consent-sandbox-sockets" if install && !a.opts.consent_sockets => {
                 a.opts.consent_sockets = true;

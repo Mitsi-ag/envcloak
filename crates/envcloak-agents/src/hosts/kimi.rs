@@ -28,6 +28,8 @@ use crate::writer::{Change, Edit, Edited, Refusal, Undo};
 pub const SERVER: &str = "envcloak";
 /// Timeout (seconds) for Kimi hooks.
 pub const KIMI_HOOK_TIMEOUT_SECS: i64 = 5;
+/// Timeout (milliseconds) for Kimi Code's MCP server entry (`toolTimeoutMs`).
+pub const KIMI_CODE_MCP_TIMEOUT_MS: u64 = 60_000;
 /// Tool matcher for Kimi's `PreToolUse` hook.
 pub const PRE_TOOL_MATCHER: &str =
     "Bash|Shell|Read|ReadFile|Write|WriteFile|Edit|StrReplaceFile|Glob|Grep|mcp:.*|mcp__.*";
@@ -151,9 +153,19 @@ pub fn detect_product(
     KimiProduct::Code
 }
 
-/// The MCP server entry in `mcp.json` (`~/.kimi-code/mcp.json` or
-/// `~/.kimi/mcp.json`).
+/// The MCP server entry in Kimi Code's `~/.kimi-code/mcp.json`, including
+/// `toolTimeoutMs: 60000` (R-M2b-33, SI-19).
 pub fn mcp_entry(envcloak: &Path) -> Value {
+    json!({
+        "command": envcloak.to_string_lossy(),
+        "args": ["mcp", "--host", "kimi"],
+        "toolTimeoutMs": KIMI_CODE_MCP_TIMEOUT_MS,
+    })
+}
+
+/// The MCP server entry in `kimi-cli`'s `~/.kimi/mcp.json` (`kimi-cli` does
+/// not document a per-server timeout key).
+pub fn cli_mcp_entry(envcloak: &Path) -> Value {
     json!({
         "command": envcloak.to_string_lossy(),
         "args": ["mcp", "--host", "kimi"],

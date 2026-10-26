@@ -81,6 +81,46 @@ pub struct Options {
     /// allowance, which turns on command networking limited to EnvCloak's
     /// socket.
     pub consent_sockets: bool,
+    /// `--signin`: appends the sign-in instruction line (`request_sign_in`)
+    /// to managed instruction blocks.
+    pub signin: bool,
+    /// `--consent-approval-mode`: with `--signin`, pre-approves the four
+    /// sign-in MCP tools (`request_sign_in`, `sign_in_status`,
+    /// `cancel_sign_in`, `end_sign_in_session`), per tool.
+    pub consent_approval_mode: bool,
+}
+
+/// Applies sign-in installer plans for a single host.
+pub struct Installer<'a, 'w> {
+    pub ctx: &'a Context<'a>,
+    pub writer: &'w mut Writer<'w>,
+}
+
+impl std::fmt::Debug for Installer<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Installer").finish_non_exhaustive()
+    }
+}
+
+impl<'a, 'w> Installer<'a, 'w> {
+    pub fn new(ctx: &'a Context<'a>, writer: &'w mut Writer<'w>) -> Self {
+        Self { ctx, writer }
+    }
+
+    /// Plans and applies global sign-in installation (`--signin`, and when
+    /// `consent` is `true`, `--consent-approval-mode`) for `host`.
+    pub fn apply_signin(&mut self, host: Host, consent: bool) -> Report {
+        let opts = Options {
+            hosts: vec![host],
+            global: true,
+            project: None,
+            consent_sockets: false,
+            signin: true,
+            consent_approval_mode: consent,
+        };
+        let p = plan(self.ctx, &opts);
+        apply(self.ctx, &p, self.writer)
+    }
 }
 
 /// A remark a report carries beside its changes: a value-free name and
@@ -285,8 +325,12 @@ impl CodexBudget {
 #[derive(Debug, Clone)]
 pub enum StepKind {
     /// EnvCloak's instruction block in a Markdown file; with `codex`, one
-    /// Codex reads, where the block must end within its budget.
-    Block { codex: Option<CodexBudget> },
+    /// Codex reads, where the block must end within its budget; with
+    /// `signin`, includes the sign-in line.
+    Block {
+        codex: Option<CodexBudget>,
+        signin: bool,
+    },
     /// Elements added to arrays of a JSON settings file.
     Json {
         host_owned: bool,
@@ -476,7 +520,7 @@ pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
         project: opts
             .project
             .as_ref()
-            .map(|d| project_plan(d, &project_hosts, &ctx.locations)),
+            .map(|d| project_plan_for(d, &project_hosts, &ctx.locations, opts.signin)),
     };
     if !global {
         return out;
@@ -500,16 +544,16 @@ pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
         };
         if let Ok(d) = &found {
             match host {
-                Host::ClaudeCode => claude_plan(ctx, &mut hp),
+                Host::ClaudeCode => claude_plan(ctx, opts, &mut hp),
                 Host::Codex => codex_plan(ctx, opts, d, &mut hp),
                 Host::Cursor => cursor_plan(ctx, &mut hp),
-                Host::Gemini => gemini_plan(ctx, &mut hp),
-                Host::Copilot => copilot_plan(ctx, &mut hp),
-                Host::OpenCode => opencode_plan(ctx, d, &mut hp),
-                Host::Kimi => kimi_plan(ctx, d, &mut hp),
-                Host::Qwen => qwen_plan(ctx, &mut hp),
-                Host::Goose => goose_plan(ctx, &mut hp),
-                Host::Aider => aider_plan(ctx, &mut hp),
+                Host::Gemini => gemini_plan(ctx, opts, &mut hp),
+                Host::Copilot => copilot_plan(ctx, opts, &mut hp),
+                Host::OpenCode => opencode_plan(ctx, opts, d, &mut hp),
+                Host::Kimi => kimi_plan(ctx, opts, d, &mut hp),
+                Host::Qwen => qwen_plan(ctx, opts, &mut hp),
+                Host::Goose => goose_plan(ctx, opts, &mut hp),
+                Host::Aider => aider_plan(ctx, opts, &mut hp),
             }
         }
         out.hosts.push(hp);
@@ -517,12 +561,20 @@ pub fn plan(ctx: &Context<'_>, opts: &Options) -> Plan {
     out
 }
 
-fn claude_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+fn claude_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
     let l = &ctx.locations;
+    let approve_signin = opts.signin && opts.consent_approval_mode;
     hp.steps.push(Step {
-        what: "add EnvCloak's instruction block".to_owned(),
+        what: if opts.signin {
+            "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+        } else {
+            "add EnvCloak's instruction block".to_owned()
+        },
         path: l.claude_instructions(),
-        kind: StepKind::Block { codex: None },
+        kind: StepKind::Block {
+            codex: None,
+            signin: opts.signin,
+        },
     });
     let settings = l.claude_settings();
     // With EnvCloak's plugin enabled, its hooks and MCP server are there
@@ -544,6 +596,13 @@ fn claude_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
                 .map(|(p, v)| (strings(&p), v)),
         );
     }
+    if approve_signin {
+        additions.extend(
+            claude::signin_allow_additions()
+                .into_iter()
+                .map(|(p, v)| (strings(&p), v)),
+        );
+    }
     let hooks = if plugin {
         String::new()
     } else {
@@ -553,10 +612,16 @@ fn claude_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
             claude::MCP_MATCHER
         )
     };
+    let signin_allows = if approve_signin {
+        ", and, with your consent, permissions.allow rules for the four sign-in tools \
+         (request_sign_in, sign_in_status, cancel_sign_in, end_sign_in_session)"
+    } else {
+        ""
+    };
     hp.steps.push(Step {
         what: format!(
             "add {hooks}the deny rule {}, sandbox deny entries for EnvCloak's vault and \
-             backups{}",
+             backups{}{signin_allows}",
             claude::READ_DENY,
             if macos {
                 ", and EnvCloak's socket to the sandbox's allowed Unix sockets"
@@ -588,9 +653,15 @@ fn claude_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
         });
     } else {
         hp.steps.push(Step {
-            what: "add EnvCloak's MCP server (user scope, mcpServers.envcloak; per-server \
-                   timeout 60 s; no approval setting for any EnvCloak tool)"
-                .to_owned(),
+            what: if approve_signin {
+                "add EnvCloak's MCP server (user scope, mcpServers.envcloak; per-server timeout \
+                 60 s; sign-in tools approved in settings.json)"
+                    .to_owned()
+            } else {
+                "add EnvCloak's MCP server (user scope, mcpServers.envcloak; per-server \
+                 timeout 60 s; no approval setting for any EnvCloak tool)"
+                    .to_owned()
+            },
             path: l.claude_json().to_path_buf(),
             kind: StepKind::ClaudeMcp {
                 entry: Some(claude::mcp_entry(&ctx.envcloak)),
@@ -607,13 +678,20 @@ fn claude_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
     }
     hp.notes.push(note(
         "outside_host_sandbox",
-        "commands EnvCloak's run_with_secrets tool starts run outside Claude Code's sandbox; \
-         Claude Code asks before each call, and the installer pre-approves none",
+        if approve_signin {
+            "commands EnvCloak's run_with_secrets tool starts run outside Claude Code's sandbox; \
+             Claude Code asks before each run_with_secrets call, and with your consent only the \
+             four sign-in tools are pre-approved"
+        } else {
+            "commands EnvCloak's run_with_secrets tool starts run outside Claude Code's sandbox; \
+             Claude Code asks before each call, and the installer pre-approves none"
+        },
     ));
 }
 
 fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan) {
     let l = &ctx.locations;
+    let approve_signin = opts.signin && opts.consent_approval_mode;
     if l.codex_instructions_override().exists() {
         hp.notes.push(note(
             "override_file",
@@ -624,7 +702,11 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
         ));
     } else {
         hp.steps.push(Step {
-            what: "add EnvCloak's instruction block".to_owned(),
+            what: if opts.signin {
+                "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+            } else {
+                "add EnvCloak's instruction block".to_owned()
+            },
             path: l.codex_instructions(),
             kind: StepKind::Block {
                 codex: Some(CodexBudget {
@@ -633,6 +715,7 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
                     shadowed_by: Some(l.codex_instructions_override()),
                     recheck: Some(Recheck::User(l.clone())),
                 }),
+                signin: opts.signin,
             },
         });
     }
@@ -667,9 +750,14 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
     let layers =
         (!linux && opts.consent_sockets && qualified).then(|| codex_layers::other_layers_fit(l));
     let socket = matches!(layers, Some(Ok(()))).then_some(ctx.socket.as_path());
+    let approval_desc = if approve_signin {
+        "approval_mode = \"approve\" for the four sign-in tools"
+    } else {
+        "no approval setting"
+    };
     hp.steps.push(Step {
         what: format!(
-            "add [mcp_servers.envcloak] (tool_timeout_sec 60; no approval setting){}",
+            "add [mcp_servers.envcloak] (tool_timeout_sec 60; {approval_desc}){}",
             if socket.is_some() {
                 ", and, with your consent, command networking limited to EnvCloak's socket \
                  (network_access, the network proxy with no domain and one unix_sockets rule)"
@@ -680,7 +768,12 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
         path: l.codex_config(),
         kind: StepKind::Toml {
             host_owned: true,
-            settings: codex::config_settings(&ctx.envcloak, linux, socket),
+            settings: codex::config_settings_with_signin(
+                &ctx.envcloak,
+                linux,
+                socket,
+                approve_signin,
+            ),
             allowance_layers: socket.is_some().then(|| l.clone()),
         },
     });
@@ -751,9 +844,15 @@ fn codex_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan
     ));
     hp.notes.push(note(
         "needs_host_approval",
-        "Codex asks before each call of EnvCloak's run_with_secrets tool (it runs commands \
-         outside Codex's sandbox), and under `codex exec` with approval policy never refuses it; \
-         the installer pre-approves no EnvCloak tool",
+        if approve_signin {
+            "Codex asks before each call of EnvCloak's run_with_secrets tool (it runs commands \
+             outside Codex's sandbox), and under `codex exec` with approval policy never refuses \
+             it; with your consent only the four sign-in tools are pre-approved"
+        } else {
+            "Codex asks before each call of EnvCloak's run_with_secrets tool (it runs commands \
+             outside Codex's sandbox), and under `codex exec` with approval policy never refuses it; \
+             the installer pre-approves no EnvCloak tool"
+        },
     ));
 }
 
@@ -800,7 +899,7 @@ fn cursor_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
     ));
 }
 
-fn gemini_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+fn gemini_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
     let l = &ctx.locations;
     let settings = l.gemini_settings();
     let instr = gemini::resolve_global_instruction_path(&l.gemini_dir(), &settings);
@@ -815,10 +914,15 @@ fn gemini_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
         }),
     };
     hp.steps.push(Step {
-        what: "add EnvCloak's instruction block".to_owned(),
+        what: if opts.signin {
+            "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+        } else {
+            "add EnvCloak's instruction block".to_owned()
+        },
         path: instr,
         kind: StepKind::Block {
             codex: Some(budget),
+            signin: opts.signin,
         },
     });
     hp.steps.push(Step {
@@ -844,13 +948,13 @@ fn gemini_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
     ));
 }
 
-fn copilot_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+fn copilot_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
     let l = &ctx.locations;
     hp.steps.push(Step {
         what: "write EnvCloak's instructions file".to_owned(),
         path: l.copilot_instructions(),
         kind: StepKind::OwnFile {
-            content: copilot::instructions_content(),
+            content: copilot::instructions_content_for(opts.signin),
         },
     });
     hp.steps.push(Step {
@@ -880,7 +984,7 @@ fn copilot_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
     ));
 }
 
-fn opencode_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
+fn opencode_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan) {
     let l = &ctx.locations;
     let opencode_agents = l.opencode_instructions();
     let claude_md = l.claude_instructions();
@@ -893,9 +997,16 @@ fn opencode_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
         ));
     } else {
         hp.steps.push(Step {
-            what: "add EnvCloak's instruction block".to_owned(),
+            what: if opts.signin {
+                "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+            } else {
+                "add EnvCloak's instruction block".to_owned()
+            },
             path: opencode_agents,
-            kind: StepKind::Block { codex: None },
+            kind: StepKind::Block {
+                codex: None,
+                signin: opts.signin,
+            },
         });
     }
     hp.steps.push(Step {
@@ -920,15 +1031,22 @@ fn opencode_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
     });
 }
 
-fn kimi_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
+fn kimi_plan(ctx: &Context<'_>, opts: &Options, d: &Detected, hp: &mut HostPlan) {
     let l = &ctx.locations;
     let product = kimi::detect_product(Some(&d.exe), Some(&d.version), l, ctx.env);
     match product {
         kimi::KimiProduct::Code => {
             hp.steps.push(Step {
-                what: "add EnvCloak's instruction block".to_owned(),
+                what: if opts.signin {
+                    "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+                } else {
+                    "add EnvCloak's instruction block".to_owned()
+                },
                 path: l.kimi_code_instructions(),
-                kind: StepKind::Block { codex: None },
+                kind: StepKind::Block {
+                    codex: None,
+                    signin: opts.signin,
+                },
             });
             hp.steps.push(Step {
                 what: "add EnvCloak's hooks".to_owned(),
@@ -975,7 +1093,7 @@ fn kimi_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
                     members: vec![(
                         strings(&["mcpServers"]),
                         kimi::SERVER.to_owned(),
-                        kimi::mcp_entry(&ctx.envcloak),
+                        kimi::cli_mcp_entry(&ctx.envcloak),
                     )],
                 },
             });
@@ -988,7 +1106,7 @@ fn kimi_plan(ctx: &Context<'_>, d: &Detected, hp: &mut HostPlan) {
     }
 }
 
-fn qwen_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+fn qwen_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
     let l = &ctx.locations;
     let settings = l.qwen_settings();
     let instr = qwen::resolve_global_instruction_path(&l.qwen_dir(), &settings);
@@ -1003,10 +1121,15 @@ fn qwen_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
         }),
     };
     hp.steps.push(Step {
-        what: "add EnvCloak's instruction block".to_owned(),
+        what: if opts.signin {
+            "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+        } else {
+            "add EnvCloak's instruction block".to_owned()
+        },
         path: instr,
         kind: StepKind::Block {
             codex: Some(budget),
+            signin: opts.signin,
         },
     });
     hp.steps.push(Step {
@@ -1027,12 +1150,19 @@ fn qwen_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
     });
 }
 
-fn goose_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+fn goose_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
     let l = &ctx.locations;
     hp.steps.push(Step {
-        what: "add EnvCloak's instruction block".to_owned(),
+        what: if opts.signin {
+            "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+        } else {
+            "add EnvCloak's instruction block".to_owned()
+        },
         path: l.goose_hints(),
-        kind: StepKind::Block { codex: None },
+        kind: StepKind::Block {
+            codex: None,
+            signin: opts.signin,
+        },
     });
     hp.steps.push(Step {
         what: "write EnvCloak's Open Plugins hook file".to_owned(),
@@ -1047,13 +1177,20 @@ fn goose_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
     ));
 }
 
-fn aider_plan(ctx: &Context<'_>, hp: &mut HostPlan) {
+fn aider_plan(ctx: &Context<'_>, opts: &Options, hp: &mut HostPlan) {
     let l = &ctx.locations;
     let agents_md = l.home().join(".agents").join("AGENTS.md");
     hp.steps.push(Step {
-        what: "add EnvCloak's instruction block".to_owned(),
+        what: if opts.signin {
+            "add EnvCloak's instruction block (with the sign-in line)".to_owned()
+        } else {
+            "add EnvCloak's instruction block".to_owned()
+        },
         path: agents_md.clone(),
-        kind: StepKind::Block { codex: None },
+        kind: StepKind::Block {
+            codex: None,
+            signin: opts.signin,
+        },
     });
     hp.steps.push(Step {
         what: "add EnvCloak's instruction file to read:".to_owned(),
@@ -1080,6 +1217,11 @@ struct Watched {
 /// An edit of Codex's socket allowance.
 fn allowance_edit(e: &Edit) -> bool {
     matches!(e, Edit::TomlValue { path, .. } if codex::is_allowance_path(path))
+}
+
+/// An edit of Codex's sign-in tool approval settings.
+fn signin_approval_edit(e: &Edit) -> bool {
+    matches!(e, Edit::TomlValue { path, .. } if codex::is_signin_approval_path(path))
 }
 
 /// An edit of Claude Code's hooks.
@@ -1124,43 +1266,90 @@ fn watched(ctx: &Context<'_>, hp: &HostPlan) -> Vec<Watched> {
     }
     let mut out = Vec::new();
     match hp.host {
-        Host::Codex if !writes(allowance_edit) => out.push(Watched {
-            path: ctx.locations.codex_config(),
-            edit: allowance_edit,
-            removed: (
-                "socket_allowance_removed",
-                "the socket allowance an earlier install wrote (network_access, the network \
-                 proxy and its unix_sockets rule for EnvCloak's socket) is not in config.toml \
-                 any more: this run does not write it (no --consent-sandbox-sockets, or a Codex \
-                 version it was not measured on), and took out what was left of it, so the \
-                 command networking it turned on is off and Codex's sandboxed shell cannot reach \
-                 EnvCloak",
-            ),
-            left: (
-                "socket_allowance_left",
-                "the socket allowance an earlier install wrote is still in config.toml, since \
-                 the change above was not made: command networking limited to EnvCloak's socket \
-                 stays on until it is taken out. Run this again once the reason above is gone, \
-                 or remove sandbox_workspace_write.network_access, [features.network_proxy] and \
-                 its unix_sockets rule for EnvCloak's socket yourself",
-            ),
-        }),
-        Host::ClaudeCode if !writes(hook_edit) => out.push(Watched {
-            path: ctx.locations.claude_settings(),
-            edit: hook_edit,
-            removed: (
-                "hooks_removed",
-                "the hooks an earlier install wrote are not in settings.json any more: the \
-                 enabled plugin carries them, so this run took out what was left of them (with \
-                 both, each hook ran twice)",
-            ),
-            left: (
-                "hooks_left",
-                "the hooks an earlier install wrote are still in settings.json, beside the \
-                 plugin's, since the change above was not made: each hook runs twice until they \
-                 are taken out (run this again once the reason above is gone)",
-            ),
-        }),
+        Host::Codex => {
+            if !writes(allowance_edit) {
+                out.push(Watched {
+                    path: ctx.locations.codex_config(),
+                    edit: allowance_edit,
+                    removed: (
+                        "socket_allowance_removed",
+                        "the socket allowance an earlier install wrote (network_access, the network \
+                         proxy and its unix_sockets rule for EnvCloak's socket) is not in config.toml \
+                         any more: this run does not write it (no --consent-sandbox-sockets, or a Codex \
+                         version it was not measured on), and took out what was left of it, so the \
+                         command networking it turned on is off and Codex's sandboxed shell cannot reach \
+                         EnvCloak",
+                    ),
+                    left: (
+                        "socket_allowance_left",
+                        "the socket allowance an earlier install wrote is still in config.toml, since \
+                         the change above was not made: command networking limited to EnvCloak's socket \
+                         stays on until it is taken out. Run this again once the reason above is gone, \
+                         or remove sandbox_workspace_write.network_access, [features.network_proxy] and \
+                         its unix_sockets rule for EnvCloak's socket yourself",
+                    ),
+                });
+            }
+            if !writes(signin_approval_edit) {
+                out.push(Watched {
+                    path: ctx.locations.codex_config(),
+                    edit: signin_approval_edit,
+                    removed: (
+                        "signin_approvals_removed",
+                        "the sign-in tool approvals an earlier install wrote \
+                         ([mcp_servers.envcloak.tools.<tool>] approval_mode = \"approve\") are \
+                         not in config.toml any more: this run does not write them (no --signin \
+                         --consent-approval-mode), and took out what was left of them",
+                    ),
+                    left: (
+                        "signin_approvals_left",
+                        "the sign-in tool approvals an earlier install wrote are still in \
+                         config.toml, since the change above was not made: run this again once \
+                         the reason above is gone, or remove the \
+                         [mcp_servers.envcloak.tools.<tool>] tables yourself",
+                    ),
+                });
+            }
+        }
+        Host::ClaudeCode => {
+            if !writes(hook_edit) {
+                out.push(Watched {
+                    path: ctx.locations.claude_settings(),
+                    edit: hook_edit,
+                    removed: (
+                        "hooks_removed",
+                        "the hooks an earlier install wrote are not in settings.json any more: the \
+                         enabled plugin carries them, so this run took out what was left of them (with \
+                         both, each hook ran twice)",
+                    ),
+                    left: (
+                        "hooks_left",
+                        "the hooks an earlier install wrote are still in settings.json, beside the \
+                         plugin's, since the change above was not made: each hook runs twice until they \
+                         are taken out (run this again once the reason above is gone)",
+                    ),
+                });
+            }
+            if !writes(claude::is_signin_allow_edit) {
+                out.push(Watched {
+                    path: ctx.locations.claude_settings(),
+                    edit: claude::is_signin_allow_edit,
+                    removed: (
+                        "signin_approvals_removed",
+                        "the sign-in tool allow rules an earlier install wrote in \
+                         permissions.allow are not in settings.json any more: this run does not \
+                         write them (no --signin --consent-approval-mode), and took out what was \
+                         left of them",
+                    ),
+                    left: (
+                        "signin_approvals_left",
+                        "the sign-in tool allow rules an earlier install wrote are still in \
+                         settings.json, since the change above was not made: run this again once \
+                         the reason above is gone, or remove them from permissions.allow yourself",
+                    ),
+                });
+            }
+        }
         _ => {}
     }
     out
@@ -1183,6 +1372,11 @@ fn claude_file_above(dir: &Path, user: &Path) -> Option<PathBuf> {
 /// The project scope's steps for `hosts` (Map C section 6). Each host's
 /// file is chosen by that host's own precedence, in `dir`.
 pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
+    project_plan_for(dir, hosts, l, false)
+}
+
+/// As [`project_plan`], with the sign-in line included when `signin` is `true`.
+pub fn project_plan_for(dir: &Path, hosts: &[Host], l: &Locations, signin: bool) -> ProjectPlan {
     let present = |n: &str| std::fs::symlink_metadata(dir.join(n)).is_ok();
     let mut notes = Vec::new();
     let mut steps: Vec<Step> = Vec::new();
@@ -1202,12 +1396,23 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
         };
         let names: Vec<&str> = hs.iter().map(|h| host_name(*h)).collect();
         let what = format!(
-            "add EnvCloak's instruction block (read by {})",
+            "add EnvCloak's instruction block{} (read by {})",
+            if signin {
+                " (with the sign-in line)"
+            } else {
+                ""
+            },
             names.join(" and ")
         );
         if let Some(s) = steps.iter_mut().find(|s| s.path == path) {
             s.what = what;
-            if let (StepKind::Block { codex: c @ None }, Some(b)) = (&mut s.kind, codex) {
+            if let (
+                StepKind::Block {
+                    codex: c @ None, ..
+                },
+                Some(b),
+            ) = (&mut s.kind, codex)
+            {
                 *c = Some(b);
             }
             return;
@@ -1215,7 +1420,7 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
         steps.push(Step {
             what,
             path,
-            kind: StepKind::Block { codex },
+            kind: StepKind::Block { codex, signin },
         });
     };
     if hosts.contains(&Host::ClaudeCode) {
@@ -1308,7 +1513,7 @@ pub fn project_plan(dir: &Path, hosts: &[Host], l: &Locations) -> ProjectPlan {
             what: "write EnvCloak's Cursor rule file".to_owned(),
             path: rule_path,
             kind: StepKind::OwnFile {
-                content: cursor::mdc_content(),
+                content: cursor::mdc_content_for(signin),
             },
         });
     }
@@ -1419,12 +1624,12 @@ fn edit_for(
     kind: &StepKind,
 ) -> impl FnMut(Option<&[u8]>, Option<&FileRecord>) -> Result<Edited, Refusal> + '_ {
     move |before: Option<&[u8]>, rec: Option<&FileRecord>| match kind {
-        StepKind::Block { codex } => match match codex {
+        StepKind::Block { codex, signin } => match match codex {
             Some(b) => {
                 b.shadowed()?;
-                blocks::insert_within(before.unwrap_or_default(), b.left()?)
+                blocks::insert_within_for(before.unwrap_or_default(), b.left()?, *signin)
             }
-            None => blocks::insert(before.unwrap_or_default()),
+            None => blocks::insert_for(before.unwrap_or_default(), *signin),
         } {
             Ok(blocks::Change::Unchanged) => Ok(None),
             Ok(blocks::Change::New(t)) => Ok(Some(Change::new(t.into_bytes(), vec![Edit::Block]))),
@@ -2525,6 +2730,7 @@ mod tests {
                 shadowed_by: None,
                 recheck: None,
             }),
+            signin: false,
         };
         let seen = std::fs::metadata(locked.join("AGENTS.md")).is_ok();
         let o = w.change(&target(&root.join("q.md")), &mut edit_for(&kind));

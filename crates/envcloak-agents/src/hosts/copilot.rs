@@ -20,13 +20,21 @@ use crate::hook::{Event, Host};
 pub const SERVER: &str = "envcloak";
 /// Timeout (seconds) for Copilot CLI hooks.
 pub const COPILOT_HOOK_TIMEOUT_SECS: u64 = 5;
+/// Timeout (milliseconds) for Copilot CLI's MCP server entry.
+pub const COPILOT_MCP_TIMEOUT_MS: u64 = 60_000;
 
 /// YAML frontmatter for `~/.copilot/instructions/envcloak.instructions.md`.
 pub const INSTRUCTIONS_FRONTMATTER: &str = "---\napplyTo: \"**\"\n---\n\n";
 
 /// Complete `envcloak.instructions.md` content.
 pub fn instructions_content() -> String {
-    format!("{INSTRUCTIONS_FRONTMATTER}{}", blocks::block())
+    instructions_content_for(false)
+}
+
+/// Complete `envcloak.instructions.md` content, with the sign-in line when
+/// `signin` is `true`.
+pub fn instructions_content_for(signin: bool) -> String {
+    format!("{INSTRUCTIONS_FRONTMATTER}{}", blocks::block_for(signin))
 }
 
 /// Complete `envcloak.json` hook file content for Copilot CLI.
@@ -66,6 +74,7 @@ pub fn mcp_entry(envcloak: &Path) -> Value {
         "command": envcloak.to_string_lossy(),
         "args": ["mcp", "--host", "copilot"],
         "tools": ["*"],
+        "timeout": COPILOT_MCP_TIMEOUT_MS,
     })
 }
 

@@ -1600,3 +1600,245 @@ fn every_tool_of_the_pinned_claude_code_that_reads_a_file_is_hooked() {
         );
     }
 }
+
+/// M2b-04 (R-M2b-33, R-M2b-34, SI-17, SI-19, D-22):
+/// On the real, pinned Claude Code and Codex, after `envcloak agents install
+/// --signin --consent-approval-mode --yes`:
+/// - the byte-identical sign-in instruction line (`SIGNIN_LINE`) is written
+///   and reaches each host's model;
+/// - per-server tool timeouts are written and read back by the real hosts;
+/// - other MCP servers' settings and approval rules remain byte-for-byte
+///   identical before and after install and uninstall;
+/// - the four sign-in tools (`request_sign_in`, `sign_in_status`,
+///   `cancel_sign_in`, `end_sign_in_session`) run without a host prompt
+///   (Claude Code `-p` without `--allowedTools`; Codex `exec` under
+///   `approval_policy="never"`), whereas `run_with_secrets`, `add_reference`
+///   and a `browser_*` tool (`browser_navigate`) are still prompted/refused
+///   by each host;
+/// - `uninstall` removes the sign-in line, timeouts and approvals, restoring
+///   every file byte for byte.
+///
+/// Mutations checked:
+/// 1. Set a server-wide approval mode (`default_tools_approval_mode = "approve"`)
+///    or a `mcp__envcloak__*` rule: `run_with_secrets`, `add_reference` and
+///    `browser_navigate` run without a prompt and the still-prompted assertion
+///    fails.
+/// 2. Write the approval mode without consent: the no-consent assertion fails.
+/// 3. Touch another server's settings: the other-servers byte-identical
+///    assertion fails.
+#[test]
+fn signin_tools_run_without_prompt_while_other_tools_still_prompt() {
+    let claude_found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "native");
+    let codex_found = Installed::find(&versions_toml(), Host::Codex.id(), "native");
+    let (Some(ci), Some(xi)) = (
+        require(claude_found, "M2b-04 signin install (Claude Code)"),
+        require(codex_found, "M2b-04 signin install (Codex)"),
+    ) else {
+        return;
+    };
+    let mut h = Harness::start();
+    vault(&mut h);
+    let claude = AgentHome::within(&h.home, Host::ClaudeCode, ci);
+    let codex = AgentHome::within(&h.home, Host::Codex, xi);
+    let home = h.home.home();
+    let bin = host_bin(&h, &[&claude, &codex]);
+    let tmp = claude.claude_tmp();
+
+    // Symlink `bin/envcloak` -> `h.cli()` so `install::stable_exe` picks
+    // `bin/envcloak` as the stable executable path on `PATH`.
+    let envcloak_link = bin.join("envcloak");
+    std::os::unix::fs::symlink(h.cli(), &envcloak_link).unwrap();
+
+    // Register another MCP server on both hosts via their own CLIs and
+    // pre-populate user configs with another server's approval settings.
+    let other = json!({"command": "/usr/bin/true", "args": ["serve"]});
+    let added = claude.host_cli(&[
+        "mcp",
+        "add-json",
+        "--scope",
+        "user",
+        "other",
+        &other.to_string(),
+    ]);
+    assert!(added.status.success(), "{}", text(&added));
+    let added = codex.host_cli(&["mcp", "add", "other", "--", "/usr/bin/true", "serve"]);
+    assert!(added.status.success(), "{}", text(&added));
+
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude/CLAUDE.md"), "# User Claude rules\n").unwrap();
+    let pre_settings = "{\n  \"permissions\": {\n    \"allow\": [\n      \"mcp__other__lookup\"\n    ],\n    \"deny\": [\n      \"Read(./secrets/**)\"\n    ]\n  }\n}\n";
+    std::fs::write(home.join(".claude/settings.json"), pre_settings).unwrap();
+    std::fs::write(home.join(".codex/AGENTS.md"), "# User Codex rules\n").unwrap();
+    let other_codex_approvals = "\n[mcp_servers.other.tools.lookup]\napproval_mode = \"approve\"\n";
+    let mut codex_toml_init = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    codex_toml_init.push_str(other_codex_approvals);
+    std::fs::write(home.join(".codex/config.toml"), &codex_toml_init).unwrap();
+
+    for f in FILES {
+        age(&home.join(f), Duration::from_secs(180));
+    }
+    let before: Vec<Vec<u8>> = FILES
+        .iter()
+        .map(|f| std::fs::read(home.join(f)).unwrap())
+        .collect();
+
+    // 1. Install with `--signin` ONLY (no `--consent-approval-mode`):
+    // no approval rule is written for any tool.
+    let (v, code) = agents(&mut h, &bin, &tmp, &["install", "--signin", "--yes"]);
+    assert_eq!(code, 0, "{v}");
+    let settings_no_consent: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        settings_no_consent["permissions"]["allow"],
+        json!(["mcp__other__lookup"]),
+        "no approval rule may be written without --consent-approval-mode: {settings_no_consent}"
+    );
+    let toml_no_consent = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    assert_eq!(
+        toml_no_consent.matches("approval_mode").count(),
+        1,
+        "no approval_mode may be written without --consent-approval-mode: {toml_no_consent}"
+    );
+
+    // 2. Install with `--signin --consent-approval-mode --yes`:
+    let (v, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["install", "--signin", "--consent-approval-mode", "--yes"],
+    );
+    assert_eq!(code, 0, "{v}");
+
+    // Byte-identical sign-in line in both instruction files:
+    for f in [".claude/CLAUDE.md", ".codex/AGENTS.md"] {
+        let md = std::fs::read_to_string(home.join(f)).unwrap();
+        assert!(
+            md.lines()
+                .any(|l| l == envcloak_agents::blocks::SIGNIN_LINE),
+            "{f} missing SIGNIN_LINE: {md}"
+        );
+    }
+
+    // Timeouts written and read back by the real hosts:
+    let claude_json: Value =
+        serde_json::from_slice(&std::fs::read(home.join(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        claude_json["mcpServers"]["envcloak"]["timeout"],
+        json!(60000)
+    );
+    let toml_with_consent = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+    assert!(
+        toml_with_consent.contains("tool_timeout_sec = 60"),
+        "{toml_with_consent}"
+    );
+    assert!(
+        toml_with_consent.contains(&codex_toml_init),
+        "other server's settings in config.toml must stay byte-identical: {toml_with_consent}"
+    );
+    for a in [&claude, &codex] {
+        let listed = text(&a.host_cli(&["mcp", "list"]));
+        assert!(
+            listed.contains("other") && listed.contains("envcloak"),
+            "{:?} mcp list: {listed}",
+            a.host
+        );
+    }
+
+    // Uninstall restores every file byte for byte, including other servers'
+    // approval settings.
+    let (u, code) = agents(&mut h, &bin, &tmp, &["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    for (f, b) in FILES.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read(home.join(f)).unwrap(),
+            b,
+            "{f} was not restored byte for byte after uninstall"
+        );
+    }
+    for f in CREATED {
+        assert!(!home.join(f).exists(), "{f}");
+    }
+
+    // Install again with `--signin --consent-approval-mode` and replace
+    // `bin/envcloak` with a wrapper that serves `ec-mcp-fixture` for `mcp`
+    // and delegates `hook` (and everything else) to `h.cli()`, so the real
+    // hosts see the 4 sign-in tools plus `run_with_secrets`, `add_reference`
+    // and `browser_navigate`.
+    let (v, code) = agents(
+        &mut h,
+        &bin,
+        &tmp,
+        &["install", "--signin", "--consent-approval-mode", "--yes"],
+    );
+    assert_eq!(code, 0, "{v}");
+    let fixture_mcp = envcloak_testkit::testkit_bin("ec-mcp-fixture");
+    std::fs::remove_file(&envcloak_link).unwrap();
+    write_script(
+        &envcloak_link,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"mcp\" ]; then\n  exec {} \"$@\"\nfi\nexec {} \"$@\"\n",
+            quoted(fixture_mcp.to_str().unwrap()),
+            quoted(h.cli().to_str().unwrap()),
+        ),
+    );
+
+    let tools_order = [
+        ("request_sign_in", true),
+        ("sign_in_status", true),
+        ("cancel_sign_in", true),
+        ("end_sign_in_session", true),
+        ("run_with_secrets", false),
+        ("add_reference", false),
+        ("browser_navigate", false),
+    ];
+
+    for (a, is_claude, flags) in [
+        (&claude, true, HostFlags::claude("default", &[])),
+        (
+            &codex,
+            false,
+            HostFlags::codex("read-only", "never").with(&["--dangerously-bypass-hook-trust"]),
+        ),
+    ] {
+        let mut steps: Vec<Value> = tools_order
+            .iter()
+            .map(|(tool, _)| {
+                if is_claude {
+                    json!({"tool": format!("mcp__envcloak__{tool}"), "input": {}})
+                } else {
+                    json!({"tool": *tool, "namespace": "mcp__envcloak", "input": {}})
+                }
+            })
+            .collect();
+        steps.push(json!({"say": "done"}));
+        let script = json!({"steps": steps});
+
+        let run = a.run(&script, "Run the sign-in tool check.", &flags, &home);
+        h.record(&format!("{:?} signin stdout", a.host), &run.output.stdout);
+        h.record(&format!("{:?} signin stderr", a.host), &run.output.stderr);
+        assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+
+        // Step 0's model request carries the sign-in instruction line.
+        let req0 = request(&run, "step 0");
+        assert!(
+            req0.contains("request_sign_in"),
+            "{:?}: SIGNIN_LINE did not reach the model",
+            a.host
+        );
+
+        for (idx, (tool, should_run)) in tools_order.iter().enumerate() {
+            let next_req = request(&run, &format!("step {}", idx + 1));
+            let output = last_tool_output(&next_req);
+            let marker = format!("ec-signin-tool-ran:{tool}");
+            let ran = output.contains(&marker);
+            assert_eq!(
+                ran, *should_run,
+                "{:?} tool {tool}: expected ran={should_run}, got ran={ran} (output: {output})",
+                a.host
+            );
+        }
+    }
+
+    h.assert_swept("M2b-04 signin install on the real hosts");
+}

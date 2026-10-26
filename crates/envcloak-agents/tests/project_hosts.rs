@@ -112,7 +112,7 @@ impl Fx {
             hosts: hosts.to_vec(),
             global: false,
             project: Some(self.root.join("proj")),
-            consent_sockets: false,
+            ..Options::default()
         };
         let (mut journal, mut backups) = (Kept, Kept);
         let mut w = Writer {

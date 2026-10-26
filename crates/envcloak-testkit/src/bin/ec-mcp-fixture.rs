@@ -85,6 +85,20 @@ fn main() {
                      "inputSchema": {"type": "object",
                                      "properties": {"path": {"type": "string"}},
                                      "required": ["path"], "additionalProperties": false}},
+                    {"name": "request_sign_in", "description": "Sign-in request fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
+                    {"name": "sign_in_status", "description": "Sign-in status fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
+                    {"name": "cancel_sign_in", "description": "Sign-in cancel fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
+                    {"name": "end_sign_in_session", "description": "Sign-in end fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
+                    {"name": "run_with_secrets", "description": "Run with secrets fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
+                    {"name": "add_reference", "description": "Add reference fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
+                    {"name": "browser_navigate", "description": "Browser navigate fixture tool.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
                 ]})),
             ),
             "tools/call" => {
@@ -94,6 +108,16 @@ fn main() {
                 let out = Arc::clone(&out);
                 let id = id.clone();
                 calls.push(std::thread::spawn(move || {
+                    let signin_probe = matches!(
+                        name.as_str(),
+                        "request_sign_in"
+                            | "sign_in_status"
+                            | "cancel_sign_in"
+                            | "end_sign_in_session"
+                            | "run_with_secrets"
+                            | "add_reference"
+                            | "browser_navigate"
+                    );
                     let text = match name.as_str() {
                         "wait" => {
                             std::thread::sleep(Duration::from_millis(ms));
@@ -106,9 +130,12 @@ fn main() {
                             args["more"].as_str().unwrap_or("")
                         ),
                         "read_file" => read_file(args["path"].as_str().unwrap_or("")),
+                        _ if signin_probe => format!("ec-signin-tool-ran:{name}"),
                         _ => "no such tool".to_owned(),
                     };
-                    let error = !matches!(name.as_str(), "wait" | "whoami" | "echo" | "read_file");
+                    let error =
+                        !(matches!(name.as_str(), "wait" | "whoami" | "echo" | "read_file")
+                            || signin_probe);
                     send(
                         &out,
                         &json!({"jsonrpc": "2.0", "id": id, "result": {
