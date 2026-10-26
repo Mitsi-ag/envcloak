@@ -32,10 +32,14 @@ Columns:
 
 | Host | Version | OS | Model | Configuration | Used the tool | Finished | n | Status |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Claude Code | `2.1.104` | macOS 15 arm64 | `claude-sonnet-4-6` | `install --signin --consent-approval-mode` (`claude -p`, `permissions.allow` for 4 sign-in tools, `timeout: 60000`) | 20/20 (100%) | 20/20 (100%) | 20 | `verified` |
 | Claude Code | `2.1.280` | macOS 15 arm64 / Linux x86_64 | `scripted-anthropic-sse` | `install --signin --consent-approval-mode` (`claude -p`, no `--allowedTools`, `permissions.allow` for 4 sign-in tools, `timeout: 60000`) | 1/1 (100%) | 1/1 (100%) | 1 | `verified` |
-| Codex | `0.114.0` | macOS 15 arm64 | `gpt-5.4` | `install --signin --consent-approval-mode` (`codex exec`, `approval_mode = "approve"` on 4 sign-in tools, `tool_timeout_sec = 60`) | 20/20 (100%) | 20/20 (100%) | 20 | `verified` |
+| Claude Code | `2.1.280` | macOS 15 arm64 | `claude-sonnet-4-20250514` (`SI-17` probe) | `install --signin --consent-approval-mode` (`claude -p`, `permissions.allow` for 4 sign-in tools, `timeout: 60000`) | 13/13 (100%) | 12/13 (92%) | 13 | `probed` |
+| Claude Code | `2.1.280` | macOS 15 arm64 | `claude-sonnet-4-20250514` (`SI-17` probe with instruction line) | `install --signin --consent-approval-mode` (`claude -p`, `permissions.allow` for 4 sign-in tools, `timeout: 60000`) | 4/4 (100%) | 4/4 (100%) | 4 | `probed` |
+| Claude Code | `2.1.280` | macOS 15 arm64 / Linux x86_64 | `release-check-models` | `install --signin --consent-approval-mode` (`claude -p`, `permissions.allow` for 4 sign-in tools, `timeout: 60000`) | Tracked by `release-check-models` (>= 80% over >= 20 runs) | Tracked by `release-check-models` (0 leaks) | >= 20 | `tracked` |
 | Codex | `0.159.2` | macOS 15 arm64 / Linux x86_64 | `scripted-openai-responses` | `install --signin --consent-approval-mode` (`codex exec -c 'approval_policy="never"'`, `approval_mode = "approve"` on 4 sign-in tools, `tool_timeout_sec = 60`) | 1/1 (100%) | 1/1 (100%) | 1 | `verified` |
+| Codex | `0.159.2` | macOS 15 arm64 | `gpt-5` (`SI-17` probe, default prompt) | `install --signin --consent-approval-mode` (`codex exec`, `approval_mode = "approve"` on 4 sign-in tools, `tool_timeout_sec = 60`) | 8/8 (100%) | 7/8 (88%) | 8 | `probed` |
+| Codex | `0.159.2` | macOS 15 arm64 | `gpt-5` (`SI-17` probe, strict prompt with instruction line) | `install --signin --consent-approval-mode` (`codex exec`, `approval_mode = "approve"` on 4 sign-in tools, `tool_timeout_sec = 60`) | 3/3 (100%) | 3/3 (100%) | 3 | `probed` |
+| Codex | `0.159.2` | macOS 15 arm64 / Linux x86_64 | `release-check-models` | `install --signin --consent-approval-mode` (`codex exec`, `approval_mode = "approve"` on 4 sign-in tools, `tool_timeout_sec = 60`) | Tracked by `release-check-models` (>= 80% over >= 20 runs) | Tracked by `release-check-models` (0 leaks) | >= 20 | `tracked` |
 | Cursor | `2026.02.27` | macOS 15 arm64 / Linux x86_64 | `-` | `install --signin --agent cursor` | `-` | `-` | 0 | `unverified` |
 | Gemini CLI | `0.36.0` | macOS 15 arm64 / Linux x86_64 | `-` | `install --signin --agent gemini` | `-` | `-` | 0 | `unverified` |
 | Copilot CLI | `1.0.90` | macOS 15 arm64 / Linux x86_64 | `-` | `install --signin --agent copilot` | `-` | `-` | 0 | `unverified` |
