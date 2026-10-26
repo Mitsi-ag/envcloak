@@ -43,19 +43,81 @@ pub enum AgentsPolicy {
     Deny,
 }
 
+/// The SHA-256 fingerprint of a sign-in scope (`envcloak-signin-scope/1`;
+/// SPEC §6.8, M2b-05, R-M2b-11, R-M2b-13).
+pub type ScopeFingerprint = [u8; 32];
+
 /// How values reach a command. Ordered by strictness: proxy mode keeps the
 /// real value out of the child (SPEC §6.2, M6). On the wire it is
-/// `inject` or `proxy`.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
+/// `inject`, `proxy`, or `signin:<64 hex>`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Mode {
     /// Values in the child's environment (SPEC §6.1).
     #[default]
     Inject,
     /// Placeholder tokens and the local proxy (SPEC §6.2).
     Proxy,
+    /// A dev sign-in authorization scoped to one exact [`ScopeFingerprint`]
+    /// (SPEC §6.8, M2b-05). Refused by every [`crate::GrantStore`] match:
+    /// no inject, proxy or helper grant covers a sign-in request, nor the
+    /// reverse.
+    SignIn(ScopeFingerprint),
+}
+
+impl Mode {
+    /// Whether a grant of mode `self` in [`crate::GrantStore`] covers a
+    /// request of mode `requested` (SPEC §10b rule 7; R-M2b-11, R-M2b-13).
+    pub const fn covers(self, requested: Mode) -> bool {
+        matches!(
+            (self, requested),
+            (Mode::Inject, Mode::Inject | Mode::Proxy) | (Mode::Proxy, Mode::Proxy)
+        )
+    }
+}
+
+impl Serialize for Mode {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Mode::Inject => s.serialize_str("inject"),
+            Mode::Proxy => s.serialize_str("proxy"),
+            Mode::SignIn(fp) => {
+                use std::fmt::Write as _;
+                let mut text = String::with_capacity(7 + 64);
+                text.push_str("signin:");
+                for b in fp {
+                    let _ = write!(text, "{b:02x}");
+                }
+                s.serialize_str(&text)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Mode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = std::borrow::Cow::<'de, str>::deserialize(d)?;
+        match s.as_ref() {
+            "inject" => Ok(Mode::Inject),
+            "proxy" => Ok(Mode::Proxy),
+            "signin" => Ok(Mode::SignIn([0u8; 32])),
+            raw if raw.starts_with("signin:") => {
+                let hex = &raw["signin:".len()..];
+                if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(serde::de::Error::custom("invalid signin mode fingerprint"));
+                }
+                let mut fp = [0u8; 32];
+                for (i, out) in fp.iter_mut().enumerate() {
+                    *out = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)
+                        .map_err(|_| serde::de::Error::custom("invalid hex"))?;
+                }
+                Ok(Mode::SignIn(fp))
+            }
+            raw => Err(serde::de::Error::unknown_variant(
+                raw,
+                &["inject", "proxy", "signin"],
+            )),
+        }
+    }
 }
 
 /// The manifest's `[policy]`, as written. It can only tighten the vault's

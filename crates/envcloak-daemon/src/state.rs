@@ -194,10 +194,18 @@ struct PasteStage {
     opened_awake: Duration,
 }
 
+/// Returns the unlocked vault from `slot` when its integrity is verified.
+pub(crate) fn slot_unlocked(slot: &Slot) -> Option<&Vault> {
+    match slot {
+        Slot::Unlocked(v) if v.integrity() == Integrity::Ok => Some(v),
+        _ => None,
+    }
+}
+
 /// The daemon's vault state.
 #[derive(Debug)]
 pub struct State {
-    slot: Slot,
+    pub(crate) slot: Slot,
     paths: VaultPaths,
     timer: LockTimer,
     last_reason: Option<LockReason>,
@@ -240,6 +248,8 @@ pub struct State {
     last_synced_anchor: Option<Anchor>,
     /// Daemon TOTP state across login accounts (M2b-03).
     totp: crate::totp::TotpState,
+    /// Daemon sign-in operations, retry store, and supervisor control pipes (M2b-05).
+    pub(crate) signin: crate::signin::ops::SigninState,
 }
 
 impl State {
@@ -282,6 +292,7 @@ impl State {
             anchored_vaults: BTreeSet::new(),
             last_synced_anchor: None,
             totp: crate::totp::TotpState::after_start(start_unix),
+            signin: crate::signin::ops::SigninState::new(),
         }
     }
 
@@ -504,6 +515,16 @@ impl State {
         // restore lease.
         self.grants.on_lock();
         self.totp.on_lock();
+        let lock_now = Now {
+            including_sleep: Duration::ZERO,
+            awake: Duration::ZERO,
+            wall: std::time::SystemTime::now(),
+        };
+        if reason == LockReason::Sleep {
+            self.signin_on_sleep(&lock_now);
+        } else {
+            self.signin_on_lock(&lock_now);
+        }
         self.standing.clear();
         self.epoch_state = EpochState::Verified;
         self.standing_generation_floor = 0;

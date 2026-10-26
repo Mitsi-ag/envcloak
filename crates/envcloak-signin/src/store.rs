@@ -616,6 +616,29 @@ impl OperationStore {
         self.owner_stop(caller, request, StopReason::EndedByOwner, now, world)
     }
 
+    /// `envcloak deny <id>` for a pending sign-in request (SPEC §10b:
+    /// tightening needs no proof): stops a pending operation before
+    /// approval.
+    pub fn deny(
+        &mut self,
+        request: &RequestId,
+        now: &Now,
+        world: &dyn World,
+    ) -> Result<Status, NotFound> {
+        self.settle(now, world);
+        let pending = self
+            .ops
+            .get(request)
+            .is_some_and(|op| op.stop.is_none() && op.phase == Phase::PendingApproval);
+        if !pending {
+            self.finish(now, world);
+            return Err(NotFound);
+        }
+        self.stop_op(request, StopReason::Cancelled, now);
+        self.finish(now, world);
+        self.status_of(request).ok_or(NotFound)
+    }
+
     fn owner_stop(
         &mut self,
         caller: &Instance,
@@ -799,6 +822,32 @@ impl OperationStore {
             Ok(())
         } else {
             Err(Discarded)
+        };
+        self.finish(now, world);
+        done
+    }
+
+    /// The supervisor on `from` reported a post-capture failure for `request`
+    /// (such as imported cookie metadata failing verification). Refused unless
+    /// `from` is `request`'s supervisor for the active generation while the
+    /// operation is in [`Phase::Captured`] and not stopped.
+    pub fn supervisor_failed(
+        &mut self,
+        from: &Channel,
+        request: &RequestId,
+        failure: AttemptFailure,
+        now: &Now,
+        world: &dyn World,
+    ) -> Result<(), ChannelRefused> {
+        self.settle(now, world);
+        let matched = self.ops.get(request).is_some_and(|op| {
+            from_supervisor(from, op) && op.stop.is_none() && op.phase == Phase::Captured
+        });
+        let done = if matched {
+            self.stop_op(request, StopReason::AttemptFailed(failure), now);
+            Ok(())
+        } else {
+            Err(ChannelRefused)
         };
         self.finish(now, world);
         done
@@ -1131,8 +1180,9 @@ impl OperationStore {
             .filter(|op| op.stop.is_none())
             .filter_map(|op| op.authorization)
             .collect();
-        self.auths
-            .retain(|id, a| held.contains(id) || !(a.ended() || a.deadline().passed(now)));
+        self.auths.retain(|id, a| {
+            held.contains(id) || !(a.ended() || a.deadline().passed(now) || a.remaining() == 0)
+        });
     }
 
     /// Ends every call: brings what the call changed up to date with the

@@ -158,7 +158,7 @@ pub(crate) fn fill_random(buf: &mut [u8]) -> Result<(), CryptoError> {
 /// # Panics
 /// When the OS random number generator fails. Nothing safe can be done
 /// without it, and release builds abort on panic.
-pub(crate) fn fill_random_or_panic(buf: &mut [u8]) {
+pub fn fill_random_or_panic(buf: &mut [u8]) {
     if fill_random(buf).is_err() {
         panic!("{}", CryptoErrorKind::Random.message());
     }

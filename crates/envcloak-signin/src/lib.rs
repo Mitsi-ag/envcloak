@@ -36,6 +36,7 @@
 
 pub mod authorization;
 pub mod operation;
+pub mod origin;
 pub mod otpauth;
 pub mod scope;
 pub mod statement;
@@ -51,14 +52,20 @@ pub use operation::{
     Operation, Phase, PublishDecision, RETRY_WINDOW, Refusal, Requester, Stop, StopReason,
     SupervisorId, TargetNow, WorkerId, publication_decision,
 };
+pub use origin::{MAX_ORIGIN, OriginError, parse_registered};
 pub use scope::{
     Account, AdapterId, CheckKind, CookieDomain, CookiePartition, CookiePath, DaemonInstance,
     DeclaredCookie, DeclaredStorage, Delivery, DeliveryMode, Environment, Epochs, Fingerprint,
-    Host, HostName, IdentityCheck, Instance, Label, Limits, Origin, ProjectScope, Scheme,
-    ScopeError, SignInScope, Site, SortedSet, Subject, Target, TargetId, Tier, TransferScope,
+    Host, HostName, IdentityCheck, Instance, Label, Limits, MAX_APPROVAL, MAX_ATTEMPT_TIMEOUT,
+    MAX_COOKIE_PATH, MAX_DEV_ATTEMPTS, MAX_HOST, MAX_LABEL, MAX_SESSION_LIFETIME, MAX_SET, Origin,
+    ProjectScope, Scheme, ScopeError, SignInScope, Site, SortedSet, Subject, Target, TargetId,
+    Tier, TransferScope,
 };
 pub use statement::{
-    ContextId, DEFAULT_DEV_ATTEMPTS, Nonce, Options, OptionsError, RequestId, SignInStatement,
+    ContextId, CookiePartitionSummary, CookieSummary, CookieSummaryExt, DEFAULT_DEV_ATTEMPTS,
+    Nonce, Options, OptionsError, OriginSummary, OriginSummaryExt, RequestId, SignInDevOptions,
+    SignInDevOptionsExt, SignInPendingDescriptor, SignInPendingDescriptorExt, SignInStatement,
+    StorageSummary, StorageSummaryExt, render_signin_statement,
 };
 pub use status::{Receipt, Revocation, State, Status};
 pub use store::{

@@ -64,11 +64,20 @@ impl Deadline {
     pub fn wall(&self) -> SystemTime {
         self.wall
     }
+
+    /// Time left before the deadline on the nearer of the two clocks.
+    pub fn remaining(&self, now: &Now) -> Duration {
+        let awake = self.awake.saturating_sub(now.awake);
+        let wall = self.wall.duration_since(now.wall).unwrap_or_default();
+        awake.min(wall)
+    }
 }
 
 /// An authorization's id, from the operation store's counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AuthorizationId(u64);
+
+const SIGNIN_GRANT_PREFIX: [u8; 8] = [0xFF, b'S', b'I', b'G', b'N', b'I', b'N', 0];
 
 impl AuthorizationId {
     pub const fn new(n: u64) -> Self {
@@ -77,6 +86,55 @@ impl AuthorizationId {
 
     pub const fn get(&self) -> u64 {
         self.0
+    }
+
+    /// Converts this authorization id into a 26-character Crockford base32
+    /// [`envcloak_policy::GrantId`] with a distinct sign-in prefix.
+    pub const fn to_grant_id(self) -> envcloak_policy::GrantId {
+        let mut b = [0u8; 16];
+        let mut i = 0;
+        while i < 8 {
+            b[i] = SIGNIN_GRANT_PREFIX[i];
+            i += 1;
+        }
+        let n = self.0.to_be_bytes();
+        while i < 16 {
+            b[i] = n[i - 8];
+            i += 1;
+        }
+        envcloak_policy::GrantId::from_bytes(b)
+    }
+
+    /// Extracts an [`AuthorizationId`] from a [`envcloak_policy::GrantId`]
+    /// created by [`AuthorizationId::to_grant_id`].
+    pub fn from_grant_id(g: envcloak_policy::GrantId) -> Option<Self> {
+        let b = g.as_bytes();
+        if b[..8] != SIGNIN_GRANT_PREFIX {
+            return None;
+        }
+        let mut n = [0u8; 8];
+        n.copy_from_slice(&b[8..]);
+        Some(AuthorizationId(u64::from_be_bytes(n)))
+    }
+
+    /// Parses a 26-character Crockford base32 sign-in grant id, `"signin:<n>"`
+    /// or decimal `<n>`.
+    pub fn parse(s: &str) -> Option<Self> {
+        if let Some(g) = envcloak_policy::GrantId::parse(s)
+            && let Some(id) = Self::from_grant_id(g)
+        {
+            return Some(id);
+        }
+        if let Some(rest) = s.strip_prefix("signin:") {
+            return rest.parse::<u64>().ok().map(AuthorizationId);
+        }
+        s.parse::<u64>().ok().map(AuthorizationId)
+    }
+}
+
+impl std::fmt::Display for AuthorizationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.to_grant_id())
     }
 }
 

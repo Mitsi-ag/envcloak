@@ -508,6 +508,51 @@ pub enum AuditEvent {
         field: &'static str,
         revision: u64,
     },
+    /// A sign-in target was added, edited or removed (`signin.target.add`,
+    /// `signin.target.edit`, `signin.target.remove`), or its proof failed.
+    SigninTarget {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        method: &'static str,
+        target: Option<String>,
+        item: Option<(ItemId, Slug)>,
+        revision: Option<u64>,
+        reason: Option<&'static str>,
+    },
+    /// A sign-in request was approved into an authorization (`approve`), or
+    /// its proof failed.
+    SigninApprove {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        request: Option<String>,
+        authorization: Option<String>,
+        item: Option<(ItemId, Slug)>,
+        reason: Option<&'static str>,
+        ttl_secs: Option<u64>,
+    },
+    /// The publication decision for a sign-in operation (`signin_publish`).
+    SigninPublish {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        request: String,
+        authorization: Option<String>,
+        item: Option<(ItemId, Slug)>,
+        reason: Option<&'static str>,
+    },
+    /// A sign-in operation was cancelled (`signin.cancel`) or its session
+    /// ended (`signin.end`).
+    SigninEnd {
+        pid: i32,
+        subject: SubjectSummary,
+        outcome: &'static str,
+        request: String,
+        authorization: Option<String>,
+        method: Option<&'static str>,
+        reason: Option<&'static str>,
+    },
 }
 
 /// A managed launch's counts, as its audit entries record them.
@@ -895,6 +940,51 @@ impl AuditEvent {
             } => format!(
                 "envcloakd: audit: login replaced id={item} field={field} revision={revision} \
                  pid={pid}"
+            ),
+            AuditEvent::SigninTarget {
+                pid,
+                outcome,
+                target,
+                revision,
+                ..
+            } => format!(
+                "envcloakd: audit: signin target {outcome} target={} revision={} pid={pid}",
+                target.as_deref().unwrap_or("none"),
+                revision.unwrap_or(0)
+            ),
+            AuditEvent::SigninApprove {
+                pid,
+                outcome,
+                request,
+                authorization,
+                ..
+            } => format!(
+                "envcloakd: audit: signin approve {outcome} request={} authorization={} pid={pid}",
+                request.as_deref().unwrap_or("none"),
+                authorization.as_deref().unwrap_or("none")
+            ),
+            AuditEvent::SigninPublish {
+                pid,
+                outcome,
+                request,
+                authorization,
+                reason,
+                ..
+            } => format!(
+                "envcloakd: audit: signin publish {outcome} request={request} authorization={} \
+                 reason={} pid={pid}",
+                authorization.as_deref().unwrap_or("none"),
+                reason.unwrap_or("none")
+            ),
+            AuditEvent::SigninEnd {
+                pid,
+                outcome,
+                request,
+                reason,
+                ..
+            } => format!(
+                "envcloakd: audit: signin {outcome} request={request} reason={} pid={pid}",
+                reason.unwrap_or("none")
             ),
         })
     }
@@ -1591,6 +1681,70 @@ impl AuditEvent {
                     Some(*revision),
                 ),
                 ..AuditRecord::new(AuditKind::LoginReplace, "replaced")
+            },
+            AuditEvent::SigninTarget {
+                subject,
+                outcome,
+                method,
+                target,
+                item,
+                revision,
+                reason,
+                ..
+            } => AuditRecord {
+                request_id: target.clone(),
+                subject: subject.clone(),
+                items: item.iter().cloned().collect(),
+                decision: decision(outcome, *reason, Some(method), *revision),
+                ..AuditRecord::new(AuditKind::SigninTarget, outcome)
+            },
+            AuditEvent::SigninApprove {
+                subject,
+                outcome,
+                request,
+                authorization,
+                item,
+                reason,
+                ttl_secs,
+                ..
+            } => AuditRecord {
+                request_id: request.clone(),
+                grant_id: authorization.clone(),
+                subject: subject.clone(),
+                items: item.iter().cloned().collect(),
+                decision: decision(outcome, *reason, Some("approve"), *ttl_secs),
+                ..AuditRecord::new(AuditKind::SigninApprove, outcome)
+            },
+            AuditEvent::SigninPublish {
+                subject,
+                outcome,
+                request,
+                authorization,
+                item,
+                reason,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                grant_id: authorization.clone(),
+                subject: subject.clone(),
+                items: item.iter().cloned().collect(),
+                decision: decision(outcome, *reason, None, None),
+                ..AuditRecord::new(AuditKind::SigninPublish, outcome)
+            },
+            AuditEvent::SigninEnd {
+                subject,
+                outcome,
+                request,
+                authorization,
+                method,
+                reason,
+                ..
+            } => AuditRecord {
+                request_id: Some(request.clone()),
+                grant_id: authorization.clone(),
+                subject: subject.clone(),
+                decision: decision(outcome, *reason, *method, None),
+                ..AuditRecord::new(AuditKind::SigninEnd, outcome)
             },
         }
     }

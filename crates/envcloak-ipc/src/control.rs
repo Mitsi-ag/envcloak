@@ -59,6 +59,142 @@ pub enum FromRunner {
     ConfirmSpawn(u32),
 }
 
+/// A message from the daemon to the browser supervisor (plan D-36;
+/// docs/IPC.md "Control-pipe messages", channel `supervisor`).
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ToSupervisor {
+    InjectState(SupervisorInjectState),
+    Publish(SupervisorPublish),
+    Close(SupervisorClose),
+}
+
+/// A message from the browser supervisor to the daemon (plan D-36;
+/// docs/IPC.md "Control-pipe messages", channel `supervisor`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FromSupervisor {
+    IdentityResponse(SupervisorIdentityResponse),
+    Check(SupervisorCheck),
+}
+
+/// The declared state of a sign-in generation handed from the daemon to its
+/// browser supervisor over the control pipe before publication (plan D-36;
+/// SPEC §4.4, §6.8). Its `Debug` never prints cookie or storage values.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorInjectState {
+    pub request: String,
+    pub generation: u64,
+    pub context: String,
+    #[serde(default)]
+    pub cookies: Vec<SupervisorCookieEntry>,
+    #[serde(default)]
+    pub storage: Vec<SupervisorStorageEntry>,
+}
+
+impl core::fmt::Debug for SupervisorInjectState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SupervisorInjectState")
+            .field("request", &self.request)
+            .field("generation", &self.generation)
+            .field("context", &self.context)
+            .field("cookies", &self.cookies.len())
+            .field("storage", &self.storage.len())
+            .finish()
+    }
+}
+
+/// One cookie entry transferred to the browser supervisor over the control
+/// pipe.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorCookieEntry {
+    pub domain: String,
+    pub host_only: bool,
+    pub path: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_top_site: Option<String>,
+    pub value: crate::wire_secret::WireSecret,
+}
+
+impl core::fmt::Debug for SupervisorCookieEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SupervisorCookieEntry")
+            .field("domain", &self.domain)
+            .field("host_only", &self.host_only)
+            .field("path", &self.path)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One `localStorage` entry transferred to the browser supervisor over the
+/// control pipe.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorStorageEntry {
+    pub origin: String,
+    pub key: String,
+    pub value: crate::wire_secret::WireSecret,
+}
+
+impl core::fmt::Debug for SupervisorStorageEntry {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SupervisorStorageEntry")
+            .field("origin", &self.origin)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Serialized publication decision from the daemon to the browser supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorPublish {
+    pub request: String,
+    pub generation: u64,
+    pub context: String,
+    pub published: bool,
+}
+
+/// Generation close command from the daemon to the browser supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorClose {
+    pub request: String,
+    pub generation: u64,
+    pub context: String,
+}
+
+/// Identity response read by the browser supervisor in the recipient context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorIdentityResponse {
+    pub request: String,
+    pub generation: u64,
+    pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+/// Grant check sent by the browser supervisor before each browser tool call,
+/// or cleanup/close acknowledgment (`cleaned: Some(bool)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorCheck {
+    pub request: String,
+    pub generation: u64,
+    pub context: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleaned: Option<bool>,
+}
+
 /// What the runner or relay receives: the binding values, and whom they
 /// are for. Its `Debug` shows names and counts only.
 #[derive(Serialize, Deserialize)]

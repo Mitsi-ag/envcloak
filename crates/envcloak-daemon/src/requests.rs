@@ -186,9 +186,15 @@ pub(crate) fn requester_terminal_in(
     caller: &SubjectEvidence,
     now: &envcloak_policy::Now,
 ) -> Option<envcloak_policy::ProofRefusal> {
-    s.grants()
+    let found = s
+        .grants()
         .pending_all(now)
-        .find_map(|p| caller.approval_refusal(&p.request.subject, &alive))
+        .find_map(|p| caller.approval_refusal(&p.request.subject, &alive));
+    found.or_else(|| {
+        s.signin()
+            .pending_subjects()
+            .find_map(|subj| caller.approval_refusal(subj, &alive))
+    })
 }
 
 /// [`refuse_unless_prover`] for a proof that answers no pending request
@@ -1261,6 +1267,9 @@ pub fn pending_get(
     peer: &PeerIdentity,
     p: PendingGetParams,
 ) -> Result<PendingGetOutput, RpcError> {
+    if p.request.len() == 32 {
+        return crate::signin::ops::pending_get(shared, peer, p);
+    }
     let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &p.claims)?;
     refuse_unless_prover(shared, peer, &caller, "pending.get")?;
@@ -1329,6 +1338,9 @@ pub fn pending_state(
     peer: &PeerIdentity,
     p: PendingStateParams,
 ) -> Result<PendingStateView, RpcError> {
+    if p.request.len() == 32 {
+        return crate::signin::ops::pending_state(shared, peer, p);
+    }
     let id = PendingId::parse(&p.request).ok_or(RpcError::new(ErrorKind::InvalidParams))?;
     let caller = evidence(shared, peer, &[])?;
     let mut s = locked(&shared.state);
@@ -1374,7 +1386,7 @@ pub fn pending_list(
     let mut s = locked(&shared.state);
     s.refuse_if_tampered()?;
     let now = now_of(&shared.clocks);
-    let requests = s
+    let mut requests: Vec<PendingView> = s
         .grants()
         .pending_all(&now)
         .filter(|p| {
@@ -1384,6 +1396,7 @@ pub fn pending_list(
         })
         .map(|p| pending_view(p, &now))
         .collect();
+    requests.extend(crate::signin::ops::pending_views(&mut s, &caller, &now));
     Ok(PendingListView { requests })
 }
 
@@ -1436,6 +1449,12 @@ pub fn approve(
     peer: &PeerIdentity,
     p: ApproveParams,
 ) -> Result<ApprovedView, RpcError> {
+    if p.request.len() == 32 {
+        return crate::signin::ops::approve(shared, peer, p);
+    }
+    if p.dev.is_some() {
+        return Err(RpcError::new(ErrorKind::InvalidOptions));
+    }
     // Without a passphrase the call is a check: every check before the
     // proof runs, and it ends at the proof (`invalid_params`), never in a
     // grant.
@@ -1764,6 +1783,9 @@ pub fn deny(
     peer: &PeerIdentity,
     p: RequestParams,
 ) -> Result<DeniedView, RpcError> {
+    if p.request.len() == 32 {
+        return crate::signin::ops::deny(shared, peer, p);
+    }
     let id = request_id(&p)?;
     let now = now_of(&shared.clocks);
     let outcome = locked(&shared.state)
@@ -1794,7 +1816,7 @@ pub fn grants_list(shared: &Shared) -> Result<GrantsView, RpcError> {
     let mut s = locked(&shared.state);
     let store = s.grants();
     store.sweep(&now, &alive);
-    let grants = store
+    let mut grants: Vec<GrantView> = store
         .grants()
         .map(|g| GrantView {
             id: g.id.to_string(),
@@ -1826,6 +1848,7 @@ pub fn grants_list(shared: &Shared) -> Result<GrantsView, RpcError> {
             remaining_secs: g.remaining(&now).as_secs(),
         })
         .collect();
+    grants.extend(crate::signin::ops::grant_views(&mut s, &now));
     Ok(GrantsView { grants })
 }
 
@@ -1835,6 +1858,19 @@ pub fn grants_revoke(
     peer: &PeerIdentity,
     p: RevokeParams,
 ) -> Result<RevokedView, RpcError> {
+    if p.grant.as_ref().is_some_and(|id| id.len() == 32) && !p.all {
+        let now = now_of(&shared.clocks);
+        let mut s = locked(&shared.state);
+        let revoked = crate::signin::ops::revoke_grants(&mut s, p.grant.as_deref(), false, &now)?;
+        s.audit(AuditEvent::Revoked {
+            pid: peer.pid,
+            count: revoked,
+        });
+        s.anchor_now();
+        return Ok(RevokedView {
+            revoked: u64::try_from(revoked).unwrap_or(u64::MAX),
+        });
+    }
     let selector = match (&p.grant, p.all) {
         (Some(id), false) => {
             RevokeSelector::Id(GrantId::parse(id).ok_or(RpcError::new(ErrorKind::InvalidParams))?)
@@ -1842,8 +1878,10 @@ pub fn grants_revoke(
         (None, true) => RevokeSelector::All,
         _ => return Err(RpcError::new(ErrorKind::InvalidParams)),
     };
+    let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
-    let revoked = s.grants().revoke(selector);
+    let mut revoked = s.grants().revoke(selector);
+    revoked += crate::signin::ops::revoke_grants(&mut s, p.grant.as_deref(), p.all, &now)?;
     s.audit(AuditEvent::Revoked {
         pid: peer.pid,
         count: revoked,

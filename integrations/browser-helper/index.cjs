@@ -2,10 +2,92 @@
 "use strict";
 
 const fs = require("node:fs");
+const dns = require("node:dns");
 const net = require("node:net");
 const path = require("node:path");
 const readline = require("node:readline");
 const { EventEmitter } = require("node:events");
+
+function installHostResolverRules(hostRulesStr) {
+  const origLookup = dns.lookup.bind(dns);
+  const origPromisesLookup = dns.promises.lookup.bind(dns.promises);
+  const hostMap = new Map();
+  for (const part of String(hostRulesStr || "").split(",")) {
+    const tokens = part.trim().split(/\s+/);
+    if (tokens.length >= 3 && tokens[0].toUpperCase() === "MAP") {
+      hostMap.set(tokens[1].toLowerCase(), tokens[2]);
+    }
+  }
+  function resolveMapped(hostname) {
+    const lower = String(hostname || "").toLowerCase();
+    return (
+      hostMap.get(lower) ||
+      (lower === "localhost" || lower.endsWith(".localhost") ? "127.0.0.1" : null)
+    );
+  }
+  dns.lookup = function patchedLookup(hostname, options, callback) {
+    let cb = callback;
+    let opts = options;
+    if (typeof options === "function") {
+      cb = options;
+      opts = {};
+    } else if (typeof options === "number") {
+      opts = { family: options };
+    } else {
+      opts = options || {};
+    }
+    const mapped = resolveMapped(hostname);
+    if (mapped) {
+      const mappedFamily = net.isIP(mapped) || 4;
+      const reqFamily = opts && typeof opts.family === "number" ? opts.family : 0;
+      process.nextTick(() => {
+        if (reqFamily && reqFamily !== mappedFamily) {
+          if (opts && opts.all) {
+            cb(null, []);
+          } else {
+            const err = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+            err.code = "ENOTFOUND";
+            cb(err);
+          }
+          return;
+        }
+        if (opts && opts.all) {
+          cb(null, [{ address: mapped, family: mappedFamily }]);
+        } else {
+          cb(null, mapped, mappedFamily);
+        }
+      });
+      return;
+    }
+    return origLookup(hostname, options, callback);
+  };
+  dns.promises.lookup = async function patchedPromisesLookup(hostname, options) {
+    let opts = {};
+    if (typeof options === "number") {
+      opts = { family: options };
+    } else if (options && typeof options === "object") {
+      opts = options;
+    }
+    const mapped = resolveMapped(hostname);
+    if (mapped) {
+      const mappedFamily = net.isIP(mapped) || 4;
+      const reqFamily = typeof opts.family === "number" ? opts.family : 0;
+      if (reqFamily && reqFamily !== mappedFamily) {
+        if (opts.all) {
+          return [];
+        }
+        const err = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+        err.code = "ENOTFOUND";
+        throw err;
+      }
+      if (opts.all) {
+        return [{ address: mapped, family: mappedFamily }];
+      }
+      return { address: mapped, family: mappedFamily };
+    }
+    return origPromisesLookup(hostname, options);
+  };
+}
 
 function parseArgs(argv) {
   const out = {
@@ -95,6 +177,7 @@ class StdioMcpTransport extends EventEmitter {
 
 async function main() {
   const opts = parseArgs(process.argv);
+  installHostResolverRules(opts.hostRules);
   const mcpPath = path.join(opts.modulesDir, "@playwright", "mcp");
   const pwPath = path.join(opts.modulesDir, "playwright");
   const { createConnection } = require(mcpPath);

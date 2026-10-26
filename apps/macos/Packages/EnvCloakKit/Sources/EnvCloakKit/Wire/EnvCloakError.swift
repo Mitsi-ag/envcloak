@@ -76,6 +76,7 @@ public enum ErrorKind: String, CaseIterable, Sendable {
     case identityOutsideInstallTree = "identity_outside_install_tree"
     case launchNotStandingCapable = "launch_not_standing_capable"
     case policyEpochUnverified = "policy_epoch_unverified"
+    case requestConflict = "request_conflict"
     case signatureInvalid = "signature_invalid"
     case unlockFailed = "unlock_failed"
     case noUnlocker = "no_unlocker"
@@ -138,6 +139,7 @@ public enum ErrorKind: String, CaseIterable, Sendable {
         case .identityOutsideInstallTree: -32044
         case .launchNotStandingCapable: -32045
         case .policyEpochUnverified: -32046
+        case .requestConflict: -32047
         case .signatureInvalid: -32051
         case .unlockFailed: -32052
         case .noUnlocker: -32053

@@ -43,6 +43,13 @@ pub use crate::app::{
 };
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
+    AdapterRefView, CookieScopeView, IdentityCheckView, LoginAddedView, LoginTierView,
+    ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
+    SessionFormatView, SigninStatusView, SigninTargetListView, SigninTargetRemovedView,
+    SigninTargetView, StandingConfirmedView, StandingListView, StandingRevokedView,
+    StorageScopeView,
+};
+use crate::view::{
     AddedView, ApprovedView, AskOpenedView, AuditVerifyView, BackupBegunView, BackupCommittedView,
     BackupListView, BackupPutView, BackupResultView, BackupView, CheckView, ClassificationView,
     CreatedView, DecisionView, DeniedView, ExposureSourceView, FileBackupCreatorView,
@@ -50,11 +57,6 @@ use crate::view::{
     PendingListView, PendingStateView, ReclassifiedView, RecoveredView, RecoveryConfirmedView,
     RemovedView, RestoreFileView, RestoreLeaseView, RevealRequestedView, RevokedView, RotatedView,
     ScanMatchView, StatusView, TargetView, UnlockedView, VerifyView,
-};
-use crate::view::{
-    LoginAddedView, LoginTierView, ManagedRegisteredView, ManagedUnregisteredView,
-    ManagedUpdatePlanView, ManagedUpdatedView, StandingConfirmedView, StandingListView,
-    StandingRevokedView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -432,13 +434,15 @@ impl Method for PendingGet {
 }
 
 /// The descriptor returned by [`PendingGet`]: either a run request's
-/// [`PendingDescriptor`] or a Secure Enclave unlocker enrolment's
-/// [`UnlockerAddDescriptor`].
+/// [`PendingDescriptor`], a sign-in request's
+/// [`envcloak_policy::SignInPendingDescriptor`], or a Secure Enclave
+/// unlocker enrolment's [`UnlockerAddDescriptor`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum PendingGetOutput {
     UnlockerAdd(UnlockerAddDescriptor),
+    SignIn(Box<envcloak_policy::SignInPendingDescriptor>),
     Run(PendingDescriptor),
 }
 
@@ -529,20 +533,102 @@ impl Method for Approve {
     type Output = ApprovedView;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub struct ApproveParams {
     pub request: String,
     pub options: ApprovalOptions,
+    /// For a sign-in request: the `dev` authorization window and attempt
+    /// budget (`options.dev` on the wire; docs/IPC.md).
+    pub dev: Option<envcloak_policy::SignInDevOptions>,
     /// SHA-256 of the canonical statement the approver read, as 64 hex
     /// characters (`envcloak_policy::statement_digest`).
     pub digest: String,
     /// The proof. Without it the call is a check ([`Approve`]).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<WireSecret>,
     /// As [`UnlockParams::claims`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub claims: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ApproveOptionsSer<'a> {
+    uses: envcloak_policy::Uses,
+    ttl_secs: u64,
+    live: &'a [EnvName],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    standing: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dev: Option<envcloak_policy::SignInDevOptions>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApproveOptionsDe {
+    uses: envcloak_policy::Uses,
+    ttl_secs: u64,
+    live: Vec<EnvName>,
+    #[serde(default)]
+    standing: Option<u64>,
+    #[serde(default)]
+    dev: Option<envcloak_policy::SignInDevOptions>,
+}
+
+impl Serialize for ApproveParams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Wire<'a> {
+            request: &'a str,
+            options: ApproveOptionsSer<'a>,
+            digest: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            passphrase: &'a Option<WireSecret>,
+            #[serde(skip_serializing_if = "<[_]>::is_empty")]
+            claims: &'a [String],
+        }
+        Wire {
+            request: &self.request,
+            options: ApproveOptionsSer {
+                uses: self.options.uses,
+                ttl_secs: self.options.ttl_secs,
+                live: &self.options.live,
+                standing: self.options.standing.map(|d| d.as_secs()),
+                dev: self.dev,
+            },
+            digest: &self.digest,
+            passphrase: &self.passphrase,
+            claims: &self.claims,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ApproveParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            request: String,
+            options: ApproveOptionsDe,
+            digest: String,
+            #[serde(default)]
+            passphrase: Option<WireSecret>,
+            #[serde(default)]
+            claims: Vec<String>,
+        }
+        let w = Wire::deserialize(deserializer)?;
+        Ok(ApproveParams {
+            request: w.request,
+            options: ApprovalOptions {
+                uses: w.options.uses,
+                ttl_secs: w.options.ttl_secs,
+                live: w.options.live,
+                standing: w.options.standing.map(std::time::Duration::from_secs),
+            },
+            dev: w.options.dev,
+            digest: w.digest,
+            passphrase: w.passphrase,
+            claims: w.claims,
+        })
+    }
 }
 
 /// `deny`: refuses a pending request. Tightening needs no proof.
@@ -1910,8 +1996,256 @@ impl core::fmt::Debug for ManagedUpdateParams {
     }
 }
 
+/// `signin.target.add`: registers a sign-in target with a passphrase proof
+/// from a terminal subject (SPEC §6.8, M2b-05). Sent without `passphrase`,
+/// it runs a pre-prompt check.
+#[derive(Debug)]
+pub struct SigninTargetAdd;
+
+impl Method for SigninTargetAdd {
+    const NAME: &'static str = "signin.target.add";
+    type Params = SigninTargetAddParams;
+    type Output = SigninTargetView;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetAddParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    pub name: String,
+    pub login: String,
+    pub app_origins: Vec<String>,
+    pub credential_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_provider_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_origins: Vec<String>,
+    pub identity_check: IdentityCheckView,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cookies: Vec<CookieScopeView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage: Vec<StorageScopeView>,
+    pub session_format: SessionFormatView,
+    pub tier: LoginTierView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<AdapterRefView>,
+    pub approval_lifetime_secs: u64,
+    pub session_lifetime_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<WireSecret>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for SigninTargetAddParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SigninTargetAddParams")
+            .field("name", &self.name)
+            .field("login", &self.login)
+            .field("tier", &self.tier)
+            .field("passphrase", &self.passphrase.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `signin.target.edit`: edits a registered sign-in target with a passphrase
+/// proof from a terminal subject, bumping its `revision` and invalidating
+/// live operations and `dev` authorizations for it (SPEC §6.8, M2b-05). Sent
+/// without `passphrase`, it runs a pre-prompt check.
+#[derive(Debug)]
+pub struct SigninTargetEdit;
+
+impl Method for SigninTargetEdit {
+    const NAME: &'static str = "signin.target.edit";
+    type Params = SigninTargetEditParams;
+    type Output = SigninTargetView;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetEditParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_origins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_origins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_provider_origins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub callback_origins: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_check: Option<IdentityCheckView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookies: Option<Vec<CookieScopeView>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<Vec<StorageScopeView>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_format: Option<SessionFormatView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<LoginTierView>,
+    /// `Some(Some(adapter))` sets the adapter; `Some(None)` clears it;
+    /// `None` leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<Option<AdapterRefView>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_lifetime_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_lifetime_secs: Option<u64>,
+    /// `Some(Some(revocation))` sets the revocation call; `Some(None)`
+    /// clears it; `None` leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<WireSecret>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for SigninTargetEditParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SigninTargetEditParams")
+            .field("name", &self.name)
+            .field("passphrase", &self.passphrase.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `signin.target.remove`: removes a registered sign-in target with a
+/// passphrase proof from a terminal subject, and ends its operations and
+/// `dev` authorizations (SPEC §6.8, M2b-05). Sent without `passphrase`, it
+/// runs a pre-prompt check.
+#[derive(Debug)]
+pub struct SigninTargetRemove;
+
+impl Method for SigninTargetRemove {
+    const NAME: &'static str = "signin.target.remove";
+    type Params = SigninTargetRemoveParams;
+    type Output = SigninTargetRemovedView;
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetRemoveParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub passphrase: Option<WireSecret>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+}
+
+impl core::fmt::Debug for SigninTargetRemoveParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SigninTargetRemoveParams")
+            .field("name", &self.name)
+            .field("passphrase", &self.passphrase.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `signin.target.list`: lists registered sign-in targets for a project (or
+/// all projects when `manifest` is absent). Metadata only.
+#[derive(Debug)]
+pub struct SigninTargetList;
+
+impl Method for SigninTargetList {
+    const NAME: &'static str = "signin.target.list";
+    type Params = SigninTargetListParams;
+    type Output = SigninTargetListView;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<String>,
+}
+
+/// `signin.request`: submits a sign-in request for a registered target and
+/// role under `operation_key`, optionally handing over the tool pipe ends
+/// (`SCM_RIGHTS`) for the browser supervisor (SPEC §6.8, M2b-05).
+#[derive(Debug)]
+pub struct SigninRequest;
+
+impl Method for SigninRequest {
+    const NAME: &'static str = "signin.request";
+    type Params = SigninRequestParams;
+    type Output = SigninStatusView;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninRequestParams {
+    pub manifest: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    pub operation_key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fds: Vec<FdRole>,
+}
+
+/// `signin.status`: returns the allowlisted status of a sign-in operation
+/// to its owner root only (SPEC §6.8, M2b-05).
+#[derive(Debug)]
+pub struct SigninStatus;
+
+impl Method for SigninStatus {
+    const NAME: &'static str = "signin.status";
+    type Params = SigninOperationParams;
+    type Output = SigninStatusView;
+}
+
+/// `signin.cancel`: cancels a sign-in operation to its owner root only
+/// (SPEC §6.8, M2b-05).
+#[derive(Debug)]
+pub struct SigninCancel;
+
+impl Method for SigninCancel {
+    const NAME: &'static str = "signin.cancel";
+    type Params = SigninOperationParams;
+    type Output = SigninStatusView;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninOperationParams {
+    pub request: String,
+}
+
+/// `signin.end`: ends a delivered sign-in session by request id or context id,
+/// to its owner root only (SPEC §6.8, M2b-05).
+#[derive(Debug)]
+pub struct SigninEnd;
+
+impl Method for SigninEnd {
+    const NAME: &'static str = "signin.end";
+    type Params = SigninEndParams;
+    type Output = SigninStatusView;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninEndParams {
+    pub session: String,
+}
+
 /// The client-role methods this daemon serves.
-pub const CLIENT_METHODS: [&str; 52] = [
+pub const CLIENT_METHODS: [&str; 60] = [
     Status::NAME,
     VaultCreate::NAME,
     Unlock::NAME,
@@ -1933,6 +2267,14 @@ pub const CLIENT_METHODS: [&str; 52] = [
     ItemsCheck::NAME,
     ItemsAdd::NAME,
     LoginAdd::NAME,
+    SigninTargetAdd::NAME,
+    SigninTargetEdit::NAME,
+    SigninTargetRemove::NAME,
+    SigninTargetList::NAME,
+    SigninRequest::NAME,
+    SigninStatus::NAME,
+    SigninCancel::NAME,
+    SigninEnd::NAME,
     ItemsTarget::NAME,
     ItemsReveal::NAME,
     ItemsRotate::NAME,
@@ -2174,6 +2516,9 @@ pub enum ErrorKind {
     /// because the vault's policy record does not match `<data>/policy-epoch`
     /// (M2 plan D-10; M2-15).
     PolicyEpochUnverified,
+    /// A sign-in request with a known `operation_key` and any scope field
+    /// changed (SPEC §6.8, M2b-05): the existing request is untouched.
+    RequestConflict,
     /// A signed approval (`app.approve`) or signed write whose 64-byte raw
     /// P-256 signature does not verify against any enrolled Secure Enclave
     /// unlocker's `approve` key; audited.
@@ -2196,7 +2541,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Every kind, in declaration order.
-    pub const ALL: [ErrorKind; 59] = [
+    pub const ALL: [ErrorKind; 60] = [
         ErrorKind::ParseError,
         ErrorKind::InvalidRequest,
         ErrorKind::MethodNotFound,
@@ -2250,6 +2595,7 @@ impl ErrorKind {
         ErrorKind::IdentityOutsideInstallTree,
         ErrorKind::LaunchNotStandingCapable,
         ErrorKind::PolicyEpochUnverified,
+        ErrorKind::RequestConflict,
         ErrorKind::SignatureInvalid,
         ErrorKind::UnlockFailed,
         ErrorKind::NoUnlocker,
@@ -2314,6 +2660,7 @@ impl ErrorKind {
             ErrorKind::IdentityOutsideInstallTree => -32044,
             ErrorKind::LaunchNotStandingCapable => -32045,
             ErrorKind::PolicyEpochUnverified => -32046,
+            ErrorKind::RequestConflict => -32047,
             ErrorKind::SignatureInvalid => -32051,
             ErrorKind::UnlockFailed => -32052,
             ErrorKind::NoUnlocker => -32053,
@@ -2379,6 +2726,7 @@ impl ErrorKind {
             ErrorKind::IdentityOutsideInstallTree => "identity_outside_install_tree",
             ErrorKind::LaunchNotStandingCapable => "launch_not_standing_capable",
             ErrorKind::PolicyEpochUnverified => "policy_epoch_unverified",
+            ErrorKind::RequestConflict => "request_conflict",
             ErrorKind::SignatureInvalid => "signature_invalid",
             ErrorKind::UnlockFailed => "unlock_failed",
             ErrorKind::NoUnlocker => "no_unlocker",
@@ -2533,6 +2881,10 @@ impl ErrorKind {
             ErrorKind::PolicyEpochUnverified => {
                 "standing approvals are paused because the vault's policy record does not match \
                  the daemon's epoch; run `envcloak standing confirm`"
+            }
+            ErrorKind::RequestConflict => {
+                "that operation key is already in use for a different sign-in scope; nothing was \
+                 changed"
             }
             ErrorKind::SignatureInvalid => {
                 "the approval signature could not be verified against an enrolled Secure Enclave \

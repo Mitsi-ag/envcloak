@@ -878,6 +878,31 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
     let mut r = request(under_agent(), two(), &["./emit"]);
     r.project = acme();
     assert_eq!(covered(&s.decide(r, &now)), g);
+
+    // R-M2b-11, R-M2b-13: no inject or proxy grant covers a Mode::SignIn
+    // request, and a Mode::SignIn grant in GrantStore covers no inject,
+    // proxy or sign-in request.
+    let fp = [0x42; 32];
+    let mut signin_req = request(under_agent(), two(), &["./emit"]);
+    signin_req.mode = Mode::SignIn(fp);
+    assert!(matches!(
+        s.decide(signin_req.clone(), &now),
+        Decision::Pending(_)
+    ));
+    assert!(matches!(
+        s2.decide(signin_req.clone(), &now),
+        Decision::Pending(_)
+    ));
+    let mut s3 = store();
+    let _g_signin = approve(&mut s3, signin_req.clone(), session(3600), &now).unwrap();
+    assert!(matches!(
+        s3.decide(request(under_agent(), two(), &["./emit"]), &now),
+        Decision::Pending(_)
+    ));
+    let mut proxy_req = request(under_agent(), two(), &["./emit"]);
+    proxy_req.mode = Mode::Proxy;
+    assert!(matches!(s3.decide(proxy_req, &now), Decision::Pending(_)));
+    assert!(matches!(s3.decide(signin_req, &now), Decision::Pending(_)));
 }
 
 #[test]

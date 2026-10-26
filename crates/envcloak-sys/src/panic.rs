@@ -195,6 +195,20 @@ pub fn test_app_identity(pid: i32) -> Option<(String, String)> {
     }
 }
 
+/// Whether `ENVCLOAK_TEST_APP_IDENTITY` is set in a test build (`testing`
+/// feature enabled); always `false` in release builds.
+#[must_use]
+pub fn test_app_configured() -> bool {
+    #[cfg(feature = "testing")]
+    {
+        std::env::var_os(crate::testing::APP_IDENTITY).is_some()
+    }
+    #[cfg(not(feature = "testing"))]
+    {
+        false
+    }
+}
+
 /// A test build's additive clock offset (`ENVCLOAK_TEST_CLOCK_FILE`), so
 /// daemon integration tests can expire pending requests and unlock challenges
 /// without sleeping. Always [`std::time::Duration::ZERO`] in a build without
