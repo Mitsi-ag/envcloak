@@ -504,6 +504,10 @@ fn m2b_acceptance_story_end_to_end() {
         .apply(&mut setup_cmd)
         .env("PATH", &path_with_hosts)
         .env("TMPDIR", claude.claude_tmp())
+        .env("ENVCLOAK_CHROME_FOR_TESTING_BIN", &chrome_exe_str)
+        .env("ENVCLOAK_NODE_BIN", &node_exe_str)
+        .env("ENVCLOAK_BROWSER_HELPER_MODULES", &helper_mods_str)
+        .env("ENVCLOAK_BROWSER_HELPER_NODE_MODULES", &helper_mods_str)
         .current_dir(&project)
         .args([
             "signin",
