@@ -2,10 +2,49 @@
 "use strict";
 
 const fs = require("node:fs");
+const dns = require("node:dns");
 const net = require("node:net");
 const path = require("node:path");
 const readline = require("node:readline");
 const { EventEmitter } = require("node:events");
+
+function installHostResolverRules(hostRulesStr) {
+  const origLookup = dns.lookup.bind(dns);
+  const hostMap = new Map();
+  for (const part of String(hostRulesStr || "").split(",")) {
+    const tokens = part.trim().split(/\s+/);
+    if (tokens.length >= 3 && tokens[0].toUpperCase() === "MAP") {
+      hostMap.set(tokens[1].toLowerCase(), tokens[2]);
+    }
+  }
+  dns.lookup = function patchedLookup(hostname, options, callback) {
+    let cb = callback;
+    let opts = options;
+    if (typeof options === "function") {
+      cb = options;
+      opts = {};
+    } else if (typeof options === "number") {
+      opts = { family: options };
+    } else {
+      opts = options || {};
+    }
+    const lower = String(hostname || "").toLowerCase();
+    const mapped =
+      hostMap.get(lower) ||
+      (lower === "localhost" || lower.endsWith(".localhost") ? "127.0.0.1" : null);
+    if (mapped) {
+      process.nextTick(() => {
+        if (opts && opts.all) {
+          cb(null, [{ address: mapped, family: 4 }]);
+        } else {
+          cb(null, mapped, 4);
+        }
+      });
+      return;
+    }
+    return origLookup(hostname, options, callback);
+  };
+}
 
 function parseArgs(argv) {
   const out = {
@@ -95,6 +134,7 @@ class StdioMcpTransport extends EventEmitter {
 
 async function main() {
   const opts = parseArgs(process.argv);
+  installHostResolverRules(opts.hostRules);
   const mcpPath = path.join(opts.modulesDir, "@playwright", "mcp");
   const pwPath = path.join(opts.modulesDir, "playwright");
   const { createConnection } = require(mcpPath);
