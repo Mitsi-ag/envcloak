@@ -39,6 +39,7 @@
 //! and sends nothing: the calls in hand are stopped then too.
 
 pub mod bridge;
+pub mod browser;
 pub mod child;
 pub mod lifecycle;
 pub mod router;
@@ -403,6 +404,18 @@ impl Server {
             let _ = router.register(tool);
         }
         let _ = tools::SignInTools::register(&mut router, false);
+        Server::with_router(router)
+    }
+
+    /// A server with the M2 tools, sign-in tools, and the 20 hosted browser
+    /// tools backed by `relay` (`M2b-08`).
+    pub fn with_browser_relay(relay: browser::BrowserRelay) -> Server {
+        let mut router = Router::new();
+        for tool in tools::m2_tools() {
+            let _ = router.register(tool);
+        }
+        let _ = tools::SignInTools::register(&mut router, false);
+        let _ = browser::register_browser_tools(&mut router, relay);
         Server::with_router(router)
     }
 

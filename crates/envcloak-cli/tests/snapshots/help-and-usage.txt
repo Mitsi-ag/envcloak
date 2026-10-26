@@ -48,8 +48,7 @@ usage:
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
   envcloak signin target add|edit|rm|ls ...
-Not in this build (each exits 125 with not_in_this_build):
-  envcloak signin setup
+  envcloak signin setup [--versions PATH] [--json]
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 --- stderr
 $ envcloak --version
@@ -109,8 +108,7 @@ usage:
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
   envcloak signin target add|edit|rm|ls ...
-Not in this build (each exits 125 with not_in_this_build):
-  envcloak signin setup
+  envcloak signin setup [--versions PATH] [--json]
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 $ envcloak vault
 exit: 2

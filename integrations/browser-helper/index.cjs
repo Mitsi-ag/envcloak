@@ -358,6 +358,14 @@ async function main() {
           };
           if (c.url) {
             out.url = String(c.url);
+          } else if (c.host_only === true) {
+            const scheme = c.secure ? "https" : "http";
+            const host = String(c.domain || "").replace(/^\./, "");
+            const p = String(c.path || "/");
+            if (!p.startsWith("/") || /\s/.test(p)) {
+              throw new Error("unsupported_session_scope");
+            }
+            out.url = `${scheme}://${host}${p}`;
           } else {
             out.domain = String(c.domain);
             out.path = String(c.path || "/");
@@ -368,7 +376,75 @@ async function main() {
           if (typeof c.expires === "number") out.expires = c.expires;
           return out;
         });
-        await recipientContext.addCookies(pwCookies);
+        try {
+          await recipientContext.addCookies(pwCookies);
+        } catch {
+          try {
+            await recipientContext.close();
+          } catch {}
+          recipientContext = null;
+          published = false;
+          throw new Error("unsupported_session_scope");
+        }
+        const storedCookies = await recipientContext.cookies();
+        const usedIndices = new Set();
+        const matchesDeclared = cookies.every((c) => {
+          const expectedName = String(c.name);
+          const expectedValue = String(c.value);
+          const expectedPath = c.url
+            ? (() => {
+                try {
+                  return new URL(String(c.url)).pathname || "/";
+                } catch {
+                  return "/";
+                }
+              })()
+            : String(c.path || "/");
+          const expectedHost = c.url
+            ? (() => {
+                try {
+                  return new URL(String(c.url)).hostname.toLowerCase();
+                } catch {
+                  return "";
+                }
+              })()
+            : String(c.domain || "").replace(/^\./, "").toLowerCase();
+          const expectHostOnly =
+            typeof c.host_only === "boolean"
+              ? c.host_only
+              : Boolean(c.url) ||
+                (typeof c.domain === "string" && c.domain.startsWith(".") ? false : null);
+          const idx = storedCookies.findIndex((sc, i) => {
+            if (usedIndices.has(i)) return false;
+            const rawScDomain = String(sc.domain || "").toLowerCase();
+            const scIsHostOnly = !rawScDomain.startsWith(".");
+            const scHost = rawScDomain.replace(/^\./, "");
+            if (sc.name !== expectedName || sc.value !== expectedValue) return false;
+            if (scHost !== expectedHost) return false;
+            if (expectHostOnly !== null && scIsHostOnly !== expectHostOnly) return false;
+            if (sc.path !== expectedPath) return false;
+            if (typeof c.httpOnly === "boolean" && sc.httpOnly !== c.httpOnly) return false;
+            if (typeof c.secure === "boolean" && sc.secure !== c.secure) return false;
+            if (
+              c.sameSite &&
+              String(sc.sameSite || "").toLowerCase() !== String(c.sameSite).toLowerCase()
+            ) {
+              return false;
+            }
+            return true;
+          });
+          if (idx === -1) return false;
+          usedIndices.add(idx);
+          return true;
+        });
+        if (!matchesDeclared || storedCookies.length !== cookies.length) {
+          try {
+            await recipientContext.close();
+          } catch {}
+          recipientContext = null;
+          published = false;
+          throw new Error("unsupported_session_scope");
+        }
       }
 
       for (const entry of origins) {
@@ -516,6 +592,35 @@ async function main() {
               },
             ],
           },
+        };
+      } finally {
+        await workerContext.close();
+      }
+    }
+
+    if (cmd === "capture_cookies_from_url") {
+      if (closed) {
+        throw new Error("browser_not_available");
+      }
+      await ensureBrowser();
+      const targetUrl = String(msg.url || "");
+      const workerContext = await browser.newContext({
+        ignoreHTTPSErrors: Boolean(msg.ignore_https_errors),
+      });
+      try {
+        const workerPage = await workerContext.newPage();
+        await workerPage.goto(targetUrl, { waitUntil: "domcontentloaded" });
+        const cookies = await workerContext.cookies();
+        return {
+          cookies: cookies.map((c) => ({
+            name: c.name,
+            value: c.value,
+            domain: c.domain,
+            path: c.path || "/",
+            httpOnly: c.httpOnly,
+            secure: c.secure,
+            sameSite: c.sameSite,
+          })),
         };
       } finally {
         await workerContext.close();

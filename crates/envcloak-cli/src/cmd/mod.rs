@@ -64,12 +64,14 @@ use envcloak_client::render::looks_like_value;
 
 /// The token of a command or option that this build registers but does
 /// not have yet (M2 plan D-23).
+#[allow(dead_code)]
 pub const NOT_IN_THIS_BUILD: &str = "not_in_this_build";
 
 /// Reports that `what`, fixed text naming a command or an option, is not
 /// in this build, and returns exit 125 (as `run`'s own failures). Nothing
 /// else is done: the caller has read no argument, so none can be echoed,
 /// and no daemon is asked.
+#[allow(dead_code)]
 pub fn not_in_this_build(what: &'static str) -> ExitCode {
     Failure::new(
         NOT_IN_THIS_BUILD,
