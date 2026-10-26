@@ -59,7 +59,7 @@ pub use child::Call;
 pub use router::{
     Annotations, Backend, RegisterError, Router, Target, Tool, ToolResult, ToolSchema,
 };
-pub use tools::Ctx;
+pub use tools::{Ctx, SignInTools};
 
 use lifecycle::Phase;
 use rpc::{Id, Incoming};
@@ -394,13 +394,15 @@ impl Default for Server {
 }
 
 impl Server {
-    /// A server with the M2 tools ([`tools::m2_tools`]), each listed.
+    /// A server with the M2 tools ([`tools::m2_tools`]), each listed, and the
+    /// sign-in tools registered unlisted until M2b-10 flips `listed` to `true`.
     pub fn new() -> Server {
         let mut router = Router::new();
         for tool in tools::m2_tools() {
             // The M2 tools' names are distinct (tested).
             let _ = router.register(tool);
         }
+        let _ = tools::SignInTools::register(&mut router, false);
         Server::with_router(router)
     }
 

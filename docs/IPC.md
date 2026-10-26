@@ -624,10 +624,10 @@ The `pty_monitor` reader binds `Report` and `Command` to direct module-scope pub
 | `run_with_secrets` | M2-06 | landed | runs a command through a child `envcloak run` |
 | `request_new_secret` | M2-06 | landed | the terminal instruction to add a key; takes no value |
 | `usage_summary` | M4 | reserved | spend and usage, listed from M4 |
-| `request_sign_in` | M2b-06 | reserved | a sign-in outcome for a registered target and role |
-| `sign_in_status` | M2b-06 | reserved | an operation's status |
-| `cancel_sign_in` | M2b-06 | reserved | ends an operation |
-| `end_sign_in_session` | M2b-06 | reserved | ends a delivered session |
+| `request_sign_in` | M2b-06 | landed | a sign-in outcome for a registered target and role |
+| `sign_in_status` | M2b-06 | landed | an operation's status |
+| `cancel_sign_in` | M2b-06 | landed | ends an operation |
+| `end_sign_in_session` | M2b-06 | landed | ends a delivered session |
 | `browser_*` | M2b-08 | reserved | the hosted browser tools of the supervisor's allowlist (SPEC §6.8); no other EnvCloak tool name starts with `browser_` |
 <!-- /reservations -->
 
