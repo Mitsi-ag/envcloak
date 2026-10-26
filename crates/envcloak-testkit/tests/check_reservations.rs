@@ -378,7 +378,7 @@ fn an_unknown_task_or_status_fails() {
     edit(
         &t,
         IPC,
-        "| `signin.status` | M2b-05 | reserved |",
+        "| `signin.status` | M2b-05 | landed |",
         "| `signin.status` | M2b-05 | taken |",
     );
     assert_fails(&t, "`signin.status` has status 'taken'");
@@ -792,12 +792,12 @@ fn an_unreserved_method_in_the_code_fails() {
 #[test]
 fn a_method_landed_as_reserved_passes() {
     let t = fixture();
-    add_method(&t, "signin.status");
+    add_method(&t, "pending.peek");
     edit(
         &t,
         IPC,
-        "| `signin.status` | M2b-05 | reserved |",
-        "| `signin.status` | M2b-05 | landed |",
+        "| `signin.end` | M2b-05 | landed | ends a delivered session, to its owner root only |\n",
+        "| `signin.end` | M2b-05 | landed | ends a delivered session, to its owner root only |\n| `pending.peek` | M2-03 | landed | peek |\n",
     );
     assert_passes(&t.home());
 }
@@ -1226,12 +1226,12 @@ fn a_method_named_by_a_raw_string_counts() {
         );
     }
     let t = fixture();
-    add_method_decl(&t, "const NAME: &'static str = r\"signin.status\";");
+    add_method_decl(&t, "const NAME: &'static str = r\"pending.peek\";");
     edit(
         &t,
         IPC,
-        "| `signin.status` | M2b-05 | reserved |",
-        "| `signin.status` | M2b-05 | landed |",
+        "| `signin.end` | M2b-05 | landed | ends a delivered session, to its owner root only |\n",
+        "| `signin.end` | M2b-05 | landed | ends a delivered session, to its owner root only |\n| `pending.peek` | M2-03 | landed | peek |\n",
     );
     assert_passes(&t.home());
 }
@@ -3351,12 +3351,12 @@ fn a_control_message_the_reader_cannot_read_is_refused() {
     edit(
         &t,
         IPC,
-        "| `supervisor` | `Publish` | M2b-05 | reserved |",
-        "| `supervisor` | `Publish` | M2b-05 | landed |",
+        "| `signin_driver` | `NeedUsername` | M2b-07 | reserved |",
+        "| `signin_driver` | `NeedUsername` | M2b-07 | landed |",
     );
     assert_fails(
         &t,
-        "`supervisor Publish` is `landed`, but the code has no such entry",
+        "`signin_driver NeedUsername` is `landed`, but the code has no such entry",
     );
 }
 
