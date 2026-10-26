@@ -997,6 +997,7 @@ import XCTest
         XCTAssertEqual(keySight.lastAnnouncement, "Clipboard cleared")
 
         // 8. VaultSession announces "EnvCloak locked" when locking explicitly, on system signal, or on daemon idle lock.
+        session.stop()
         await session.lock()
         XCTAssertEqual(session.state, .locked)
         XCTAssertEqual(session.notifications.lastAnnouncement, "EnvCloak locked")

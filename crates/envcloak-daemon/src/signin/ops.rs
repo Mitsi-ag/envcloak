@@ -1742,6 +1742,10 @@ pub fn request(
     let status = lookup.status();
     let req_id = status.request;
     if let Some(pipes) = tool_pipes
+        && !matches!(
+            status.state,
+            OpState::Published | OpState::Ended | OpState::Cancelled | OpState::Failed
+        )
         && let Some(meta) = s.signin.ops.get_mut(&req_id)
         && meta.tool_pipes.is_none()
     {
@@ -2984,23 +2988,32 @@ fn default_supervised_worker_config(
         flow,
     };
 
-    let needs_localhost_resolver = parsed
+    let mut localhost_hosts = std::collections::BTreeSet::new();
+    for o in parsed
         .app_origins
         .iter()
         .chain(parsed.credential_origins.iter())
         .chain(parsed.identity_provider_origins.iter())
         .chain(parsed.callback_origins.iter())
-        .any(|o| {
-            let h = o.host().to_string();
-            h == "localhost" || h.ends_with(".localhost")
-        });
+    {
+        let h = o.host().to_string();
+        if h == "localhost" || h.ends_with(".localhost") {
+            localhost_hosts.insert(h);
+        }
+    }
+    let host_resolver_rules = (!localhost_hosts.is_empty()).then(|| {
+        let mut rules = vec!["MAP *.localhost 127.0.0.1".to_owned()];
+        for h in localhost_hosts {
+            rules.push(format!("MAP {h} 127.0.0.1"));
+        }
+        rules.join(", ")
+    });
 
     Some(SupervisedWorkerRunConfig {
         bootstrap,
         chrome_exe,
         chrome_sha256,
-        host_resolver_rules: needs_localhost_resolver
-            .then(|| "MAP *.localhost 127.0.0.1".to_owned()),
+        host_resolver_rules,
         test_ca_spki_sha256: None,
         extra_chrome_args: Vec::new(),
         status_dir: None,

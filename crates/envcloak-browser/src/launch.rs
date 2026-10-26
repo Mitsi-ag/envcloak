@@ -19,9 +19,7 @@
 
 use std::fs::File;
 use std::io::{self, Read};
-#[cfg(any(target_os = "linux", target_os = "android"))]
-use std::os::fd::AsFd;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -239,7 +237,18 @@ impl LaunchSpec {
         cmd.rlimit_core_zero = true;
         cmd.args(&args);
         cmd.env("HOME", &self.attempt_dir_path);
-        cmd.env("TMPDIR", &self.attempt_dir_path);
+        // On Linux, Chromium's ProcessSingleton binds a Unix domain socket at
+        // `$TMPDIR/.org.chromium.Chromium.XXXXXX/SingletonSocket` (46 bytes of
+        // suffix). When `attempt_dir_path` exceeds 55 bytes, setting `TMPDIR` to
+        // `attempt_dir_path` overflows `sockaddr_un.sun_path` (108 bytes on
+        // Linux) and Chromium exits immediately with code 21 ("Socket path too
+        // long"). Fall back to `/tmp` when `attempt_dir_path` exceeds 55 bytes.
+        let tmpdir: &Path = if self.attempt_dir_path.as_os_str().len() <= 55 {
+            &self.attempt_dir_path
+        } else {
+            Path::new("/tmp")
+        };
+        cmd.env("TMPDIR", tmpdir);
         cmd.env("PATH", "/usr/bin:/bin");
         cmd.current_dir(&self.attempt_dir_path);
 
@@ -468,7 +477,15 @@ impl EntryImageAnchor {
     ) -> Result<OwnedChild, EntryImageError> {
         envcloak_sys::fail_point("signin.entry_image.spawn")
             .map_err(|_| EntryImageError::SpawnFailed)?;
-        self.spawn_bound_imp(argv, env, fds)
+        let devnull = File::open("/dev/null").map_err(|_| EntryImageError::SpawnFailed)?;
+        let mut full_fds = Vec::with_capacity(fds.len() + 3);
+        for std_fd in 0..=2 {
+            if !fds.iter().any(|(_, dst)| *dst == std_fd) {
+                full_fds.push((devnull.as_fd(), std_fd));
+            }
+        }
+        full_fds.extend_from_slice(fds);
+        self.spawn_bound_imp(argv, env, &full_fds)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
