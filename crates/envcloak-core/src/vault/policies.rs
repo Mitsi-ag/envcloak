@@ -28,9 +28,14 @@ use crate::crypto::{Keyring, Purpose, keyed_hash};
 use super::codec::{Dec, Enc};
 use super::error::{VaultError, VaultErrorKind};
 use super::items::{FieldId, ItemId, LoginTier, PolicyId};
+use super::policy::{
+    AccountLinkRecord, AlertRuleRecord, BudgetRecord, ControlFactRecord, ManualFactRecord,
+    SpendSnapshot, SubscriptionRecord,
+};
 
 /// The kind of a policy record: its first byte. Part of the vault format
-/// (docs/VAULT.md "Reserved for M2 and M2b"): never renumber or reuse.
+/// (docs/VAULT.md "Reserved for M2 and M2b" and "Reserved for M4"): never
+/// renumber or reuse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PolicyKind {
@@ -38,15 +43,29 @@ pub enum PolicyKind {
     /// A [`SignInTarget`] (named as docs/VAULT.md reserves it).
     SigninTarget = 2,
     ManagedServer = 3,
+    Subscription = 5,
+    Budget = 6,
+    AlertRule = 7,
+    ManualFact = 8,
+    ControlFact = 9,
+    SpendSnapshot = 10,
+    AccountLink = 11,
 }
 
 impl PolicyKind {
     /// The record version this build writes for each kind.
     fn version(self) -> u8 {
         match self {
-            PolicyKind::StandingApproval | PolicyKind::SigninTarget | PolicyKind::ManagedServer => {
-                1
-            }
+            PolicyKind::StandingApproval
+            | PolicyKind::SigninTarget
+            | PolicyKind::ManagedServer
+            | PolicyKind::Subscription
+            | PolicyKind::Budget
+            | PolicyKind::AlertRule
+            | PolicyKind::ManualFact
+            | PolicyKind::ControlFact
+            | PolicyKind::SpendSnapshot
+            | PolicyKind::AccountLink => 1,
         }
     }
 }
@@ -68,6 +87,13 @@ pub enum PolicyRecord {
     StandingApproval(StandingApproval),
     SignInTarget(SignInTarget),
     ManagedServer(ManagedServer),
+    Subscription(SubscriptionRecord),
+    Budget(BudgetRecord),
+    AlertRule(AlertRuleRecord),
+    ManualFact(ManualFactRecord),
+    ControlFact(ControlFactRecord),
+    SpendSnapshot(SpendSnapshot),
+    AccountLink(AccountLinkRecord),
 }
 
 /// How a standing approval was proven. Part of the record: never
@@ -562,6 +588,13 @@ impl PolicyRecord {
             PolicyRecord::StandingApproval(_) => PolicyKind::StandingApproval,
             PolicyRecord::SignInTarget(_) => PolicyKind::SigninTarget,
             PolicyRecord::ManagedServer(_) => PolicyKind::ManagedServer,
+            PolicyRecord::Subscription(_) => PolicyKind::Subscription,
+            PolicyRecord::Budget(_) => PolicyKind::Budget,
+            PolicyRecord::AlertRule(_) => PolicyKind::AlertRule,
+            PolicyRecord::ManualFact(_) => PolicyKind::ManualFact,
+            PolicyRecord::ControlFact(_) => PolicyKind::ControlFact,
+            PolicyRecord::SpendSnapshot(_) => PolicyKind::SpendSnapshot,
+            PolicyRecord::AccountLink(_) => PolicyKind::AccountLink,
         }
     }
 
@@ -572,6 +605,13 @@ impl PolicyRecord {
             PolicyRecord::StandingApproval(s) => s.in_bounds(),
             PolicyRecord::SignInTarget(t) => t.in_bounds(),
             PolicyRecord::ManagedServer(m) => m.in_bounds(),
+            PolicyRecord::Subscription(r) => r.in_bounds(),
+            PolicyRecord::Budget(r) => r.in_bounds(),
+            PolicyRecord::AlertRule(r) => r.in_bounds(),
+            PolicyRecord::ManualFact(r) => r.in_bounds(),
+            PolicyRecord::ControlFact(r) => r.in_bounds(),
+            PolicyRecord::SpendSnapshot(r) => r.in_bounds(),
+            PolicyRecord::AccountLink(r) => r.in_bounds(),
         }
     }
 
@@ -594,6 +634,13 @@ impl PolicyRecord {
             PolicyRecord::StandingApproval(s) => s.encode(&mut e),
             PolicyRecord::SignInTarget(t) => t.encode(&mut e),
             PolicyRecord::ManagedServer(m) => m.encode(&mut e),
+            PolicyRecord::Subscription(r) => r.encode(&mut e),
+            PolicyRecord::Budget(r) => r.encode(&mut e),
+            PolicyRecord::AlertRule(r) => r.encode(&mut e),
+            PolicyRecord::ManualFact(r) => r.encode(&mut e),
+            PolicyRecord::ControlFact(r) => r.encode(&mut e),
+            PolicyRecord::SpendSnapshot(r) => r.encode(&mut e),
+            PolicyRecord::AccountLink(r) => r.encode(&mut e),
         }
         e.finish()
     }
@@ -609,6 +656,13 @@ impl PolicyRecord {
             (1, 1) => PolicyRecord::StandingApproval(StandingApproval::decode(&mut d)?),
             (2, 1) => PolicyRecord::SignInTarget(SignInTarget::decode(&mut d)?),
             (3, 1) => PolicyRecord::ManagedServer(ManagedServer::decode(&mut d)?),
+            (5, 1) => PolicyRecord::Subscription(SubscriptionRecord::decode(&mut d)?),
+            (6, 1) => PolicyRecord::Budget(BudgetRecord::decode(&mut d)?),
+            (7, 1) => PolicyRecord::AlertRule(AlertRuleRecord::decode(&mut d)?),
+            (8, 1) => PolicyRecord::ManualFact(ManualFactRecord::decode(&mut d)?),
+            (9, 1) => PolicyRecord::ControlFact(ControlFactRecord::decode(&mut d)?),
+            (10, 1) => PolicyRecord::SpendSnapshot(SpendSnapshot::decode(&mut d)?),
+            (11, 1) => PolicyRecord::AccountLink(AccountLinkRecord::decode(&mut d)?),
             _ => return Err(corrupt()),
         };
         d.end()?;
@@ -1336,6 +1390,17 @@ mod tests {
     }
 
     fn every_record() -> Vec<PolicyRecord> {
+        use super::super::policy::{
+            AlertRuleKind, BillingCadence, BudgetPeriod, BudgetScope, CapEnforcement, CapScope,
+            LimitResetPeriod, ManualFactTarget, SnapshotBucket, SnapshotResultClass,
+            SpendAccountId, SpendAttribution, SpendSource,
+        };
+        use crate::money::{Iso4217, Money};
+        let usd20 = Money::new(2000, 2, Iso4217::USD).unwrap();
+        let acc = SpendAccountId {
+            provider: "openrouter".into(),
+            account: "default".into(),
+        };
         vec![
             standing(None, false, false),
             standing(Some(vec![1; 64]), true, true),
@@ -1356,6 +1421,95 @@ mod tests {
             managed(ManagedTransport::Bridge {
                 origin: "https://mcp.example.test".into(),
                 header_names: vec!["Authorization".into()],
+            }),
+            PolicyRecord::Subscription(SubscriptionRecord {
+                name: "Claude Max".into(),
+                provider: Some("anthropic".into()),
+                account: Some("default".into()),
+                amount: usd20,
+                cadence: BillingCadence::Monthly,
+                renewal_at: Some(1_760_000_000),
+                linked_items: vec![ItemId::from_bytes([1; 16])],
+                created_at: 1_750_000_000,
+                updated_at: 1_750_000_000,
+            }),
+            PolicyRecord::Budget(BudgetRecord {
+                scope: BudgetScope::Account(acc.clone()),
+                amount: usd20,
+                period: BudgetPeriod::Monthly,
+                tz: "Australia/Sydney".into(),
+                thresholds: vec![50, 75, 90, 100],
+                created_at: 1_750_000_000,
+                updated_at: 1_750_000_000,
+            }),
+            PolicyRecord::AlertRule(AlertRuleRecord {
+                rule: AlertRuleKind::LowBalance { threshold: usd20 },
+                scope: BudgetScope::Provider("openrouter".into()),
+                raised_at: Some(1_750_000_100),
+                raised_source: Some(SpendSource::Poll),
+                dedupe_period: Some(202610),
+                acked_at: None,
+                snoozed_until: None,
+                created_at: 1_750_000_000,
+                updated_at: 1_750_000_100,
+            }),
+            PolicyRecord::ManualFact(ManualFactRecord {
+                target: ManualFactTarget::Account(acc.clone()),
+                balance: Some(usd20),
+                spend_mtd: None,
+                renewal_at: None,
+                plan: Some("pro".into()),
+                read_at: 1_750_000_000,
+                source: SpendSource::Manual {
+                    subject: SubjectKindRecord::Terminal,
+                },
+                attribution: SpendAttribution::Manual,
+            }),
+            PolicyRecord::ControlFact(ControlFactRecord {
+                target: ManualFactTarget::Account(acc.clone()),
+                amount: usd20,
+                reset: Some(LimitResetPeriod::Monthly),
+                remaining: Some(usd20),
+                scope: CapScope::Key,
+                enforcement: CapEnforcement::EnforcingDocumented {
+                    citation: "openrouter.ai/docs/limits".into(),
+                },
+                byok_in_limit: Some(false),
+                source: SpendSource::Poll,
+                read_at: 1_750_000_000,
+            }),
+            PolicyRecord::SpendSnapshot(SpendSnapshot {
+                account: acc,
+                polling_enabled: true,
+                read_at: 1_750_000_000,
+                source: SpendSource::Poll,
+                attribution: SpendAttribution::SameKey,
+                last_result: SnapshotResultClass::Ok,
+                balance: Some(usd20),
+                credit_limit: Some(usd20),
+                limit_remaining: Some(usd20),
+                limit_reset: Some(LimitResetPeriod::Monthly),
+                spend_day: Some(Money::zero_at_scale(2, Iso4217::USD)),
+                spend_week: Some(usd20),
+                spend_month: Some(usd20),
+                spend_total: Some(usd20),
+                expires_at: None,
+                is_management_key: Some(false),
+                byok_in_limit: Some(false),
+                key_metrics: Vec::new(),
+                buckets: vec![SnapshotBucket {
+                    day_index: 20_000,
+                    spend: Money::new(100, 2, Iso4217::USD).unwrap(),
+                    partial: false,
+                }],
+            }),
+            PolicyRecord::AccountLink(AccountLinkRecord {
+                item: ItemId::from_bytes([1; 16]),
+                usage_credential: Some(ItemId::from_bytes([2; 16])),
+                provider: "openai".into(),
+                provider_key_id: "key_abc123".into(),
+                attribution: SpendAttribution::AdminMatchedByHint,
+                linked_at: 1_750_000_000,
             }),
         ]
     }
@@ -1489,9 +1643,16 @@ mod tests {
             [
                 PolicyKind::StandingApproval as u8,
                 PolicyKind::SigninTarget as u8,
-                PolicyKind::ManagedServer as u8
+                PolicyKind::ManagedServer as u8,
+                PolicyKind::Subscription as u8,
+                PolicyKind::Budget as u8,
+                PolicyKind::AlertRule as u8,
+                PolicyKind::ManualFact as u8,
+                PolicyKind::ControlFact as u8,
+                PolicyKind::SpendSnapshot as u8,
+                PolicyKind::AccountLink as u8,
             ],
-            [1, 2, 3],
+            [1, 2, 3, 5, 6, 7, 8, 9, 10, 11],
             "docs/VAULT.md's reserved numbers"
         );
     }

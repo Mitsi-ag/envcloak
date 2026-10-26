@@ -30,6 +30,7 @@ mod login;
 mod migrate;
 mod paths;
 mod policies;
+pub mod policy;
 mod schema;
 mod snapshot;
 mod state;
@@ -74,6 +75,13 @@ pub use policies::{
     MAX_LIST, MAX_SIGNATURE, MAX_TEXT, ManagedServer, ManagedTransport, PolicyKind, PolicyRecord,
     ProjectIdentity, ProofKind, RegisteredLaunch, SessionFormat, SignInTarget, StandingApproval,
     StandingBinding, StandingSetHeader, StorageScope, SubjectKindRecord, TransferScope,
+};
+pub use policy::{
+    AccountLinkRecord, AlertRuleKind, AlertRuleRecord, BillingCadence, BudgetPeriod, BudgetRecord,
+    BudgetScope, CapEnforcement, CapScope, ControlFactRecord, KeySpendMetric, LimitResetPeriod,
+    MAX_DAILY_BUCKETS, MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_KEYS, MAX_SPEND_STR, MAX_THRESHOLDS,
+    ManualFactRecord, ManualFactTarget, SnapshotBucket, SnapshotResultClass, SpendAccountId,
+    SpendAttribution, SpendSnapshot, SpendSource, SubscriptionRecord, spend_str_ok,
 };
 pub use schema::{CURRENT_SCHEMA, StorageReport};
 pub use txn::Txn;
