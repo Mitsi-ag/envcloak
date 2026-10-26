@@ -91,6 +91,12 @@ pub fn run(args: &[&str]) -> ExitCode {
         println!("usage: {USAGE_TEXT}");
         return ExitCode::SUCCESS;
     }
+    if args == ["--browser-supervisor"] {
+        return match envcloak_mcp::browser::run_browser_supervisor() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(f) => f.report(FAILURE),
+        };
+    }
     let a = match parse(args) {
         Ok(a) => a,
         Err(why) => {

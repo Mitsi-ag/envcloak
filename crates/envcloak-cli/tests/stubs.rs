@@ -22,7 +22,7 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 
 /// Each registered command or option (the words that select it) and how
 /// its refusal names it.
-const STUBS: &[(&[&str], &str)] = &[(&["signin", "setup"], "`envcloak signin setup`")];
+const STUBS: &[(&[&str], &str)] = &[];
 
 /// Exit code of a stub, as of `run`'s own failures.
 const NOT_IN_THIS_BUILD: i32 = 125;
@@ -161,6 +161,7 @@ fn every_stub_refuses_an_argument_that_is_not_utf8() {
         &["agents", "status", "--probe"],
         &["agents", "migrate-mcp"],
         &["standing"],
+        &["signin", "setup"],
     ] {
         let mut cmd = cli_command(&home, words, &[]);
         cmd.arg(bad);
@@ -230,15 +231,15 @@ fn an_unknown_subcommand_of_a_stub_is_a_usage_error() {
         (vec!["standing"], false),
         (vec!["login"], false),
         (vec!["login", "list"], false),
-        (vec!["signin"], true),
-        (vec!["signin", "target"], true),
+        (vec!["signin"], false),
+        (vec!["signin", "target"], false),
     ];
     for c in &cs {
         cases.push((vec!["agents", c.as_str()], false));
         cases.push((vec!["items", c.as_str()], false));
         cases.push((vec!["standing", c.as_str()], false));
         cases.push((vec!["login", c.as_str()], false));
-        cases.push((vec!["signin", c.as_str()], true));
+        cases.push((vec!["signin", c.as_str()], false));
     }
     for (args, stub) in cases {
         let out = run(&home, &args, &[]);
@@ -280,7 +281,7 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
     let help = stdout(&out);
     let (available, unavailable) = help
         .split_once("Not in this build (each exits 125 with not_in_this_build):\n")
-        .unwrap_or_else(|| panic!("no unavailable section: {help}"));
+        .unwrap_or((&help, ""));
     for (words, what) in STUBS {
         assert!(lists(unavailable, words), "{what} is not listed: {help}");
         assert!(
@@ -300,6 +301,7 @@ fn the_help_lists_every_stub_as_not_in_this_build() {
     assert!(lists(available, &["mcp-bridge"]));
     assert!(lists(available, &["login", "add"]));
     assert!(lists(available, &["signin", "target"]));
+    assert!(lists(available, &["signin", "setup"]));
     let run = available
         .lines()
         .find(|l| l.trim_start().starts_with("envcloak run "))
