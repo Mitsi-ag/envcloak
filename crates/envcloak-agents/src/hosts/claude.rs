@@ -43,6 +43,22 @@ pub const SERVER: &str = "envcloak";
 pub const MCP_SERVERS: &str = "mcpServers";
 /// The deny rule for env files.
 pub const READ_DENY: &str = "Read(**/.env*)";
+/// The four sign-in MCP tools that `--signin --consent-approval-mode` may
+/// pre-approve (R-M2b-34, D-22).
+pub const SIGNIN_TOOLS: [&str; 4] = [
+    "request_sign_in",
+    "sign_in_status",
+    "cancel_sign_in",
+    "end_sign_in_session",
+];
+/// The four `permissions.allow` rules for [`SIGNIN_TOOLS`] in Claude Code's
+/// `~/.claude/settings.json` when `--signin --consent-approval-mode` is passed.
+pub const SIGNIN_ALLOW_RULES: [&str; 4] = [
+    "mcp__envcloak__request_sign_in",
+    "mcp__envcloak__sign_in_status",
+    "mcp__envcloak__cancel_sign_in",
+    "mcp__envcloak__end_sign_in_session",
+];
 /// The `PreToolUse` matcher for Claude Code's own tools: an exact list,
 /// every tool of the pinned version (2.1.280's `sdk-tools.d.ts`, and
 /// `ClaudeDesign`, whose `arguments` its server checks) that runs a
@@ -100,6 +116,26 @@ pub fn hooks_additions(envcloak: &Path) -> Vec<(Vec<&'static str>, Value)> {
             json!({"hooks": [handler(envcloak, Event::SessionStart)]}),
         ),
     ]
+}
+
+/// The `permissions.allow` rules for the four sign-in tools, added to
+/// `~/.claude/settings.json` only when `--signin --consent-approval-mode` is
+/// passed (R-M2b-34, D-22).
+pub fn signin_allow_additions() -> Vec<(Vec<&'static str>, Value)> {
+    SIGNIN_ALLOW_RULES
+        .iter()
+        .map(|rule| (vec!["permissions", "allow"], json!(rule)))
+        .collect()
+}
+
+/// Whether `e` is one of the four sign-in `permissions.allow` rules.
+pub fn is_signin_allow_edit(e: &crate::writer::Edit) -> bool {
+    matches!(
+        e,
+        crate::writer::Edit::JsonElement { path, value, .. }
+            if path.iter().map(String::as_str).eq(["permissions", "allow"])
+                && value.as_str().is_some_and(|s| SIGNIN_ALLOW_RULES.contains(&s))
+    )
 }
 
 /// The settings no plugin carries, which the installer adds to

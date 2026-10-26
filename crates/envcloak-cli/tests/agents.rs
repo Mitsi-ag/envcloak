@@ -3212,3 +3212,216 @@ fn tier_2_and_tier_3_install_status_and_uninstall() {
     assert_eq!(code, 0, "{u}");
     f.sweep();
 }
+
+/// M2b-04 (R-M2b-33, R-M2b-34, SI-17, SI-19, D-22):
+/// - `--signin` appends the one byte-identical line naming `request_sign_in`
+///   to instruction blocks across hosts and project files; without
+///   `--consent-approval-mode`, no approval setting is written for any tool.
+/// - With `--signin --consent-approval-mode`, only the four sign-in tools
+///   (`request_sign_in`, `sign_in_status`, `cancel_sign_in`,
+///   `end_sign_in_session`) are pre-approved per tool in Claude Code
+///   (`permissions.allow`) and Codex (`[mcp_servers.envcloak.tools.<tool>]
+///   approval_mode = "approve"`); `run_with_secrets`, `add_reference`,
+///   `list_secrets`, `project_status`, `request_new_secret` and `browser_*`
+///   are never pre-approved, and no server-wide approval mode is set.
+/// - Other MCP servers' settings and approval rules remain byte-identical
+///   before and after install and uninstall.
+/// - Reinstalling without `--consent-approval-mode` removes the sign-in tool
+///   approvals and emits `signin_approvals_removed`; `uninstall` restores
+///   every file byte for byte.
+#[test]
+fn signin_install_consent_approval_mode_and_other_servers_preserved() {
+    let f = Fixture::new();
+    let claude_json_before = std::fs::read(f.path(".claude.json")).unwrap();
+    let settings_before = std::fs::read(f.path(".claude/settings.json")).unwrap();
+    let toml_before = std::fs::read(f.path(".codex/config.toml")).unwrap();
+
+    // 1. `--signin` and `--consent-approval-mode` are install-only flags.
+    for bad in [
+        &["uninstall", "--signin"][..],
+        &["uninstall", "--consent-approval-mode"],
+        &["status", "--signin"],
+        &["status", "--consent-approval-mode"],
+    ] {
+        let out = f.agents(bad);
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", stderr(&out));
+    }
+
+    // 2. `install --signin --yes` (without `--consent-approval-mode`):
+    // writes the sign-in line, per-server timeouts, and NO tool approval.
+    let (r, code) = f.report(&["install", "--signin", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    for rel in [".claude/CLAUDE.md", ".codex/AGENTS.md"] {
+        let md = std::fs::read_to_string(f.path(rel)).unwrap();
+        assert_eq!(
+            md,
+            format!(
+                "{}\n{}",
+                if rel.contains("claude") {
+                    CLAUDE_MD
+                } else {
+                    CODEX_AGENTS_MD
+                },
+                blocks::signin_block()
+            )
+        );
+        assert!(md.lines().any(|l| l == blocks::SIGNIN_LINE), "{rel}: {md}");
+    }
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(f.path(".claude/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!(["mcp__other__lookup", "Bash(npm test)"]),
+        "no tool approval may be written without --consent-approval-mode: {settings}"
+    );
+    let toml = std::fs::read_to_string(f.path(".codex/config.toml")).unwrap();
+    assert!(
+        toml.contains(OTHER_SERVER),
+        "other server's TOML section must stay byte-identical: {toml}"
+    );
+    assert_eq!(
+        toml.matches("approval_mode").count(),
+        2,
+        "only the other server's 2 approval_mode occurrences may exist without consent: {toml}"
+    );
+    assert!(toml.contains("tool_timeout_sec = 60"), "{toml}");
+    let claude_json: Value =
+        serde_json::from_slice(&std::fs::read(f.path(".claude.json")).unwrap()).unwrap();
+    assert_eq!(
+        claude_json["mcpServers"]["envcloak"]["timeout"],
+        json!(60000)
+    );
+    assert_eq!(
+        claude_json["mcpServers"]["other"],
+        serde_json::from_slice::<Value>(&claude_json_before).unwrap()["mcpServers"]["other"]
+    );
+
+    // 3. `install --consent-approval-mode --yes` (without `--signin`):
+    // downgrades the block to the plain block and still writes no approval.
+    let (r, code) = f.report(&["install", "--consent-approval-mode", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    for rel in [".claude/CLAUDE.md", ".codex/AGENTS.md"] {
+        let md = std::fs::read_to_string(f.path(rel)).unwrap();
+        assert!(!md.contains("request_sign_in"), "{rel}: {md}");
+    }
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(f.path(".claude/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!(["mcp__other__lookup", "Bash(npm test)"]),
+        "{settings}"
+    );
+    let toml = std::fs::read_to_string(f.path(".codex/config.toml")).unwrap();
+    assert_eq!(toml.matches("approval_mode").count(), 2, "{toml}");
+
+    // 4. `install --signin --consent-approval-mode --yes`:
+    // pre-approves ONLY the 4 sign-in tools per tool, and preserves other servers byte-for-byte.
+    let (r, code) = f.report(&["install", "--signin", "--consent-approval-mode", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    let settings_text = std::fs::read_to_string(f.path(".claude/settings.json")).unwrap();
+    let settings: Value = serde_json::from_str(&settings_text).unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!([
+            "mcp__other__lookup",
+            "Bash(npm test)",
+            "mcp__envcloak__request_sign_in",
+            "mcp__envcloak__sign_in_status",
+            "mcp__envcloak__cancel_sign_in",
+            "mcp__envcloak__end_sign_in_session",
+        ]),
+        "{settings}"
+    );
+    let toml = std::fs::read_to_string(f.path(".codex/config.toml")).unwrap();
+    assert!(
+        toml.contains(OTHER_SERVER),
+        "other server's TOML section must stay byte-identical: {toml}"
+    );
+    for tool in [
+        "request_sign_in",
+        "sign_in_status",
+        "cancel_sign_in",
+        "end_sign_in_session",
+    ] {
+        assert!(
+            toml.contains(&format!(
+                "[mcp_servers.envcloak.tools.{tool}]\napproval_mode = \"approve\""
+            )),
+            "missing {tool} in {toml}"
+        );
+    }
+    assert_eq!(
+        toml.matches("approval_mode").count(),
+        6,
+        "expected 2 from other server + 4 sign-in tools: {toml}"
+    );
+    assert_eq!(
+        toml.matches("default_tools_approval_mode").count(),
+        1,
+        "envcloak must never set default_tools_approval_mode: {toml}"
+    );
+    for forbidden in [
+        "run_with_secrets",
+        "add_reference",
+        "list_secrets",
+        "project_status",
+        "request_new_secret",
+        "browser_",
+        "mcp__envcloak__*",
+    ] {
+        assert!(
+            !settings_text.contains(forbidden),
+            "{forbidden} in {settings_text}"
+        );
+        assert!(!toml.contains(forbidden), "{forbidden} in {toml}");
+    }
+
+    // 5. Reinstall with `--signin` (no `--consent-approval-mode`):
+    // removes the 4 sign-in tool approvals and emits `signin_approvals_removed`.
+    let (r, code) = f.report(&["install", "--signin", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    for host in ["claude-code", "codex"] {
+        assert!(
+            notes(&r, host).contains(&"signin_approvals_removed".to_owned()),
+            "{host} missing signin_approvals_removed: {r}"
+        );
+    }
+    let settings: Value =
+        serde_json::from_slice(&std::fs::read(f.path(".claude/settings.json")).unwrap()).unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!(["mcp__other__lookup", "Bash(npm test)"]),
+        "{settings}"
+    );
+    let toml = std::fs::read_to_string(f.path(".codex/config.toml")).unwrap();
+    assert_eq!(toml.matches("approval_mode").count(), 2, "{toml}");
+    assert!(toml.contains(OTHER_SERVER), "{toml}");
+
+    // 6. Install again with `--signin --consent-approval-mode`, then `uninstall --yes`:
+    // every file is restored byte for byte.
+    let (r, code) = f.report(&["install", "--signin", "--consent-approval-mode", "--yes"]);
+    assert_eq!(code, 0, "{r}");
+    let (u, code) = f.report(&["uninstall", "--yes"]);
+    assert_eq!(code, 0, "{u}");
+    assert_eq!(
+        std::fs::read(f.path(".claude/CLAUDE.md")).unwrap(),
+        CLAUDE_MD.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(f.path(".codex/AGENTS.md")).unwrap(),
+        CODEX_AGENTS_MD.as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(f.path(".claude/settings.json")).unwrap(),
+        settings_before
+    );
+    assert_eq!(
+        std::fs::read(f.path(".codex/config.toml")).unwrap(),
+        toml_before
+    );
+    assert_eq!(
+        std::fs::read(f.path(".claude.json")).unwrap(),
+        claude_json_before
+    );
+    f.sweep();
+}

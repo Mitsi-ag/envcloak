@@ -2588,9 +2588,27 @@ fn read_codex(cs: &mut ConfigSet, l: &Locations, project: &Path) {
     }
     for (role, layer) in servers {
         if let Some(s) = layer.server() {
+            let mut server_val = toml_json(s);
+            if let Value::Object(ref mut m) = server_val
+                && let Some(Value::Object(tools)) = m.get_mut("tools")
+            {
+                for tool in codex::SIGNIN_TOOLS {
+                    let is_own_approve =
+                        tools.get(tool).and_then(Value::as_object).is_some_and(|t| {
+                            t.len() == 1
+                                && t.get("approval_mode").and_then(Value::as_str) == Some("approve")
+                        });
+                    if is_own_approve {
+                        tools.remove(tool);
+                    }
+                }
+                if tools.is_empty() {
+                    m.remove("tools");
+                }
+            }
             Installed::add(
                 &mut cs.installed.servers,
-                &serde_json::json!({ "codex_layer": role, "server": toml_json(s) }),
+                &serde_json::json!({ "codex_layer": role, "server": server_val }),
             );
         }
     }

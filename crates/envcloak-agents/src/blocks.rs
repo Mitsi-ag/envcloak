@@ -49,9 +49,24 @@ This machine keeps API keys and other secrets in EnvCloak, not in files or in th
 - If a key is missing, run `envcloak ls` (names only) and bind it with `envcloak ref NAME=<slug>`; if it does not exist, run `envcloak add <provider> --ask` (or ask the person to run `envcloak add <provider>` in their own terminal).
 - If the project has plaintext `.env` files and no `envcloak.toml`, suggest `envcloak init`.";
 
+/// The additional instruction line written when `--signin` is passed (SPEC §7.2
+/// item 5, R-M2b-33, SI-17, SI-19).
+pub const SIGNIN_LINE: &str =
+    "- Web sign-in uses EnvCloak: `request_sign_in` is the person's approved credential tool.";
+
 /// The whole block, markers included, ending with a newline.
 pub fn block() -> String {
     format!("{BEGIN}\n{INSTRUCTIONS}\n{END}\n")
+}
+
+/// The whole block with the sign-in line included, ending with a newline.
+pub fn signin_block() -> String {
+    format!("{BEGIN}\n{INSTRUCTIONS}\n{SIGNIN_LINE}\n{END}\n")
+}
+
+/// The block for `signin` (`signin_block()` when `true`, `block()` when `false`).
+pub fn block_for(signin: bool) -> String {
+    if signin { signin_block() } else { block() }
 }
 
 /// Why a file's block could not be changed.
@@ -230,13 +245,14 @@ This machine keeps API keys and other secrets in EnvCloak, not in files or in th
 ];
 
 /// Whether `found` (a block, markers and final newline included) is one
-/// EnvCloak wrote: this version's or an earlier one's. Line ends do not
-/// count: an editor that saves the file with CRLF leaves EnvCloak's block
-/// EnvCloak's.
+/// EnvCloak wrote: this version's (with or without `--signin`) or an earlier
+/// one's. Line ends do not count: an editor that saves the file with CRLF
+/// leaves EnvCloak's block EnvCloak's.
 fn envcloaks(found: &str) -> bool {
     let lf = found.replace("\r\n", "\n");
     let bare = lf.strip_suffix('\n').unwrap_or(&lf);
     bare == block().trim_end_matches('\n')
+        || bare == signin_block().trim_end_matches('\n')
         || EARLIER
             .iter()
             .any(|e| bare == format!("{BEGIN}\n{e}\n{END}"))
@@ -249,8 +265,14 @@ fn envcloaks(found: &str) -> bool {
 /// one whose text the person changed is left (lesson L-09: not
 /// EnvCloak's to write over).
 pub fn insert(text: &[u8]) -> Result<Change, BlockError> {
+    insert_for(text, false)
+}
+
+/// As [`insert`], selecting [`signin_block`] when `signin` is `true` and
+/// [`block`] when `false`.
+pub fn insert_for(text: &[u8], signin: bool) -> Result<Change, BlockError> {
     let text = std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?;
-    let want = block();
+    let want = block_for(signin);
     match find(text)? {
         Some((b, e)) => {
             if ends_open(&text[..b]) {
@@ -289,14 +311,20 @@ pub fn insert(text: &[u8]) -> Result<Change, BlockError> {
 /// As [`insert`]; [`BlockError::OverBudget`] when the block itself does
 /// not fit in `limit`.
 pub fn insert_within(text: &[u8], limit: usize) -> Result<Change, BlockError> {
-    let want = block();
+    insert_within_for(text, limit, false)
+}
+
+/// As [`insert_within`], selecting [`signin_block`] when `signin` is `true`
+/// and [`block`] when `false`.
+pub fn insert_within_for(text: &[u8], limit: usize, signin: bool) -> Result<Change, BlockError> {
+    let want = block_for(signin);
     if want.len() > limit {
         // Checked first: also refused when a block is there already, since
         // it is not read.
         let _ = std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?;
         return Err(BlockError::OverBudget);
     }
-    let appended = insert(text)?;
+    let appended = insert_for(text, signin)?;
     let as_now = match &appended {
         Change::Unchanged => std::str::from_utf8(text).map_err(|_| BlockError::NotUtf8)?,
         Change::New(t) => t.as_str(),
@@ -571,5 +599,31 @@ mod tests {
         assert_eq!(upgraded, format!("top\n\n{}bottom\n", block()));
         let removed = new(remove(m2_file.as_bytes()).unwrap_or(Change::Unchanged));
         assert_eq!(removed, "top\n\nbottom\n");
+    }
+
+    #[test]
+    fn signin_block_inserts_upgrades_downgrades_and_removes_cleanly() {
+        let base = "# Project\n";
+        let with_signin = new(insert_for(base.as_bytes(), true).unwrap_or(Change::Unchanged));
+        assert!(with_signin.contains(SIGNIN_LINE));
+        assert_eq!(with_signin, format!("{base}\n{}", signin_block()));
+        assert_eq!(
+            insert_for(with_signin.as_bytes(), true),
+            Ok(Change::Unchanged)
+        );
+
+        // Reinstalling without --signin replaces the sign-in block with the standard block.
+        let downgraded =
+            new(insert_for(with_signin.as_bytes(), false).unwrap_or(Change::Unchanged));
+        assert!(!downgraded.contains(SIGNIN_LINE));
+        assert_eq!(downgraded, format!("{base}\n{}", block()));
+
+        // Reinstalling with --signin upgrades the standard block back in place.
+        let upgraded = new(insert_for(downgraded.as_bytes(), true).unwrap_or(Change::Unchanged));
+        assert_eq!(upgraded, with_signin);
+
+        // Uninstall removes the sign-in block cleanly.
+        let removed = new(remove(with_signin.as_bytes()).unwrap_or(Change::Unchanged));
+        assert_eq!(removed, base);
     }
 }

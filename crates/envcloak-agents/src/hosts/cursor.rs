@@ -36,7 +36,13 @@ pub const MDC_FRONTMATTER: &str =
 
 /// Complete `.cursor/rules/envcloak.mdc` content.
 pub fn mdc_content() -> String {
-    format!("{MDC_FRONTMATTER}{}", blocks::block())
+    mdc_content_for(false)
+}
+
+/// Complete `.cursor/rules/envcloak.mdc` content, with the sign-in line when
+/// `signin` is `true`.
+pub fn mdc_content_for(signin: bool) -> String {
+    format!("{MDC_FRONTMATTER}{}", blocks::block_for(signin))
 }
 
 /// The MCP server entry in `~/.cursor/mcp.json`.

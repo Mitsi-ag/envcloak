@@ -41,6 +41,15 @@ use crate::writer::{Change, Edit, Edited, Refusal, Undo};
 /// The MCP server's name.
 pub const SERVER: &str = "envcloak";
 
+/// The four sign-in MCP tools that `--signin --consent-approval-mode` may
+/// pre-approve in `[mcp_servers.envcloak.tools.<tool>]` (R-M2b-34, D-22).
+pub const SIGNIN_TOOLS: [&str; 4] = [
+    "request_sign_in",
+    "sign_in_status",
+    "cancel_sign_in",
+    "end_sign_in_session",
+];
+
 /// How many bytes of the instruction files it joins Codex reads by
 /// default (`project_doc_max_bytes`, Map C section 2.2).
 pub const DOC_BUDGET: usize = 32 * 1024;
@@ -119,6 +128,20 @@ pub type Setting = (Vec<String>, Value);
 /// The settings the installer writes into `config.toml`: the MCP server,
 /// and with `socket` (macOS, with consent) the bounded socket allowance.
 pub fn config_settings(envcloak: &Path, linux: bool, socket: Option<&Path>) -> Vec<Setting> {
+    config_settings_with_signin(envcloak, linux, socket, false)
+}
+
+/// The settings the installer writes into `config.toml`: the MCP server,
+/// with `approve_signin_tools` (`--signin --consent-approval-mode`) the four
+/// per-tool `approval_mode = "approve"` entries under
+/// `[mcp_servers.envcloak.tools.<tool>]`, and with `socket` (macOS, with
+/// consent) the bounded socket allowance.
+pub fn config_settings_with_signin(
+    envcloak: &Path,
+    linux: bool,
+    socket: Option<&Path>,
+    approve_signin_tools: bool,
+) -> Vec<Setting> {
     let timeout = tool_timeouts::host(Host::Codex.id())
         .map_or(tool_timeouts::UNKNOWN_CUTOFF, |h| h.tool_timeout);
     let mut server = Map::new();
@@ -133,6 +156,14 @@ pub fn config_settings(envcloak: &Path, linux: bool, socket: Option<&Path>) -> V
     server.insert("tool_timeout_sec".to_owned(), json!(timeout.as_secs()));
     let k = |p: &[&str]| p.iter().map(|s| (*s).to_owned()).collect::<Vec<String>>();
     let mut out = vec![(k(&["mcp_servers", SERVER]), Value::Object(server))];
+    if approve_signin_tools {
+        for tool in SIGNIN_TOOLS {
+            out.push((
+                k(&["mcp_servers", SERVER, "tools", tool, "approval_mode"]),
+                json!("approve"),
+            ));
+        }
+    }
     if let Some(s) = socket {
         out.push((
             k(&["sandbox_workspace_write", "network_access"]),
@@ -150,6 +181,17 @@ pub fn config_settings(envcloak: &Path, linux: bool, socket: Option<&Path>) -> V
         ));
     }
     out
+}
+
+/// Whether `path` is one of the four sign-in tool approval settings under
+/// `[mcp_servers.envcloak.tools.<tool>]`.
+pub fn is_signin_approval_path(path: &[String]) -> bool {
+    let p: Vec<&str> = path.iter().map(String::as_str).collect();
+    matches!(
+        p.as_slice(),
+        ["mcp_servers", SERVER, "tools", tool, "approval_mode"]
+            if SIGNIN_TOOLS.contains(tool)
+    )
 }
 
 fn not_toml() -> Refusal {
@@ -256,7 +298,7 @@ fn set_kept(t: &mut Table, leaf: &str, value: &Value) -> Result<(), Refusal> {
             let stale: Vec<String> = old
                 .iter()
                 .map(|(k, _)| k.to_owned())
-                .filter(|k| !m.contains_key(k))
+                .filter(|k| !m.contains_key(k) && k != "tools")
                 .collect();
             for k in stale {
                 old.remove(&k);
@@ -281,11 +323,12 @@ fn set_kept(t: &mut Table, leaf: &str, value: &Value) -> Result<(), Refusal> {
 }
 
 /// The values EnvCloak writes over, and so keeps as what was there
-/// before: a boolean, or a rule's `"allow"` or `"deny"`. Anything else at
-/// one of its keys is not written over (and so never copied into
-/// EnvCloak's state, lesson L-12).
+/// before: a boolean, or a rule's `"allow"`, `"deny"`, `"approve"` or
+/// `"prompt"`. Anything else at one of its keys is not written over (and so
+/// never copied into EnvCloak's state, lesson L-12).
 fn plain_previous(v: &Value) -> bool {
-    matches!(v, Value::Bool(_)) || matches!(v.as_str(), Some("allow" | "deny"))
+    matches!(v, Value::Bool(_))
+        || matches!(v.as_str(), Some("allow" | "deny" | "approve" | "prompt"))
 }
 
 fn broader() -> Refusal {
@@ -411,6 +454,52 @@ pub fn is_allowance_path(path: &[String]) -> bool {
     )
 }
 
+/// Removes owned child edits under `path` from a JSON object representation of
+/// the table at `path`, pruning intermediate tables that become empty.
+fn remove_owned_child_from_json(obj: &mut Map<String, Value>, rel: &[String], expected: &Value) {
+    match rel {
+        [] => {}
+        [leaf] => {
+            if obj.get(leaf) == Some(expected) {
+                obj.remove(leaf);
+            }
+        }
+        [head, tail @ ..] => {
+            let empty = if let Some(Value::Object(child)) = obj.get_mut(head) {
+                remove_owned_child_from_json(child, tail, expected);
+                child.is_empty()
+            } else {
+                false
+            };
+            if empty {
+                obj.remove(head);
+            }
+        }
+    }
+}
+
+fn strip_owned_children(current: Option<Value>, path: &[String], owned: &[Edit]) -> Option<Value> {
+    let Some(Value::Object(mut map)) = current else {
+        return current;
+    };
+    let mut seen: Vec<&[String]> = Vec::new();
+    for e in owned.iter().rev() {
+        if let Edit::TomlValue {
+            path: ep,
+            value: ev,
+            ..
+        } = e
+            && ep.len() > path.len()
+            && ep.starts_with(path)
+            && !seen.contains(&ep.as_slice())
+        {
+            seen.push(ep.as_slice());
+            remove_owned_child_from_json(&mut map, &ep[path.len()..], ev);
+        }
+    }
+    Some(Value::Object(map))
+}
+
 /// `before` (`None` for no file) with `settings` set. `owned` names the
 /// settings EnvCloak wrote before, which it may change; another value
 /// already at the MCP server's place is a conflict, refused. The settings
@@ -468,7 +557,7 @@ pub fn apply(
                 .and_then(Item::as_table_mut)
                 .ok_or_else(shape)?;
         }
-        let current = t.get(leaf).map(item_json);
+        let current = strip_owned_children(t.get(leaf).map(item_json), path, owned);
         if current.as_ref() == Some(value) {
             continue;
         }
@@ -551,11 +640,20 @@ pub fn undo(current: &[u8], edits: &[Edit], created_file: bool) -> Result<Undo, 
     Ok(Undo::Rewrite(out.into_bytes()))
 }
 
-/// `doc` with the TOML `edits` taken out by structure, in reverse: each
-/// set back to what was there before, or removed, while it still holds
-/// what EnvCloak wrote; then the tables made for it, while empty.
+/// `doc` with the TOML `edits` taken out by structure, deepest paths first
+/// and in reverse order: each set back to what was there before, or removed,
+/// while it still holds what EnvCloak wrote; then the tables made for it,
+/// while empty.
 fn undo_in(doc: &mut DocumentMut, edits: &[Edit]) -> Result<(), Refusal> {
-    for e in edits.iter().rev() {
+    let mut ordered: Vec<(usize, &Edit)> = edits.iter().enumerate().collect();
+    ordered.sort_by_key(|(idx, e)| {
+        let depth = match e {
+            Edit::TomlValue { path, .. } => path.len(),
+            _ => 0,
+        };
+        std::cmp::Reverse((depth, *idx))
+    });
+    for (_, e) in ordered {
         let Edit::TomlValue {
             path,
             value,
@@ -912,5 +1010,76 @@ mod tests {
         let s = config_settings(Path::new("/b/envcloak"), true, None);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].1["env_vars"][0], "XDG_RUNTIME_DIR");
+    }
+
+    #[test]
+    fn signin_tool_approvals_go_in_and_come_out_preserving_other_servers() {
+        let before = "[mcp_servers.other]\ncommand = \"/bin/other\"\n\n[mcp_servers.other.tools.lookup]\napproval_mode = \"approve\"\n";
+        let with_signin = config_settings_with_signin(Path::new("/b/envcloak"), false, None, true);
+        let without_signin =
+            config_settings_with_signin(Path::new("/b/envcloak"), false, None, false);
+
+        let (after, edits) = run(before, &with_signin);
+        let doc: DocumentMut = after.parse().unwrap_or_else(|e| panic!("{e}\n{after}"));
+        for tool in SIGNIN_TOOLS {
+            assert_eq!(
+                doc["mcp_servers"]["envcloak"]["tools"][tool]["approval_mode"].as_str(),
+                Some("approve"),
+                "{tool}: {after}"
+            );
+        }
+        assert!(
+            doc["mcp_servers"]["envcloak"]["tools"]
+                .get("run_with_secrets")
+                .is_none(),
+            "{after}"
+        );
+        assert!(
+            !after.contains("default_tools_approval_mode"),
+            "never server-wide approval: {after}"
+        );
+        // Other server's settings stay byte-identical at the start of the file.
+        assert!(after.starts_with(before), "{after}");
+
+        // Idempotent when applied again with the same settings.
+        assert_eq!(
+            apply(Some(after.as_bytes()), &with_signin, &edits),
+            Ok(None)
+        );
+
+        // Upgrading the binary path while keeping sign-in approvals preserves both.
+        let upgraded_signin =
+            config_settings_with_signin(Path::new("/new/envcloak"), false, None, true);
+        let Ok(Some(c)) = apply(Some(after.as_bytes()), &upgraded_signin, &edits) else {
+            panic!("expected binary upgrade");
+        };
+        let upgraded_text = String::from_utf8(c.bytes).unwrap_or_default();
+        assert!(upgraded_text.contains("/new/envcloak"), "{upgraded_text}");
+        for tool in SIGNIN_TOOLS {
+            assert!(upgraded_text.contains(tool), "{tool}: {upgraded_text}");
+        }
+
+        // Re-applying without consent removes the 4 sign-in tool approvals and empty tools table.
+        let Ok(Some(c_drop)) = apply(Some(after.as_bytes()), &without_signin, &edits) else {
+            panic!("expected sign-in approvals to be removed");
+        };
+        let dropped_text = String::from_utf8(c_drop.bytes).unwrap_or_default();
+        assert!(!dropped_text.contains("request_sign_in"), "{dropped_text}");
+        assert!(
+            dropped_text.contains("[mcp_servers.other.tools.lookup]"),
+            "{dropped_text}"
+        );
+        assert_eq!(c_drop.dropped.len(), 4);
+        assert!(c_drop.dropped.iter().all(|e| matches!(
+            e,
+            Edit::TomlValue { path, .. } if is_signin_approval_path(path)
+        )));
+
+        // Full undo restores the original config.toml byte-for-byte.
+        let back = match undo(after.as_bytes(), &edits, false) {
+            Ok(Undo::Rewrite(b)) => String::from_utf8(b).unwrap_or_default(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(back, before);
     }
 }

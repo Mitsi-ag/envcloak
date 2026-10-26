@@ -111,7 +111,7 @@ const HELP: &str = "usage:
   envcloak backup create [--json]
   envcloak recover --backup <file> [--kit-fd N] [--new-passphrase-fd N] [--json]
   envcloak mcp [--host ID] [--wait-ms N]
-  envcloak agents install [--global] [--project] [--agent ID]... [--consent-sandbox-sockets] [--yes] [--json]
+  envcloak agents install [--global] [--project] [--agent ID]... [--signin] [--consent-approval-mode] [--consent-sandbox-sockets] [--yes] [--json]
   envcloak agents uninstall [--global] [--project] [--agent ID]... [--yes] [--json]
   envcloak agents status [--json]
   envcloak agents status --probe [--agent ID]... [--json]
