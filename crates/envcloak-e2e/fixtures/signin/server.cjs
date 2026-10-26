@@ -7,6 +7,9 @@ const crypto = require("node:crypto");
 const { URL } = require("node:url");
 const { generateFixtureCerts } = require("./certs.cjs");
 const { verifyTotp } = require("./totp.cjs");
+const {
+  createTestSessionHandler,
+} = require("../../../../integrations/test-session/node/index.cjs");
 
 const RFC6238_SHA1_HEX = "3132333435363738393031323334353637383930";
 
@@ -163,7 +166,12 @@ async function main() {
     });
   }
 
-  function mintSession({ account, tenant, role }) {
+  let clockOffsetMs = 0;
+  function currentClockMs() {
+    return Date.now() + clockOffsetMs;
+  }
+
+  function mintSession({ account, tenant, role, expiresAtMs = null }) {
     const token = `sess_${crypto.randomBytes(12).toString("hex")}`;
     sessions.set(token, {
       account,
@@ -171,6 +179,7 @@ async function main() {
       role,
       revoked: false,
       expired: false,
+      expiresAtMs,
     });
     return token;
   }
@@ -181,6 +190,9 @@ async function main() {
     if (!tok) return null;
     const s = sessions.get(tok);
     if (!s || s.revoked || s.expired) return null;
+    if (typeof s.expiresAtMs === "number" && currentClockMs() >= s.expiresAtMs) {
+      return null;
+    }
     return { token: tok, ...s };
   }
 
@@ -193,6 +205,45 @@ async function main() {
   let changedPortOrigin = "";
   let httpsTestCaOrigin = "";
   let httpsSelfSignedOrigin = "";
+
+  const testSessionHandler = createTestSessionHandler({
+    enabled: configArg.test_session_enabled !== false,
+    key: adapterKey,
+    clock: currentClockMs,
+    mint: ({ identity, tenant, role, expiresAtMs }) => {
+      const effectiveTenant = tenant || "t1";
+      counters.mints += 1;
+      counters.by_origin.app.mints += 1;
+      const token = mintSession({
+        account: identity,
+        tenant: effectiveTenant,
+        role,
+        expiresAtMs,
+      });
+      const cookieEntry = {
+        name: "session",
+        value: token,
+        domain: "acme.localhost",
+        path: "/",
+        httpOnly: true,
+        sameSite: "Strict",
+      };
+      const storageEntry = {
+        origin: appOrigin,
+        localStorage: [{ name: "acme_tenant", value: effectiveTenant }],
+      };
+      return {
+        session_token: token,
+        setCookie: `session=${token}; Path=/; HttpOnly; SameSite=Strict`,
+        cookies: [cookieEntry],
+        storage: [storageEntry],
+        declared_state: {
+          cookies: [cookieEntry],
+          origins: [storageEntry],
+        },
+      };
+    },
+  });
 
   async function handleLoginPost(req, res, originBucket, isWrongTarget) {
     await checkBarrier("login");
@@ -384,55 +435,9 @@ async function main() {
         return;
       }
 
-      if (req.method === "POST" && u.pathname === "/__envcloak/test-session") {
+      if (u.pathname === "/__envcloak/test-session") {
         await checkBarrier("test_session");
-        const auth = String(req.headers.authorization || "");
-        const bearer = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-        const headerKey = req.headers["x-envcloak-adapter-key"] || bearer;
-        if (headerKey !== adapterKey) {
-          res.writeHead(401, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok: false, error: "invalid_adapter_key" }));
-          return;
-        }
-        const raw = await readBody(req);
-        const body = parseParams(raw, req.headers["content-type"]);
-        const account = body.account || "editor@acme.test";
-        const tenant = body.tenant || "t1";
-        const role = body.role || "editor";
-        counters.mints += 1;
-        counters.by_origin.app.mints += 1;
-        const token = mintSession({ account, tenant, role });
-        res.writeHead(200, {
-          "content-type": "application/json",
-          "set-cookie": `session=${token}; Path=/; HttpOnly; SameSite=Strict`,
-        });
-        res.end(
-          JSON.stringify({
-            ok: true,
-            session_token: token,
-            account,
-            tenant,
-            role,
-            declared_state: {
-              cookies: [
-                {
-                  name: "session",
-                  value: token,
-                  domain: "acme.localhost",
-                  path: "/",
-                  httpOnly: true,
-                  sameSite: "Strict",
-                },
-              ],
-              origins: [
-                {
-                  origin: appOrigin,
-                  localStorage: [{ name: "acme_tenant", value: tenant }],
-                },
-              ],
-            },
-          })
-        );
+        await testSessionHandler(req, res);
         return;
       }
 
@@ -848,6 +853,7 @@ async function main() {
         counters.mints = 0;
         counters.revocations = 0;
         counters.observer_cookie_hits = 0;
+        clockOffsetMs = 0;
         for (const k of Object.keys(counters.exfiltration_by_channel)) {
           counters.exfiltration_by_channel[k] = 0;
         }
@@ -857,6 +863,24 @@ async function main() {
         acceptedCodes.length = 0;
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+
+      if (req.method === "POST" && u.pathname === "/control/advance-clock") {
+        const raw = await readBody(req);
+        const body = parseParams(raw, req.headers["content-type"]);
+        const deltaMs = Number(body.delta_ms || 0);
+        if (Number.isFinite(deltaMs)) {
+          clockOffsetMs += deltaMs;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            clock_offset_ms: clockOffsetMs,
+            now_ms: currentClockMs(),
+          })
+        );
         return;
       }
 

@@ -12,7 +12,7 @@ use envcloak_testkit::signin::{
     ExpectedIdentity, FORBIDDEN_PATH_ARGS, SigninFixture, SupervisorOptions, ToolAllowlist,
     browser_versions_path, http_request, measure_chrome_pipe_and_session, parse_counters,
     read_browser_pins, require_browser_runtime, resolve_node_binary, run_cookie_scope_probe,
-    verify_chrome_executable,
+    test_session_mint, verify_chrome_executable,
 };
 use serde_json::{Value, json};
 
@@ -668,17 +668,15 @@ fn all_nineteen_mcp_context_observations_and_generation_isolation() {
     assert_eq!(shared_res.get("ok"), Some(&json!(true)));
 
     // Observation 19: wrong_tenant_blocked_before_publish
-    let (wt_status, wt_body) = http_request(
-        "POST",
-        &format!("{}/__envcloak/test-session", origins.app),
-        &[
-            ("content-type", "application/json"),
-            ("x-envcloak-adapter-key", &origins.adapter_key),
-        ],
+    let (wt_status, wt_body) = test_session_mint(
+        &origins.app,
+        &origins.adapter_key,
         &json!({
+            "identity": "editor@acme.test",
             "account": "editor@acme.test",
             "tenant": "t2",
             "role": "editor",
+            "ttl": 900,
         })
         .to_string(),
     )
@@ -1087,14 +1085,10 @@ fn fixture_totp_rfc_6238_vectors_and_controls() {
     assert_eq!(accepted[0].code, code_now);
 
     // Server-side session expiry (b19) and revocation (b10).
-    let (sess_status, sess_body) = http_request(
-        "POST",
-        &format!("{}/__envcloak/test-session", origins.app),
-        &[
-            ("content-type", "application/json"),
-            ("x-envcloak-adapter-key", &origins.adapter_key),
-        ],
-        r#"{"account":"editor@acme.test","tenant":"t1","role":"editor"}"#,
+    let (sess_status, sess_body) = test_session_mint(
+        &origins.app,
+        &origins.adapter_key,
+        r#"{"identity":"editor@acme.test","account":"editor@acme.test","tenant":"t1","role":"editor","ttl":900}"#,
     )
     .expect("mint test session");
     assert_eq!(sess_status, 200);

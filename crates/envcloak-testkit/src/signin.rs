@@ -1163,6 +1163,8 @@ impl SigninFixture {
         cmd.env("HOME", temp_dir.path());
         cmd.env("TMPDIR", temp_dir.path());
         cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("NODE_ENV", "test");
+        cmd.env("ENVCLOAK_TEST_SESSION", "1");
         cmd.arg(&script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1350,6 +1352,22 @@ impl Control {
         Ok(())
     }
 
+    /// Advances the fixture server's clock by `delta_ms` milliseconds so
+    /// server-side session expiry (`ttl`) can be tested deterministically.
+    pub fn advance_clock(&self, delta_ms: i64) -> Result<(), String> {
+        let payload = json!({ "delta_ms": delta_ms }).to_string();
+        let (status, body) = http_request(
+            "POST",
+            &format!("{}/control/advance-clock", self.control_origin),
+            &[("content-type", "application/json")],
+            &payload,
+        )?;
+        if status != 200 {
+            return Err(format!("advance_clock({delta_ms}) failed: {status} {body}"));
+        }
+        Ok(())
+    }
+
     /// Verifies a TOTP code using the fixture's independent Node
     /// `crypto.createHmac` implementation.
     pub fn verify_totp(
@@ -1529,6 +1547,95 @@ pub fn http_request(
         .parse()
         .map_err(|e| format!("parse status code: {e}"))?;
     Ok((status, resp_body.to_owned()))
+}
+
+/// Computes an RFC 2104 HMAC-SHA-256 hex digest using `sha2::Sha256`.
+pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    const BLOCK_LEN: usize = 64;
+    let mut k_block = [0u8; BLOCK_LEN];
+    if key.len() > BLOCK_LEN {
+        let digest = Sha256::digest(key);
+        k_block[..32].copy_from_slice(&digest);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK_LEN];
+    let mut opad = [0x5cu8; BLOCK_LEN];
+    for i in 0..BLOCK_LEN {
+        ipad[i] ^= k_block[i];
+        opad[i] ^= k_block[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    let tag = outer.finalize();
+    tag.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Computes the D-28 HMAC-SHA-256 signature for `POST /__envcloak/test-session`.
+pub fn sign_test_session_request(
+    adapter_key: &str,
+    method: &str,
+    path: &str,
+    timestamp_secs: u64,
+    nonce: &str,
+    body: &str,
+) -> String {
+    let payload = format!(
+        "{}\n{}\n{}\n{}\n{}",
+        method.to_ascii_uppercase(),
+        path,
+        timestamp_secs,
+        nonce,
+        body
+    );
+    hmac_sha256_hex(adapter_key.as_bytes(), payload.as_bytes())
+}
+
+/// Sends a D-28 HMAC-authenticated `POST /__envcloak/test-session` request to
+/// `app_origin` using a fresh timestamp and nonce.
+pub fn test_session_mint(
+    app_origin: &str,
+    adapter_key: &str,
+    body: &str,
+) -> Result<(u16, String), String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let ts_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_700_000_000);
+    let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nonce = format!("nonce-{}-{:016x}", std::process::id(), seq);
+    let ts_str = ts_secs.to_string();
+    let sig = sign_test_session_request(
+        adapter_key,
+        "POST",
+        "/__envcloak/test-session",
+        ts_secs,
+        &nonce,
+        body,
+    );
+    http_request(
+        "POST",
+        &format!("{app_origin}/__envcloak/test-session"),
+        &[
+            ("content-type", "application/json"),
+            ("x-envcloak-timestamp", &ts_str),
+            ("x-envcloak-nonce", &nonce),
+            ("x-envcloak-signature", &sig),
+        ],
+        body,
+    )
 }
 
 /// D-34 / R-M2b-49 headless Chrome process measurement result.

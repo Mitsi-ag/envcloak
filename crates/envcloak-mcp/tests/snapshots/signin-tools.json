@@ -1,0 +1,338 @@
+{
+  "tools": [
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "description": "Signs in to a registered development target with stored credentials after the person approves in EnvCloak, and delivers the resulting session to EnvCloak's hosted browser context. The resulting session acts as that account on the target's origins for the session's lifetime. Cancelling a tool call only stops waiting for an answer; call cancel_sign_in to end the operation itself. Takes the target name, optional role, and an idempotency operation_key (never echoed or logged), never a credential value, URL, script, callback, or DevTools address, and never returns a password, TOTP code, cookie, or storage token.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "operation_key": {
+            "description": "Caller-chosen idempotency key (`1..=128` characters of `[A-Za-z0-9._-]`). Never echoed or logged.",
+            "type": "string"
+          },
+          "project_dir": {
+            "description": "Optional absolute path of the project directory whose envcloak.toml scopes the sign-in request.",
+            "type": "string"
+          },
+          "role": {
+            "description": "Optional role name on the target (`1..=64` characters of `[A-Za-z0-9._-]`). Never a URL, script, callback, or DevTools address.",
+            "type": "string"
+          },
+          "target": {
+            "description": "Name of the registered sign-in target (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). Never a URL, script, callback, or DevTools address.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "operation_key"
+        ],
+        "type": "object"
+      },
+      "name": "request_sign_in",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleanup": {
+            "type": "string"
+          },
+          "delivered_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request": {
+            "type": "string"
+          },
+          "retry_until_secs": {
+            "type": "integer"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "revocation": {
+            "type": "string"
+          },
+          "shared_loopback_cookie_jar": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request",
+          "revision",
+          "state",
+          "retry_until_secs",
+          "delivered_context",
+          "cleanup",
+          "revocation",
+          "reason",
+          "shared_loopback_cookie_jar",
+          "authorization"
+        ],
+        "type": "object"
+      },
+      "title": "Sign in to a development target"
+    },
+    {
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "description": "Checks the status of a sign-in operation started with request_sign_in (which signs in with stored credentials after the person approves in EnvCloak, so the resulting session acts as that account). Cancelling a tool call only stops waiting for an answer; call cancel_sign_in to end the operation itself, or end_sign_in_session to close an active session. Never returns a credential value, cookie, or storage token.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "description": "The 32-character lowercase hex request identifier returned by request_sign_in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "type": "object"
+      },
+      "name": "sign_in_status",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleanup": {
+            "type": "string"
+          },
+          "delivered_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request": {
+            "type": "string"
+          },
+          "retry_until_secs": {
+            "type": "integer"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "revocation": {
+            "type": "string"
+          },
+          "shared_loopback_cookie_jar": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request",
+          "revision",
+          "state",
+          "retry_until_secs",
+          "delivered_context",
+          "cleanup",
+          "revocation",
+          "reason",
+          "shared_loopback_cookie_jar",
+          "authorization"
+        ],
+        "type": "object"
+      },
+      "title": "Check a sign-in operation's status"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Ends a sign-in operation started with request_sign_in (which signs in with stored credentials after the person approves in EnvCloak, producing a session that acts as that account). Cancelling a request_sign_in or sign_in_status tool call only stops waiting for an answer; cancel_sign_in ends the operation itself, stops any in-flight sign-in worker, and tears down any browser context it opened.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "description": "The 32-character lowercase hex request identifier returned by request_sign_in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "request"
+        ],
+        "type": "object"
+      },
+      "name": "cancel_sign_in",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleanup": {
+            "type": "string"
+          },
+          "delivered_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request": {
+            "type": "string"
+          },
+          "retry_until_secs": {
+            "type": "integer"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "revocation": {
+            "type": "string"
+          },
+          "shared_loopback_cookie_jar": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request",
+          "revision",
+          "state",
+          "retry_until_secs",
+          "delivered_context",
+          "cleanup",
+          "revocation",
+          "reason",
+          "shared_loopback_cookie_jar",
+          "authorization"
+        ],
+        "type": "object"
+      },
+      "title": "Cancel a sign-in operation"
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "description": "Ends an active browser session delivered by request_sign_in (which signed in with stored credentials after the person approved in EnvCloak, so the session acts as that account). Cancelling a tool call only stops waiting while cancel_sign_in ends a pending or running operation; end_sign_in_session closes the delivered browser context, runs configured server-side revocation, and confirms local cleanup.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "session": {
+            "description": "The delivered session handle (`ctx-...`) or 32-character lowercase hex request identifier to end.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "name": "end_sign_in_session",
+      "outputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cleanup": {
+            "type": "string"
+          },
+          "delivered_context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "request": {
+            "type": "string"
+          },
+          "retry_until_secs": {
+            "type": "integer"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "revocation": {
+            "type": "string"
+          },
+          "shared_loopback_cookie_jar": {
+            "type": "boolean"
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request",
+          "revision",
+          "state",
+          "retry_until_secs",
+          "delivered_context",
+          "cleanup",
+          "revocation",
+          "reason",
+          "shared_loopback_cookie_jar",
+          "authorization"
+        ],
+        "type": "object"
+      },
+      "title": "End a delivered sign-in session"
+    }
+  ]
+}

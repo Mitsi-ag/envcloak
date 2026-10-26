@@ -15,6 +15,9 @@ pub mod list_secrets;
 pub mod project_status;
 pub mod request_new_secret;
 pub mod run_with_secrets;
+pub mod signin;
+
+pub use signin::SignInTools;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -46,6 +49,8 @@ pub struct Ctx {
     /// `project_status` reports (an agent is never shown the person's list
     /// of pending requests, SPEC §10b).
     pending: Mutex<Tracked>,
+    /// Optional explicit runtime paths for tests running an isolated daemon.
+    run_paths: Option<envcloak_ipc::RunPaths>,
 }
 
 /// The requests remembered, and whether one was not for want of room.
@@ -66,7 +71,14 @@ impl Ctx {
             host,
             wait,
             pending: Mutex::new(Tracked::default()),
+            run_paths: None,
         }
+    }
+
+    /// Sets explicit daemon runtime paths (for isolated test homes).
+    pub fn with_run_paths(mut self, paths: envcloak_ipc::RunPaths) -> Ctx {
+        self.run_paths = Some(paths);
+        self
     }
 
     /// Remembers `id`. False when [`MAX_TRACKED`] are remembered already:
@@ -107,8 +119,21 @@ impl Ctx {
     /// A verified connection to the daemon whose every call is answered
     /// by `deadline`, or fails then.
     pub(crate) fn connect_by(&self, deadline: Instant) -> Result<Client, Failure> {
-        let paths = envcloak_client::connect::run_paths()?;
+        let paths = match &self.run_paths {
+            Some(p) => p.clone(),
+            None => envcloak_client::connect::run_paths()?,
+        };
         Client::connect_by(&paths, deadline).map_err(Failure::from)
+    }
+
+    /// A verified blocking connection to the daemon for calls that hand over
+    /// file descriptors (`SCM_RIGHTS`).
+    pub(crate) fn connect_for_fds(&self) -> Result<Client, Failure> {
+        let paths = match &self.run_paths {
+            Some(p) => p.clone(),
+            None => envcloak_client::connect::run_paths()?,
+        };
+        Client::connect(&paths).map_err(Failure::from)
     }
 }
 

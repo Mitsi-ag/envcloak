@@ -1,0 +1,14 @@
+{
+  "name": "@envcloak/test-session-node",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EnvCloak D-28 loopback test-session adapter middleware for Node.js (http.createServer, Express, Connect)",
+  "main": "index.cjs",
+  "files": [
+    "index.cjs",
+    "example.cjs"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
