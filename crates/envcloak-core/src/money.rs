@@ -610,6 +610,9 @@ impl Money {
 
     /// Rescales this amount to `target_scale` (`0..=6`) using `rounding`.
     pub fn rescale(&self, target_scale: u8, rounding: Rounding) -> Result<Self, UnitError> {
+        if self.scale > MAX_SCALE {
+            return Err(UnitError::InvalidScale(self.scale));
+        }
         if target_scale > MAX_SCALE {
             return Err(UnitError::InvalidScale(target_scale));
         }
@@ -667,6 +670,12 @@ impl Money {
     /// Compares two amounts of the same currency across potentially different
     /// scales. Returns [`UnitError::CurrencyMismatch`] if currencies differ.
     pub fn same_currency_cmp(&self, other: &Self) -> Result<Ordering, UnitError> {
+        if self.scale > MAX_SCALE {
+            return Err(UnitError::InvalidScale(self.scale));
+        }
+        if other.scale > MAX_SCALE {
+            return Err(UnitError::InvalidScale(other.scale));
+        }
         if self.currency != other.currency {
             return Err(UnitError::CurrencyMismatch {
                 expected: self.currency,
@@ -684,17 +693,18 @@ impl Money {
     pub fn format_number(&self) -> String {
         let neg = self.minor < 0;
         let abs = self.minor.unsigned_abs();
-        if self.scale == 0 {
+        let clamped_scale = self.scale.min(MAX_SCALE);
+        if clamped_scale == 0 {
             return if neg {
                 format!("-{abs}")
             } else {
                 format!("{abs}")
             };
         }
-        let div = POW10_I64[usize::from(self.scale)].unsigned_abs();
+        let div = POW10_I64[usize::from(clamped_scale)].unsigned_abs();
         let whole = abs / div;
         let frac = abs % div;
-        let width = usize::from(self.scale);
+        let width = usize::from(clamped_scale);
         if neg {
             format!("-{whole}.{frac:0width$}")
         } else {

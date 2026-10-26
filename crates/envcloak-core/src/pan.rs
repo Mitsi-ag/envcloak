@@ -233,6 +233,10 @@ fn trim_ascii(b: &[u8]) -> &[u8] {
     &b[start..end]
 }
 
+fn is_token_continuation(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'/'
+}
+
 /// Scans `text` for any token sequence that forms a Luhn-valid, BIN-matched
 /// PAN, bounded by non-alphanumeric characters (so longer digit strings or
 /// identifiers containing digits are not split into false matches).
@@ -242,16 +246,10 @@ pub fn find_pan_in_text(text: &str) -> Option<Pan> {
     let mut i = 0;
     while i < n {
         if bytes[i].is_ascii_digit() {
-            let preceded_by_alnum = i > 0
-                && (bytes[i - 1].is_ascii_alphanumeric()
-                    || bytes[i - 1] == b'_'
-                    || bytes[i - 1] == b'/');
+            let preceded_by_alnum = i > 0 && is_token_continuation(bytes[i - 1]);
             if !preceded_by_alnum {
                 if let Some((pan, end)) = scan_candidate(bytes, i) {
-                    let followed_by_alnum = end < n
-                        && (bytes[end].is_ascii_alphanumeric()
-                            || bytes[end] == b'_'
-                            || bytes[end] == b'/');
+                    let followed_by_alnum = end < n && is_token_continuation(bytes[end]);
                     if !followed_by_alnum {
                         return Some(pan);
                     }
@@ -271,23 +269,41 @@ fn scan_candidate(bytes: &[u8], start: usize) -> Option<(Pan, usize)> {
     let n = bytes.len();
     let mut i = start;
     let mut digits = 0usize;
-    let mut last_digit_end = start;
     let mut sep_char: Option<u8> = None;
+    let mut boundaries: Vec<usize> = Vec::with_capacity(4);
 
     while i < n {
-        let b = bytes[i];
-        if b.is_ascii_digit() {
+        let mut group_digits = 0usize;
+        while i < n && bytes[i].is_ascii_digit() {
+            group_digits += 1;
             digits += 1;
             i += 1;
-            last_digit_end = i;
             if digits > 19 {
-                return None;
+                if sep_char.is_none() {
+                    // Single contiguous run of >19 digits (e.g. a 20-digit ID)
+                    // is never a PAN.
+                    return None;
+                }
+                break;
             }
-        } else if (b == b' ' || b == b'-')
-            && i > start
-            && i + 1 < n
-            && bytes[i + 1].is_ascii_digit()
-        {
+        }
+        if group_digits == 0 || digits > 19 {
+            break;
+        }
+
+        let followed_by_token = i < n && is_token_continuation(bytes[i]);
+        if (13..=19).contains(&digits) && !followed_by_token {
+            boundaries.push(i);
+        }
+
+        // An unseparated full-length candidate (>= 13 digits in the first
+        // contiguous group) never continues across a space or hyphen.
+        if sep_char.is_none() && group_digits >= 13 {
+            break;
+        }
+
+        if i + 1 < n && (bytes[i] == b' ' || bytes[i] == b'-') && bytes[i + 1].is_ascii_digit() {
+            let b = bytes[i];
             match sep_char {
                 None => sep_char = Some(b),
                 Some(c) if c == b => {}
@@ -299,9 +315,9 @@ fn scan_candidate(bytes: &[u8], start: usize) -> Option<(Pan, usize)> {
         }
     }
 
-    if (13..=19).contains(&digits) {
-        if let Some(pan) = luhn_bin(&bytes[start..last_digit_end]) {
-            return Some((pan, last_digit_end));
+    for &end in boundaries.iter().rev() {
+        if let Some(pan) = luhn_bin(&bytes[start..end]) {
+            return Some((pan, end));
         }
     }
     None
@@ -363,6 +379,20 @@ mod tests {
         let dbg = format!("{pan:?}");
         assert!(!dbg.contains("41111111"));
         assert!(dbg.contains("1111"));
+
+        // Spaced or unspaced PAN followed by CVV or expiry is still detected
+        for sample in [
+            "4111 1111 1111 1111 123",
+            "4111 1111 1111 1111 12/28",
+            "4111 1111 1111 1111 2028",
+            "4111111111111111 123",
+            "4111111111111111 12/28",
+        ] {
+            let detected = find_pan_in_text(sample)
+                .unwrap_or_else(|| panic!("expected PAN in sample: {sample}"));
+            assert_eq!(detected.brand(), CardBrand::Visa);
+            assert_eq!(detected.last4_str(), "1111");
+        }
 
         // Order IDs and long hex/numeric strings do not trigger false positives
         assert_eq!(find_pan_in_text("order #1234567890123452"), None);
