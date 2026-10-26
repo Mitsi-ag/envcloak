@@ -88,7 +88,7 @@ const HELP: &str = "usage:
   envcloak daemon uninstall
   envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
-  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION]] [--live NAME]... [--passphrase-fd N]
+  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION] | --dev DURATION [--attempts N]] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
   envcloak grants revoke <GRANT> | --all
@@ -125,8 +125,9 @@ const HELP: &str = "usage:
   envcloak doctor [--json] [--path <path>]... [--git-history] [--report]
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
+  envcloak signin target add|edit|rm|ls ...
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak signin
+  envcloak signin setup
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
@@ -213,7 +214,7 @@ fn main() -> ExitCode {
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
     let word = |i: usize| args.get(i).and_then(|a| a.to_str());
     Some(match word(0)? {
-        "signin" => cmd::signin::run(&[]),
+        "signin" if word(1)? == "setup" => cmd::signin::run(&["setup"]),
         _ => return None,
     })
 }

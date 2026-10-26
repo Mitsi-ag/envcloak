@@ -414,13 +414,13 @@ impl PendingListView {
     /// send anything (SPEC §1.1); the strings are still escaped before
     /// they are printed.
     pub fn well_formed(&self) -> bool {
-        let mut seen: Vec<PendingId> = Vec::with_capacity(self.requests.len());
+        let mut seen: Vec<String> = Vec::with_capacity(self.requests.len());
         for r in &self.requests {
-            let Some(id) = PendingId::parse(&r.request) else {
-                return false;
-            };
-            if id.to_string() != r.request
-                || seen.contains(&id)
+            let valid_id = PendingId::parse(&r.request).is_some_and(|id| id.to_string() == r.request)
+                || envcloak_signin::RequestId::parse(&r.request)
+                    .is_some_and(|id| id.to_string() == r.request);
+            if !valid_id
+                || seen.contains(&r.request)
                 || r.bindings.len() > MAX_LISTED_BINDINGS
                 || (r.more_bindings > 0 && r.bindings.len() < MAX_LISTED_BINDINGS)
                 || r.bindings
@@ -429,7 +429,7 @@ impl PendingListView {
             {
                 return false;
             }
-            seen.push(id);
+            seen.push(r.request.clone());
         }
         true
     }
@@ -2262,5 +2262,208 @@ pub struct RevealRequestedView {
 views!(
     AskOpenedView,
     RevealRequestedView,
-    envcloak_policy::AskStateOutcome
+    envcloak_policy::AskStateOutcome,
+    SigninTargetView,
+    SigninTargetListView,
+    SigninTargetRemovedView,
+    SigninStatusView,
 );
+
+/// How a sign-in target's identity is checked in the receiving context
+/// (SPEC §6.8, M2b-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityCheckKindView {
+    Endpoint,
+    Element,
+}
+
+impl IdentityCheckKindView {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IdentityCheckKindView::Endpoint => "endpoint",
+            IdentityCheckKindView::Element => "element",
+        }
+    }
+}
+
+impl From<envcloak_core::vault::IdentityCheckKind> for IdentityCheckKindView {
+    fn from(k: envcloak_core::vault::IdentityCheckKind) -> Self {
+        match k {
+            envcloak_core::vault::IdentityCheckKind::Endpoint => IdentityCheckKindView::Endpoint,
+            envcloak_core::vault::IdentityCheckKind::Element => IdentityCheckKindView::Element,
+        }
+    }
+}
+
+impl From<IdentityCheckKindView> for envcloak_core::vault::IdentityCheckKind {
+    fn from(k: IdentityCheckKindView) -> Self {
+        match k {
+            IdentityCheckKindView::Endpoint => envcloak_core::vault::IdentityCheckKind::Endpoint,
+            IdentityCheckKindView::Element => envcloak_core::vault::IdentityCheckKind::Element,
+        }
+    }
+}
+
+/// A sign-in target's identity check declaration (SPEC §6.8, M2b-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityCheckView {
+    pub kind: IdentityCheckKindView,
+    pub locator: String,
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    pub role: String,
+}
+
+/// One declared cookie scope on a sign-in target (SPEC §6.8, M2b-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CookieScopeView {
+    pub name: String,
+    pub domain: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_top_site: Option<String>,
+    #[serde(default)]
+    pub cross_site_ancestor: bool,
+}
+
+/// One declared `localStorage` key on a sign-in target (SPEC §6.8, M2b-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageScopeView {
+    pub origin: String,
+    pub key: String,
+}
+
+/// A test-session adapter's id and version (SPEC §6.8, M2b-05).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterRefView {
+    pub id: String,
+    pub version: String,
+}
+
+/// Which parts of browser state a sign-in target transfers (SPEC §6.8, M2b-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionFormatView {
+    Cookies,
+    Storage,
+    #[serde(alias = "cookies-and-storage")]
+    CookiesAndStorage,
+}
+
+impl SessionFormatView {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SessionFormatView::Cookies => "cookies",
+            SessionFormatView::Storage => "storage",
+            SessionFormatView::CookiesAndStorage => "cookies_and_storage",
+        }
+    }
+}
+
+impl From<envcloak_core::vault::SessionFormat> for SessionFormatView {
+    fn from(f: envcloak_core::vault::SessionFormat) -> Self {
+        match f {
+            envcloak_core::vault::SessionFormat::Cookies => SessionFormatView::Cookies,
+            envcloak_core::vault::SessionFormat::Storage => SessionFormatView::Storage,
+            envcloak_core::vault::SessionFormat::CookiesAndStorage => {
+                SessionFormatView::CookiesAndStorage
+            }
+        }
+    }
+}
+
+impl From<SessionFormatView> for envcloak_core::vault::SessionFormat {
+    fn from(f: SessionFormatView) -> Self {
+        match f {
+            SessionFormatView::Cookies => envcloak_core::vault::SessionFormat::Cookies,
+            SessionFormatView::Storage => envcloak_core::vault::SessionFormat::Storage,
+            SessionFormatView::CookiesAndStorage => {
+                envcloak_core::vault::SessionFormat::CookiesAndStorage
+            }
+        }
+    }
+}
+
+/// A registered sign-in target (`signin.target.add`, `signin.target.edit`,
+/// `signin.target.list`; SPEC §6.8, M2b-05). Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetView {
+    /// 26 Crockford base32 characters (`PolicyId`).
+    pub id: String,
+    pub name: String,
+    pub login_item: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login_slug: Option<String>,
+    pub revision: u64,
+    pub app_origins: Vec<String>,
+    pub credential_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_provider_origins: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub callback_origins: Vec<String>,
+    pub identity_check: IdentityCheckView,
+    pub cookies: Vec<CookieScopeView>,
+    pub storage: Vec<StorageScopeView>,
+    pub session_format: SessionFormatView,
+    pub tier: LoginTierView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<AdapterRefView>,
+    pub approval_lifetime_secs: u64,
+    pub session_lifetime_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation: Option<String>,
+    /// True when any credential origin or cookie host is a loopback hostname
+    /// (`localhost`, `*.localhost`, `127.0.0.1`, `[::1]`).
+    pub shared_loopback_cookie_jar: bool,
+    #[serde(default)]
+    pub ended_operations: u64,
+    #[serde(default)]
+    pub revoked_authorizations: u64,
+}
+
+/// `signin.target.list`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetListView {
+    pub targets: Vec<SigninTargetView>,
+}
+
+/// `signin.target.remove`'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninTargetRemovedView {
+    pub removed: u64,
+    pub ended_operations: u64,
+    pub revoked_authorizations: u64,
+}
+
+/// What `signin.request`, `signin.status`, `signin.cancel` and `signin.end`
+/// return (SPEC §6.8, M2b-05). Metadata only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SigninStatusView {
+    /// 32 lowercase hex characters (`envcloak_signin::RequestId`).
+    pub request: String,
+    pub revision: u64,
+    pub state: String,
+    pub retry_until_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered_context: Option<String>,
+    pub cleanup: String,
+    pub revocation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub shared_loopback_cookie_jar: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<String>,
+}

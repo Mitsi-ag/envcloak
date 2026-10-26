@@ -616,12 +616,15 @@ impl Client {
     ) -> Result<PendingDescriptor, ClientError> {
         match self.pending_get_any(id, claims)? {
             PendingGetOutput::Run(d) => Ok(d),
-            PendingGetOutput::UnlockerAdd(_) => Err(ClientError::Protocol),
+            PendingGetOutput::UnlockerAdd(_) | PendingGetOutput::SignIn(_) => {
+                Err(ClientError::Protocol)
+            }
         }
     }
 
     /// `pending.get` for request `id`, returning either a run request's
-    /// [`PendingDescriptor`] or an `unlocker_add` request's descriptor.
+    /// [`PendingDescriptor`], an `unlocker_add` request's descriptor, or a
+    /// sign-in request's [`envcloak_signin::SignInPendingDescriptor`].
     ///
     /// # Errors
     /// As [`Client::call`].
@@ -644,8 +647,19 @@ impl Client {
     /// As [`Client::call`]; [`crate::ErrorKind::Busy`] when the caller's
     /// root asks too often.
     pub fn pending_state(&mut self, id: &PendingId) -> Result<PendingState, ClientError> {
+        self.pending_state_str(&id.to_string())
+    }
+
+    /// `pending.state` for request `id` (either a `PendingId` or a sign-in
+    /// `RequestId`): how it stands, told only to the request's own process
+    /// tree (`unknown` to anyone else).
+    ///
+    /// # Errors
+    /// As [`Client::call`]; [`crate::ErrorKind::Busy`] when the caller's
+    /// root asks too often.
+    pub fn pending_state_str(&mut self, id: &str) -> Result<PendingState, ClientError> {
         self.call::<PendingPoll>(&PendingStateParams {
-            request: id.to_string(),
+            request: id.to_owned(),
         })
         .map(|v| v.state)
     }
@@ -680,9 +694,28 @@ impl Client {
         passphrase: SecretBytes,
         claims: &[String],
     ) -> Result<ApprovedView, ClientError> {
+        self.approve_with_dev(id, options, None, digest, passphrase, claims)
+    }
+
+    /// `approve` request `id` with `options`, optional sign-in `dev` window
+    /// options, the `digest` of the statement read, the passphrase, and the
+    /// approver's claims.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn approve_with_dev(
+        &mut self,
+        id: &str,
+        options: ApprovalOptions,
+        dev: Option<envcloak_signin::SignInDevOptions>,
+        digest: &[u8; 32],
+        passphrase: SecretBytes,
+        claims: &[String],
+    ) -> Result<ApprovedView, ClientError> {
         self.call::<Approve>(&ApproveParams {
             request: id.to_owned(),
             options,
+            dev,
             digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
             passphrase: Some(WireSecret::new(passphrase)),
             claims: claims.to_vec(),
@@ -704,9 +737,26 @@ impl Client {
         digest: &[u8; 32],
         claims: &[String],
     ) -> Result<ApprovedView, ClientError> {
+        self.approve_check_with_dev(id, options, None, digest, claims)
+    }
+
+    /// `approve` of request `id` without the passphrase, carrying optional
+    /// sign-in `dev` window options.
+    ///
+    /// # Errors
+    /// As [`Client::call`].
+    pub fn approve_check_with_dev(
+        &mut self,
+        id: &str,
+        options: ApprovalOptions,
+        dev: Option<envcloak_signin::SignInDevOptions>,
+        digest: &[u8; 32],
+        claims: &[String],
+    ) -> Result<ApprovedView, ClientError> {
         self.call::<Approve>(&ApproveParams {
             request: id.to_owned(),
             options,
+            dev,
             digest: digest.iter().map(|b| format!("{b:02x}")).collect(),
             passphrase: None,
             claims: claims.to_vec(),
@@ -1899,5 +1949,91 @@ impl Client {
         p: &crate::app::AppAuditListParams,
     ) -> Result<crate::app::AppAuditListView, ClientError> {
         self.call::<crate::app::AppAuditList>(p)
+    }
+
+    /// `signin.target.add`: registers a sign-in target with a passphrase
+    /// proof (or runs a pre-prompt check when `p.passphrase` is `None`).
+    pub fn signin_target_add(
+        &mut self,
+        p: &crate::proto::SigninTargetAddParams,
+    ) -> Result<crate::view::SigninTargetView, ClientError> {
+        self.call::<crate::proto::SigninTargetAdd>(p)
+    }
+
+    /// `signin.target.edit`: updates a sign-in target with a passphrase
+    /// proof (or runs a pre-prompt check when `p.passphrase` is `None`).
+    pub fn signin_target_edit(
+        &mut self,
+        p: &crate::proto::SigninTargetEditParams,
+    ) -> Result<crate::view::SigninTargetView, ClientError> {
+        self.call::<crate::proto::SigninTargetEdit>(p)
+    }
+
+    /// `signin.target.remove`: deletes a sign-in target and ends its active
+    /// authorizations.
+    pub fn signin_target_remove(
+        &mut self,
+        p: &crate::proto::SigninTargetRemoveParams,
+    ) -> Result<crate::view::SigninTargetRemovedView, ClientError> {
+        self.call::<crate::proto::SigninTargetRemove>(p)
+    }
+
+    /// `signin.target.list`: lists registered sign-in targets in stable
+    /// `(name, role)` order.
+    pub fn signin_target_list(
+        &mut self,
+        manifest: Option<&str>,
+    ) -> Result<crate::view::SigninTargetListView, ClientError> {
+        self.call::<crate::proto::SigninTargetList>(&crate::proto::SigninTargetListParams {
+            manifest: manifest.map(str::to_owned),
+        })
+    }
+
+    /// `signin.request`: opens or retries a sign-in operation.
+    pub fn signin_request(
+        &mut self,
+        p: &crate::proto::SigninRequestParams,
+    ) -> Result<crate::view::SigninStatusView, ClientError> {
+        self.call::<crate::proto::SigninRequest>(p)
+    }
+
+    /// `signin.request` carrying passed file descriptors (`SCM_RIGHTS`).
+    pub fn signin_request_with_fds(
+        &mut self,
+        p: &crate::proto::SigninRequestParams,
+        fds: &[BorrowedFd<'_>],
+    ) -> Result<crate::view::SigninStatusView, ClientError> {
+        self.call_with_fds::<crate::proto::SigninRequest>(p, fds)
+    }
+
+    /// `signin.status`: returns the status of a sign-in operation.
+    pub fn signin_status(
+        &mut self,
+        request: &str,
+    ) -> Result<crate::view::SigninStatusView, ClientError> {
+        self.call::<crate::proto::SigninStatus>(&crate::proto::SigninOperationParams {
+            request: request.to_owned(),
+        })
+    }
+
+    /// `signin.cancel`: cancels an active or pending sign-in operation.
+    pub fn signin_cancel(
+        &mut self,
+        request: &str,
+    ) -> Result<crate::view::SigninStatusView, ClientError> {
+        self.call::<crate::proto::SigninCancel>(&crate::proto::SigninOperationParams {
+            request: request.to_owned(),
+        })
+    }
+
+    /// `signin.end`: ends a delivered sign-in session by request id or
+    /// context id.
+    pub fn signin_end(
+        &mut self,
+        session: &str,
+    ) -> Result<crate::view::SigninStatusView, ClientError> {
+        self.call::<crate::proto::SigninEnd>(&crate::proto::SigninEndParams {
+            session: session.to_owned(),
+        })
     }
 }

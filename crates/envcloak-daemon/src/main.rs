@@ -52,6 +52,7 @@ mod requests;
 mod reveal;
 mod scan_match;
 mod server;
+mod signin;
 mod spawn_envcloak;
 mod standing;
 mod state;

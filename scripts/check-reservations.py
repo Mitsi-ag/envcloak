@@ -2954,6 +2954,7 @@ def code_mcp_tools(root):
 CONTROL_CHANNELS = {
     "pty_monitor": ("crates/envcloak-sys/src/pty_monitor.rs", ("Report", "Command")),
     "runner": ("crates/envcloak-ipc/src/control.rs", ("ToRunner", "FromRunner")),
+    "supervisor": ("crates/envcloak-ipc/src/control.rs", ("ToSupervisor", "FromSupervisor")),
 }
 ENUM_DECL = re.compile(r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)")
 VARIANT = re.compile(r"([A-Z][A-Za-z0-9]*)(\s*\((?:[^()]|\([^()]*\))*\))?")

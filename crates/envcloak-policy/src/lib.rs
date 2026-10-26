@@ -83,7 +83,7 @@ pub use grants::{
 pub use limiter::{AttemptLimiter, FIRST_WAIT, FREE_ATTEMPTS, MAX_WAIT};
 pub use manifest::{
     AgentsPolicy, BindingSource, Manifest, ManifestError, ManifestErrorKind, ManifestPolicy, Mode,
-    Origin, parse_manifest, resolve, resolve_sourced,
+    Origin, ScopeFingerprint, parse_manifest, resolve, resolve_sourced,
 };
 pub use names::{Binding, EnvName, ProfileName, Reference, VALUE_RUN, value_shaped};
 pub use pending::{

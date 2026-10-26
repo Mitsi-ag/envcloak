@@ -616,6 +616,29 @@ impl OperationStore {
         self.owner_stop(caller, request, StopReason::EndedByOwner, now, world)
     }
 
+    /// `envcloak deny <id>` for a pending sign-in request (SPEC §10b:
+    /// tightening needs no proof): stops a pending operation before
+    /// approval.
+    pub fn deny(
+        &mut self,
+        request: &RequestId,
+        now: &Now,
+        world: &dyn World,
+    ) -> Result<Status, NotFound> {
+        self.settle(now, world);
+        let pending = self
+            .ops
+            .get(request)
+            .is_some_and(|op| op.stop.is_none() && op.phase == Phase::PendingApproval);
+        if !pending {
+            self.finish(now, world);
+            return Err(NotFound);
+        }
+        self.stop_op(request, StopReason::Cancelled, now);
+        self.finish(now, world);
+        self.status_of(request).ok_or(NotFound)
+    }
+
     fn owner_stop(
         &mut self,
         caller: &Instance,
@@ -792,7 +815,7 @@ impl OperationStore {
         let running = self.ops.get(request).is_some_and(|op| {
             op.stop.is_none()
                 && op.generation == Some(worker.generation())
-                && op.phase == Phase::AttemptRunning
+                && matches!(op.phase, Phase::AttemptRunning | Phase::Captured)
         });
         let done = if running {
             self.stop_op(request, StopReason::AttemptFailed(failure), now);
@@ -1131,8 +1154,9 @@ impl OperationStore {
             .filter(|op| op.stop.is_none())
             .filter_map(|op| op.authorization)
             .collect();
-        self.auths
-            .retain(|id, a| held.contains(id) || !(a.ended() || a.deadline().passed(now)));
+        self.auths.retain(|id, a| {
+            held.contains(id) || !(a.ended() || a.deadline().passed(now) || a.remaining() == 0)
+        });
     }
 
     /// Ends every call: brings what the call changed up to date with the

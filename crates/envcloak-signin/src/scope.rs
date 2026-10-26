@@ -157,8 +157,29 @@ macro_rules! id16 {
             pub const fn as_bytes(&self) -> &[u8; 16] {
                 &self.0
             }
+
+            pub fn parse(s: &str) -> Option<Self> {
+                decode_hex::<16>(s).map($name)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&hex(&self.0))
+            }
         }
     };
+}
+
+pub(crate) fn decode_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != 2 * N || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u8::from_str_radix(s.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(out)
 }
 
 id16!(
@@ -340,6 +361,43 @@ impl Host {
         HostName::new(s).map(Host::Name)
     }
 
+    /// Parses a host name, canonical IPv4 address or IPv6 address (with or
+    /// without brackets).
+    pub fn parse(s: &str) -> Result<Self, ScopeError> {
+        if s.is_empty() {
+            return Err(ScopeError::Host);
+        }
+        if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            if inner.is_empty()
+                || !inner
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b':')
+            {
+                return Err(ScopeError::Host);
+            }
+            return inner
+                .parse::<std::net::Ipv6Addr>()
+                .map(|a| Host::V6(a.octets()))
+                .map_err(|_| ScopeError::Host);
+        }
+        if s.contains(':') {
+            if !s
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b':')
+            {
+                return Err(ScopeError::Host);
+            }
+            return s
+                .parse::<std::net::Ipv6Addr>()
+                .map(|a| Host::V6(a.octets()))
+                .map_err(|_| ScopeError::Host);
+        }
+        if let Ok(v4) = s.parse::<std::net::Ipv4Addr>() {
+            return Ok(Host::V4(v4.octets()));
+        }
+        HostName::new(s).map(Host::Name)
+    }
+
     /// Whether `http` may be registered for it (SPEC §6.8): `127.0.0.1`,
     /// `::1` or a name under `localhost`.
     pub fn is_loopback(&self) -> bool {
@@ -368,11 +426,87 @@ impl Host {
     }
 }
 
+/// Formats an IPv6 address's 16 octets according to the WHATWG URL
+/// standard's IPv6 serializer (RFC 5952): eight 16-bit big-endian pieces in
+/// lowercase hex without leading zeros, with the first longest run of at
+/// least two zero pieces compressed to `::`.
+pub(crate) fn format_ipv6_whatwg(octets: &[u8; 16]) -> String {
+    let mut pieces = [0u16; 8];
+    for (i, p) in pieces.iter_mut().enumerate() {
+        *p = u16::from_be_bytes([octets[2 * i], octets[2 * i + 1]]);
+    }
+    let mut best_start = None;
+    let mut best_len = 1usize;
+    let mut i = 0;
+    while i < 8 {
+        if pieces[i] == 0 {
+            let mut j = i + 1;
+            while j < 8 && pieces[j] == 0 {
+                j += 1;
+            }
+            let len = j - i;
+            if len > best_len {
+                best_len = len;
+                best_start = Some(i);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = String::new();
+    let mut idx = 0;
+    while idx < 8 {
+        if best_start == Some(idx) {
+            out.push_str("::");
+            idx += best_len;
+            if idx == 8 {
+                break;
+            }
+        } else {
+            if idx > 0 && best_start.map(|s| s + best_len) != Some(idx) {
+                out.push(':');
+            }
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{:x}", pieces[idx]));
+            idx += 1;
+        }
+    }
+    out
+}
+
+impl fmt::Display for Host {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Host::Name(n) => f.write_str(n.as_str()),
+            Host::V4([a, b, c, d]) => write!(f, "{a}.{b}.{c}.{d}"),
+            Host::V6(octets) => write!(f, "[{}]", format_ipv6_whatwg(octets)),
+        }
+    }
+}
+
 /// An origin's scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Scheme {
     Http,
     Https,
+}
+
+impl Scheme {
+    /// The scheme's default port (`80` for `http`, `443` for `https`).
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Scheme::Http => 80,
+            Scheme::Https => 443,
+        }
+    }
+
+    /// The scheme's lowercase ASCII token.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        }
+    }
 }
 
 /// An exact origin (plan D-26): scheme, host and port, compared byte for
@@ -405,6 +539,16 @@ impl Origin {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.port == self.scheme.default_port() {
+            write!(f, "{}://{}", self.scheme.as_str(), self.host)
+        } else {
+            write!(f, "{}://{}:{}", self.scheme.as_str(), self.host, self.port)
+        }
     }
 }
 

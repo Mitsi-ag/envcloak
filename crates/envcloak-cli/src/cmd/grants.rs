@@ -17,6 +17,7 @@ use envcloak_client::fail::{FAILURE, Failure, usage};
 use envcloak_client::render::json_text;
 use envcloak_ipc::view::{GrantView, GrantsView};
 use envcloak_policy::{GrantId, SubjectKind, Uses, escape_for_display};
+use envcloak_signin::AuthorizationId;
 
 const USAGE: &str = "envcloak grants list [--json]\n       envcloak grants revoke <GRANT> | --all";
 
@@ -25,10 +26,15 @@ pub fn run(args: &[&str]) -> ExitCode {
         ["list"] => list(false),
         ["list", "--json"] => list(true),
         ["revoke", "--all"] => revoke(None),
-        ["revoke", id] => match GrantId::parse(id) {
-            Some(id) => revoke(Some(id)),
-            None => return usage(USAGE),
-        },
+        ["revoke", id] => {
+            let parsed = GrantId::parse(id)
+                .map(|g| g.to_string())
+                .or_else(|| AuthorizationId::parse(id).map(|a| a.to_string()));
+            match parsed {
+                Some(id) => revoke(Some(id)),
+                None => return usage(USAGE),
+            }
+        }
         _ => return usage(USAGE),
     }
     .unwrap_or_else(|f| f.report(FAILURE))
@@ -54,7 +60,10 @@ fn listing(grants: &GrantsView, json: bool) -> String {
 
 fn grant_text(g: &GrantView) -> String {
     let e = escape_for_display;
-    let id = GrantId::parse(&g.id).map_or_else(|| e(&g.id), |id| id.to_string());
+    let id = GrantId::parse(&g.id)
+        .map(|id| id.to_string())
+        .or_else(|| AuthorizationId::parse(&g.id).map(|a| a.to_string()))
+        .unwrap_or_else(|| e(&g.id));
     let who = match (g.kind, &g.label) {
         (SubjectKind::Agent, Some(l)) => format!("agent {}", e(l)),
         (SubjectKind::Agent, None) => "an agent".to_owned(),
@@ -104,9 +113,8 @@ fn words(secs: u64) -> String {
     }
 }
 
-fn revoke(id: Option<GrantId>) -> Result<ExitCode, Failure> {
-    let text = id.map(|id| id.to_string());
-    let revoked = connect()?.grants_revoke(text.as_deref())?;
+fn revoke(id: Option<String>) -> Result<ExitCode, Failure> {
+    let revoked = connect()?.grants_revoke(id.as_deref())?;
     match revoked.revoked {
         0 => println!("No grant was revoked."),
         1 => println!("Revoked 1 grant."),

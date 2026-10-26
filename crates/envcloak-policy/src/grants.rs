@@ -149,6 +149,14 @@ impl GrantId {
         ids::decode(s, 26, &mut b)?;
         Some(GrantId(b))
     }
+
+    pub const fn from_bytes(b: [u8; 16]) -> Self {
+        GrantId(b)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
 }
 
 impl core::fmt::Display for GrantId {
@@ -418,9 +426,10 @@ impl Grant {
 
     /// Rules 5 and 7: the same project, and a mode at least as strict; and
     /// for a managed server, the same launch revision (rule 6).
+    /// `Mode::SignIn` is refused by every grant match here (R-M2b-11, R-M2b-13).
     fn covers_project_and_mode(&self, r: &AccessRequest) -> bool {
         self.project == r.project
-            && r.mode >= self.mode
+            && self.mode.covers(r.mode)
             && self.launch == ManagedRequest::launch(r)
             && self.origin.as_deref() == ManagedRequest::origin(r)
     }
@@ -675,10 +684,14 @@ fn fingerprint(r: &AccessRequest) -> [u8; 32] {
         str(item.as_bytes());
         str(field.as_bytes());
     }
-    str(match r.mode {
-        Mode::Inject => b"inject",
-        Mode::Proxy => b"proxy",
-    });
+    match &r.mode {
+        Mode::Inject => str(b"inject"),
+        Mode::Proxy => str(b"proxy"),
+        Mode::SignIn(fp) => {
+            str(b"signin");
+            str(fp);
+        }
+    }
     for a in &r.argv_display {
         str(a.as_bytes());
     }

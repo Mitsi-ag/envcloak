@@ -27,6 +27,7 @@ use envcloak_client::fail::{FAILURE, Failure, usage};
 use envcloak_client::render::json_text;
 use envcloak_ipc::view::{PendingListView, PendingView};
 use envcloak_policy::{PendingId, SubjectKind, escape_for_display};
+use envcloak_signin::RequestId;
 
 const USAGE: &str = "envcloak pending [--json]";
 
@@ -68,7 +69,10 @@ fn listing(list: &PendingListView, json: bool) -> String {
 
 fn request_text(r: &PendingView) -> String {
     let e = escape_for_display;
-    let id = PendingId::parse(&r.request).map_or_else(|| e(&r.request), |id| id.to_string());
+    let id = PendingId::parse(&r.request)
+        .map(|id| id.to_string())
+        .or_else(|| RequestId::parse(&r.request).map(|id| id.to_string()))
+        .unwrap_or_else(|| e(&r.request));
     let who = match (r.kind, &r.agent) {
         (SubjectKind::Agent, Some(l)) => format!("agent {}", e(l)),
         (SubjectKind::Agent, None) => "an agent".to_owned(),

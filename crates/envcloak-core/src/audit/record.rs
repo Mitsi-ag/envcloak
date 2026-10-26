@@ -145,6 +145,18 @@ pub enum AuditKind {
     /// A login field was replaced (`envcloak rotate <slug>#<field>`), with a
     /// proof, or the proof failed.
     LoginReplace = 36,
+    /// A sign-in target was added, edited or removed (`envcloak signin target
+    /// add|edit|rm`), with a proof, or the proof failed.
+    SigninTarget = 37,
+    /// A sign-in request was approved into an authorization, with a proof, or
+    /// the proof failed.
+    SigninApprove = 38,
+    /// The publication decision for a sign-in operation (`published` or
+    /// `refused`).
+    SigninPublish = 41,
+    /// A sign-in operation was cancelled (`signin.cancel`) or its session
+    /// ended (`signin.end`).
+    SigninEnd = 42,
     /// A request against a managed MCP server's project refused before any
     /// pending request: not its registered launch
     /// (`managed_command_mismatch`), a launch that changed
@@ -177,7 +189,7 @@ pub enum AuditKind {
 
 impl AuditKind {
     /// Every kind, in number order.
-    pub const ALL: [AuditKind; 41] = [
+    pub const ALL: [AuditKind; 45] = [
         AuditKind::Run,
         AuditKind::Approve,
         AuditKind::Deny,
@@ -212,6 +224,10 @@ impl AuditKind {
         AuditKind::StandingGrant,
         AuditKind::LoginAdd,
         AuditKind::LoginReplace,
+        AuditKind::SigninTarget,
+        AuditKind::SigninApprove,
+        AuditKind::SigninPublish,
+        AuditKind::SigninEnd,
         AuditKind::ManagedLaunch,
         AuditKind::StandingConfirm,
         AuditKind::UnlockerAdd,
@@ -258,6 +274,10 @@ impl AuditKind {
             AuditKind::StandingGrant => "standing_grant",
             AuditKind::LoginAdd => "login_add",
             AuditKind::LoginReplace => "login_replace",
+            AuditKind::SigninTarget => "signin_target",
+            AuditKind::SigninApprove => "signin_approve",
+            AuditKind::SigninPublish => "signin_publish",
+            AuditKind::SigninEnd => "signin_end",
             AuditKind::ManagedLaunch => "managed_launch",
             AuditKind::StandingConfirm => "standing_confirm",
             AuditKind::UnlockerAdd => "unlocker_add",

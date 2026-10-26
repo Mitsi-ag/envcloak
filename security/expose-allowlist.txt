@@ -54,3 +54,4 @@ crates/envcloak-scan/src/formats/bitwarden.rs # validate numeric export type tag
 crates/envcloak-mcp/src/bridge/relay.rs # hands the daemon's released header values to the response redactor and sets them on outbound requests to the registered origin only
 crates/envcloak-core/src/vault/login.rs # LoginFieldReader::open and AttemptLease unit tests
 crates/envcloak-daemon/src/totp.rs # issues an AttemptLease and opens a login's TOTP enrollment for RFC 6238 generation
+crates/envcloak-daemon/src/signin/ops.rs # copies captured browser state into a wiping SecretBytes frame sent only over the bound supervisor control pipe

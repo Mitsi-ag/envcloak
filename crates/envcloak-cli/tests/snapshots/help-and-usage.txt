@@ -10,7 +10,7 @@ usage:
   envcloak daemon uninstall
   envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
-  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION]] [--live NAME]... [--passphrase-fd N]
+  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION] | --dev DURATION [--attempts N]] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
   envcloak grants revoke <GRANT> | --all
@@ -47,8 +47,9 @@ usage:
   envcloak doctor [--json] [--path <path>]... [--git-history] [--report]
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
+  envcloak signin target add|edit|rm|ls ...
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak signin
+  envcloak signin setup
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 --- stderr
 $ envcloak --version
@@ -70,7 +71,7 @@ usage:
   envcloak daemon uninstall
   envcloak run [--profile NAME] [--ref NAME=slug[#field]]... [--env-file FILE] [--manifest PATH] [--wait DURATION] [--pty] -- <cmd...>
   envcloak pending [--json]
-  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION]] [--live NAME]... [--passphrase-fd N]
+  envcloak approve <REQUEST> [--once | --for DURATION | --standing [DURATION] | --dev DURATION [--attempts N]] [--live NAME]... [--passphrase-fd N]
   envcloak deny <REQUEST>
   envcloak grants list [--json]
   envcloak grants revoke <GRANT> | --all
@@ -107,8 +108,9 @@ usage:
   envcloak doctor [--json] [--path <path>]... [--git-history] [--report]
   envcloak mcp-bridge (--manifest PATH --url URL --header-ref HEADER=slug[#field]... | --stdio --launch ID) [--wait [DURATION]]
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
+  envcloak signin target add|edit|rm|ls ...
 Not in this build (each exits 125 with not_in_this_build):
-  envcloak signin
+  envcloak signin setup
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 $ envcloak vault
 exit: 2
@@ -198,7 +200,7 @@ $ envcloak approve
 exit: 2
 --- stdout
 --- stderr
-envcloak: usage: envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h) | --standing [DURATION (30s to 30d)]] [--live NAME]... [--passphrase-fd N]
+envcloak: usage: envcloak approve <REQUEST> [--once | --for DURATION (30s to 24h) | --standing [DURATION (30s to 30d)] | --dev DURATION [--attempts N]] [--live NAME]... [--passphrase-fd N]
 $ envcloak deny
 exit: 2
 --- stdout

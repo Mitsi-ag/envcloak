@@ -33,6 +33,7 @@ use crate::grants::{
     ManagedRequest, Now, OptionsError, ProofKind, Uses,
 };
 use crate::ids;
+use crate::manifest::Mode;
 use crate::project::{MANIFEST_NAME, ProjectIdentity};
 use crate::statement::{StandingSummary, escape_for_display};
 
@@ -623,6 +624,9 @@ impl StandingStore {
         now: SystemTime,
         items: &[ItemMeta],
     ) -> Option<StandingId> {
+        if matches!(r.mode, Mode::SignIn(_)) {
+            return None;
+        }
         let (agent_id, CodeIdentity::LinuxSha256 { digests }) =
             extract_code_identity(&r.subject, catalog, home).ok()?
         else {
@@ -675,7 +679,10 @@ impl StandingStore {
         if standing_ttl > MAX_STANDING_TTL {
             return Err(StandingError::InvalidOptions(OptionsError::TtlTooLong));
         }
-        if opts.uses != Uses::Session || !opts.live.is_empty() {
+        if opts.uses != Uses::Session
+            || !opts.live.is_empty()
+            || matches!(r.mode, Mode::SignIn(_))
+        {
             return Err(StandingError::InvalidOptions(OptionsError::StandingInvalid));
         }
         // Check launch and bindings and identity.
@@ -773,7 +780,7 @@ impl StandingStore {
         items: &[ItemMeta],
         catalog: &AgentCatalog,
     ) -> Option<&StandingRecord> {
-        if subject.kind() != SubjectKind::Agent {
+        if subject.kind() != SubjectKind::Agent || matches!(r.mode, Mode::SignIn(_)) {
             return None;
         }
         let (idx, label) = subject.nearest_agent()?;

@@ -395,7 +395,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `identity_outside_install_tree` | -32044 | M2-15 | landed | `--standing` for a Linux executable outside its agent's documented install trees |
 | `launch_not_standing_capable` | -32045 | M2-15 | landed | `--standing` for a managed launch that is not `bound` |
 | `policy_epoch_unverified` | -32046 | M2-15 | landed | standing records refused until `envcloak standing confirm`, because the vault is behind its policy record |
-| `request_conflict` | -32047 | M2b-05 | reserved | a sign-in request with a known `operation_key` and any scope field changed; the existing request is untouched |
+| `request_conflict` | -32047 | M2b-05 | landed | a sign-in request with a known `operation_key` and any scope field changed; the existing request is untouched |
 | `restore_refused` | -32048 | M2-05 | landed | a backup v2 restore refused before the proof: made by an agent or unknown process without `--created-by-agent` (`created_by_agent`), or a result not recorded without `--unrecorded` (`result_unrecorded`); M1-AUDIT refuses an `init --undo` (`files.restore`) the same way, without a new entry, and the CLI refuses it before it asks for the passphrase, after the statement names the maker |
 | `no_such_lease` | -32049 | M2-05 | landed | a backup v2 read with a lease that is not this process's on this terminal, or that ended |
 | `backup_frozen` | -32050 | M2-05 | landed | a chunk or a commit for a committed backup v2, or a second result for one of its files |
@@ -449,13 +449,14 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `standing.confirm` | M2-15 | landed | re-seals the policy record over every standing record, with a proof |
 | `items.reveal` | M2-21 | landed | terminal reveal on Linux, with a proof |
 | `login.add` | M2b-03 | landed | adds a login item; its fields cross only from the client |
-| `signin.target.add` | M2b-05 | reserved | registers a sign-in target, with a proof |
-| `signin.target.edit` | M2b-05 | reserved | edits a sign-in target, with a proof; bumps its authorization revision |
-| `signin.target.remove` | M2b-05 | reserved | removes a sign-in target |
-| `signin.request` | M2b-05 | reserved | a sign-in request, which hands over the tool pipe ends for the browser supervisor |
-| `signin.status` | M2b-05 | reserved | an operation's allowlisted status, to its owner root only |
-| `signin.cancel` | M2b-05 | reserved | ends an operation, to its owner root only |
-| `signin.end` | M2b-05 | reserved | ends a delivered session, to its owner root only |
+| `signin.target.add` | M2b-05 | landed | registers a sign-in target, with a proof |
+| `signin.target.edit` | M2b-05 | landed | edits a sign-in target, with a proof; bumps its authorization revision |
+| `signin.target.remove` | M2b-05 | landed | removes a sign-in target |
+| `signin.target.list` | M2b-05 | landed | lists registered sign-in targets; metadata only |
+| `signin.request` | M2b-05 | landed | a sign-in request, which hands over the tool pipe ends for the browser supervisor |
+| `signin.status` | M2b-05 | landed | an operation's allowlisted status, to its owner root only |
+| `signin.cancel` | M2b-05 | landed | ends an operation, to its owner root only |
+| `signin.end` | M2b-05 | landed | ends a delivered session, to its owner root only |
 <!-- /reservations -->
 
 **Fields and answers** added to existing methods:
@@ -576,12 +577,12 @@ The `pty_monitor` reader binds `Report` and `Command` to direct module-scope pub
 | `runner` | `ConfirmSpawn` | M2-27 | landed | runner to daemon (macOS): the suspended child's pid, for the daemon's code check |
 | `runner` | `Confirmed` | M2-27 | landed | daemon to runner: the child may run |
 | `runner` | `Refused` | M2-27 | landed | daemon to runner: kill the child and exit with `managed_launch_changed` |
-| `supervisor` | `InjectState` | M2b-05 | reserved | daemon to browser supervisor: the declared state of its generation, once, after capture and before publication (plan D-36; SPEC §4.4, §6.8) |
+| `supervisor` | `InjectState` | M2b-05 | landed | daemon to browser supervisor: the declared state of its generation, once, after capture and before publication (plan D-36; SPEC §4.4, §6.8) |
 | `supervisor` | `Claim` | spare | reserved | the hand-over's name while it was a socket method (`signin.claim`), before plan D-36 moved it to this pipe as `InjectState`; kept free so it never names another message |
-| `supervisor` | `IdentityResponse` | M2b-05 | reserved | supervisor to daemon: the bounded identity response read in the recipient context |
-| `supervisor` | `Publish` | M2b-05 | reserved | daemon to supervisor: the serialized publication decision |
-| `supervisor` | `Check` | M2b-05 | reserved | supervisor to daemon: the grant check before each browser tool call |
-| `supervisor` | `Close` | M2b-05 | reserved | daemon to supervisor: the generation ends |
+| `supervisor` | `IdentityResponse` | M2b-05 | landed | supervisor to daemon: the bounded identity response read in the recipient context |
+| `supervisor` | `Publish` | M2b-05 | landed | daemon to supervisor: the serialized publication decision |
+| `supervisor` | `Check` | M2b-05 | landed | supervisor to daemon: the grant check before each browser tool call |
+| `supervisor` | `Close` | M2b-05 | landed | daemon to supervisor: the generation ends |
 | `pty_monitor` | `Started` | M2-17 | landed | monitor to CLI: the command was executed, with its pid (the first report) |
 | `pty_monitor` | `SetupFailed` | M2-17 | landed | monitor to CLI: the session, the descriptors or the terminal could not be set up, with the `errno`; no command ran |
 | `pty_monitor` | `ExecFailed` | M2-17 | landed | monitor to CLI: no candidate path could be executed, with the `errno` of the last `execve` (`EACCES` when one was refused) |

@@ -719,11 +719,18 @@ pub(crate) fn refuse_item_prover(
     now: &envcloak_policy::Now,
     method: &'static str,
 ) -> Result<(), RpcError> {
-    let refusal = caller.proof_refusal().or_else(|| {
-        s.grants()
-            .pending_all(now)
-            .find_map(|p| caller.approval_refusal(&p.request.subject, &crate::requests::alive))
-    });
+    let refusal = caller
+        .proof_refusal()
+        .or_else(|| {
+            s.grants()
+                .pending_all(now)
+                .find_map(|p| caller.approval_refusal(&p.request.subject, &crate::requests::alive))
+        })
+        .or_else(|| {
+            s.signin()
+                .pending_subjects()
+                .find_map(|subj| caller.approval_refusal(subj, &crate::requests::alive))
+        });
     if let Some(r) = refusal {
         s.audit(AuditEvent::ProofRefused {
             pid: peer.pid,
@@ -938,6 +945,7 @@ pub fn rotate(
             Err(e) => return Err(proven.aborted(peer, Write::Rotate, e)),
         };
         proven.s.totp().on_login_replaced(t.item, new_rev);
+        let ended = proven.s.signin_reconcile(shared);
         let subject = subject_summary(peer, &proven.caller);
         proven.s.audit(AuditEvent::LoginReplaced {
             pid: peer.pid,
@@ -954,7 +962,7 @@ pub fn rotate(
             length,
             classification: ClassificationView::from(before),
             reclassified_from: None,
-            grants_ended: 0,
+            grants_ended: u64::try_from(ended).unwrap_or(u64::MAX),
         });
     }
     let written = (|| {
@@ -1083,10 +1091,11 @@ fn without_proof(
     let caller = evidence(shared, peer, claims)?;
     let mut s = locked(&shared.state);
     let v = s.unlocked_mut()?;
-    let t = target(v, slug, None, None)?;
+    let t = target_or_login(v, slug, None, None)?;
     let before = set_classification(v, t.item, to)?;
     Ok(reclassified(
         &mut s,
+        shared,
         peer,
         subject_summary(peer, &caller),
         &t,
@@ -1107,7 +1116,7 @@ fn loosen(
     claims: &[String],
     pass: SecretBytes,
 ) -> Result<ReclassifiedView, RpcError> {
-    let resolve = |v: &Vault| target(v, slug, None, Some(item));
+    let resolve = |v: &Vault| target_or_login(v, slug, None, Some(item));
     let mut proven = prove(shared, peer, Write::Reclassify, claims, pass, &resolve)?;
     let written = (|| {
         let v = proven.s.unlocked_mut()?;
@@ -1120,7 +1129,15 @@ fn loosen(
         Err(e) => return Err(proven.aborted(peer, Write::Reclassify, e)),
     };
     let subject = subject_summary(peer, &proven.caller);
-    Ok(reclassified(&mut proven.s, peer, subject, &t, before, to))
+    Ok(reclassified(
+        &mut proven.s,
+        shared,
+        peer,
+        subject,
+        &t,
+        before,
+        to,
+    ))
 }
 
 /// Writes `to` as `item`'s classification, unless it has it already (the
@@ -1149,6 +1166,7 @@ fn set_classification(
 /// audited; the answer says what changed.
 fn reclassified(
     s: &mut crate::state::State,
+    shared: &Shared,
     peer: &PeerIdentity,
     subject: SubjectSummary,
     t: &Target,
@@ -1157,7 +1175,9 @@ fn reclassified(
 ) -> ReclassifiedView {
     let changed = before != to;
     let grants = if changed {
-        s.grants().on_item_reclassified(t.item)
+        s.grants()
+            .on_item_reclassified(t.item)
+            .saturating_add(s.signin_reconcile(shared))
     } else {
         0
     };
@@ -1333,7 +1353,7 @@ pub fn remove(
     p: RemoveParams,
 ) -> Result<RemovedView, RpcError> {
     let pass = p.passphrase.into_inner();
-    let resolve = |v: &Vault| target(v, &p.slug, None, Some(&p.item));
+    let resolve = |v: &Vault| target_or_login(v, &p.slug, None, Some(&p.item));
     let mut proven = prove(shared, peer, Write::Remove, &p.claims, pass, &resolve)?;
     let written = (|| {
         let v = proven.s.unlocked_mut()?;
@@ -1355,7 +1375,11 @@ pub fn remove(
         Ok(w) => w,
         Err(e) => return Err(proven.aborted(peer, Write::Remove, e)),
     };
-    let mut grants = proven.s.grants().on_item_removed(t.item);
+    let mut grants = proven
+        .s
+        .grants()
+        .on_item_removed(t.item)
+        .saturating_add(proven.s.signin_reconcile(shared));
     let standing_ids: Vec<envcloak_policy::StandingId> = proven
         .s
         .standing()

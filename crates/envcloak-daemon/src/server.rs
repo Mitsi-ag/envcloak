@@ -218,7 +218,7 @@ impl Shared {
     /// catalog, the production hash cache, no registry), with its vault
     /// at `paths`, for tests of what requests read through it (on Linux,
     /// where executables are hashed).
-    #[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+    #[cfg(test)]
     pub(crate) fn for_tests(paths: VaultPaths) -> Shared {
         let clocks = SystemClocks;
         let state = State::open(paths, crate::lock::DEFAULT_IDLE, Reading::now(&clocks));
@@ -481,6 +481,7 @@ fn tick(shared: &Shared) {
     let now = now_of(&shared.clocks);
     let mut s = locked(&shared.state);
     s.grants().sweep(&now, &requests::alive);
+    s.signin_sweep(&now);
     s.prune_app_stages(now.awake);
     s.sweep_expired_asks(&now);
     s.backups().sweep(now.awake);
@@ -758,7 +759,7 @@ fn serve(stream: &UnixStream, peer: &PeerIdentity, shared: &Shared) {
 
 /// Answers one request frame: the answer and, for a restore chunk, its
 /// delivery, which the caller holds until the answer is written.
-fn dispatch<'s>(
+pub(crate) fn dispatch<'s>(
     frame: &Frame,
     peer: &PeerIdentity,
     shared: &'s Shared,
@@ -787,9 +788,10 @@ fn respond<'s>(
         Err(e) => return proto::error_frame(None, &e).ok(),
     };
     let id = req.id;
-    // Only a `run.request` hands descriptors over; any other request that
-    // carries one is refused, and they are closed.
-    if !fds.is_empty() && req.method != RunRequest::NAME {
+    // Only a `run.request` or `signin.request` hands descriptors over; any
+    // other request that carries one is refused, and they are closed.
+    if !fds.is_empty() && req.method != RunRequest::NAME && req.method != proto::SigninRequest::NAME
+    {
         drop(fds);
         return proto::error_frame(Some(id), &RpcError::new(ErrorKind::InvalidParams)).ok();
     }
@@ -900,6 +902,30 @@ fn respond<'s>(
         proto::LoginAdd::NAME => {
             answer::<proto::LoginAdd>(id, &req, |p| items::login_add(shared, peer, p))
         }
+        proto::SigninTargetAdd::NAME => answer::<proto::SigninTargetAdd>(id, &req, |p| {
+            crate::signin::targets::add(shared, peer, p)
+        }),
+        proto::SigninTargetEdit::NAME => answer::<proto::SigninTargetEdit>(id, &req, |p| {
+            crate::signin::targets::edit(shared, peer, p)
+        }),
+        proto::SigninTargetRemove::NAME => answer::<proto::SigninTargetRemove>(id, &req, |p| {
+            crate::signin::targets::remove(shared, peer, p)
+        }),
+        proto::SigninTargetList::NAME => answer::<proto::SigninTargetList>(id, &req, |p| {
+            crate::signin::targets::list(shared, p)
+        }),
+        proto::SigninRequest::NAME => answer::<proto::SigninRequest>(id, &req, |p| {
+            crate::signin::ops::request(shared, peer, p, fds)
+        }),
+        proto::SigninStatus::NAME => answer::<proto::SigninStatus>(id, &req, |p| {
+            crate::signin::ops::status(shared, peer, p)
+        }),
+        proto::SigninCancel::NAME => answer::<proto::SigninCancel>(id, &req, |p| {
+            crate::signin::ops::cancel(shared, peer, p)
+        }),
+        proto::SigninEnd::NAME => answer::<proto::SigninEnd>(id, &req, |p| {
+            crate::signin::ops::end(shared, peer, p)
+        }),
         ItemsTarget::NAME => {
             answer::<ItemsTarget>(id, &req, |p| items::target_view(shared, peer, p))
         }

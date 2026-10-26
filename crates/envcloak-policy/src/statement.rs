@@ -516,6 +516,7 @@ fn mode_word(m: Mode) -> &'static str {
     match m {
         Mode::Inject => "inject",
         Mode::Proxy => "proxy",
+        Mode::SignIn(_) => "signin",
     }
 }
 
