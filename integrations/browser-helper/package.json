@@ -1,0 +1,12 @@
+{
+  "name": "envcloak-browser-helper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-generation Playwright MCP recipient browser helper for EnvCloak sign-in",
+  "main": "index.cjs",
+  "dependencies": {
+    "@playwright/mcp": "0.0.83",
+    "playwright": "1.64.0-alpha-1790635538000",
+    "playwright-core": "1.64.0-alpha-1790635538000"
+  }
+}

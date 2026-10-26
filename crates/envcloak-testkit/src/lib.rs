@@ -50,6 +50,7 @@ mod encode;
 mod fresh;
 mod home;
 pub mod lifeline;
+pub mod signin;
 pub mod transcripts;
 
 pub use canary::{Canary, by_label, canaries, fresh_seed, labels};

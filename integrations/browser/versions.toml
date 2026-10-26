@@ -1,0 +1,40 @@
+# Pinned Node.js, @playwright/mcp browser helper, and Chrome for Testing
+# builds for sign-in worker and recipient browser sessions (M2b-02, D-29,
+# D-34, Q-06).
+#
+# Both the worker browser and the recipient browser use the same pinned
+# Chrome for Testing version, verified by SHA-256 before launch. On macOS,
+# the bundle is checked to ensure com.apple.quarantine is absent before
+# starting.
+
+[node]
+version = "22.23.3"
+
+[node.sha256]
+darwin-arm64 = "68f4d07ca49e0500cc135c7e0a445093e228e42e126ac22306d045f0a8c2636b"
+linux-x64 = "fde6a4bf8d0562f7751d1a2d6cb9b417c4cfe107bbcb0aa3e9a24e125e348f48"
+
+[browser_helper]
+package = "@playwright/mcp"
+version = "0.0.83"
+playwright_version = "1.64.0-alpha-1790635538000"
+entry = "node_modules/@playwright/mcp/index.js"
+entry_sha256 = "28c639173fb79f5cae1ed44519995cea0dd2aee2f4a48a2511f06f153802b946"
+core_bundle = "node_modules/playwright-core/lib/coreBundle.js"
+core_bundle_sha256 = "cd6730be1bbcff00771a0fc1390f200306d28428ce68e305420ca623cb39cdeb"
+
+[chrome_for_testing]
+version = "151.0.7922.34"
+revision = "1234"
+
+[chrome_for_testing.url]
+darwin-arm64 = "https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.34/mac-arm64/chrome-mac-arm64.zip"
+linux-x64 = "https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.34/linux64/chrome-linux64.zip"
+
+[chrome_for_testing.entry]
+darwin-arm64 = "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+linux-x64 = "chrome-linux64/chrome"
+
+[chrome_for_testing.sha256]
+darwin-arm64 = "a596b1cfc6353e987fcec8d71a23a28cd6a9e7a6b4e20b908e4c4fcffe51158e"
+linux-x64 = "7e41e7f91068c8977939c7011642921c39f9a25f7167f6e627e938a85f7913e2"
