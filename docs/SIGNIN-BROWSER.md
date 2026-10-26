@@ -6,12 +6,12 @@ This document records the pinned versions, runtime and process measurements (`Q-
 
 All version and SHA-256 pins for the hosted browser helper live in `integrations/browser/versions.toml` and `integrations/browser-helper/package-lock.json`:
 
-| Component | Version / Revision | Entry / Binary | SHA-256 (`darwin-arm64`) |
-| --- | --- | --- | --- |
-| Node.js runtime | `22.23.3` | `bin/node` | `68f4d07ca49e0500cc135c7e0a445093e228e42e126ac22306d045f0a8c2636b` |
-| `@playwright/mcp` | `0.0.83` | `node_modules/@playwright/mcp/index.js` | `f074f600f153506ec534bc816e49e1948ba103864112e5ce310668cf1a1d8013` |
-| `playwright` / `playwright-core` | `1.64.0-alpha-1790635538000` | `node_modules/playwright-core/lib/mcpBundleImpl.js` | `bf0d6770a7262d9f3fd9d64377ad269ef7e3801831ac96b75e1274ac3c90ef96` |
-| Chrome for Testing | `151.0.7922.34` (`chromium-1234`) | `chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing` | `a596b1cfc6353e987fcec8d71a23a28cd6a9e7a6b4e20b908e4c4fcffe51158e` |
+| Component | Version / Revision | Entry / Binary | SHA-256 (`darwin-arm64`) | SHA-256 (`linux-x64`) |
+| --- | --- | --- | --- | --- |
+| Node.js runtime | `22.23.3` | `bin/node` | `68f4d07ca49e0500cc135c7e0a445093e228e42e126ac22306d045f0a8c2636b` | `fde6a4bf8d0562f7751d1a2d6cb9b417c4cfe107bbcb0aa3e9a24e125e348f48` |
+| `@playwright/mcp` | `0.0.83` | `node_modules/@playwright/mcp/index.js` | `28c639173fb79f5cae1ed44519995cea0dd2aee2f4a48a2511f06f153802b946` | `28c639173fb79f5cae1ed44519995cea0dd2aee2f4a48a2511f06f153802b946` |
+| `playwright` / `playwright-core` | `1.64.0-alpha-1790635538000` | `node_modules/playwright-core/lib/coreBundle.js` | `cd6730be1bbcff00771a0fc1390f200306d28428ce68e305420ca623cb39cdeb` | `cd6730be1bbcff00771a0fc1390f200306d28428ce68e305420ca623cb39cdeb` |
+| Chrome for Testing | `151.0.7922.34` (`chromium-1234`) | `chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing` / `chrome-linux64/chrome` | `a596b1cfc6353e987fcec8d71a23a28cd6a9e7a6b4e20b908e4c4fcffe51158e` | `0b20b130e7edd9dd51873be867761295fe0cfad490c2b9a64f95bd3cfc08fa71` |
 
 ### Q-06 Node Runtime Decision and Measurements
 

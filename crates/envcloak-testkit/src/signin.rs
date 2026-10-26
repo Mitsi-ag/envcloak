@@ -296,18 +296,29 @@ pub fn verify_chrome_executable(chrome_exe: &Path, expected_sha256: &str) -> Res
     Ok(())
 }
 
-/// Finds and verifies the pinned Node runtime, `@playwright/mcp` helper
-/// modules, and Chrome for Testing executable against `versions_toml`.
+/// Environment variable set in CI browser jobs so a missing or mismatched
+/// browser runtime fails the test instead of skipping.
+pub const REQUIRE_BROWSER_RUNTIME_VAR: &str = "ENVCLOAK_REQUIRE_BROWSER_RUNTIME";
+
+/// Command to provision and verify the pinned browser runtime.
+pub const INSTALL_BROWSER_RUNTIME: &str = "python3 scripts/install-browser-runtime.py";
+
+/// Resolves and verifies the pinned Node.js binary against `pins`.
+///
+/// Checks `ENVCLOAK_NODE_BIN` first, then `<cache_dir>/node-<version>-<plat>/bin/node`,
+/// and verifies its SHA-256 against `pins.node_sha256`.
 ///
 /// # Errors
-/// Returns why any component is missing or fails its SHA-256 / version pin.
-pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRuntime, String> {
-    let pins = read_browser_pins(versions_toml)?;
+/// Returns an error if the binary is missing or its SHA-256 does not match `pins.node_sha256`.
+pub fn resolve_node_binary(pins: &BrowserPins) -> Result<PathBuf, String> {
     let plat = platform().ok_or_else(|| "unsupported platform".to_owned())?;
-
-    let node_exe = cache_dir()
-        .join(format!("node-{}-{plat}", pins.node_version))
-        .join("bin/node");
+    let node_exe = if let Some(env_node) = std::env::var_os("ENVCLOAK_NODE_BIN") {
+        PathBuf::from(env_node)
+    } else {
+        cache_dir()
+            .join(format!("node-{}-{plat}", pins.node_version))
+            .join("bin/node")
+    };
     let got_node = sha256_file(&node_exe)
         .map_err(|e| format!("pinned Node missing at {}: {e}", node_exe.display()))?;
     if got_node != pins.node_sha256 {
@@ -317,6 +328,18 @@ pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRu
             pins.node_sha256
         ));
     }
+    Ok(node_exe)
+}
+
+/// Finds and verifies the pinned Node runtime, `@playwright/mcp` helper
+/// modules, and Chrome for Testing executable against `versions_toml`.
+///
+/// # Errors
+/// Returns why any component is missing or fails its SHA-256 / version pin.
+pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRuntime, String> {
+    let pins = read_browser_pins(versions_toml)?;
+    let plat = platform().ok_or_else(|| "unsupported platform".to_owned())?;
+    let node_exe = resolve_node_binary(&pins)?;
 
     let root = repo_root();
     let helper_dir = root.join("integrations/browser-helper");
@@ -326,6 +349,9 @@ pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRu
     }
 
     let mut module_candidates = Vec::new();
+    if let Some(env_dir) = std::env::var_os("ENVCLOAK_BROWSER_HELPER_NODE_MODULES") {
+        module_candidates.push(PathBuf::from(env_dir));
+    }
     if let Some(env_dir) = std::env::var_os("ENVCLOAK_BROWSER_HELPER_MODULES") {
         module_candidates.push(PathBuf::from(env_dir));
     }
@@ -335,9 +361,7 @@ pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRu
             .join(format!("browser-helper-{}-{plat}", pins.helper_version))
             .join("node_modules"),
     );
-    module_candidates.push(PathBuf::from(
-        "/Users/mitsi/.npm/_npx/9833c18b2d85bc59/node_modules",
-    ));
+    module_candidates.push(cache_dir().join("browser-helper").join("node_modules"));
 
     let mut verified_modules = None;
     let mut last_mod_err = String::from("no browser-helper node_modules candidate found");
@@ -397,17 +421,22 @@ pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRu
     let helper_modules = verified_modules.ok_or(last_mod_err)?;
 
     let mut chrome_candidates = Vec::new();
+    if let Some(env_chrome) = std::env::var_os("ENVCLOAK_CHROME_FOR_TESTING_BIN") {
+        chrome_candidates.push(PathBuf::from(env_chrome));
+    }
     if let Some(env_chrome) = std::env::var_os("ENVCLOAK_CHROME_FOR_TESTING") {
         chrome_candidates.push(PathBuf::from(env_chrome));
+    }
+    if let Some(pw_path) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+        chrome_candidates.push(
+            PathBuf::from(pw_path)
+                .join(format!("chromium-{}", pins.chrome_revision))
+                .join(&pins.chrome_entry),
+        );
     }
     chrome_candidates.push(
         cache_dir()
             .join(format!("chrome-for-testing-{}-{plat}", pins.chrome_version))
-            .join(&pins.chrome_entry),
-    );
-    chrome_candidates.push(
-        PathBuf::from("/Volumes/KeenShiftDev/caches/ms-playwright")
-            .join(format!("chromium-{}", pins.chrome_revision))
             .join(&pins.chrome_entry),
     );
     if let Some(home) = std::env::var_os("HOME") {
@@ -445,6 +474,32 @@ pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRu
         helper_modules,
         chrome_exe: found_chrome,
     })
+}
+
+/// Resolves and verifies the pinned browser runtime for tests (`agents::require`
+/// pattern).
+///
+/// When the runtime is not installed in the cache, skips the test with a notice
+/// on stderr unless `ENVCLOAK_REQUIRE_BROWSER_RUNTIME` or
+/// `ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS` is set, in which case it panics.
+///
+/// # Panics
+/// Panics if `ENVCLOAK_REQUIRE_BROWSER_RUNTIME` or
+/// `ENVCLOAK_TEST_REQUIRE_AGENT_HOSTS` is set and the runtime is missing or
+/// fails verification.
+pub fn require_browser_runtime() -> Option<VerifiedBrowserRuntime> {
+    match resolve_browser_runtime(&browser_versions_path()) {
+        Ok(rt) => Some(rt),
+        Err(why) => {
+            if std::env::var_os(REQUIRE_BROWSER_RUNTIME_VAR).is_some()
+                || std::env::var_os(crate::agents::REQUIRE_VAR).is_some()
+            {
+                panic!("browser runtime required ({why}; run: {INSTALL_BROWSER_RUNTIME})");
+            }
+            eprintln!("skipping browser runtime test ({why}; run: {INSTALL_BROWSER_RUNTIME})");
+            None
+        }
+    }
 }
 
 /// Bounded response returned by the helper's `read_identity` control command.
@@ -1091,19 +1146,7 @@ impl SigninFixture {
     /// fixture process fails to report its listening ports.
     pub fn try_start() -> Result<(Origins, Control), String> {
         let pins = read_browser_pins(&browser_versions_path())?;
-        let plat = platform().ok_or_else(|| "unsupported platform".to_owned())?;
-        let node_exe = cache_dir()
-            .join(format!("node-{}-{plat}", pins.node_version))
-            .join("bin/node");
-        let got_node = sha256_file(&node_exe)
-            .map_err(|e| format!("pinned Node missing at {}: {e}", node_exe.display()))?;
-        if got_node != pins.node_sha256 {
-            return Err(format!(
-                "node_hash_mismatch: {} has {got_node}, expected {}",
-                node_exe.display(),
-                pins.node_sha256
-            ));
-        }
+        let node_exe = resolve_node_binary(&pins)?;
 
         let script = repo_root().join("crates/envcloak-e2e/fixtures/signin/server.cjs");
         if !script.is_file() {

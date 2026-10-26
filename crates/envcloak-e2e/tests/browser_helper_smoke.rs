@@ -11,7 +11,8 @@ use envcloak_testkit::signin::{
     ALLOWED_BROWSER_TOOLS, BrowserSupervisor, CONTEXT_NOT_PUBLISHED, CookieScopeReport,
     ExpectedIdentity, FORBIDDEN_PATH_ARGS, SigninFixture, SupervisorOptions, ToolAllowlist,
     browser_versions_path, http_request, measure_chrome_pipe_and_session, parse_counters,
-    read_browser_pins, resolve_browser_runtime, run_cookie_scope_probe, verify_chrome_executable,
+    read_browser_pins, require_browser_runtime, resolve_node_binary, run_cookie_scope_probe,
+    verify_chrome_executable,
 };
 use serde_json::{Value, json};
 
@@ -30,6 +31,41 @@ fn extract_text(result: &Value) -> String {
 
 #[test]
 fn tool_allowlist_snapshot_and_refusals() {
+    // Pure ToolAllowlist::admit and ToolAllowlist::list checks run unconditionally.
+    assert_eq!(
+        ToolAllowlist::admit(
+            "browser_navigate",
+            &json!({ "url": "http://acme.localhost:8080/login" })
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        ToolAllowlist::admit(
+            "browser_navigate",
+            &json!({ "url": "https://127.0.0.1:8443/login" })
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        ToolAllowlist::admit("browser_run_code_unsafe", &json!({})),
+        Err("tool_not_allowed")
+    );
+    assert_eq!(
+        ToolAllowlist::admit(
+            "browser_take_screenshot",
+            &json!({ "filename": "/tmp/out.png" })
+        ),
+        Err("tool_not_allowed")
+    );
+    assert_eq!(
+        ToolAllowlist::admit("browser_navigate", &json!({ "url": "file:///etc/passwd" })),
+        Err("tool_not_allowed")
+    );
+
+    let Some(_runtime) = require_browser_runtime() else {
+        return;
+    };
+
     let mut sup = BrowserSupervisor::start(SupervisorOptions::default())
         .expect("start BrowserSupervisor with pinned runtime");
     sup.mcp_initialize().expect("mcp initialize");
@@ -197,6 +233,9 @@ fn tool_allowlist_snapshot_and_refusals() {
 
 #[test]
 fn all_nineteen_mcp_context_observations_and_generation_isolation() {
+    let Some(_runtime) = require_browser_runtime() else {
+        return;
+    };
     let (origins, control) = SigninFixture::start();
 
     let mut sup_a = BrowserSupervisor::start(SupervisorOptions {
@@ -693,6 +732,9 @@ fn all_nineteen_mcp_context_observations_and_generation_isolation() {
 
 #[test]
 fn si_16_cookie_scope_probe_matches_rfc_6265() {
+    let Some(_runtime) = require_browser_runtime() else {
+        return;
+    };
     let report = run_cookie_scope_probe().expect("run_cookie_scope_probe");
     assert_eq!(
         report,
@@ -712,6 +754,40 @@ fn si_16_cookie_scope_probe_matches_rfc_6265() {
 
 #[test]
 fn fixture_totp_rfc_6238_vectors_and_controls() {
+    // Pure counter parser self-test runs unconditionally (catches off-by-one mutations).
+    let sample = json!({
+        "password_submissions": 3,
+        "code_submissions": 2,
+        "wrong_target_submissions": 5,
+        "mints": 1,
+        "revocations": 4,
+        "observer_cookie_hits": 2,
+        "exfiltration_by_channel": { "fetch": 1, "beacon": 2 },
+        "by_origin": {
+            "idp": {
+                "requests": 7,
+                "password_submissions": 3,
+                "code_submissions": 2,
+                "mints": 1,
+                "revocations": 0,
+                "exfiltrations": 0
+            }
+        }
+    });
+    let parsed = parse_counters(&sample).expect("parse_counters sample");
+    assert_eq!(parsed.password_submissions, 3);
+    assert_eq!(parsed.code_submissions, 2);
+    assert_eq!(parsed.wrong_target_submissions, 5);
+    assert_eq!(parsed.mints, 1);
+    assert_eq!(parsed.revocations, 4);
+    assert_eq!(parsed.observer_cookie_hits, 2);
+    assert_eq!(parsed.exfiltration_by_channel.get("fetch"), Some(&1));
+    assert_eq!(parsed.exfiltration_by_channel.get("beacon"), Some(&2));
+    assert_eq!(parsed.by_origin.get("idp").unwrap().requests, 7);
+
+    let Some(_runtime) = require_browser_runtime() else {
+        return;
+    };
     let (origins, control) = SigninFixture::start();
 
     // RFC 6238 Appendix B canonical test secrets (ASCII):
@@ -763,37 +839,6 @@ fn fixture_totp_rfc_6238_vectors_and_controls() {
             "6-digit TOTP failed at ts={ts} alg={alg}: expected {expected_6}, got {v6:?}"
         );
     }
-
-    // Counter parser self-test (catches off-by-one mutations in counter parsing).
-    let sample = json!({
-        "password_submissions": 3,
-        "code_submissions": 2,
-        "wrong_target_submissions": 5,
-        "mints": 1,
-        "revocations": 4,
-        "observer_cookie_hits": 2,
-        "exfiltration_by_channel": { "fetch": 1, "beacon": 2 },
-        "by_origin": {
-            "idp": {
-                "requests": 7,
-                "password_submissions": 3,
-                "code_submissions": 2,
-                "mints": 1,
-                "revocations": 0,
-                "exfiltrations": 0
-            }
-        }
-    });
-    let parsed = parse_counters(&sample).expect("parse_counters sample");
-    assert_eq!(parsed.password_submissions, 3);
-    assert_eq!(parsed.code_submissions, 2);
-    assert_eq!(parsed.wrong_target_submissions, 5);
-    assert_eq!(parsed.mints, 1);
-    assert_eq!(parsed.revocations, 4);
-    assert_eq!(parsed.observer_cookie_hits, 2);
-    assert_eq!(parsed.exfiltration_by_channel.get("fetch"), Some(&1));
-    assert_eq!(parsed.exfiltration_by_channel.get("beacon"), Some(&2));
-    assert_eq!(parsed.by_origin.get("idp").unwrap().requests, 7);
 
     // Concurrent submissions & wrong-target / exfiltration channel counters.
     control.reset_counters().expect("reset_counters");
@@ -1093,8 +1138,15 @@ fn fixture_totp_rfc_6238_vectors_and_controls() {
 
 #[test]
 fn wrong_chrome_for_testing_hash_is_refused() {
-    let runtime =
-        resolve_browser_runtime(&browser_versions_path()).expect("resolve_browser_runtime");
+    let pins = read_browser_pins(&browser_versions_path()).expect("read_browser_pins");
+    assert_eq!(
+        pins.node_version, "22.23.3",
+        "browser versions.toml must pin Node 22.23.3"
+    );
+
+    let Some(runtime) = require_browser_runtime() else {
+        return;
+    };
     let bad_hash = "0000000000000000000000000000000000000000000000000000000000000000";
     let err = verify_chrome_executable(&runtime.chrome_exe, bad_hash)
         .expect_err("wrong Chrome SHA-256 must fail verification");
@@ -1103,8 +1155,17 @@ fn wrong_chrome_for_testing_hash_is_refused() {
         "expected chrome_for_testing_hash_mismatch, got {err}"
     );
 
+    // Also verify resolve_node_binary refuses a tampered Node SHA-256.
+    let mut bad_node_pins = pins.clone();
+    bad_node_pins.node_sha256 = bad_hash.to_owned();
+    let node_err =
+        resolve_node_binary(&bad_node_pins).expect_err("wrong Node SHA-256 must fail verification");
+    assert!(
+        node_err.contains("node_hash_mismatch"),
+        "expected node_hash_mismatch, got {node_err}"
+    );
+
     // Also test BrowserSupervisor::start_with_versions with a tampered versions.toml.
-    let pins = read_browser_pins(&browser_versions_path()).expect("read_browser_pins");
     let orig_toml =
         std::fs::read_to_string(browser_versions_path()).expect("read browser versions.toml");
     let tampered_toml = orig_toml.replace(&pins.chrome_sha256, bad_hash);
@@ -1124,6 +1185,9 @@ fn wrong_chrome_for_testing_hash_is_refused() {
 
 #[test]
 fn chrome_pipe_exit_and_session_containment_measurement() {
+    let Some(_runtime) = require_browser_runtime() else {
+        return;
+    };
     let m = measure_chrome_pipe_and_session().expect("measure_chrome_pipe_and_session");
     assert!(
         m.product.contains("151.0.7922.34"),

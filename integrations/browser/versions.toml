@@ -10,9 +10,21 @@
 [node]
 version = "22.23.3"
 
+[node.url]
+darwin-arm64 = "https://nodejs.org/dist/v{version}/node-v{version}-darwin-arm64.tar.gz"
+linux-x64 = "https://nodejs.org/dist/v{version}/node-v{version}-linux-x64.tar.xz"
+
+[node.archive_sha256]
+darwin-arm64 = "23b25245dcfb9af7262f8ff142e9e2e0af025368117329e7a7458a51e5922f53"
+linux-x64 = "df450af89261115ef9f9e3830c3eeb2cc9213b63c720b1af623cb5dcbe2e02de"
+
 [node.sha256]
 darwin-arm64 = "68f4d07ca49e0500cc135c7e0a445093e228e42e126ac22306d045f0a8c2636b"
 linux-x64 = "fde6a4bf8d0562f7751d1a2d6cb9b417c4cfe107bbcb0aa3e9a24e125e348f48"
+
+[node.tree_sha256]
+darwin-arm64 = "50c7196e2751a2336079f05f50a4bd220dca035cfa9f3bb8fb8acaa43b985f9e"
+linux-x64 = "9480f03571438d3e0c800174f657e2f529ce647d443d7dc040034ae675e8febf"
 
 [browser_helper]
 package = "@playwright/mcp"
@@ -31,10 +43,14 @@ revision = "1234"
 darwin-arm64 = "https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.34/mac-arm64/chrome-mac-arm64.zip"
 linux-x64 = "https://storage.googleapis.com/chrome-for-testing-public/151.0.7922.34/linux64/chrome-linux64.zip"
 
+[chrome_for_testing.archive_sha256]
+darwin-arm64 = "01a23ef9501b2745e0c2944c2e583207e6f6132d8d91c3a87ff65b5079e438ef"
+linux-x64 = "ae8736ac28bc69278551500f219fc749575648263c43ec5990749eff43b9fcf8"
+
 [chrome_for_testing.entry]
 darwin-arm64 = "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
 linux-x64 = "chrome-linux64/chrome"
 
 [chrome_for_testing.sha256]
 darwin-arm64 = "a596b1cfc6353e987fcec8d71a23a28cd6a9e7a6b4e20b908e4c4fcffe51158e"
-linux-x64 = "7e41e7f91068c8977939c7011642921c39f9a25f7167f6e627e938a85f7913e2"
+linux-x64 = "0b20b130e7edd9dd51873be867761295fe0cfad490c2b9a64f95bd3cfc08fa71"
