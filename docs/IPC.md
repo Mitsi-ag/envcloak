@@ -753,5 +753,119 @@ The M3 plan's `status.daemon.identity` is not a row here: `envcloak status --jso
 |---|---|---|---|
 | `envcloak-unlocker-statement/1` | M3-08 | landed | adding a Secure Enclave unlocker, approved in a terminal with the passphrase: its label, the SHA-256 fingerprints of both its public keys and the Team ID and signing identifier the daemon verified for the app (plan D3-08) |
 | `envcloak-write-statement/1` | M3-14 | landed | signed in the app: replacing or removing an item, adding or removing a Secure Enclave unlocker, removing the passphrase unlocker |
-| `envcloak-reveal-statement/1` | M3-14 | landed | a reveal in the app, signed (SPEC §6.7) |
+| `envcloak-reveal-statement/1` | M3-14 | landed | a reveal in the app, signed (SPEC §6.7; M4-01 D4-12 note: includes item class and field kind; `envcloak-reveal-statement/2` is reserved below only if needed by M4-23) |
+<!-- /reservations -->
+
+## Reserved for M4
+
+Status: M4 plan decisions D4-03, D4-11, D4-12, D4-13, D4-14, D4-15, D4-16, D4-18, D4-19, D4-21, D4-22, D4-23 and D4-27, written by task M4-01. Every name and number the M4 tasks will add to the protocol and to the CLI's own failure tokens is assigned to its task here before any code uses it, so M4's lanes and the shared protocol files never take the same entry. The vault's numbers (audit kinds 60 to 70, item class 5, field tags 17 to 19 and policy kinds 5 to 11) are in VAULT.md under the same heading. Nothing below is built yet.
+
+The rules and statuses are those of "Reserved for M2 and M2b" and "Reserved for M3" above, and `scripts/check-reservations.py` reads each registry's tables across all sections as one table: a name or number is taken once across them, and a section holds each table at most once. A row here names an M4 task (`M4-01` to `M4-25`, with `M4-06a`, `M4-06b`, `M4-09a` and `M4-09b`) or join (`M4-J1` to `M4-J6`), a later milestone or `spare`. The MCP tool `usage_summary` (which task M4-14 lands) is already reserved in the `mcp_tool` table under "Reserved for M2 and M2b", and the two statement domains M4's signed app actions use (`envcloak-write-statement/1` for proof-gated app writes, and `envcloak-reveal-statement/1` carrying class and field kind per D4-12, with `envcloak-reveal-statement/2` conditionally reserved below) are in `statement_domain`.
+
+**Error kinds** (`data.kind`; -32060 to -32066, after M3's -32051 to -32055):
+
+<!-- reservations:error_kind -->
+| Token | Code | Task | Status | Use |
+|---|---|---|---|---|
+| `poll_disabled` | -32060 | M4-09b | reserved | polling is off for the provider (`spend.poll.now`, D4-13) |
+| `adapter_unavailable` | -32061 | M4-09b | reserved | the provider has no polling adapter in this build, or the item is not of the class the adapter reads (D4-02, D4-06) |
+| `currency_mismatch` | -32062 | M4-11 | reserved | a budget or figure in a currency that does not match the target's currency (D4-07, D4-08) |
+| `card_refused` | -32063 | M4-16 | reserved | a card number or CVV sent when its opt-in is off, a card field requested outside `app.reveal`, or cardholder, billing address or expiry requested by a caller with agent evidence (D4-11, D4-22, SPEC §2a-bis) |
+| `human_only` | -32064 | M4-03 | reserved | a write in D4-14's list, `spend.poll.enable`, or `spend codexbar` called by a peer whose evidence names an agent, refused before any read or proof check (D4-13, D4-14, D4-21, SPEC §10b) |
+| `admin_shaped` | -32065 | M4-19 | reserved | an `sk-admin-` or `sk-ant-admin01-` value added as a resolvable `secret` without `--store-admin-as-secret` (D4-06, SPEC §6.3, §8) |
+| `ingest_limited` | -32066 | M4-03 | reserved | `spend.ingest` called more than 12 times in an hour from one subject root (D4-16) |
+<!-- /reservations -->
+
+**Reasons** (`data.reason`; each joins `envcloak_ipc::proto::REASONS` and its words in the CLI when it lands):
+
+<!-- reservations:reason -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `card_opt_in_required` | M4-16 | reserved | `card_refused`: the card number or CVV opt-in is off for the card (`card.optin`, D4-11) |
+| `codexbar_invalid` | M4-18 | reserved | `invalid_params` on `spend.ingest` or `spend codexbar`: output exceeded 1 MiB, named another provider, or did not carry the API `source` value (D4-21) |
+| `downgrade_refused` | M4-03 | reserved | a `client_reported` or `manual` figure lower than the current polled figure was recorded beside it without lowering the displayed spend or clearing an alert (D4-15) |
+| `duplicate_subscription` | M4-03 | reserved | `subs.add` named a subscription that already exists |
+| `poller_failed` | M4-09a | reserved | the `envcloak spend-poller` helper exited without a valid `PollResultFrame` or failed its checked-spawn verification (D4-03) |
+| `provider_denied` | M4-07 | reserved | a poll request URL matched a `denied_paths` entry or the usage-credential never list (D4-04, D4-06, D4-29) |
+| `stale_figure` | M4-05 | reserved | a provider cap read is older than 26 hours and therefore does not qualify as a hard cap (D4-07) |
+| `usage_credential_refused` | M4-19 | reserved | an attempt to bind, resolve, inject or reveal a `usage_credential` item (class 5, D4-06) |
+<!-- /reservations -->
+
+**Methods** (client role, SPEC §4.3; each proof-taking method refuses callers with agent evidence before checking the proof, D4-14, SPEC §10b):
+
+<!-- reservations:method -->
+| Method | Task | Status | Use |
+|---|---|---|---|
+| `spend.summary` | M4-03 | reserved | spend roll-up by provider, account or project: accounts, keys with expiry, subscriptions, monthly burn per currency and active alerts, paged within a frame; tightened to the named project without emails for callers with agent evidence (D4-10, D4-22, SPEC §4.3, §8) |
+| `spend.item` | M4-03 | reserved | one key's spend, balance, attribution, status, control rows and links; tightened for callers with agent evidence (D4-10, D4-22, SPEC §4.3, §8) |
+| `spend.manual.set` | M4-03 | reserved | sets a manual balance, renewal, plan or provider cap fact (`manual_fact` or `control_fact` policy record, source `manual`); raising a manual balance is a proof write refused to callers with agent evidence first (D4-10, D4-14, D4-15, SPEC §4.3, §10b) |
+| `spend.ingest` | M4-03 | reserved | records typed `client_reported` metrics (such as `envcloak spend codexbar`), tighten-only and rate-limited to 12 calls per hour per subject root (D4-10, D4-15, D4-16, D4-21, SPEC §4.3, §4.4) |
+| `spend.poll.enable` | M4-09b | reserved | enables polling for a provider; needs no proof, refused to callers with agent evidence (D4-13, SPEC §4.3, §8) |
+| `spend.poll.disable` | M4-09b | reserved | disables polling for a provider; proof write refused to callers with agent evidence first (D4-13, D4-14, SPEC §4.3, §10b) |
+| `spend.poll.now` | M4-09b | reserved | triggers an immediate poll for enabled providers through a daemon-started `envcloak spend-poller` child over its inherited control pipe (D4-03, D4-13, SPEC §4.3, §4.4, §8) |
+| `spend.link` | M4-20 | reserved | links a key to a provider key id reported by a `usage_credential` poll (`account_link` policy record, `admin_linked_by_person`); proof write refused to callers with agent evidence first (D4-14, D4-19, SPEC §4.3, §10b) |
+| `spend.codexbar.set_path` | M4-18 | reserved | registers the absolute path and code identity (`cdhash` and Team ID on macOS, SHA-256 on Linux) of the pinned CodexBar binary; proof write refused to callers with agent evidence first (D4-14, D4-21, SPEC §4.3, §10b) |
+| `subs.add` | M4-03 | reserved | adds a subscription (`subscription` policy record, SPEC §2a-bis, §4.3) |
+| `subs.list` | M4-03 | reserved | lists subscriptions and monthly burn per currency; scoped to the named project for callers with agent evidence (D4-22, SPEC §2a-bis, §4.3) |
+| `subs.remove` | M4-03 | reserved | removes a subscription; proof write refused to callers with agent evidence first (D4-14, SPEC §4.3, §10b) |
+| `budget.add` | M4-11 | reserved | adds or lowers a budget (`budget` policy record); raising an existing budget's amount or widening its scope is a proof write refused to callers with agent evidence first (D4-14, SPEC §2a-bis, §4.3, §10b) |
+| `budget.list` | M4-11 | reserved | lists budgets, forecasts and the five-control table rows with their availability (D4-07, D4-17, D4-28, SPEC §2a-bis, §4.3) |
+| `budget.remove` | M4-11 | reserved | removes a budget; proof write refused to callers with agent evidence first (D4-14, SPEC §4.3, §10b) |
+| `alerts.list` | M4-12 | reserved | lists active, acknowledged and snoozed spend alerts and alert rules (D4-16, SPEC §4.3, §8) |
+| `alerts.ack` | M4-12 | reserved | acknowledges an alert for its current period; proof write refused to callers with agent evidence first (D4-14, D4-16, SPEC §4.3, §10b) |
+| `alerts.snooze` | M4-12 | reserved | snoozes an alert or removes an alert rule; proof write refused to callers with agent evidence first (D4-14, D4-16, SPEC §4.3, §10b) |
+| `items.edit` | M4-03 | reserved | edits an item's metadata (`title`, `notes`, `tags`, `expires_at`, `account`, `links.*`); moving `expires_at` later or clearing it and changing `account` or `links.*` are proof writes refused to callers with agent evidence first (D4-14, D4-15, SPEC §4.3, §10b) |
+| `items.set_class` | M4-19 | reserved | re-seals a `secret` item into class 5 (`usage_credential`) in one transaction; proof write refused to callers with agent evidence first (D4-06, D4-14, SPEC §4.3, §10b) |
+| `card.add` | M4-16 | reserved | adds a payment card (`ItemClass::Card` = 2, item record version 4) with metadata and optional number and CVV when opted in (D4-11, SPEC §2a-bis, §4.3, §4.4) |
+| `card.list` | M4-16 | reserved | lists cards (brand, last four, expiry, issuer and health summary; only slug, brand and last four for callers with agent evidence; never a full number or CVV, D4-11, D4-22, SPEC §4.3) |
+| `card.show` | M4-16 | reserved | shows one card's metadata, billing links with hosts and health checklist (only slug, brand and last four for callers with agent evidence; never a full number or CVV, D4-11, D4-22, SPEC §4.3) |
+| `card.remove` | M4-16 | reserved | removes a card after taking an encrypted vault backup (`backup_failed` if the backup fails); proof write refused to callers with agent evidence first (D4-11, D4-14, SPEC §4.3, §10b) |
+| `card.optin` | M4-16 | reserved | turns a card's number or CVV storage opt-in on or off; turning the number opt-in off erases the number, CVV and card hash after a vault backup and is a proof write refused to callers with agent evidence first (D4-11, D4-14, SPEC §4.3, §10b) |
+<!-- /reservations -->
+
+**App-role methods** (SPEC §4.3; the app calls the client methods above plus `app.reveal`, signed with `envcloak-write-statement/1` or `envcloak-reveal-statement/1`, and `app.card.paste` if M3-14's paste does not carry an item class):
+
+<!-- reservations:app_method -->
+| Method | Task | Status | Use |
+|---|---|---|---|
+| `app.card.paste` | M4-23 | reserved | saves a staged card number or CVV from the app's sealed paste flow if `app.paste` does not carry an item class (D4-11, M4-23, SPEC §4.3) |
+<!-- /reservations -->
+
+**Fields and answers** added to existing methods:
+
+<!-- reservations:field -->
+| Method | Field | Task | Status | Use |
+|---|---|---|---|---|
+| `status` | `spend` | M4-12 | reserved | spend change counter and active alert summary on `status` so the app refetches `SpendStore` only when spend state changed (D4-16, M4-21) |
+<!-- /reservations -->
+
+**The CLI's own failure tokens**:
+
+<!-- reservations:exit_token -->
+| Token | Task | Status | Use |
+|---|---|---|---|
+| `poll_failed` | M4-09b | reserved | `envcloak spend poll now` failed or reported a non-ok poll result class |
+| `card_invalid` | M4-16 | reserved | `envcloak card` rejected invalid card input before or at the daemon |
+| `budget_invalid` | M4-13 | reserved | `envcloak budget` given an invalid scope, amount, currency or time zone |
+| `sub_invalid` | M4-04 | reserved | `envcloak sub` given an invalid amount, currency or cadence |
+| `alert_unknown` | M4-13 | reserved | `envcloak alerts ack` or `snooze` named an alert or rule that does not exist |
+| `codexbar_unverified` | M4-18 | reserved | `envcloak spend codexbar` refused because no binary path is configured or the binary's code identity did not match (D4-21) |
+<!-- /reservations -->
+
+**Control-pipe messages** (`poller` helper channel between `envcloakd` and `envcloak spend-poller`, D4-03, D4-27; never a socket method):
+
+<!-- reservations:control_message -->
+| Channel | Message | Task | Status | Use |
+|---|---|---|---|---|
+| `poller` | `PollJobFrame` | M4-09a | reserved | daemon to `envcloak spend-poller`: one poll job (one key, one adapter specification and the item's allowed-host snapshot, D4-03, D4-27) |
+| `poller` | `PollResultFrame` | M4-09a | reserved | `envcloak spend-poller` to daemon: the bounded `PollResult` (`ResultClass` and typed metric values only, never raw response bytes, D4-03, D4-27) |
+| `poller` | `PollAbort` | M4-09a | reserved | daemon to `envcloak spend-poller`: abort the in-flight poll immediately (D4-03) |
+<!-- /reservations -->
+
+**Statement domains**:
+
+<!-- reservations:statement_domain -->
+| Domain | Task | Status | Use |
+|---|---|---|---|
+| `envcloak-reveal-statement/2` | M4-23 | reserved | conditional on D4-12: signed in the app for a card or secret reveal if `envcloak-reveal-statement/1` (M3-14) does not already carry the item class and field kind |
 <!-- /reservations -->

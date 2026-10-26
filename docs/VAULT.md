@@ -463,3 +463,59 @@ Status: M3 plan decision D3-02 and lane C's rule 9, written by task M3-01. The v
 |---|---|---|---|---|
 | 3 | `secure_enclave` | M3-08 | landed | the macOS Secure Enclave unlocker: the VMK HPKE-sealed to the `unlock` public key, beside the pinned `approve` public key, the label, the creation time and the Team ID and signing identifier it was enrolled under; public keys only (SPEC §5) |
 <!-- /reservations -->
+
+## Reserved for M4
+
+Status: M4 plan decisions D4-01, D4-06, D4-09, D4-11, D4-13, D4-14, D4-16, D4-19 and K4-16, written by task M4-01. The vault's numbers that the M4 tasks will add are assigned here before any code uses them, under the rules and statuses of IPC.md's "Reserved for M2 and M2b", "Reserved for M3" and "Reserved for M4", which `scripts/check-reservations.py` checks against the code. Numbers are never reused. Nothing below is built yet.
+
+M4 adds no vault schema migration unless M4-02's write-cost measurement fires K4-04's kill criterion: schema version stays 2 (plan decisions D4-09, K4-16). Spend state is stored as typed, versioned `PolicyRecord` variants (`PolicyKind` 5 to 11 below) in the existing `policies` table (`TableTag::Policies` = 3, `FieldTag::Policy` = 7). `usage_credential` is `ItemClass` 5 in the existing `items` table (D4-06). Payment cards use M1's baseline `ItemClass::Card` = 2 (`scripts/check-reservations-baseline.txt`) with item record version 4 (card part: brand, last four, expiry month and year, issuer, cardholder, billing address, billing providers and accounts, and the number, CVV and sync opt-ins, sealed under the `card` subkey and written only for `card` items while `secret`, `issuer_credential` and `login` items continue to be written as version 3; D4-11), field kinds 5 (`card_number`) and 6 (`card_cvv`) in field record version 2, associated-data `FieldTag` entries 17 to 19 below, and the keyed-hash domain `envcloak/v2/card-number` under the `card` subkey beside `envcloak/v2/login-value` (written only when the card number opt-in is on; D4-11, K4-16). Because these new tags and hash domain apply only to newly created card rows and never re-seal or alter any existing schema-version-2 row, they fit schema version 2 without a migration (K4-16).
+
+**Audit kinds** (60 to 70, after M3's 46 to 50):
+
+<!-- reservations:audit_kind -->
+| Number | Token | Task | Status | Use |
+|---|---|---|---|---|
+| 60 | `spend_poll` | M4-09b | reserved | a poll about to run, written durably before the key is written to the poller's pipe (D4-13, SPEC §3 principle 4) |
+| 61 | `spend_poll_result` | M4-09b | reserved | a poll finished, with its `ResultClass` and provider; never a response body or key (D4-03, D4-04) |
+| 62 | `spend_ingest` | M4-03 | reserved | typed `client_reported` metrics ingested through `spend.ingest`, with the subject kind and claimed tool (D4-10, D4-16, D4-21) |
+| 63 | `spend_config` | M4-03 | reserved | polling enabled or disabled, manual spend or control fact set, subscription changed, or CodexBar binary path set (D4-13, D4-14, D4-21) |
+| 64 | `budget_change` | M4-11 | reserved | a budget or alert rule added, edited, removed, acknowledged or snoozed (D4-14, D4-16) |
+| 65 | `card_add` | M4-16 | reserved | a payment card added, with its slug, brand and last four digits only (D4-11) |
+| 66 | `card_change` | M4-16 | reserved | a card's metadata changed or a card removed after a vault backup, with its slug and last four digits only (D4-11, D4-14) |
+| 67 | `card_optin` | M4-16 | reserved | a card's number or CVV opt-in turned on or off (after a vault backup when turned off, D4-11, D4-14) |
+| 68 | `item_edit` | M4-03 | reserved | an item's metadata (`title`, `notes`, `tags`, `expires_at`, `account`, `links.*`) edited via `items.edit` (D4-14, D4-15) |
+| 69 | `item_class_change` | M4-19 | reserved | an item re-sealed into class 5 (`usage_credential`) via `items.set_class`, with the old and new classes and grants ended (D4-06, D4-14) |
+| 70 | `usage_link` | M4-20 | reserved | a key linked to a provider key id via `spend.link` (D4-14, D4-19) |
+<!-- /reservations -->
+
+**Item classes** (`items.class` and the associated data's `item_class`):
+
+<!-- reservations:item_class -->
+| Number | Class | Task | Status | Use |
+|---|---|---|---|---|
+| 5 | `usage_credential` | M4-19 | reserved | a usage credential (organization or admin read key): never resolvable by any subject, opened only by the poller job builder through its typed reader (D4-06, SPEC §2a-bis, §5, §8) |
+<!-- /reservations -->
+
+**Associated-data tags** (CRYPTO.md "Associated data"):
+
+<!-- reservations:field_tag -->
+| Number | Field | Task | Status | Use |
+|---|---|---|---|---|
+| 17 | `card_meta` | M4-15 | reserved | item record version 4 card part sealed under the `card` subkey (D4-11, K4-16) |
+| 18 | `card_number` | M4-15 | reserved | a card's opted-in PAN field (`CardFieldKind::CardNumber` = 5) sealed under the `card` subkey (D4-11, K4-16) |
+| 19 | `card_cvv` | M4-15 | reserved | a card's opted-in CVV field (`CardFieldKind::CardCvv` = 6) sealed under the `card` subkey (D4-11, K4-16) |
+<!-- /reservations -->
+
+**Policy record kinds** (`policies.sealed`; each record also carries its own version):
+
+<!-- reservations:policy_kind -->
+| Number | Kind | Task | Status | Use |
+|---|---|---|---|---|
+| 5 | `subscription` | M4-02 | reserved | a recurring subscription record (`SubscriptionRecord`, D4-09, SPEC §2a-bis, §5) |
+| 6 | `budget` | M4-02 | reserved | a budget record (`BudgetRecord`: scope, amount, currency, time zone, thresholds, D4-09, SPEC §2a-bis, §5) |
+| 7 | `alert_rule` | M4-02 | reserved | an alert rule and persisted alert state (`AlertRuleRecord`: active, acknowledged and snoozed periods, D4-09, D4-16, SPEC §5, §8) |
+| 8 | `manual_fact` | M4-02 | reserved | a user-entered balance, renewal or plan fact (`ManualFactRecord`, source `manual`, D4-09, D4-10, SPEC §5, §8) |
+| 9 | `control_fact` | M4-02 | reserved | a recorded provider cap or control fact (`ControlFactRecord`, D4-07, D4-09, SPEC §2a-bis, §5) |
+| 10 | `spend_snapshot` | M4-02 | reserved | per-account spend snapshot (`SpendSnapshot`: latest typed values with source, attribution, `read_at`, `ResultClass` and 35 daily buckets, D4-09, D4-10, D4-17, SPEC §5, §8) |
+| 11 | `account_link` | M4-02 | reserved | a link between a `secret` item and a provider key id from a `usage_credential` poll (`AccountLinkRecord`, D4-09, D4-19, SPEC §5, §8) |
+<!-- /reservations -->

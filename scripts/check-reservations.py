@@ -298,14 +298,21 @@ M2_TASKS = (
 )
 # The M3 plan's lane-C tasks and its joins (M3 plan section 7).
 M3_TASKS = {"M3-%02d" % n for n in range(1, 22)} | {"M3-J%d" % n for n in range(1, 7)}
+# The M4 plan's tasks and joins (M4 plan section 7, with M4-06 and M4-09 split into a and b).
+M4_TASKS = (
+    {"M4-%02d" % n for n in range(1, 26) if n not in (6, 9)}
+    | {"M4-06a", "M4-06b", "M4-09a", "M4-09b"}
+    | {"M4-J%d" % n for n in range(1, 7)}
+)
 # Later milestones, named bare.
 LATER = {"M%d" % n for n in range(3, 12)}
-TASKS = M2_TASKS | M3_TASKS | LATER | {"spare"}
+TASKS = M2_TASKS | M3_TASKS | M4_TASKS | LATER | {"spare"}
 # The headings a reservations table sits under: each section's own tasks,
 # and its milestone (a bare later milestone must come after it).
 SECTIONS = {
     "Reserved for M2 and M2b": (M2_TASKS, 2),
     "Reserved for M3": (M3_TASKS, 3),
+    "Reserved for M4": (M4_TASKS, 4),
 }
 HEADING = re.compile(r"^## (.*?)[ \t]*$", re.M)
 STATUSES = ("reserved", "landed", "reuse")
@@ -3293,11 +3300,11 @@ def check_rows(reg, rows):
             key = "%s %s" % (scope, name)
         task, status = row["Task"], row["Status"]
         if task not in TASKS:
-            fail("%s: `%s` names %r, which is not an M2, M2b or M3 task, a later milestone or `spare`" % (where, key, task))
+            fail("%s: `%s` names %r, which is not an M2, M2b or M3 task, an M4 task, a later milestone or `spare`" % (where, key, task))
         section = row.get("_section")
         if section in SECTIONS:
             own, milestone = SECTIONS[section]
-            if task in (M2_TASKS | M3_TASKS) and task not in own:
+            if task in (M2_TASKS | M3_TASKS | M4_TASKS) and task not in own:
                 home = [s for s, (tasks, _) in SECTIONS.items() if task in tasks]
                 fail("%s: `%s` is %s's, so its row belongs under \"%s\", not \"%s\"" % (where, key, task, home[0], section))
             if task in LATER and int(task[1:]) <= milestone:
