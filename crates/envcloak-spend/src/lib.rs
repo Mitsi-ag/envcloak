@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod burn;
+pub mod controls;
 pub mod series;
 pub mod status;
 
@@ -12,6 +13,13 @@ pub use account::{
     AccountKey, Attribution, Source, SubjectKindRecord, attribution_words, source_words,
 };
 pub use burn::{Burn, CurrencyBurn, normalise_subscription_monthly};
+pub use controls::{
+    Availability, BudgetDataFeed, BudgetEvalContext, BudgetScope, CONTROL_TABLE, CapEnforcement,
+    CapResetPeriod, CapScope, Control, ControlLabel, ControlTableRow, EnforcingBasis, KeySet,
+    MAX_FRESH_CAP_AGE_SECS, PROVIDER_CONTROL_NOTES, ProviderCapFact, ProviderControlNote,
+    UnverifiedReason, controls_for, covers, format_cap_amount, hard_cap_words, label,
+    provider_note, row_for,
+};
 pub use series::{DailySeries, LAST_30_DAYS_WINDOW, Last30DaysSummary, MIN_OBSERVED_DAYS_FOR_30D};
 pub use status::{
     DEFAULT_EXPIRING_DAYS, KeyStatus, KeyStatusInputs, UNUSED_90_DAYS_SECS, effective_expiry,

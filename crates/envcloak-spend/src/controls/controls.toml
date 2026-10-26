@@ -1,0 +1,112 @@
+# Spend controls table and provider lag metadata (`SPEC §2a-bis`, `D4-07`, `D4-28`).
+#
+# Run `python3 scripts/gen-controls.py` after editing this file to regenerate
+# `crates/envcloak-spend/src/controls/table.rs`. Both `scripts/gen-controls.py`
+# and `crates/envcloak-spend/tests/labels.rs` verify that the five `[[control]]`
+# rows match the table in `docs/SPEC.md` §2a-bis byte for byte.
+
+[[control]]
+id = "provider_cap"
+name = "Provider-enforced usage cap"
+enforced_by = "The provider (a spend or key limit set in its API or dashboard)"
+stops = "Usage the provider refuses after the cap, under its own rules"
+does_not_stop = "Usage accrued before the provider applies the cap; provider-specific lag"
+
+[[control]]
+id = "proxy_gate"
+name = "Proxy spend gate (M6)"
+enforced_by = "EnvCloak's proxy, synchronously, per request. By default an estimated-spend gate. It is a hard cap only when the provider adapter supplies a conservative per-request cost bound: the proxy then atomically reserves that bound before dispatch (counting concurrent and retried requests), reconciles actual charges afterwards, and refuses request classes that have no safe bound"
+stops = "Requests through an EnvCloak proxy session once reserved or estimated spend reaches the budget"
+does_not_stop = "Traffic outside the proxy (inject mode, other machines, the provider's console); for the estimated gate, estimation error and requests already in flight"
+
+[[control]]
+id = "auto_key_disable"
+name = "Automatic key disable"
+enforced_by = "EnvCloak or Cloud, after polling usage, where the provider's API can disable a key"
+stops = "New usage after the key is disabled"
+does_not_stop = "Usage between polls and during the provider's billing lag"
+
+[[control]]
+id = "card_auth_limit"
+name = "Card authorization limit"
+enforced_by = "The card issuer"
+stops = "Payments the provider tries to collect on that card"
+does_not_stop = "Usage already delivered: the provider can bill another method, suspend the account or pursue the debt"
+
+[[control]]
+id = "alert_only"
+name = "Alert only"
+enforced_by = "Notifications"
+stops = "Nothing"
+does_not_stop = "Everything, and is not evaluated while the vault is locked or the machine sleeps"
+
+# Per-provider cap scope and stated lag (`m4/research.md` §3).
+[[provider]]
+id = "openai"
+display_name = "OpenAI"
+cap_scope = "organization and project hard spend limit"
+stated_lag = "provider-specific lag (not stated by OpenAI)"
+source = "OpenAI OpenAPI spec (`/organization/spend_limit`, `enforcement.status`)"
+
+[[provider]]
+id = "anthropic"
+display_name = "Anthropic"
+cap_scope = "organization and workspace spend limits"
+stated_lag = "usage data within 5 minutes"
+source = "platform.claude.com/docs/en/manage-claude/spend-limits-api"
+
+[[provider]]
+id = "gemini"
+display_name = "Gemini"
+cap_scope = "project spend cap, tier cap per billing account, or prepaid balance at zero"
+stated_lag = "a 10 minute latency period; batch and long jobs may continue"
+source = "ai.google.dev/gemini-api/docs/billing"
+
+[[provider]]
+id = "groq"
+display_name = "Groq"
+cap_scope = "organization monthly hard cap"
+stated_lag = "10-15 minute delay in spend tracking"
+source = "console.groq.com/docs/spend-limits"
+
+[[provider]]
+id = "mistral"
+display_name = "Mistral"
+cap_scope = "organization and workspace monthly limit"
+stated_lag = "provider-specific lag (429 when monthly limit reached)"
+source = "docs.mistral.ai/api/endpoint/beta/admin/billing"
+
+[[provider]]
+id = "openrouter"
+display_name = "OpenRouter"
+cap_scope = "per-key limit with optional reset"
+stated_lag = "provider-specific lag (402 when exceeded, per OpenRouter's documentation)"
+source = "openrouter.ai/docs/api-reference/api-keys"
+
+[[provider]]
+id = "github"
+display_name = "GitHub"
+cap_scope = "organization budgets with prevent_further_usage"
+stated_lag = "provider-specific lag"
+source = "docs.github.com/en/billing"
+
+[[provider]]
+id = "deepseek"
+display_name = "DeepSeek"
+cap_scope = "prepaid account balance"
+stated_lag = "calls stop at zero balance"
+source = "api-docs.deepseek.com"
+
+[[provider]]
+id = "moonshot"
+display_name = "Moonshot"
+cap_scope = "prepaid account balance"
+stated_lag = "calls stop at or below zero balance"
+source = "platform.kimi.ai/docs/api/balance"
+
+[[provider]]
+id = "vercel"
+display_name = "Vercel"
+cap_scope = "production deployment pause (does not cover AI Gateway)"
+stated_lag = "every few minutes"
+source = "vercel.com/docs/spend-management"
