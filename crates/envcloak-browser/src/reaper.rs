@@ -26,9 +26,7 @@
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -36,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use envcloak_sys::{
     OwnedChild, ProcessOps, create_beneath, create_rw_beneath, fail_point,
     reap_reparented_children, remove_tree_beneath_and_verify, set_child_subreaper, sync_file,
-    try_lock_exclusive,
+    try_lock_exclusive, wait_any,
 };
 
 use crate::launch::LaunchSpec;
@@ -351,8 +349,8 @@ impl Reaper {
     /// - Waits for `ReaperCommand::Stop` on `control_r`, EOF on `lifeline`, or
     ///   Chrome's exit, then runs [`execute_teardown_sequence`], replies on
     ///   `control_w`, releases `reaper.lock`, and returns [`ReaperOutcome`].
-    pub fn run<CR: Read + Send + 'static, CW: Write>(
-        control_r: CR,
+    pub fn run<CR: Read + AsFd + Send + 'static, CW: Write>(
+        mut control_r: CR,
         mut control_w: CW,
         lifeline: OwnedFd,
         spec: LaunchSpec,
@@ -413,59 +411,44 @@ impl Reaper {
         // daemon or reaper ever reading a PID from disk.
         write_worker_diagnostic(&attempt_dir_file, &child);
 
-        // 4. Watch lifeline EOF and control messages while polling `child.has_exited()`.
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let status_requested = Arc::new(AtomicBool::new(false));
-
-        {
-            let stop_lifeline = Arc::clone(&stop_flag);
-            let mut lifeline_file = File::from(lifeline);
-            let _ = std::thread::Builder::new()
-                .name("reaper-lifeline".into())
-                .spawn(move || {
-                    let mut buf = [0u8; 1];
-                    let _ = lifeline_file.read(&mut buf);
-                    stop_lifeline.store(true, Ordering::SeqCst);
-                });
-        }
-
-        {
-            let stop_ctrl = Arc::clone(&stop_flag);
-            let status_ctrl = Arc::clone(&status_requested);
-            let mut ctrl_reader = control_r;
-            let _ = std::thread::Builder::new()
-                .name("reaper-control".into())
-                .spawn(move || {
-                    let mut frame = [0u8; REAPER_COMMAND_BYTES];
-                    while ctrl_reader.read_exact(&mut frame).is_ok() {
-                        match ReaperCommand::decode(&frame) {
-                            Ok(ReaperCommand::Stop) => {
-                                stop_ctrl.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                            Ok(ReaperCommand::Status) => {
-                                status_ctrl.store(true, Ordering::SeqCst);
-                            }
-                            Err(_) => {
-                                stop_ctrl.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
-                    stop_ctrl.store(true, Ordering::SeqCst);
-                });
-        }
-
-        while !stop_flag.load(Ordering::SeqCst) {
-            if status_requested.swap(false, Ordering::SeqCst) {
-                let _ = control_w.write_all(&ReaperReply::Running.encode());
-                let _ = control_w.flush();
-            }
+        // 4. Single-threaded poll on lifeline EOF and control messages while checking `child.has_exited()`.
+        loop {
             if child.has_exited().unwrap_or(true) {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(15));
+            let ready = match wait_any(
+                &[
+                    (Some(lifeline.as_fd()), true, false),
+                    (Some(control_r.as_fd()), true, false),
+                ],
+                Some(Duration::from_millis(25)),
+            ) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if ready[0].any() {
+                break;
+            }
+            if ready[1].any() {
+                if !ready[1].readable && (ready[1].hung_up || ready[1].failed) {
+                    break;
+                }
+                let mut frame = [0u8; REAPER_COMMAND_BYTES];
+                if control_r.read_exact(&mut frame).is_err() {
+                    break;
+                }
+                match ReaperCommand::decode(&frame) {
+                    Ok(ReaperCommand::Stop) => break,
+                    Ok(ReaperCommand::Status) => {
+                        let _ = control_w.write_all(&ReaperReply::Running.encode());
+                        let _ = control_w.flush();
+                    }
+                    Err(_) => break,
+                }
+            }
         }
+        drop(lifeline);
+        drop(control_r);
 
         // 5. Execute strict teardown sequence.
         let cleanup = execute_teardown_sequence(child, &attempt_dir_file, attempt_id, true);

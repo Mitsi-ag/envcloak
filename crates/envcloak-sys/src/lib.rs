@@ -131,7 +131,7 @@ pub use fd::{
     chdir_on_spawn, claim_inherited_fd, cloexec_flag, close_on_exec_above, inherit_on_spawn,
     inherited_fd, pipe_cloexec, take_inherited_fd,
 };
-pub use fs::open_beneath;
+pub use fs::{open_beneath, open_regular_nofollow};
 pub use fsclock::wait_for_clock_past;
 pub use harden::{
     Hardening, core_dump_limit, disable_core_dumps, harden_process, hardening_report,

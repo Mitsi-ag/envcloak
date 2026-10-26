@@ -218,6 +218,12 @@ impl<R: Read, W: Write> CdpClient<R, W> {
         self.events.pop_front()
     }
 
+    /// Removes and returns a response for `id` if it has already been received
+    /// and queued in `pending_responses`.
+    pub fn take_pending_response(&mut self, id: u64) -> Option<Result<Value, CdpError>> {
+        self.pending_responses.remove(&id)
+    }
+
     /// Enables a CDP domain (`<Domain>.enable`) on `session_id` (`None` for the
     /// root browser connection). Refuses any domain outside [`ALLOWED_CDP_DOMAINS`].
     ///

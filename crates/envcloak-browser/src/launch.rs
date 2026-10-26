@@ -259,26 +259,7 @@ impl LaunchSpec {
 }
 
 fn open_regular_nofollow(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(0x0100 /* O_NOFOLLOW / platform-Handled below */)
-        .open(path)
-        .or_else(|_| std::fs::OpenOptions::new().read(true).open(path))?;
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() || !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    if !f.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    Ok(f)
+    envcloak_sys::open_regular_nofollow(path)
 }
 
 /// Computes the lowercase hex SHA-256 digest of `file` through its open file descriptor.

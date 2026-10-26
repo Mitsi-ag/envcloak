@@ -719,9 +719,53 @@ fn gate_b1_wrong_target_matrix_and_https_ca_vs_self_signed() {
         "zero credentials submitted to self-signed HTTPS origin"
     );
 
-    // 3. Registered HTTPS origin with the fixture test CA (`test_ca_spki_sha256` under
-    // `testing`): succeeds and captures the declared `session` cookie.
+    // 3. Worker POST to a registered non-entry `https://` `app` origin: `LoopbackOriginProxy`
+    // allows the `CONNECT` tunnel because `https_test_ca` is in `scope.app`, so only the
+    // worker target's CDP `Fetch.enable` (installed by `Target.setAutoAttach`) can intercept
+    // the inner HTTPS `POST` and stop the attempt with `OffOrigin` (`GuardPhase::CredentialSubmission`).
     let https_ca_origin = parse_registered(&origins.https_test_ca).expect("parse https_test_ca");
+    {
+        let non_entry_https_scope = TargetScope {
+            app: SortedSet::new(vec![app_origin.clone(), https_ca_origin.clone()])
+                .expect("valid app scope"),
+            credential_entry: SortedSet::new(vec![app_origin.clone()]).expect("valid entry scope"),
+            identity_provider: SortedSet::new(vec![]).expect("valid idp scope"),
+            callback: SortedSet::new(vec![]).expect("valid callback scope"),
+        };
+        let code = fixture_totp_code(&control, &origins.editor_totp_secret_hex, 0);
+        let worker_https_post_url = format!(
+            "{}/login/exfil?channel=worker&target={}/login",
+            origins.app, origins.https_test_ca
+        );
+        let (outcome, reply, _dir) = run_browser_login_attempt(
+            &runtime,
+            &worker_https_post_url,
+            non_entry_https_scope,
+            whoami_identity_check(),
+            expected_editor.clone(),
+            default_transfer_scope(&app_origin),
+            WorkerSessionFormat::CookiesAndStorage,
+            "editor@acme.test",
+            &origins.editor_password,
+            &[code],
+            Some(origins.host_resolver_rules.clone()),
+            Some(origins.test_ca_spki_sha256.clone()),
+        );
+        assert_eq!(
+            outcome,
+            AttemptOutcome::Stopped(WorkerStopReason::OffOrigin),
+            "worker POST to registered non-entry HTTPS app origin must be stopped by worker CDP Fetch guard"
+        );
+        assert_eq!(reply, ReaperReply::Confirmed);
+    }
+    let snap_after_worker_https = control.counters().expect("counters");
+    assert_eq!(
+        snap_after_worker_https.by_origin["https_test_ca"].password_submissions, 0,
+        "zero credentials submitted by worker to non-entry HTTPS app origin"
+    );
+
+    // 4. Registered HTTPS origin with the fixture test CA (`test_ca_spki_sha256` under
+    // `testing`): succeeds and captures the declared `session` cookie.
     let https_ca_scope = build_target_scope(&https_ca_origin, None);
     {
         let code = fixture_totp_code(&control, &origins.editor_totp_secret_hex, 0);

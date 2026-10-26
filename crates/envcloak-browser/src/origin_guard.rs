@@ -87,6 +87,7 @@ pub enum GuardPhase {
 pub struct OriginGuard {
     scope: TargetScope,
     attached_sessions: BTreeSet<String>,
+    pending_guard_commands: BTreeSet<u64>,
     violations: Vec<GuardViolation>,
 }
 
@@ -96,6 +97,7 @@ impl OriginGuard {
         Self {
             scope,
             attached_sessions: BTreeSet::new(),
+            pending_guard_commands: BTreeSet::new(),
             violations: Vec::new(),
         }
     }
@@ -285,30 +287,40 @@ impl OriginGuard {
             return Ok(());
         }
 
-        if matches!(target_type, "page" | "iframe") {
-            let _ = cdp.call(
-                Some(session_id),
-                "Target.setAutoAttach",
-                json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
-                    "flatten": true
-                }),
-            );
+        if matches!(
+            target_type,
+            "page" | "iframe" | "worker" | "shared_worker" | "service_worker"
+        ) {
+            let auto_id = cdp
+                .send_command(
+                    Some(session_id),
+                    "Target.setAutoAttach",
+                    json!({
+                        "autoAttach": true,
+                        "waitForDebuggerOnStart": true,
+                        "flatten": true
+                    }),
+                )
+                .map_err(|_| self.record_violation(GuardViolation::AttachFailed))?;
+            self.pending_guard_commands.insert(auto_id);
 
-            cdp.call(
-                Some(session_id),
-                "Fetch.enable",
-                json!({
-                    "patterns": [{ "urlPattern": "*", "requestStage": "Request" }]
-                }),
-            )
-            .map_err(|_| self.record_violation(GuardViolation::AttachFailed))?;
+            let fetch_id = cdp
+                .send_command(
+                    Some(session_id),
+                    "Fetch.enable",
+                    json!({
+                        "patterns": [{ "urlPattern": "*", "requestStage": "Request" }]
+                    }),
+                )
+                .map_err(|_| self.record_violation(GuardViolation::AttachFailed))?;
+            self.pending_guard_commands.insert(fetch_id);
 
-            let _ = cdp.call(Some(session_id), "Network.enable", json!({}));
-            let _ = cdp.call(Some(session_id), "Page.enable", json!({}));
-            let _ = cdp.call(Some(session_id), "DOM.enable", json!({}));
-            let _ = cdp.call(Some(session_id), "DOMStorage.enable", json!({}));
+            let _ = cdp.send_command(Some(session_id), "Network.enable", json!({}));
+            if matches!(target_type, "page" | "iframe") {
+                let _ = cdp.send_command(Some(session_id), "Page.enable", json!({}));
+                let _ = cdp.send_command(Some(session_id), "DOM.enable", json!({}));
+                let _ = cdp.send_command(Some(session_id), "DOMStorage.enable", json!({}));
+            }
         }
 
         // Release the target from `waitForDebuggerOnStart` without blocking on
@@ -513,11 +525,25 @@ impl OriginGuard {
     }
 
     /// Drains and processes all currently queued CDP events through
-    /// [`OriginGuard::process_cdp_event`].
+    /// [`OriginGuard::process_cdp_event`], and verifies that all pipelined
+    /// `Target.setAutoAttach` and `Fetch.enable` commands succeeded.
     pub fn drain_events<R: Read, W: Write>(
         &mut self,
         cdp: &mut CdpClient<R, W>,
     ) -> Result<(), AttemptFailure> {
+        let mut attach_failed = false;
+        self.pending_guard_commands
+            .retain(|&cmd_id| match cdp.take_pending_response(cmd_id) {
+                Some(Ok(_)) => false,
+                Some(Err(_)) => {
+                    attach_failed = true;
+                    false
+                }
+                None => true,
+            });
+        if attach_failed {
+            return Err(self.record_violation(GuardViolation::AttachFailed));
+        }
         while let Some(ev) = cdp.pop_event() {
             self.process_cdp_event(cdp, &ev)?;
         }
@@ -716,7 +742,11 @@ fn handle_proxy_client(mut client: TcpStream, guard: &OriginGuard, blocked: &Ato
             return;
         };
         let port = origin.port();
-        let Ok(mut upstream) = TcpStream::connect(("127.0.0.1", port)) else {
+        let upstream_addr = match origin.host() {
+            Host::V6(_) => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            _ => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        };
+        let Ok(mut upstream) = TcpStream::connect(upstream_addr) else {
             let _ = client.write_all(
                 b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
@@ -781,9 +811,13 @@ fn handle_proxy_client(mut client: TcpStream, guard: &OriginGuard, blocked: &Ato
     }
 
     let port = origin.port();
+    let upstream_addr = match origin.host() {
+        Host::V6(_) => std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+        _ => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+    };
 
     let path_and_query = extract_path_and_query(&full_url);
-    let Ok(mut upstream) = TcpStream::connect(("127.0.0.1", port)) else {
+    let Ok(mut upstream) = TcpStream::connect(upstream_addr) else {
         let _ = client.write_all(
             b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );

@@ -265,8 +265,13 @@ fn loopback_http_post(
         format!("{}:{port}", origin.host())
     };
 
-    let mut stream =
-        TcpStream::connect(("127.0.0.1", port)).map_err(|_| WorkerStopReason::WorkerLost)?;
+    let addr = match origin.host() {
+        envcloak_signin::Host::V6(_) => {
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))
+        }
+        _ => std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+    };
+    let mut stream = TcpStream::connect(addr).map_err(|_| WorkerStopReason::WorkerLost)?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
