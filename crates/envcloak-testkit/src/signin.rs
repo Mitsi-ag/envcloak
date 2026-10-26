@@ -303,32 +303,69 @@ pub const REQUIRE_BROWSER_RUNTIME_VAR: &str = "ENVCLOAK_REQUIRE_BROWSER_RUNTIME"
 /// Command to provision and verify the pinned browser runtime.
 pub const INSTALL_BROWSER_RUNTIME: &str = "python3 scripts/install-browser-runtime.py";
 
-/// Resolves and verifies the pinned Node.js binary against `pins`.
-///
-/// Checks `ENVCLOAK_NODE_BIN` first, then `<cache_dir>/node-<version>-<plat>/bin/node`,
-/// and verifies its SHA-256 against `pins.node_sha256`.
+/// Resolves the Node.js binary for tests and verifies its SHA-256 against
+/// `pins` when the pinned cache entry exists or `ENVCLOAK_REQUIRE_BROWSER_RUNTIME`
+/// is set; falls back to `node` on `PATH` (such as `actions/setup-node@v4` in
+/// CI's `test` job) when the pinned cache directory has not been populated.
 ///
 /// # Errors
-/// Returns an error if the binary is missing or its SHA-256 does not match `pins.node_sha256`.
+/// Returns an error if no Node binary is found or if a pinned Node binary fails
+/// its SHA-256 verification.
 pub fn resolve_node_binary(pins: &BrowserPins) -> Result<PathBuf, String> {
     let plat = platform().ok_or_else(|| "unsupported platform".to_owned())?;
-    let node_exe = if let Some(env_node) = std::env::var_os("ENVCLOAK_NODE_BIN") {
-        PathBuf::from(env_node)
-    } else {
-        cache_dir()
-            .join(format!("node-{}-{plat}", pins.node_version))
-            .join("bin/node")
-    };
-    let got_node = sha256_file(&node_exe)
-        .map_err(|e| format!("pinned Node missing at {}: {e}", node_exe.display()))?;
-    if got_node != pins.node_sha256 {
-        return Err(format!(
-            "node_hash_mismatch: {} has SHA-256 {got_node}, expected {}",
-            node_exe.display(),
-            pins.node_sha256
-        ));
+    if let Some(env_node) = std::env::var_os("ENVCLOAK_NODE_BIN") {
+        let node_exe = PathBuf::from(env_node);
+        let got_node = sha256_file(&node_exe)
+            .map_err(|e| format!("ENVCLOAK_NODE_BIN missing at {}: {e}", node_exe.display()))?;
+        if got_node != pins.node_sha256 {
+            return Err(format!(
+                "node_hash_mismatch: {} has SHA-256 {got_node}, expected {}",
+                node_exe.display(),
+                pins.node_sha256
+            ));
+        }
+        return Ok(node_exe);
     }
-    Ok(node_exe)
+
+    let pinned_exe = cache_dir()
+        .join(format!("node-{}-{plat}", pins.node_version))
+        .join("bin/node");
+    if pinned_exe.is_file() || std::env::var_os(REQUIRE_BROWSER_RUNTIME_VAR).is_some() {
+        let got_node = sha256_file(&pinned_exe)
+            .map_err(|e| format!("pinned Node missing at {}: {e}", pinned_exe.display()))?;
+        if got_node != pins.node_sha256 {
+            return Err(format!(
+                "node_hash_mismatch: {} has SHA-256 {got_node}, expected {}",
+                pinned_exe.display(),
+                pins.node_sha256
+            ));
+        }
+        return Ok(pinned_exe);
+    }
+
+    if let Some(path_os) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_os) {
+            let cand = dir.join("node");
+            if cand.is_file() {
+                return Ok(cand);
+            }
+        }
+    }
+    for fallback in [
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+        "/usr/bin/node",
+    ] {
+        let cand = PathBuf::from(fallback);
+        if cand.is_file() {
+            return Ok(cand);
+        }
+    }
+
+    Err(format!(
+        "pinned Node missing at {} and no node found on PATH",
+        pinned_exe.display()
+    ))
 }
 
 /// Finds and verifies the pinned Node runtime, `@playwright/mcp` helper
@@ -1516,10 +1553,18 @@ pub fn http_request(
         .set_write_timeout(Some(Duration::from_secs(15)))
         .map_err(|e| format!("set_write_timeout: {e}"))?;
 
-    let mut req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    let has_custom_host = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
+    let mut req = if has_custom_host {
+        format!(
+            "{method} {path} HTTP/1.0\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    } else {
+        format!(
+            "{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
     for (k, v) in headers {
         req.push_str(&format!("{k}: {v}\r\n"));
     }

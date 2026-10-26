@@ -116,10 +116,16 @@ pub fn is_forbidden_signin_arg(s: &str) -> bool {
     })
 }
 
-/// Validates a sign-in `target` name (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`,
-/// `1..=64` ASCII bytes) and rejects any URL, script, callback, or CDP address.
+/// Validates a sign-in `target` name (`1..=128` ASCII bytes of `[a-z0-9._-/]`,
+/// starting and ending with `[a-z0-9]`, without `//` or `..`) and rejects any
+/// URL, script, callback, or CDP address.
 pub fn validate_target(s: &str) -> Result<(), Failure> {
-    if s.is_empty() || s.len() > 64 || is_forbidden_signin_arg(s) {
+    if s.is_empty()
+        || s.len() > 128
+        || is_forbidden_signin_arg(s)
+        || s.contains("//")
+        || s.contains("..")
+    {
         return Err(invalid());
     }
     let bytes = s.as_bytes();
@@ -127,7 +133,10 @@ pub fn validate_target(s: &str) -> Result<(), Failure> {
     if !is_lower_alnum(bytes[0]) || !is_lower_alnum(bytes[bytes.len() - 1]) {
         return Err(invalid());
     }
-    if !bytes.iter().all(|&b| is_lower_alnum(b) || b == b'-') {
+    if !bytes
+        .iter()
+        .all(|&b| is_lower_alnum(b) || matches!(b, b'.' | b'_' | b'-' | b'/'))
+    {
         return Err(invalid());
     }
     Ok(())
@@ -275,7 +284,8 @@ pub mod request_sign_in {
                         "target": {
                             "type": "string",
                             "description": "Name of the registered sign-in target \
-                                 (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). Never a URL, script, \
+                                 (`1..=128` characters of `[a-z0-9._-/]` starting and ending \
+                                 with `[a-z0-9]`, e.g. `acme/local`). Never a URL, script, \
                                  callback, or DevTools address.",
                         },
                         "role": {

@@ -37,6 +37,38 @@ function isLoopbackAddress(addr) {
   );
 }
 
+function isLoopbackHostHeader(hostHeader) {
+  if (typeof hostHeader !== "string" || hostHeader.trim().length === 0) {
+    return false;
+  }
+  const raw = hostHeader.trim().toLowerCase();
+  let hostname = raw;
+  if (raw.startsWith("[")) {
+    const closeIdx = raw.indexOf("]");
+    if (closeIdx === -1) return false;
+    hostname = raw.slice(0, closeIdx + 1);
+    const rest = raw.slice(closeIdx + 1);
+    if (rest.length > 0 && !/^:[0-9]{1,5}$/.test(rest)) {
+      return false;
+    }
+  } else {
+    const colonIdx = raw.indexOf(":");
+    if (colonIdx !== -1) {
+      hostname = raw.slice(0, colonIdx);
+      const portPart = raw.slice(colonIdx + 1);
+      if (!/^[0-9]{1,5}$/.test(portPart)) {
+        return false;
+      }
+    }
+  }
+  return (
+    hostname === "127.0.0.1" ||
+    hostname === "[::1]" ||
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost")
+  );
+}
+
 function canonicalSigningPayload({ method, path, timestamp, nonce, body }) {
   return `${String(method).toUpperCase()}\n${path}\n${timestamp}\n${nonce}\n${body}`;
 }
@@ -252,14 +284,18 @@ function createTestSessionHandler(options = {}) {
       return true;
     }
 
-    // Loopback listener restriction.
+    // Loopback listener and Host header restriction (DNS-rebinding defense).
     const remoteAddr =
       req.socket && req.socket.remoteAddress
         ? req.socket.remoteAddress
         : req.connection && req.connection.remoteAddress
           ? req.connection.remoteAddress
           : "";
-    if (!isLoopbackAddress(remoteAddr)) {
+    const hostHeader =
+      req.headers && typeof req.headers.host === "string"
+        ? req.headers.host
+        : "";
+    if (!isLoopbackAddress(remoteAddr) || !isLoopbackHostHeader(hostHeader)) {
       sendJson(res, 403, { ok: false, error: "loopback_required" });
       return true;
     }

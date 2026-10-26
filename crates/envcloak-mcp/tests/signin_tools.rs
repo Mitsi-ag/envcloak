@@ -544,6 +544,26 @@ fn url_script_callback_cdp_and_secret_arguments_refused_unechoed() {
 
 #[test]
 fn fuzz_signin_argument_grammars_accept_valid_and_reject_injections() {
+    for valid_slash_target in ["acme/local", "acme.org/staging_1", "stripe/dev-01"] {
+        assert!(
+            validate_target(valid_slash_target).is_ok(),
+            "expected {valid_slash_target:?} to be accepted"
+        );
+    }
+    for invalid_target in [
+        "http://acme.localhost",
+        "acme//local",
+        "acme/../local",
+        "/acme",
+        "acme/",
+        "localhost:9222",
+    ] {
+        assert!(
+            validate_target(invalid_target).is_err(),
+            "expected {invalid_target:?} to be rejected"
+        );
+    }
+
     let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next_u64 = || -> u64 {
         state ^= state << 13;
@@ -671,7 +691,7 @@ fn listed_signin_tools_round_trip_over_ipc_without_echoing_operation_key() {
             let reply = match req.method {
                 SigninRequest::NAME => {
                     let p = req.params::<<SigninRequest as Method>::Params>().unwrap();
-                    assert_eq!(p.target, "acme-console");
+                    assert_eq!(p.target, "acme/local");
                     assert_eq!(p.role.as_deref(), Some("editor"));
                     assert_eq!(p.operation_key, expected_op_key);
                     let view = SigninStatusView {
@@ -756,7 +776,7 @@ fn listed_signin_tools_round_trip_over_ipc_without_echoing_operation_key() {
         1,
         "request_sign_in",
         json!({
-            "target": "acme-console",
+            "target": "acme/local",
             "role": "editor",
             "operation_key": op_key_canary,
             "project_dir": project_dir_str,
@@ -1051,10 +1071,40 @@ async function checkCase(envSetup, handlerOpts) {
         collected_outputs.extend_from_slice(body_origin.as_bytes());
     }
 
+    // 3d-host. Non-loopback `Host` header (DNS-rebinding defense) -> 403 loopback_required, 0 mints.
+    let bad_host_nonce = "nonce-bad-host-0000001";
+    let bad_host_sig = sign_test_session_request(
+        &origins.adapter_key,
+        "POST",
+        "/__envcloak/test-session",
+        now_secs,
+        bad_host_nonce,
+        body,
+    );
+    let (st_bad_host, body_bad_host) = http_request(
+        "POST",
+        &format!("{}/__envcloak/test-session", origins.app),
+        &[
+            ("host", "evil.example.com:4100"),
+            ("content-type", "application/json"),
+            ("x-envcloak-timestamp", &ts_str),
+            ("x-envcloak-nonce", bad_host_nonce),
+            ("x-envcloak-signature", &bad_host_sig),
+        ],
+        body,
+    )
+    .unwrap();
+    assert_eq!(st_bad_host, 403, "{body_bad_host}");
+    assert!(
+        body_bad_host.contains("loopback_required"),
+        "{body_bad_host}"
+    );
+    collected_outputs.extend_from_slice(body_bad_host.as_bytes());
+
     assert_eq!(
         control.counters().unwrap().mints,
         0,
-        "no session may be minted for unauthenticated, stale, or Origin-carrying requests"
+        "no session may be minted for unauthenticated, stale, non-loopback Host, or Origin-carrying requests"
     );
 
     // 3e. Valid signed request -> 200 OK, mints == 1.

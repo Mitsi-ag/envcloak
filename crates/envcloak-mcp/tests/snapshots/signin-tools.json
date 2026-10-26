@@ -23,7 +23,7 @@
             "type": "string"
           },
           "target": {
-            "description": "Name of the registered sign-in target (`^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$`). Never a URL, script, callback, or DevTools address.",
+            "description": "Name of the registered sign-in target (`1..=128` characters of `[a-z0-9._-/]` starting and ending with `[a-z0-9]`, e.g. `acme/local`). Never a URL, script, callback, or DevTools address.",
             "type": "string"
           }
         },
