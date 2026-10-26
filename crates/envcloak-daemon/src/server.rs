@@ -911,21 +911,21 @@ fn respond<'s>(
         proto::SigninTargetRemove::NAME => answer::<proto::SigninTargetRemove>(id, &req, |p| {
             crate::signin::targets::remove(shared, peer, p)
         }),
-        proto::SigninTargetList::NAME => answer::<proto::SigninTargetList>(id, &req, |p| {
-            crate::signin::targets::list(shared, p)
-        }),
+        proto::SigninTargetList::NAME => {
+            answer::<proto::SigninTargetList>(id, &req, |p| crate::signin::targets::list(shared, p))
+        }
         proto::SigninRequest::NAME => answer::<proto::SigninRequest>(id, &req, |p| {
             crate::signin::ops::request(shared, peer, p, fds)
         }),
-        proto::SigninStatus::NAME => answer::<proto::SigninStatus>(id, &req, |p| {
-            crate::signin::ops::status(shared, peer, p)
-        }),
-        proto::SigninCancel::NAME => answer::<proto::SigninCancel>(id, &req, |p| {
-            crate::signin::ops::cancel(shared, peer, p)
-        }),
-        proto::SigninEnd::NAME => answer::<proto::SigninEnd>(id, &req, |p| {
-            crate::signin::ops::end(shared, peer, p)
-        }),
+        proto::SigninStatus::NAME => {
+            answer::<proto::SigninStatus>(id, &req, |p| crate::signin::ops::status(shared, peer, p))
+        }
+        proto::SigninCancel::NAME => {
+            answer::<proto::SigninCancel>(id, &req, |p| crate::signin::ops::cancel(shared, peer, p))
+        }
+        proto::SigninEnd::NAME => {
+            answer::<proto::SigninEnd>(id, &req, |p| crate::signin::ops::end(shared, peer, p))
+        }
         ItemsTarget::NAME => {
             answer::<ItemsTarget>(id, &req, |p| items::target_view(shared, peer, p))
         }

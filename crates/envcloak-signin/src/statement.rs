@@ -24,8 +24,11 @@ use std::fmt::{self, Write as _};
 use std::time::Duration;
 
 use envcloak_core::vault::ItemId;
+pub use envcloak_policy::{
+    CookiePartitionSummary, CookieSummary, OriginSummary, SignInDevOptions,
+    SignInPendingDescriptor, StorageSummary,
+};
 use envcloak_policy::{SubjectKind, SubjectSummary, escape_for_display};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::scope::{
@@ -245,17 +248,13 @@ impl SignInStatement {
     }
 }
 
-/// Wire form of `options.dev` in `approve` (docs/IPC.md): a sign-in `dev`
-/// authorization's window in seconds and attempt budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignInDevOptions {
-    pub window_secs: u64,
-    pub attempts: u8,
+/// Conversion helper for [`SignInDevOptions`].
+pub trait SignInDevOptionsExt {
+    fn to_options(self) -> Options;
 }
 
-impl SignInDevOptions {
-    pub fn to_options(self) -> Options {
+impl SignInDevOptionsExt for SignInDevOptions {
+    fn to_options(self) -> Options {
         Options::Dev {
             window: Duration::from_secs(self.window_secs),
             attempts: self.attempts,
@@ -263,18 +262,14 @@ impl SignInDevOptions {
     }
 }
 
-/// Wire summary of an [`Origin`] in [`SignInPendingDescriptor`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct OriginSummary {
-    pub scheme: String,
-    pub host_kind: String,
-    pub host: String,
-    pub port: u16,
+/// Conversion helpers for [`OriginSummary`].
+pub trait OriginSummaryExt {
+    fn from_origin(o: &Origin) -> Self;
+    fn to_origin(&self) -> Option<Origin>;
 }
 
-impl OriginSummary {
-    pub fn from_origin(o: &Origin) -> Self {
+impl OriginSummaryExt for OriginSummary {
+    fn from_origin(o: &Origin) -> Self {
         let (host_kind, host) = encode_host(o.host());
         OriginSummary {
             scheme: o.scheme().as_str().to_owned(),
@@ -284,7 +279,7 @@ impl OriginSummary {
         }
     }
 
-    pub fn to_origin(&self) -> Option<Origin> {
+    fn to_origin(&self) -> Option<Origin> {
         let scheme = parse_scheme(&self.scheme)?;
         let host = decode_host(&self.host_kind, &self.host)?;
         Origin::new(scheme, host, self.port).ok()
@@ -322,31 +317,14 @@ fn decode_host(kind: &str, s: &str) -> Option<Host> {
     }
 }
 
-/// Wire summary of a [`CookiePartition`] in [`CookieSummary`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CookiePartitionSummary {
-    pub scheme: String,
-    pub host_kind: String,
-    pub host: String,
-    pub cross_site_ancestor: bool,
+/// Conversion helpers for [`CookieSummary`].
+pub trait CookieSummaryExt {
+    fn from_cookie(c: &DeclaredCookie) -> Self;
+    fn to_cookie(&self) -> Option<DeclaredCookie>;
 }
 
-/// Wire summary of a [`DeclaredCookie`] in [`SignInPendingDescriptor`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CookieSummary {
-    pub name: String,
-    pub domain_kind: String,
-    pub domain_host_kind: String,
-    pub domain: String,
-    pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition: Option<CookiePartitionSummary>,
-}
-
-impl CookieSummary {
-    pub fn from_cookie(c: &DeclaredCookie) -> Self {
+impl CookieSummaryExt for CookieSummary {
+    fn from_cookie(c: &DeclaredCookie) -> Self {
         let (domain_kind, domain_host_kind, domain) = match &c.domain {
             CookieDomain::HostOnly(h) => {
                 let (hk, hs) = encode_host(h);
@@ -383,7 +361,7 @@ impl CookieSummary {
         }
     }
 
-    pub fn to_cookie(&self) -> Option<DeclaredCookie> {
+    fn to_cookie(&self) -> Option<DeclaredCookie> {
         let name = Label::new(&self.name).ok()?;
         let domain = match self.domain_kind.as_str() {
             "host_only" => {
@@ -414,23 +392,21 @@ impl CookieSummary {
     }
 }
 
-/// Wire summary of a [`DeclaredStorage`] in [`SignInPendingDescriptor`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StorageSummary {
-    pub origin: OriginSummary,
-    pub key: String,
+/// Conversion helpers for [`StorageSummary`].
+pub trait StorageSummaryExt {
+    fn from_storage(s: &DeclaredStorage) -> Self;
+    fn to_storage(&self) -> Option<DeclaredStorage>;
 }
 
-impl StorageSummary {
-    pub fn from_storage(s: &DeclaredStorage) -> Self {
+impl StorageSummaryExt for StorageSummary {
+    fn from_storage(s: &DeclaredStorage) -> Self {
         StorageSummary {
             origin: OriginSummary::from_origin(&s.origin),
             key: s.key.as_str().to_owned(),
         }
     }
 
-    pub fn to_storage(&self) -> Option<DeclaredStorage> {
+    fn to_storage(&self) -> Option<DeclaredStorage> {
         Some(DeclaredStorage {
             origin: self.origin.to_origin()?,
             key: Label::new(&self.key).ok()?,
@@ -438,81 +414,20 @@ impl StorageSummary {
     }
 }
 
-/// A pending sign-in operation as `pending.get` delivers it to an approval
-/// surface (SPEC §6.8, §10b; M2b-05). Carries every field of the
-/// [`SignInStatement`]'s scope and envelope plus display metadata (`subject`,
-/// `login_slug`, `target_slug`) so the client reconstructs the exact
-/// [`SignInStatement`] and renders the receipt from the same validated
-/// fields.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignInPendingDescriptor {
-    /// Request id (16 bytes as 32 lowercase hex characters).
-    pub request: String,
-    /// Daemon nonce (32 bytes as 64 lowercase hex characters).
-    pub nonce: String,
-    /// Creation time, Unix seconds.
-    pub created_unix: u64,
-    /// Pending expiry time, Unix seconds.
-    pub expires_unix: u64,
-    /// Reserved recipient-context id.
-    pub context: u64,
-    /// Caller subject summary for display.
-    pub subject: SubjectSummary,
-    /// SHA-256 of the caller's gathered evidence (64 hex chars).
-    pub subject_evidence_sha256: String,
-    /// Project canonical directory (UTF-8 lossy for display; exact bytes in `project_dir_hex`).
-    pub project_dir: String,
-    /// Project canonical directory bytes as lowercase hex.
-    pub project_dir_hex: String,
-    pub project_dev: u64,
-    pub project_ino: u64,
-    /// SHA-256 of the effective sign-in configuration (64 hex chars).
-    pub project_config_sha256: String,
-    /// Login item slug for display.
-    pub login_slug: String,
-    /// Login item id (ULID).
-    pub login_item: String,
-    pub authorization_revision: u64,
-    pub account: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tenant: Option<String>,
-    pub role: String,
-    /// `"test"` or `"live"`.
-    pub environment: String,
-    /// Target slug for display.
-    pub target_slug: String,
-    /// Target id (32 hex chars).
-    pub target_id: String,
-    pub target_revision: u64,
-    /// Adapter id (32 hex chars).
-    pub adapter_id: String,
-    pub adapter_revision: u64,
-    pub entry_origins: Vec<OriginSummary>,
-    /// `"endpoint"` or `"element"`.
-    pub check_kind: String,
-    pub check_locator: String,
-    pub cookies: Vec<CookieSummary>,
-    pub storage: Vec<StorageSummary>,
-    pub requester_pid: i32,
-    pub requester_start_time: u64,
-    pub browser_generation: u64,
-    /// `"each"` or `"dev"`.
-    pub tier: String,
-    pub max_attempts: u8,
-    pub approval_secs: u64,
-    pub attempt_timeout_secs: u64,
-    pub session_lifetime_secs: u64,
-    /// Daemon instance (32 hex chars).
-    pub daemon_instance: String,
-    pub vault_epoch: u64,
-    pub policy_epoch: u64,
+/// Statement reconstruction helpers for [`SignInPendingDescriptor`].
+pub trait SignInPendingDescriptorExt {
+    fn from_statement(
+        stmt: &SignInStatement,
+        subject: SubjectSummary,
+        login_slug: String,
+        target_slug: String,
+    ) -> Self;
+    fn to_scope(&self) -> Option<SignInScope>;
+    fn to_statement(&self, options: Options) -> Option<SignInStatement>;
 }
 
-impl SignInPendingDescriptor {
-    /// Builds a descriptor from a [`SignInStatement`] and its display
-    /// metadata.
-    pub fn from_statement(
+impl SignInPendingDescriptorExt for SignInPendingDescriptor {
+    fn from_statement(
         stmt: &SignInStatement,
         subject: SubjectSummary,
         login_slug: String,
@@ -592,8 +507,7 @@ impl SignInPendingDescriptor {
         }
     }
 
-    /// Reconstructs the validated [`SignInScope`] from this descriptor.
-    pub fn to_scope(&self) -> Option<SignInScope> {
+    fn to_scope(&self) -> Option<SignInScope> {
         let evidence = decode_hex::<32>(&self.subject_evidence_sha256)?;
         let dir = decode_hex_vec(&self.project_dir_hex)?;
         if self.project_dir != String::from_utf8_lossy(&dir) {
@@ -652,7 +566,7 @@ impl SignInPendingDescriptor {
         .ok()?;
         let daemon = DaemonInstance::parse(&self.daemon_instance)?;
         SignInScope::new(
-             crate::scope::Subject {
+            crate::scope::Subject {
                 root: Instance {
                     pid: self.subject.root.pid,
                     start_time: self.subject.root.start_time,
@@ -703,8 +617,7 @@ impl SignInPendingDescriptor {
         .ok()
     }
 
-    /// Reconstructs the [`SignInStatement`] for `options`.
-    pub fn to_statement(&self, options: Options) -> Option<SignInStatement> {
+    fn to_statement(&self, options: Options) -> Option<SignInStatement> {
         let scope = self.to_scope()?;
         let request = RequestId::parse(&self.request)?;
         let nonce = Nonce::parse(&self.nonce)?;
@@ -752,12 +665,17 @@ fn has_loopback_host(scope: &SignInScope) -> bool {
         _ => h.is_loopback(),
     };
     scope.target().entry_origins.iter().any(|o| is_lb(o.host()))
-        || scope.target().transfer.cookies.iter().any(|c| match &c.domain {
-            CookieDomain::HostOnly(h) => is_lb(h),
-            CookieDomain::Domain(n) => {
-                n.as_str() == "localhost" || n.as_str().ends_with(".localhost")
-            }
-        })
+        || scope
+            .target()
+            .transfer
+            .cookies
+            .iter()
+            .any(|c| match &c.domain {
+                CookieDomain::HostOnly(h) => is_lb(h),
+                CookieDomain::Domain(n) => {
+                    n.as_str() == "localhost" || n.as_str().ends_with(".localhost")
+                }
+            })
         || scope
             .target()
             .transfer

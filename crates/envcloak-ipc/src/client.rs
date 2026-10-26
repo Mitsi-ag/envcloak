@@ -624,7 +624,7 @@ impl Client {
 
     /// `pending.get` for request `id`, returning either a run request's
     /// [`PendingDescriptor`], an `unlocker_add` request's descriptor, or a
-    /// sign-in request's [`envcloak_signin::SignInPendingDescriptor`].
+    /// sign-in request's [`envcloak_policy::SignInPendingDescriptor`].
     ///
     /// # Errors
     /// As [`Client::call`].
@@ -707,7 +707,7 @@ impl Client {
         &mut self,
         id: &str,
         options: ApprovalOptions,
-        dev: Option<envcloak_signin::SignInDevOptions>,
+        dev: Option<envcloak_policy::SignInDevOptions>,
         digest: &[u8; 32],
         passphrase: SecretBytes,
         claims: &[String],
@@ -749,7 +749,7 @@ impl Client {
         &mut self,
         id: &str,
         options: ApprovalOptions,
-        dev: Option<envcloak_signin::SignInDevOptions>,
+        dev: Option<envcloak_policy::SignInDevOptions>,
         digest: &[u8; 32],
         claims: &[String],
     ) -> Result<ApprovedView, ClientError> {

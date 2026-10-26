@@ -537,7 +537,6 @@ dependencies = [
  "envcloak-core",
  "envcloak-ipc",
  "envcloak-policy",
- "envcloak-signin",
  "envcloak-sys",
  "envcloak-testkit",
  "secrecy",

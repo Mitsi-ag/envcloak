@@ -885,8 +885,14 @@ fn binding_changes_after_approval_prompt_for_the_difference() {
     let fp = [0x42; 32];
     let mut signin_req = request(under_agent(), two(), &["./emit"]);
     signin_req.mode = Mode::SignIn(fp);
-    assert!(matches!(s.decide(signin_req.clone(), &now), Decision::Pending(_)));
-    assert!(matches!(s2.decide(signin_req.clone(), &now), Decision::Pending(_)));
+    assert!(matches!(
+        s.decide(signin_req.clone(), &now),
+        Decision::Pending(_)
+    ));
+    assert!(matches!(
+        s2.decide(signin_req.clone(), &now),
+        Decision::Pending(_)
+    ));
     let mut s3 = store();
     let _g_signin = approve(&mut s3, signin_req.clone(), session(3600), &now).unwrap();
     assert!(matches!(

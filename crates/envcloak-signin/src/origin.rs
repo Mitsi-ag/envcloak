@@ -133,11 +133,7 @@ pub fn parse_registered(input: &str) -> Result<Origin, OriginError> {
 }
 
 fn parse_port(s: &str) -> Result<u16, OriginError> {
-    if s.is_empty()
-        || s.len() > 5
-        || s.starts_with('0')
-        || !s.bytes().all(|b| b.is_ascii_digit())
-    {
+    if s.is_empty() || s.len() > 5 || s.starts_with('0') || !s.bytes().all(|b| b.is_ascii_digit()) {
         return Err(OriginError::Port);
     }
     let port = s.parse::<u16>().map_err(|_| OriginError::Port)?;
@@ -181,7 +177,10 @@ mod tests {
         let cases = [
             ("https://app.example.com", "https://app.example.com"),
             ("https://app.example.com:443", "https://app.example.com"),
-            ("https://app.example.com:8443", "https://app.example.com:8443"),
+            (
+                "https://app.example.com:8443",
+                "https://app.example.com:8443",
+            ),
             ("http://127.0.0.1", "http://127.0.0.1"),
             ("http://127.0.0.1:80", "http://127.0.0.1"),
             ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
@@ -191,7 +190,10 @@ mod tests {
             ("http://sub.app.localhost", "http://sub.app.localhost"),
             ("https://[2001:db8::1]:8443", "https://[2001:db8::1]:8443"),
             ("https://[2001:0db8:0:0:0:0:0:1]", "https://[2001:db8::1]"),
-            ("https://xn--bcher-kva.example", "https://xn--bcher-kva.example"),
+            (
+                "https://xn--bcher-kva.example",
+                "https://xn--bcher-kva.example",
+            ),
         ];
         for (input, expected) in cases {
             let parsed = parse_registered(input).expect(input);

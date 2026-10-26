@@ -43,6 +43,13 @@ pub use crate::app::{
 };
 use crate::frame::{DecodeError, Frame, FrameError};
 use crate::view::{
+    AdapterRefView, CookieScopeView, IdentityCheckView, LoginAddedView, LoginTierView,
+    ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
+    SessionFormatView, SigninStatusView, SigninTargetListView, SigninTargetRemovedView,
+    SigninTargetView, StandingConfirmedView, StandingListView, StandingRevokedView,
+    StorageScopeView,
+};
+use crate::view::{
     AddedView, ApprovedView, AskOpenedView, AuditVerifyView, BackupBegunView, BackupCommittedView,
     BackupListView, BackupPutView, BackupResultView, BackupView, CheckView, ClassificationView,
     CreatedView, DecisionView, DeniedView, ExposureSourceView, FileBackupCreatorView,
@@ -50,13 +57,6 @@ use crate::view::{
     PendingListView, PendingStateView, ReclassifiedView, RecoveredView, RecoveryConfirmedView,
     RemovedView, RestoreFileView, RestoreLeaseView, RevealRequestedView, RevokedView, RotatedView,
     ScanMatchView, StatusView, TargetView, UnlockedView, VerifyView,
-};
-use crate::view::{
-    AdapterRefView, CookieScopeView, IdentityCheckView, LoginAddedView, LoginTierView,
-    ManagedRegisteredView, ManagedUnregisteredView, ManagedUpdatePlanView, ManagedUpdatedView,
-    SessionFormatView, SigninStatusView, SigninTargetListView, SigninTargetRemovedView,
-    SigninTargetView, StandingConfirmedView, StandingListView, StandingRevokedView,
-    StorageScopeView,
 };
 use crate::wire_secret::WireSecret;
 
@@ -435,14 +435,14 @@ impl Method for PendingGet {
 
 /// The descriptor returned by [`PendingGet`]: either a run request's
 /// [`PendingDescriptor`], a sign-in request's
-/// [`envcloak_signin::SignInPendingDescriptor`], or a Secure Enclave
+/// [`envcloak_policy::SignInPendingDescriptor`], or a Secure Enclave
 /// unlocker enrolment's [`UnlockerAddDescriptor`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum PendingGetOutput {
     UnlockerAdd(UnlockerAddDescriptor),
-    SignIn(Box<envcloak_signin::SignInPendingDescriptor>),
+    SignIn(Box<envcloak_policy::SignInPendingDescriptor>),
     Run(PendingDescriptor),
 }
 
@@ -539,7 +539,7 @@ pub struct ApproveParams {
     pub options: ApprovalOptions,
     /// For a sign-in request: the `dev` authorization window and attempt
     /// budget (`options.dev` on the wire; docs/IPC.md).
-    pub dev: Option<envcloak_signin::SignInDevOptions>,
+    pub dev: Option<envcloak_policy::SignInDevOptions>,
     /// SHA-256 of the canonical statement the approver read, as 64 hex
     /// characters (`envcloak_policy::statement_digest`).
     pub digest: String,
@@ -557,7 +557,7 @@ struct ApproveOptionsSer<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     standing: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    dev: Option<envcloak_signin::SignInDevOptions>,
+    dev: Option<envcloak_policy::SignInDevOptions>,
 }
 
 #[derive(Deserialize)]
@@ -569,7 +569,7 @@ struct ApproveOptionsDe {
     #[serde(default)]
     standing: Option<u64>,
     #[serde(default)]
-    dev: Option<envcloak_signin::SignInDevOptions>,
+    dev: Option<envcloak_policy::SignInDevOptions>,
 }
 
 impl Serialize for ApproveParams {

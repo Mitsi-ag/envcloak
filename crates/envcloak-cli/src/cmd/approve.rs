@@ -223,8 +223,7 @@ fn parse(args: &[&str]) -> Option<ApproveArgs> {
     live.sort();
     live.dedup();
     let signin_dev = dev_window.map(|w| (w, dev_attempts));
-    let has_run_options =
-        uses.is_some() || ttl.is_some() || standing.is_some() || !live.is_empty();
+    let has_run_options = uses.is_some() || ttl.is_some() || standing.is_some() || !live.is_empty();
     Some(ApproveArgs {
         request,
         options: ApprovalOptions {
@@ -381,9 +380,8 @@ fn run_approve_signin(
         None if a.has_run_options => Some(Options::Once),
         None => None,
     };
-    let (statement, chosen_options, digest) =
-        render_signin_statement(&descriptor, opt_override)
-            .ok_or_else(|| Failure::new("protocol_error", "the daemon's answer was malformed"))?;
+    let (statement, chosen_options, digest) = render_signin_statement(&descriptor, opt_override)
+        .ok_or_else(|| Failure::new("protocol_error", "the daemon's answer was malformed"))?;
     let dev_params = match chosen_options {
         Options::Once => None,
         Options::Dev { window, attempts } => Some(SignInDevOptions {
@@ -422,14 +420,8 @@ fn run_approve_signin(
             t.read_secret("Vault passphrase to approve this: ")?
         }
     };
-    let approved = connect()?.approve_with_dev(
-        id,
-        wire_options,
-        dev_params,
-        &digest,
-        passphrase,
-        claims,
-    )?;
+    let approved =
+        connect()?.approve_with_dev(id, wire_options, dev_params, &digest, passphrase, claims)?;
     let auth = AuthorizationId::parse(&approved.grant)
         .ok_or_else(|| Failure::new("protocol_error", "the daemon's answer was malformed"))?;
     match chosen_options {
@@ -529,15 +521,21 @@ mod tests {
         assert_eq!(a.signin_dev, None);
         assert_eq!(a.passphrase_fd, None);
         let req32 = "0123456789abcdef0123456789abcdef";
-        let a = parse(&[req32, "--dev", "4h", "--attempts", "5", "--passphrase-fd", "3"]).unwrap();
+        let a = parse(&[
+            req32,
+            "--dev",
+            "4h",
+            "--attempts",
+            "5",
+            "--passphrase-fd",
+            "3",
+        ])
+        .unwrap();
         assert_eq!(
             a.request,
             RequestSelector::SignIn(RequestId::parse(req32).unwrap())
         );
-        assert_eq!(
-            a.signin_dev,
-            Some((Duration::from_secs(4 * 3600), Some(5)))
-        );
+        assert_eq!(a.signin_dev, Some((Duration::from_secs(4 * 3600), Some(5))));
         let a = parse(&[
             "abcdefgh",
             "--for",

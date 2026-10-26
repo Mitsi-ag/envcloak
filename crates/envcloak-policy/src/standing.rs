@@ -679,9 +679,7 @@ impl StandingStore {
         if standing_ttl > MAX_STANDING_TTL {
             return Err(StandingError::InvalidOptions(OptionsError::TtlTooLong));
         }
-        if opts.uses != Uses::Session
-            || !opts.live.is_empty()
-            || matches!(r.mode, Mode::SignIn(_))
+        if opts.uses != Uses::Session || !opts.live.is_empty() || matches!(r.mode, Mode::SignIn(_))
         {
             return Err(StandingError::InvalidOptions(OptionsError::StandingInvalid));
         }

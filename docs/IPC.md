@@ -301,6 +301,7 @@ The CLI prints `envcloak: <token>: <message>` for its own failures, adding `daem
 | `code_identity` | client-side `daemon_unverified`; the daemon's identity or runtime policy failed; a pre-send failure sends no request, while loss after sending began reports uncertain delivery |
 | `rolled_back` | `vault_tampered` and the `keychain_anchor_mismatch` audit entry: the keychain rollback anchor is ahead of the vault file, which opens read-only |
 | `keychain_anchor_missing` | the `keychain_anchor_mismatch` audit entry: a vault that had a keychain rollback anchor had none at unlock, and the anchor was written again |
+| `invalid_otpauth`, `live_dev` | `invalid_item` from `login.add` and `items.rotate` on `#totp` (M2b-03): a malformed `otpauth://` enrollment URI, or a `live`-classified login item given `tier: "dev"` |
 
 ## Lock
 

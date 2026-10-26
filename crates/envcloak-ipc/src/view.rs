@@ -416,16 +416,30 @@ impl PendingListView {
     pub fn well_formed(&self) -> bool {
         let mut seen: Vec<String> = Vec::with_capacity(self.requests.len());
         for r in &self.requests {
-            let valid_id = PendingId::parse(&r.request).is_some_and(|id| id.to_string() == r.request)
-                || envcloak_signin::RequestId::parse(&r.request)
-                    .is_some_and(|id| id.to_string() == r.request);
+            let is_pending_id =
+                PendingId::parse(&r.request).is_some_and(|id| id.to_string() == r.request);
+            let is_signin_id = r.request.len() == 32
+                && r.request
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let valid_id = is_pending_id || is_signin_id;
+            let valid_binding = |b: &str| {
+                if envcloak_core::vault::Slug::new(b).is_ok() {
+                    return true;
+                }
+                if is_signin_id
+                    && let Some(rest) = b.strip_prefix("signin:")
+                    && let Some((_, slug)) = rest.rsplit_once('=')
+                {
+                    return envcloak_core::vault::Slug::new(slug).is_ok();
+                }
+                false
+            };
             if !valid_id
                 || seen.contains(&r.request)
                 || r.bindings.len() > MAX_LISTED_BINDINGS
                 || (r.more_bindings > 0 && r.bindings.len() < MAX_LISTED_BINDINGS)
-                || r.bindings
-                    .iter()
-                    .any(|b| envcloak_core::vault::Slug::new(b).is_err())
+                || !r.bindings.iter().all(|b| valid_binding(b))
             {
                 return false;
             }
@@ -2451,7 +2465,7 @@ pub struct SigninTargetRemovedView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SigninStatusView {
-    /// 32 lowercase hex characters (`envcloak_signin::RequestId`).
+    /// 32 lowercase hex characters (sign-in `RequestId`).
     pub request: String,
     pub revision: u64,
     pub state: String,

@@ -1419,6 +1419,127 @@ pub fn render_reveal_statement(d: &RevealDescriptor) -> String {
     t
 }
 
+/// Wire form of `options.dev` in `approve` (docs/IPC.md): a sign-in `dev`
+/// authorization's window in seconds and attempt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignInDevOptions {
+    pub window_secs: u64,
+    pub attempts: u8,
+}
+
+/// Wire summary of an `Origin` in [`SignInPendingDescriptor`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OriginSummary {
+    pub scheme: String,
+    pub host_kind: String,
+    pub host: String,
+    pub port: u16,
+}
+
+/// Wire summary of a `CookiePartition` in [`CookieSummary`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CookiePartitionSummary {
+    pub scheme: String,
+    pub host_kind: String,
+    pub host: String,
+    pub cross_site_ancestor: bool,
+}
+
+/// Wire summary of a `DeclaredCookie` in [`SignInPendingDescriptor`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CookieSummary {
+    pub name: String,
+    pub domain_kind: String,
+    pub domain_host_kind: String,
+    pub domain: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<CookiePartitionSummary>,
+}
+
+/// Wire summary of a `DeclaredStorage` in [`SignInPendingDescriptor`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSummary {
+    pub origin: OriginSummary,
+    pub key: String,
+}
+
+/// A pending sign-in operation as `pending.get` delivers it to an approval
+/// surface (SPEC §6.8, §10b; M2b-05). Carries every field of the
+/// `SignInStatement`'s scope and envelope plus display metadata (`subject`,
+/// `login_slug`, `target_slug`) so the client reconstructs the exact
+/// `SignInStatement` and renders the receipt from the same validated
+/// fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignInPendingDescriptor {
+    /// Request id (16 bytes as 32 lowercase hex characters).
+    pub request: String,
+    /// Daemon nonce (32 bytes as 64 lowercase hex characters).
+    pub nonce: String,
+    /// Creation time, Unix seconds.
+    pub created_unix: u64,
+    /// Pending expiry time, Unix seconds.
+    pub expires_unix: u64,
+    /// Reserved recipient-context id.
+    pub context: u64,
+    /// Caller subject summary for display.
+    pub subject: SubjectSummary,
+    /// SHA-256 of the caller's gathered evidence (64 hex chars).
+    pub subject_evidence_sha256: String,
+    /// Project canonical directory (UTF-8 lossy for display; exact bytes in `project_dir_hex`).
+    pub project_dir: String,
+    /// Project canonical directory bytes as lowercase hex.
+    pub project_dir_hex: String,
+    pub project_dev: u64,
+    pub project_ino: u64,
+    /// SHA-256 of the effective sign-in configuration (64 hex chars).
+    pub project_config_sha256: String,
+    /// Login item slug for display.
+    pub login_slug: String,
+    /// Login item id (ULID).
+    pub login_item: String,
+    pub authorization_revision: u64,
+    pub account: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    pub role: String,
+    /// `"test"` or `"live"`.
+    pub environment: String,
+    /// Target slug for display.
+    pub target_slug: String,
+    /// Target id (32 hex chars).
+    pub target_id: String,
+    pub target_revision: u64,
+    /// Adapter id (32 hex chars).
+    pub adapter_id: String,
+    pub adapter_revision: u64,
+    pub entry_origins: Vec<OriginSummary>,
+    /// `"endpoint"` or `"element"`.
+    pub check_kind: String,
+    pub check_locator: String,
+    pub cookies: Vec<CookieSummary>,
+    pub storage: Vec<StorageSummary>,
+    pub requester_pid: i32,
+    pub requester_start_time: u64,
+    pub browser_generation: u64,
+    /// `"each"` or `"dev"`.
+    pub tier: String,
+    pub max_attempts: u8,
+    pub approval_secs: u64,
+    pub attempt_timeout_secs: u64,
+    pub session_lifetime_secs: u64,
+    /// Daemon instance (32 hex chars).
+    pub daemon_instance: String,
+    pub vault_epoch: u64,
+    pub policy_epoch: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

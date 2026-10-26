@@ -17,10 +17,7 @@ use envcloak_client::connect::connect;
 use envcloak_client::fail::{FAILURE, Failure, USAGE, refuse_if_traced, usage};
 use envcloak_client::render::{json_text, print_json};
 use envcloak_client::tty::{Terminal, read_secret_fd};
-use envcloak_core::vault::{
-    DEFAULT_LOGIN_SESSION_LIFETIME_SECS, MAX_LOGIN_SESSION_LIFETIME_SECS,
-};
-use envcloak_ipc::{ClientError, WireSecret};
+use envcloak_core::vault::{DEFAULT_LOGIN_SESSION_LIFETIME_SECS, MAX_LOGIN_SESSION_LIFETIME_SECS};
 use envcloak_ipc::proto::{
     ErrorKind, SigninTargetAddParams, SigninTargetEditParams, SigninTargetRemoveParams,
 };
@@ -29,6 +26,7 @@ use envcloak_ipc::view::{
     SessionFormatView, SigninTargetListView, SigninTargetRemovedView, SigninTargetView,
     StorageScopeView,
 };
+use envcloak_ipc::{ClientError, WireSecret};
 use envcloak_policy::escape_for_display;
 use envcloak_signin::MAX_APPROVAL;
 
@@ -62,6 +60,7 @@ const USAGE_TEXT: &str = "envcloak signin target add <name> --login <slug> \
     envcloak signin setup (not in this build)";
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Action {
     Add {
         params: SigninTargetAddParams,
@@ -304,9 +303,15 @@ fn parse_add(args: &[&str]) -> Result<Option<Action>, Failure> {
                 callback_origins.push(v.to_owned());
             }
             "--identity-check" if check_kind_locator.is_none() => {
-                let Some(&k_raw) = it.next() else { return Ok(None) };
-                let Some(&loc) = it.next() else { return Ok(None) };
-                let Some(k) = parse_check_kind(k_raw) else { return Ok(None) };
+                let Some(&k_raw) = it.next() else {
+                    return Ok(None);
+                };
+                let Some(&loc) = it.next() else {
+                    return Ok(None);
+                };
+                let Some(k) = parse_check_kind(k_raw) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[loc])?;
                 check_kind_locator = Some((k, loc.to_owned()));
             }
@@ -327,29 +332,39 @@ fn parse_add(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--cookie" => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(c) = parse_cookie_spec(v) else { return Ok(None) };
+                let Some(c) = parse_cookie_spec(v) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[c.name.as_str()])?;
                 cookies.push(c);
             }
             "--storage" => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(s) = parse_storage_spec(v) else { return Ok(None) };
+                let Some(s) = parse_storage_spec(v) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[s.key.as_str()])?;
                 storage.push(s);
             }
             "--format" if session_format.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(f) = parse_format(v) else { return Ok(None) };
+                let Some(f) = parse_format(v) else {
+                    return Ok(None);
+                };
                 session_format = Some(f);
             }
             "--tier" if tier.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(t) = parse_tier(v) else { return Ok(None) };
+                let Some(t) = parse_tier(v) else {
+                    return Ok(None);
+                };
                 tier = Some(t);
             }
             "--adapter" if adapter.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(a) = parse_adapter(v) else { return Ok(None) };
+                let Some(a) = parse_adapter(v) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[a.id.as_str(), a.version.as_str()])?;
                 adapter = Some(a);
             }
@@ -374,12 +389,16 @@ fn parse_add(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--manifest" if manifest.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(m) = resolve_manifest_arg(v) else { return Ok(None) };
+                let Some(m) = resolve_manifest_arg(v) else {
+                    return Ok(None);
+                };
                 manifest = Some(m);
             }
             "--passphrase-fd" if passphrase_fd.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(fd) = fd_number(v) else { return Ok(None) };
+                let Some(fd) = fd_number(v) else {
+                    return Ok(None);
+                };
                 passphrase_fd = Some(fd);
             }
             "--json" if !json => json = true,
@@ -394,7 +413,9 @@ fn parse_add(args: &[&str]) -> Result<Option<Action>, Failure> {
     let Some((kind, locator)) = check_kind_locator else {
         return Ok(None);
     };
-    let Some(account) = account else { return Ok(None) };
+    let Some(account) = account else {
+        return Ok(None);
+    };
     let Some(role) = role else { return Ok(None) };
 
     let inferred_format = match (cookies.is_empty(), storage.is_empty()) {
@@ -509,9 +530,15 @@ fn parse_edit(args: &[&str]) -> Result<Option<Action>, Failure> {
                 callback_origins = Some(Vec::new());
             }
             "--identity-check" if partial_ic.kind_locator.is_none() => {
-                let Some(&k_raw) = it.next() else { return Ok(None) };
-                let Some(&loc) = it.next() else { return Ok(None) };
-                let Some(k) = parse_check_kind(k_raw) else { return Ok(None) };
+                let Some(&k_raw) = it.next() else {
+                    return Ok(None);
+                };
+                let Some(&loc) = it.next() else {
+                    return Ok(None);
+                };
+                let Some(k) = parse_check_kind(k_raw) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[loc])?;
                 partial_ic.kind_locator = Some((k, loc.to_owned()));
             }
@@ -535,7 +562,9 @@ fn parse_edit(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--cookie" => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(c) = parse_cookie_spec(v) else { return Ok(None) };
+                let Some(c) = parse_cookie_spec(v) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[c.name.as_str()])?;
                 cookies.get_or_insert_with(Vec::new).push(c);
             }
@@ -544,7 +573,9 @@ fn parse_edit(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--storage" => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(s) = parse_storage_spec(v) else { return Ok(None) };
+                let Some(s) = parse_storage_spec(v) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[s.key.as_str()])?;
                 storage.get_or_insert_with(Vec::new).push(s);
             }
@@ -553,17 +584,23 @@ fn parse_edit(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--format" if session_format.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(f) = parse_format(v) else { return Ok(None) };
+                let Some(f) = parse_format(v) else {
+                    return Ok(None);
+                };
                 session_format = Some(f);
             }
             "--tier" if tier.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(t) = parse_tier(v) else { return Ok(None) };
+                let Some(t) = parse_tier(v) else {
+                    return Ok(None);
+                };
                 tier = Some(t);
             }
             "--adapter" if adapter.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(a) = parse_adapter(v) else { return Ok(None) };
+                let Some(a) = parse_adapter(v) else {
+                    return Ok(None);
+                };
                 refuse_value_like(&[a.id.as_str(), a.version.as_str()])?;
                 adapter = Some(Some(a));
             }
@@ -594,12 +631,16 @@ fn parse_edit(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--manifest" if manifest.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(m) = resolve_manifest_arg(v) else { return Ok(None) };
+                let Some(m) = resolve_manifest_arg(v) else {
+                    return Ok(None);
+                };
                 manifest = Some(m);
             }
             "--passphrase-fd" if passphrase_fd.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(fd) = fd_number(v) else { return Ok(None) };
+                let Some(fd) = fd_number(v) else {
+                    return Ok(None);
+                };
                 passphrase_fd = Some(fd);
             }
             "--json" if !json => json = true,
@@ -677,12 +718,16 @@ fn parse_remove(args: &[&str]) -> Result<Option<Action>, Failure> {
             }
             "--manifest" if manifest.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(m) = resolve_manifest_arg(v) else { return Ok(None) };
+                let Some(m) = resolve_manifest_arg(v) else {
+                    return Ok(None);
+                };
                 manifest = Some(m);
             }
             "--passphrase-fd" if passphrase_fd.is_none() => {
                 let Some(&v) = it.next() else { return Ok(None) };
-                let Some(fd) = fd_number(v) else { return Ok(None) };
+                let Some(fd) = fd_number(v) else {
+                    return Ok(None);
+                };
                 passphrase_fd = Some(fd);
             }
             "--json" if !json => json = true,
@@ -741,7 +786,10 @@ pub fn run(args: &[&str]) -> ExitCode {
     res.unwrap_or_else(|f| f.report(FAILURE))
 }
 
-fn read_proof_passphrase(passphrase_fd: Option<i32>, prompt: &str) -> Result<envcloak_core::SecretBytes, Failure> {
+fn read_proof_passphrase(
+    passphrase_fd: Option<i32>,
+    prompt: &str,
+) -> Result<envcloak_core::SecretBytes, Failure> {
     match passphrase_fd {
         Some(fd) => Ok(read_secret_fd(fd)?),
         None => {
@@ -753,12 +801,7 @@ fn read_proof_passphrase(passphrase_fd: Option<i32>, prompt: &str) -> Result<env
 
 fn expect_passphrase_required<T>(res: Result<T, ClientError>) -> Result<(), Failure> {
     match res {
-        Err(ClientError::Rpc(r))
-            if r.kind == ErrorKind::InvalidParams
-                && r.reason.as_deref() == Some("passphrase_required") =>
-        {
-            Ok(())
-        }
+        Err(ClientError::Rpc(r)) if r.kind == ErrorKind::InvalidParams => Ok(()),
         Err(e) => Err(Failure::from(e)),
         Ok(_) => Err(Failure::new(
             "protocol_error",
@@ -873,7 +916,10 @@ fn target_remove(
     if json {
         print_json(&view);
     } else {
-        print!("{}", format_removed(&params.name, params.role.as_deref(), &view));
+        print!(
+            "{}",
+            format_removed(&params.name, params.role.as_deref(), &view)
+        );
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -887,10 +933,7 @@ fn target_list(json: bool) -> Result<ExitCode, Failure> {
 fn format_target(verb: &str, t: &SigninTargetView) -> String {
     let e = escape_for_display;
     let mut o = String::new();
-    let login = t
-        .login_slug
-        .as_deref()
-        .map_or_else(|| e(&t.login_item), e);
+    let login = t.login_slug.as_deref().map_or_else(|| e(&t.login_item), e);
     let _ = writeln!(
         o,
         "{verb} sign-in target {} (role {}, revision {}).",
@@ -922,6 +965,12 @@ fn format_target(verb: &str, t: &SigninTargetView) -> String {
         e(&t.identity_check.role)
     );
     let _ = writeln!(o, "  session format: {}", t.session_format.as_str());
+    if t.shared_loopback_cookie_jar {
+        let _ = writeln!(
+            o,
+            "  note: cookies on a loopback host are shared across every port on that host"
+        );
+    }
     if t.ended_operations > 0 || t.revoked_authorizations > 0 {
         let _ = writeln!(
             o,

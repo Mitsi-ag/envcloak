@@ -40,11 +40,11 @@ use envcloak_signin::{
     Environment, Epochs, Fresh, IdentityResponse, Instance, Label, Limits, LoginNow, MAX_APPROVAL,
     MAX_DEV_ATTEMPTS, MAX_SESSION_LIFETIME, Nonce, OperationKey, OperationStore, Options, Phase,
     ProjectScope, PublishDecision, Request, RequestError, RequestId, Requester, Revocation,
-    SignInDevOptions, SignInPendingDescriptor, SignInScope, State as OpState, Status, StopReason,
-    Subject, SupervisorId, TargetNow, Tier, WorkerId, World,
+    SignInDevOptions, SignInDevOptionsExt, SignInPendingDescriptor, SignInPendingDescriptorExt,
+    SignInScope, State as OpState, Status, StopReason, Subject, SupervisorId, TargetNow, Tier,
+    WorkerId, World,
 };
 use envcloak_sys::PeerIdentity;
-use secrecy::ExposeSecret;
 use sha2::{Digest, Sha256};
 
 use crate::audit::AuditEvent;
@@ -54,10 +54,8 @@ use crate::requests::{
     alive, digest_of, evidence, manifest_error, refuse_unless_prover, subject_summary,
 };
 use crate::server::{Shared, locked, refuse_if_traced};
-use crate::signin::targets::{
-    find_target_by_id, find_target_by_name_and_role, target_from_vault,
-};
-use crate::state::{State, slot_unlocked, vault_reason};
+use crate::signin::targets::{find_target_by_id, find_target_by_name_and_role, target_from_vault};
+use crate::state::{Slot, State, slot_unlocked, vault_reason};
 
 /// Default per-attempt timeout (5 minutes).
 pub const DEFAULT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -146,6 +144,7 @@ pub struct SigninAuthMeta {
     pub login_item: ItemId,
     pub login_slug: Slug,
     pub target_name: String,
+    pub role: String,
     pub created_wall: SystemTime,
 }
 
@@ -280,7 +279,8 @@ pub(crate) fn compute_effective_limits(
     subject_kind: SubjectKind,
 ) -> Option<Limits> {
     let is_agent = subject_kind == SubjectKind::Agent;
-    if is_agent && (login_meta.tier == LoginTier::NeverAgent || target_tier == LoginTier::NeverAgent)
+    if is_agent
+        && (login_meta.tier == LoginTier::NeverAgent || target_tier == LoginTier::NeverAgent)
     {
         return None;
     }
@@ -374,8 +374,14 @@ struct LiveDaemonWorld<'a> {
     overrides: &'a WorldOverrides,
 }
 
+std::thread_local! {
+    static CURRENT_CACHE: std::cell::RefCell<BTreeMap<ScopeFingerprint, Current>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
 impl World for LiveDaemonWorld<'_> {
     fn epochs(&self) -> Epochs {
+        CURRENT_CACHE.with(|c| c.borrow_mut().clear());
         let (vault_epoch, policy_epoch) = self
             .vault
             .and_then(|v| {
@@ -398,6 +404,11 @@ impl World for LiveDaemonWorld<'_> {
     }
 
     fn current(&self, scope: &SignInScope) -> Current {
+        let use_cache = self.ops.len() > 1;
+        let fp = *scope.fingerprint().as_bytes();
+        if use_cache && let Some(cached) = CURRENT_CACHE.with(|c| c.borrow().get(&fp).cloned()) {
+            return cached;
+        }
         let dir_path = Path::new(std::ffi::OsStr::from_bytes(&scope.project().dir));
         let manifest_path = dir_path.join(envcloak_policy::MANIFEST_NAME);
         let project = project_identity(&manifest_path).ok().map(|id| {
@@ -473,14 +484,20 @@ impl World for LiveDaemonWorld<'_> {
             .requester
             .unwrap_or_else(|| live_requester_state(self.catalog, self.ops, self.auths, scope));
 
-        Current {
+        let out = Current {
             project,
             login,
             target,
             limits,
             browser,
             requester,
+        };
+        if use_cache {
+            CURRENT_CACHE.with(|c| {
+                c.borrow_mut().insert(fp, out.clone());
+            });
         }
+        out
     }
 }
 
@@ -529,6 +546,9 @@ impl State {
         now: &Now,
         catalog: Option<&envcloak_policy::AgentCatalog>,
     ) -> (usize, usize) {
+        if matches!(self.slot, Slot::Busy) {
+            return (0, 0);
+        }
         let ops_before = self.signin_live_ops_count();
         let auths_before = self.signin_live_auths_count(now);
         let effects = {
@@ -653,11 +673,10 @@ impl State {
                         if let Some(pipe) = meta.supervisor_pipe.take()
                             && pipe.supervisor.generation() == generation
                         {
-                            let context = self
-                                .signin
-                                .store
-                                .operation(&request)
-                                .map_or_else(|| "0".to_owned(), |op| op.context().get().to_string());
+                            let context = self.signin.store.operation(&request).map_or_else(
+                                || "0".to_owned(),
+                                |op| op.context().get().to_string(),
+                            );
                             let _ = send_to_supervisor(
                                 &pipe.daemon_stream,
                                 &ToSupervisor::Close(SupervisorClose {
@@ -677,9 +696,7 @@ impl State {
     fn audit_signin_transitions(&mut self) {
         let live_auth_ids: Vec<AuthorizationId> =
             self.signin.store.authorizations().map(|a| a.id()).collect();
-        self.signin
-            .auths
-            .retain(|id, _| live_auth_ids.contains(id));
+        self.signin.auths.retain(|id, _| live_auth_ids.contains(id));
 
         let mut events = Vec::new();
         for (id, meta) in &mut self.signin.ops {
@@ -722,7 +739,6 @@ impl State {
     /// `request` if and only if `Channel::Supervisor(pipe.supervisor)` is
     /// authorized by `OperationStore::inject_state`. Records the send in
     /// [`SigninState::send_log`].
-    #[allow(clippy::disallowed_methods)]
     pub fn signin_inject_over_bound_pipe(
         &mut self,
         request: RequestId,
@@ -761,7 +777,8 @@ impl State {
             (res, eff)
         };
         self.execute_signin_effects(effects, now, None);
-        let inj = inj.map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "inject_refused"))?;
+        let inj =
+            inj.map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "inject_refused"))?;
 
         let meta = self
             .signin
@@ -793,14 +810,14 @@ impl State {
                     path: decl.path.as_str().to_owned(),
                     name: decl.name.as_str().to_owned(),
                     partition_top_site,
-                    value: WireSecret::from(SecretBytes::copy_from(val.expose_secret())),
+                    value: WireSecret::from(val),
                 });
             }
             for (origin, key, val) in captured.storage {
                 storage_wire.push(SupervisorStorageEntry {
                     origin,
                     key,
-                    value: WireSecret::from(SecretBytes::copy_from(val.expose_secret())),
+                    value: WireSecret::from(val),
                 });
             }
         }
@@ -852,11 +869,7 @@ impl State {
             .as_ref()
             .is_some_and(|set| set.iter().cloned().collect::<Vec<_>>() == expected);
         if !matches {
-            let worker = self
-                .signin
-                .ops
-                .get(&request)
-                .and_then(|m| m.active_worker);
+            let worker = self.signin.ops.get(&request).and_then(|m| m.active_worker);
             if let Some(w) = worker {
                 let effects = {
                     let vault = slot_unlocked(&self.slot);
@@ -921,7 +934,8 @@ impl State {
                 tenant,
                 role,
             }) => {
-                if msg_gen != supervisor.generation().get() || msg_req != bound_request.to_string() {
+                if msg_gen != supervisor.generation().get() || msg_req != bound_request.to_string()
+                {
                     return Err(RpcError::with_reason(
                         ErrorKind::InvalidParams,
                         "pipe_origin_mismatch",
@@ -943,13 +957,10 @@ impl State {
                     .as_deref()
                     .and_then(|s| Label::new(s).ok())
                     .unwrap_or_else(|| Label::new("__unverified__").expect("static label"));
-                let tenant_lbl = match tenant.as_deref() {
-                    Some(t) => Some(
-                        Label::new(t)
-                            .unwrap_or_else(|_| Label::new("__invalid__").expect("static label")),
-                    ),
-                    None => None,
-                };
+                let tenant_lbl = tenant.as_deref().map(|t| {
+                    Label::new(t)
+                        .unwrap_or_else(|_| Label::new("__invalid__").expect("static label"))
+                });
                 let role_lbl = role
                     .as_deref()
                     .and_then(|s| Label::new(s).ok())
@@ -1260,7 +1271,10 @@ fn status_view_of(
         delivered_context,
         cleanup: cleanup_token(status.receipt.cleanup).to_owned(),
         revocation: revocation_token(status.receipt.revocation).to_owned(),
-        reason: status.receipt.reason.map(|r| stop_reason_token(r).to_owned()),
+        reason: status
+            .receipt
+            .reason
+            .map(|r| stop_reason_token(r).to_owned()),
         shared_loopback_cookie_jar,
         authorization,
     }
@@ -1335,9 +1349,7 @@ pub fn request(
         let login_rev = v
             .login_revision(item_meta.id)
             .ok_or(RpcError::new(ErrorKind::Internal))?;
-        let login_meta = item_meta
-            .login
-            .ok_or(RpcError::new(ErrorKind::Internal))?;
+        let login_meta = item_meta.login.ok_or(RpcError::new(ErrorKind::Internal))?;
         (
             item_meta.id,
             item_meta.slug,
@@ -1407,6 +1419,8 @@ pub fn request(
     )
     .map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "invalid_signin_scope"))?;
 
+    let shared_jar = parsed_target.shared_loopback_cookie_jar;
+    let subj_summary = subject_summary(peer, &caller);
     let (lookup, effects) = loop {
         let mut req_bytes = [0u8; 16];
         let mut nonce_bytes = [0u8; 32];
@@ -1416,6 +1430,34 @@ pub fn request(
             request: RequestId::from_bytes(req_bytes),
             nonce: Nonce::from_bytes(nonce_bytes),
         };
+        if s.signin.ops.contains_key(&fresh.request) {
+            continue;
+        }
+        s.signin.ops.insert(
+            fresh.request,
+            SigninOperationMeta {
+                request: fresh.request,
+                scope: scope.clone(),
+                peer: *peer,
+                subject: caller.clone(),
+                subject_summary: subj_summary.clone(),
+                claims: p.claims.clone(),
+                manifest_path: manifest_path.to_path_buf(),
+                project_dir: loaded.identity.canonical_dir.clone(),
+                login_item,
+                login_slug: login_slug.clone(),
+                target_policy_id: parsed_target.policy_id,
+                target_name: parsed_target.name.clone(),
+                shared_loopback_cookie_jar: shared_jar,
+                created_awake: now.awake,
+                captured_state: None,
+                active_worker: None,
+                supervisor_pipe: None,
+                tool_pipes: None,
+                publish_audited: false,
+                end_audited: false,
+            },
+        );
         let res = {
             let vault = slot_unlocked(&s.slot);
             let world = LiveDaemonWorld {
@@ -1439,45 +1481,34 @@ pub fn request(
         };
         match res {
             Ok(l) => {
+                if l.status().request != fresh.request {
+                    s.signin.ops.remove(&fresh.request);
+                }
                 let eff = s.signin.store.drain_effects();
                 break (l, eff);
             }
-            Err(RequestError::IdInUse) => continue,
-            Err(RequestError::Conflict) => return Err(RpcError::new(ErrorKind::RequestConflict)),
-            Err(RequestError::Full) => return Err(RpcError::new(ErrorKind::TooManyPending)),
-            Err(RequestError::WrongDaemon) => return Err(RpcError::new(ErrorKind::Internal)),
+            Err(RequestError::IdInUse) => {
+                s.signin.ops.remove(&fresh.request);
+                continue;
+            }
+            Err(RequestError::Conflict) => {
+                s.signin.ops.remove(&fresh.request);
+                return Err(RpcError::new(ErrorKind::RequestConflict));
+            }
+            Err(RequestError::Full) => {
+                s.signin.ops.remove(&fresh.request);
+                return Err(RpcError::new(ErrorKind::TooManyPending));
+            }
+            Err(RequestError::WrongDaemon) => {
+                s.signin.ops.remove(&fresh.request);
+                return Err(RpcError::new(ErrorKind::Internal));
+            }
         }
     };
 
     let status = lookup.status();
     let req_id = status.request;
-    let shared_jar = parsed_target.shared_loopback_cookie_jar;
-
-    if let std::collections::btree_map::Entry::Vacant(e) = s.signin.ops.entry(req_id) {
-        let subj_summary = subject_summary(peer, &caller);
-        e.insert(SigninOperationMeta {
-            request: req_id,
-            scope,
-            peer: *peer,
-            subject: caller,
-            subject_summary: subj_summary,
-            claims: p.claims,
-            manifest_path: manifest_path.to_path_buf(),
-            project_dir: loaded.identity.canonical_dir,
-            login_item,
-            login_slug,
-            target_policy_id: parsed_target.policy_id,
-            target_name: parsed_target.name,
-            shared_loopback_cookie_jar: shared_jar,
-            created_awake: now.awake,
-            captured_state: None,
-            active_worker: None,
-            supervisor_pipe: None,
-            tool_pipes,
-            publish_audited: false,
-            end_audited: false,
-        });
-    } else if let Some(pipes) = tool_pipes
+    if let Some(pipes) = tool_pipes
         && let Some(meta) = s.signin.ops.get_mut(&req_id)
         && meta.tool_pipes.is_none()
     {
@@ -1486,7 +1517,7 @@ pub fn request(
 
     s.execute_signin_effects(effects, &now, Some(&shared.catalog));
 
-    let view = status_view_of(&s, req_id, status, shared_jar);
+    let view = status_view_of(s, req_id, status, shared_jar);
     s.signin.send_log.push(SendRecord {
         request: req_id,
         destination: SendDestination::IpcReply {
@@ -1534,10 +1565,7 @@ pub fn status(
             auths: &s.signin.auths,
             overrides: &s.signin.world_overrides,
         };
-        let r = s
-            .signin
-            .store
-            .status(&caller_root, &req_id, &now, &world);
+        let r = s.signin.store.status(&caller_root, &req_id, &now, &world);
         let eff = s.signin.store.drain_effects();
         (r, eff)
     };
@@ -1583,10 +1611,7 @@ pub fn cancel(
             auths: &s.signin.auths,
             overrides: &s.signin.world_overrides,
         };
-        let r = s
-            .signin
-            .store
-            .cancel(&caller_root, &req_id, &now, &world);
+        let r = s.signin.store.cancel(&caller_root, &req_id, &now, &world);
         let eff = s.signin.store.drain_effects();
         (r, eff)
     };
@@ -1662,7 +1687,10 @@ fn policy_subject_summary(ev: &SubjectEvidence) -> PolicySubjectSummary {
         root: PolicyProcessSummary {
             pid: root.pid,
             start_time: root.start_time.raw(),
-            exe: root.exe.as_ref().map(|e| e.path.to_string_lossy().into_owned()),
+            exe: root
+                .exe
+                .as_ref()
+                .map(|e| e.path.to_string_lossy().into_owned()),
         },
     }
 }
@@ -1751,8 +1779,9 @@ pub(crate) fn pending_views(
             },
             project: meta.project_dir.to_string_lossy().into_owned(),
             bindings: vec![format!(
-                "signin:{}:{}",
+                "signin:{}#{}={}",
                 meta.target_name,
+                meta.scope.account().role.as_str(),
                 meta.login_slug.as_str()
             )],
             more_bindings: 0,
@@ -1784,10 +1813,7 @@ pub(crate) fn pending_state(
             auths: &s.signin.auths,
             overrides: &s.signin.world_overrides,
         };
-        let r = s
-            .signin
-            .store
-            .status(&caller_root, &req_id, &now, &world);
+        let r = s.signin.store.status(&caller_root, &req_id, &now, &world);
         let eff = s.signin.store.drain_effects();
         (r, eff)
     };
@@ -1921,66 +1947,72 @@ pub(crate) fn approve(
         (vault, generation, pass, chosen_options)
     };
 
-    envcloak_sys::pause_point("signin.approve.during_proof");
     let verified = {
         let _gate = locked(&shared.proof_gate);
         vault.verify_passphrase(&pass)
     };
     drop(pass);
 
-    let mut s = locked(&shared.state);
-    let now = now_of(&shared.clocks);
-    let back = s.finish_proof(generation, vault);
-    match verified {
-        Ok(()) => {
-            s.limiter().succeeded();
-            back?;
-            let caller = evidence(shared, peer, &p.claims)?;
-            let meta_subject = s
-                .signin
-                .ops
-                .get(&req_id)
-                .map(|m| m.subject.clone())
-                .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?;
-            if let Some(r) = caller.approval_refusal(&meta_subject, &alive) {
-                s.audit(AuditEvent::ProofRefused {
-                    pid: peer.pid,
-                    method: "approve",
-                    reason: r.token(),
-                });
-                return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+    {
+        let mut s = locked(&shared.state);
+        let now = now_of(&shared.clocks);
+        let back = s.finish_proof(generation, vault);
+        match verified {
+            Ok(()) => {
+                s.limiter().succeeded();
+                back?;
             }
-            let res = finish_signin_approve(
-                &mut s,
-                shared,
-                peer,
-                &caller,
-                req_id,
-                chosen_options,
-                &digest,
-                &now,
-            )?;
-            drop(s);
-            maybe_drive_test_stub_supervisor(shared, req_id);
-            Ok(res)
-        }
-        Err(e) if e.kind() == VaultErrorKind::Crypto(CryptoErrorKind::Unlock) => {
-            s.limiter().failed(&now);
-            s.audit(AuditEvent::ProofFailed {
-                pid: peer.pid,
-                kind: AuditKind::SigninApprove,
-            });
-            back?;
-            Err(RpcError::new(ErrorKind::WrongPassphrase))
-        }
-        Err(e) => {
-            back?;
-            Err(RpcError::with_reason(
-                ErrorKind::VaultUnavailable,
-                vault_reason(e.kind()),
-            ))
+            Err(e) if e.kind() == VaultErrorKind::Crypto(CryptoErrorKind::Unlock) => {
+                s.limiter().failed(&now);
+                s.audit(AuditEvent::ProofFailed {
+                    pid: peer.pid,
+                    kind: AuditKind::SigninApprove,
+                });
+                back?;
+                return Err(RpcError::new(ErrorKind::WrongPassphrase));
+            }
+            Err(e) => {
+                back?;
+                return Err(RpcError::with_reason(
+                    ErrorKind::VaultUnavailable,
+                    vault_reason(e.kind()),
+                ));
+            }
         }
     }
+
+    envcloak_sys::pause_point("signin.approve.during_proof");
+
+    let mut s = locked(&shared.state);
+    let now = now_of(&shared.clocks);
+    let caller = evidence(shared, peer, &p.claims)?;
+    let meta_subject = s
+        .signin
+        .ops
+        .get(&req_id)
+        .map(|m| m.subject.clone())
+        .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?;
+    if let Some(r) = caller.approval_refusal(&meta_subject, &alive) {
+        s.audit(AuditEvent::ProofRefused {
+            pid: peer.pid,
+            method: "approve",
+            reason: r.token(),
+        });
+        return Err(RpcError::with_reason(ErrorKind::ProofRefused, r.token()));
+    }
+    let res = finish_signin_approve(
+        &mut s,
+        shared,
+        peer,
+        &caller,
+        req_id,
+        chosen_options,
+        &digest,
+        &now,
+    )?;
+    drop(s);
+    maybe_drive_test_stub_supervisor(shared, req_id);
+    Ok(res)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2040,6 +2072,7 @@ fn finish_signin_approve(
     let item_id = meta.login_item;
     let login_slug = meta.login_slug.clone();
     let target_name = meta.target_name.clone();
+    let role = meta.scope.account().role.as_str().to_owned();
     let fp: ScopeFingerprint = *meta.scope.fingerprint().as_bytes();
     s.signin.auths.insert(
         auth_id,
@@ -2051,6 +2084,7 @@ fn finish_signin_approve(
             login_item: item_id,
             login_slug: login_slug.clone(),
             target_name,
+            role,
             created_wall: now.wall,
         },
     );
@@ -2162,7 +2196,7 @@ pub(crate) fn grant_views(s: &mut State, now: &Now) -> Vec<GrantView> {
                 .map(|e| e.path.to_string_lossy().into_owned()),
             project_dir: meta.project_dir.to_string_lossy().into_owned(),
             bindings: vec![GrantBindingView {
-                env_name: format!("SIGNIN:{}", meta.target_name),
+                env_name: format!("signin:{}#{}", meta.target_name, meta.role),
                 slug: meta.login_slug.as_str().to_owned(),
                 live: false,
             }],
@@ -2428,16 +2462,14 @@ mod tests {
         AdapterRefView, ClassificationView, CookieScopeView, IdentityCheckKindView,
         IdentityCheckView, LoginTierView, SessionFormatView,
     };
-    use envcloak_signin::{
-        CookieDomain, CookiePartition, CookiePath, Host, Label, Scheme, Site,
-    };
+    use envcloak_signin::{CookieDomain, CookiePartition, CookiePath, Host, Label, Scheme, Site};
 
     struct TestEnv {
         _tmp: tempfile::TempDir,
         manifest_path: PathBuf,
         shared: Shared,
         peer: PeerIdentity,
-        pass: SecretBytes,
+        pass: &'static [u8],
     }
 
     impl TestEnv {
@@ -2448,7 +2480,8 @@ mod tests {
             let data_dir = tmp.path().join("data");
             std::fs::create_dir_all(&data_dir).unwrap();
             let paths = VaultPaths::under(data_dir);
-            let pass = SecretBytes::copy_from(b"correct-horse-battery-staple-test");
+            let pass_bytes: &'static [u8] = b"correct-horse-battery-staple-test";
+            let pass = SecretBytes::copy_from(pass_bytes);
             let kit = RecoveryKit::generate();
             let v = create_vault_with_kit(&paths, &pass, &kit, KdfParams::minimum()).unwrap();
             drop(v);
@@ -2526,9 +2559,7 @@ mod tests {
                     approval_lifetime_secs: 900,
                     session_lifetime_secs: 900,
                     revocation: None,
-                    passphrase: Some(WireSecret::from(SecretBytes::copy_from(
-                        pass.expose_secret(),
-                    ))),
+                    passphrase: Some(WireSecret::from(SecretBytes::copy_from(pass_bytes))),
                     claims: Vec::new(),
                 },
             )
@@ -2539,7 +2570,7 @@ mod tests {
                 manifest_path,
                 shared,
                 peer,
-                pass,
+                pass: pass_bytes,
             }
         }
 
@@ -2591,9 +2622,7 @@ mod tests {
                     },
                     dev,
                     digest: digest_hex,
-                    passphrase: Some(WireSecret::from(SecretBytes::copy_from(
-                        self.pass.expose_secret(),
-                    ))),
+                    passphrase: Some(WireSecret::from(SecretBytes::copy_from(self.pass))),
                     claims: Vec::new(),
                 },
             )
@@ -2711,7 +2740,7 @@ mod tests {
                 field: Some("password".into()),
                 item: item_id,
                 value: WireSecret::from(SecretBytes::copy_from(b"new-pw-secret-789")),
-                passphrase: WireSecret::from(SecretBytes::copy_from(env.pass.expose_secret())),
+                passphrase: WireSecret::from(SecretBytes::copy_from(env.pass)),
                 claims: Vec::new(),
             },
         )
@@ -2760,9 +2789,7 @@ mod tests {
                 approval_lifetime_secs: Some(600),
                 session_lifetime_secs: None,
                 revocation: None,
-                passphrase: Some(WireSecret::from(SecretBytes::copy_from(
-                    env.pass.expose_secret(),
-                ))),
+                passphrase: Some(WireSecret::from(SecretBytes::copy_from(env.pass))),
                 claims: Vec::new(),
             },
         )
@@ -2988,18 +3015,8 @@ mod tests {
             let err = s
                 .signin_verify_imported_cookies(id, &stored, &now)
                 .unwrap_err();
-            assert_eq!(
-                err.kind,
-                ErrorKind::InvalidParams,
-                "{label}"
-            );
-            let stop = s
-                .signin
-                .store
-                .operation(&id)
-                .unwrap()
-                .stop()
-                .expect(label);
+            assert_eq!(err.kind, ErrorKind::InvalidParams, "{label}");
+            let stop = s.signin.store.operation(&id).unwrap().stop().expect(label);
             assert!(!stop.delivered, "{label}");
             assert_eq!(
                 stop.reason,

@@ -167,9 +167,9 @@ fn valid_target_name(name: &str) -> bool {
         .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     first_ok
         && name.len() <= 128
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b'/')
+        })
 }
 
 fn adapter_id_of(adapter: Option<&VaultAdapterRef>) -> (AdapterId, u64) {
@@ -404,7 +404,10 @@ fn has_shared_loopback_cookie_jar(
 }
 
 /// Resolves a login item reference (`slug` or 26-char ULID `ItemId`) in `v`.
-pub(crate) fn resolve_login_item<'v>(v: &'v Vault, reference: &str) -> Result<&'v ItemMeta, RpcError> {
+pub(crate) fn resolve_login_item<'v>(
+    v: &'v Vault,
+    reference: &str,
+) -> Result<&'v ItemMeta, RpcError> {
     if let Ok(slug) = Slug::new(reference)
         && let Some(item) = v.find(&slug)
     {
@@ -620,10 +623,7 @@ pub(crate) fn find_target_by_name_and_role(
 }
 
 /// Looks up a sign-in target by [`TargetId`] in the unlocked vault.
-pub(crate) fn find_target_by_id(
-    v: &Vault,
-    id: TargetId,
-) -> Result<Option<ParsedTarget>, RpcError> {
+pub(crate) fn find_target_by_id(v: &Vault, id: TargetId) -> Result<Option<ParsedTarget>, RpcError> {
     let pid = PolicyId::from_bytes(*id.as_bytes());
     let policies = v
         .policies()
@@ -709,6 +709,7 @@ fn build_vault_target(
     Ok((record, view))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_target_proof<T>(
     shared: &Shared,
     peer: &PeerIdentity,
@@ -814,6 +815,7 @@ fn verify_target_proof<T>(
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum SigninTargetOutcome {
     Target(SigninTargetView),
     Removed(SigninTargetRemovedView),
@@ -1099,10 +1101,7 @@ pub fn remove(
 }
 
 /// `signin.target.list`.
-pub fn list(
-    shared: &Shared,
-    p: SigninTargetListParams,
-) -> Result<SigninTargetListView, RpcError> {
+pub fn list(shared: &Shared, p: SigninTargetListParams) -> Result<SigninTargetListView, RpcError> {
     validate_manifest_opt(p.manifest.as_deref())?;
     let s = locked(&shared.state);
     let v = s.unlocked()?;

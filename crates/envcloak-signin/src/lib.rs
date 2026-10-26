@@ -62,9 +62,10 @@ pub use scope::{
     Tier, TransferScope,
 };
 pub use statement::{
-    ContextId, CookiePartitionSummary, CookieSummary, DEFAULT_DEV_ATTEMPTS, Nonce, Options,
-    OptionsError, OriginSummary, RequestId, SignInDevOptions, SignInPendingDescriptor,
-    SignInStatement, StorageSummary, render_signin_statement,
+    ContextId, CookiePartitionSummary, CookieSummary, CookieSummaryExt, DEFAULT_DEV_ATTEMPTS,
+    Nonce, Options, OptionsError, OriginSummary, OriginSummaryExt, RequestId, SignInDevOptions,
+    SignInDevOptionsExt, SignInPendingDescriptor, SignInPendingDescriptorExt, SignInStatement,
+    StorageSummary, StorageSummaryExt, render_signin_statement,
 };
 pub use status::{Receipt, Revocation, State, Status};
 pub use store::{
