@@ -742,8 +742,10 @@ fn target_edit_during_proof_refuses_stale_proof_and_lock_or_cancel_tears_down() 
     assert_eq!(v_lock.state, "pending_approval");
     c.lock().unwrap();
     c.unlock(f.pass(), &[]).unwrap();
-    let (st_kind, _) = rpc_kind(c.signin_status(&v_lock.request).unwrap_err());
-    assert_eq!(st_kind, ErrorKind::NoSuchRequest);
+    let st_lock = c.signin_status(&v_lock.request).unwrap();
+    assert_eq!(st_lock.state, "failed");
+    assert_eq!(st_lock.reason.as_deref(), Some("locked"));
+    assert!(c.pending_list().unwrap().requests.is_empty());
     f.sweep();
 }
 
