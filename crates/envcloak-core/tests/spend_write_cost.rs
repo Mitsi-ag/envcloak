@@ -2,6 +2,12 @@
 //! (kinds 5 to 11), gate s9 (no byte-string over 64 bytes or unbounded string),
 //! crash consistency on snapshot overwrite (gate 5), read-only open on unknown
 //! policy kind/version (gate 6), and the D4-09 / K4-04 write-cost measurement.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::inconsistent_digit_grouping,
+    clippy::assertions_on_constants
+)]
 
 use std::collections::BTreeMap;
 use std::process::Command;
