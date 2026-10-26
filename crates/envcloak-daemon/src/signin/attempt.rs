@@ -29,8 +29,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use envcloak_browser::{
-    AttemptOutcome, AttemptSpec, DaemonToDriver, DeclaredState, DriverMessage, EntryImageAnchor,
-    LaunchSpec, WorkerStopReason,
+    AttemptFlow, AttemptOutcome, AttemptSpec, DaemonToDriver, DeclaredState, DriverMessage,
+    EntryImageAnchor, LaunchSpec, WorkerStopReason,
 };
 use envcloak_core::SecretBytes;
 use envcloak_core::vault::{AttemptLease, FieldKind, ItemId, Vault};
@@ -103,6 +103,7 @@ pub struct ActiveAttemptSession {
     pub lifeline_w: OwnedFd,
     pub account_guard: AttemptGuard,
     pub lease: AttemptLease,
+    pub is_test_session: bool,
     pub cancelled: Arc<AtomicBool>,
     pub stop_override: Arc<Mutex<Option<StopReason>>>,
 }
@@ -568,6 +569,7 @@ impl AttemptSupervisor {
         launch.test_ca_spki_sha256 = test_ca_spki_sha256;
         launch.extra_args = extra_chrome_args;
 
+        let is_test_session = matches!(spec.flow, AttemptFlow::TestSession { .. });
         let spawner = self.spawner.get_or_init(SupervisionSpawner::start);
         let (driver, reaper, lifeline_w) = match spawner.spawn_pair(anchor, spec, launch) {
             Ok(pair) => pair,
@@ -619,6 +621,7 @@ impl AttemptSupervisor {
             lifeline_w,
             account_guard,
             lease,
+            is_test_session,
             cancelled: Arc::clone(&cancelled),
             stop_override: Arc::clone(&stop_override),
         };
@@ -703,6 +706,7 @@ impl AttemptSupervisor {
             lifeline_w,
             account_guard,
             lease,
+            is_test_session,
             cancelled,
             stop_override,
         } = session;
@@ -711,6 +715,7 @@ impl AttemptSupervisor {
             &self.totp,
             &account_guard,
             &lease,
+            is_test_session,
             &mut driver,
             &reaper.child,
             &cancelled,
@@ -940,6 +945,7 @@ fn drive_session_loop(
     totp: &TotpState,
     account_guard: &AttemptGuard,
     lease: &AttemptLease,
+    is_test_session: bool,
     driver: &mut DriverSession,
     reaper_child: &OwnedChild,
     cancelled: &AtomicBool,
@@ -998,12 +1004,15 @@ fn drive_session_loop(
                 }
                 let mut field_res: Option<Result<SecretBytes, TotpError>> = None;
                 let vault_ok = with_vault(&mut |vault| {
-                    let pw = totp.read_field(account_guard, lease, vault, FieldKind::Password);
+                    let (primary, fallback) = if is_test_session {
+                        (FieldKind::AdapterKey, FieldKind::Password)
+                    } else {
+                        (FieldKind::Password, FieldKind::AdapterKey)
+                    };
+                    let pw = totp.read_field(account_guard, lease, vault, primary);
                     field_res = Some(match pw {
                         Ok(v) => Ok(v),
-                        Err(_) => {
-                            totp.read_field(account_guard, lease, vault, FieldKind::AdapterKey)
-                        }
+                        Err(_) => totp.read_field(account_guard, lease, vault, fallback),
                     });
                 });
                 let Some(field_res) = field_res.filter(|_| vault_ok) else {

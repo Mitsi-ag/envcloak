@@ -5,6 +5,8 @@
 //! (`browser_*`) are checked against [`ToolAllowlist::admit`] and the active
 //! session lease before being forwarded to the supervised browser helper.
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
 use envcloak_client::fail::Failure;
@@ -15,13 +17,18 @@ use crate::router::{Annotations, Backend, ToolResult, ToolSchema};
 use crate::tools::Ctx;
 
 use super::allowlist::{ALLOWED_BROWSER_TOOLS, TOOL_NOT_ALLOWED, ToolAllowlist};
-use super::supervisor::{BrowserSupervisor, CONTEXT_NOT_PUBLISHED, GRANT_REVOKED};
+use super::supervisor::{
+    BrowserSupervisor, CONTEXT_NOT_PUBLISHED, GRANT_REVOKED, SupervisorOptions,
+};
 
 /// Shared, thread-safe handle to an optional [`BrowserSupervisor`] backing the
 /// 19 hosted browser tools in `envcloak mcp`.
 #[derive(Clone, Default)]
 pub struct BrowserRelay {
     inner: Arc<Mutex<Option<BrowserSupervisor>>>,
+    pending_pipes: Arc<Mutex<BTreeMap<String, OwnedFd>>>,
+    activated_requests: Arc<Mutex<BTreeSet<String>>>,
+    active_request: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for BrowserRelay {
@@ -38,6 +45,9 @@ impl BrowserRelay {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
+            pending_pipes: Arc::new(Mutex::new(BTreeMap::new())),
+            activated_requests: Arc::new(Mutex::new(BTreeSet::new())),
+            active_request: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -46,7 +56,80 @@ impl BrowserRelay {
     pub fn with_supervisor(supervisor: BrowserSupervisor) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Some(supervisor))),
+            pending_pipes: Arc::new(Mutex::new(BTreeMap::new())),
+            activated_requests: Arc::new(Mutex::new(BTreeSet::new())),
+            active_request: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Registers the read end of the control pipe passed to `signin.request`
+    /// for `request`, so [`Self::activate_from_request`] can consume the
+    /// daemon's wiping `ToSupervisor::InjectState` frame once the sign-in
+    /// attempt is published.
+    pub fn register_request_pipe(&self, request: &str, pipe_out: OwnedFd) {
+        if self
+            .activated_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(request)
+        {
+            return;
+        }
+        self.pending_pipes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(request.to_owned())
+            .or_insert(pipe_out);
+    }
+
+    /// Activates the recipient [`BrowserSupervisor`] for `request` when the
+    /// sign-in operation reaches `published` or `ready`.
+    pub fn activate_from_request(&self, request: &str) {
+        if self
+            .activated_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(request)
+        {
+            self.with_supervisor_mut(|sup| sup.set_lease_active(true));
+            return;
+        }
+        let pipe_opt = self
+            .pending_pipes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(request);
+        if let Some(pipe_fd) = pipe_opt {
+            let mut file = std::fs::File::from(pipe_fd);
+            if let Ok(frame) = envcloak_ipc::Frame::read_from(&mut file)
+                && let Ok(envcloak_ipc::control::ToSupervisor::InjectState(inj)) = frame.decode()
+                && let Ok(mut sup) = BrowserSupervisor::start(SupervisorOptions {
+                    host_resolver_rules: Some("MAP *.localhost 127.0.0.1".to_owned()),
+                    ..SupervisorOptions::default()
+                })
+            {
+                let gen_str = inj.generation.to_string();
+                let _ = sup.mcp_initialize();
+                if sup.create_context(&gen_str).is_ok()
+                    && sup.inject_daemon_control_state(&inj).is_ok()
+                    && sup.publish(&gen_str).is_ok()
+                {
+                    sup.set_lease_active(true);
+                    self.attach(sup);
+                    *self
+                        .active_request
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(request.to_owned());
+                    self.activated_requests
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(request.to_owned());
+                    return;
+                }
+            }
+        }
+        self.with_supervisor_mut(|sup| sup.set_lease_active(true));
     }
 
     /// Replaces or attaches a [`BrowserSupervisor`] to this relay.
@@ -146,7 +229,7 @@ impl Backend for BrowserRelay {
             .collect()
     }
 
-    fn call(&self, name: &str, args: &Map<String, Value>, _ctx: &Ctx, _call: &Call) -> ToolResult {
+    fn call(&self, name: &str, args: &Map<String, Value>, ctx: &Ctx, call: &Call) -> ToolResult {
         let args_val = Value::Object(args.clone());
         if let Err(why) = ToolAllowlist::admit(name, &args_val) {
             return ToolResult::Err(Failure::new(
@@ -154,6 +237,22 @@ impl Backend for BrowserRelay {
                 format!("{TOOL_NOT_ALLOWED}: {why}"),
             ));
         }
+        let active_req = self
+            .active_request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let daemon_revoked = if let Some(req_id) = active_req.as_deref() {
+            match ctx
+                .connect(call)
+                .and_then(|mut c| Ok(c.signin_status(req_id)?))
+            {
+                Ok(view) => !matches!(view.state.as_str(), "published" | "ready"),
+                Err(_) => true,
+            }
+        } else {
+            false
+        };
         let mut guard = self
             .inner
             .lock()
@@ -164,6 +263,12 @@ impl Backend for BrowserRelay {
                 format!("{CONTEXT_NOT_PUBLISHED}: no signed-in browser context is published"),
             ));
         };
+        if daemon_revoked {
+            sup.set_lease_active(false);
+            if let Some(gen_id) = sup.bound_generation().map(str::to_owned) {
+                let _ = sup.close(&gen_id);
+            }
+        }
         if !sup.is_lease_active() {
             return ToolResult::Err(Failure::new(
                 "policy_denied",

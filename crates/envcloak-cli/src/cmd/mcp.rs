@@ -107,6 +107,23 @@ pub fn run(args: &[&str]) -> ExitCode {
     serve(a).unwrap_or_else(|f| f.report(FAILURE))
 }
 
+fn should_enable_browser_relay() -> bool {
+    if std::env::var_os("ENVCLOAK_MCP_SIGNIN").is_some() {
+        return true;
+    }
+    let Ok(loc) = envcloak_agents::locations::Locations::from_env() else {
+        return false;
+    };
+    for path in [loc.claude_instructions(), loc.codex_instructions()] {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && text.contains("request_sign_in")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn serve(a: McpArgs) -> Result<ExitCode, Failure> {
     // Before any thread starts, so every thread inherits the mask and the
     // signals wait for the one that takes them.
@@ -127,7 +144,12 @@ fn serve(a: McpArgs) -> Result<ExitCode, Failure> {
                 "this program's own path could not be found; the server did not start",
             )
         })?;
-    let server = envcloak_mcp::Server::new();
+    let (server, relay) = if should_enable_browser_relay() {
+        let r = envcloak_mcp::browser::BrowserRelay::new();
+        (envcloak_mcp::Server::with_browser_relay(r.clone()), Some(r))
+    } else {
+        (envcloak_mcp::Server::new(), None)
+    };
     let shutdown = server.shutdown();
     std::thread::spawn(move || {
         if let Ok(sig) = signals.wait() {
@@ -135,7 +157,10 @@ fn serve(a: McpArgs) -> Result<ExitCode, Failure> {
             envcloak_sys::exit_by_signal(sig);
         }
     });
-    let ctx = envcloak_mcp::Ctx::new(exe, a.host, a.wait);
+    let mut ctx = envcloak_mcp::Ctx::new(exe, a.host, a.wait);
+    if let Some(r) = relay {
+        ctx = ctx.with_browser_relay(r);
+    }
     match server.run(std::io::stdin(), std::io::stdout(), ctx) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(e)

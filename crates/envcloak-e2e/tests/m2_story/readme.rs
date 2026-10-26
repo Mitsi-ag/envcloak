@@ -237,10 +237,11 @@ pub fn verify_docs_against_matrix(
         };
         if cells.len() == 4 && cells[0] == "Guarantee" {
             if !cells[1].to_ascii_lowercase().contains("unavailable")
-                || !cells[3].to_ascii_lowercase().contains("unavailable")
+                || !cells[3].to_ascii_lowercase().contains("available")
+                || cells[3].to_ascii_lowercase().contains("unavailable")
             {
                 return Err(
-                    "README.md guarantees table header must mark Proxy mode (M6+) and Sign-in mode (M2b+) as unavailable in this build"
+                    "README.md guarantees table header must mark Proxy mode (M6+) as unavailable and Sign-in mode (M2b+) as available in this build"
                         .to_owned(),
                 );
             }
@@ -273,9 +274,9 @@ pub fn verify_docs_against_matrix(
                 "README.md guarantees row {row_name:?} Proxy column does not mark M6 as unavailable: {proxy_cell:?}"
             ));
         }
-        if !signin_cell.to_ascii_lowercase().contains("unavailable") {
+        if signin_cell.to_ascii_lowercase().contains("unavailable") {
             return Err(format!(
-                "README.md guarantees row {row_name:?} Sign-in column does not mark M2b as unavailable: {signin_cell:?}"
+                "README.md guarantees row {row_name:?} Sign-in column still marks M2b as unavailable: {signin_cell:?}"
             ));
         }
         if !inject_cell.contains(expected_inject_substr) {

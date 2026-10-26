@@ -388,19 +388,26 @@ pub fn cache_dir() -> PathBuf {
     if let Some(dir) = env::var_os("ENVCLOAK_AGENT_HOSTS") {
         return PathBuf::from(dir);
     }
-    if let Ok(exe) = env::current_exe()
-        && let Some(mut profile) = exe.parent()
-    {
-        if profile.file_name().is_some_and(|n| n == "deps")
-            && let Some(parent) = profile.parent()
-        {
-            profile = parent;
-        }
-        if let Some(target_dir) = profile.parent() {
-            let candidate = target_dir.join("agent-hosts");
-            if candidate.is_dir() {
-                return candidate;
+    if let Ok(raw_exe) = env::current_exe() {
+        let exe = fs::canonicalize(&raw_exe).unwrap_or(raw_exe);
+        if let Some(mut profile) = exe.parent() {
+            if profile.file_name().is_some_and(|n| n == "deps")
+                && let Some(parent) = profile.parent()
+            {
+                profile = parent;
             }
+            if let Some(target_dir) = profile.parent() {
+                let candidate = target_dir.join("agent-hosts");
+                if candidate.is_dir() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    if let Some(target_dir) = env::var_os("CARGO_TARGET_DIR") {
+        let candidate = PathBuf::from(target_dir).join("agent-hosts");
+        if candidate.is_dir() {
+            return candidate;
         }
     }
     let shared_main_cache =

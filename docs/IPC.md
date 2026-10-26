@@ -515,6 +515,7 @@ A task takes the rows it is named in. To take another row, or a new one, it chan
 | `scan_failed` | M2-22 | landed | scrub could not finish source discovery or candidate collection |
 | `statement_changed` | M2-22 | landed | the scrub undo statement changed before the restore proof was used |
 | `unsupported` | M2-22 | landed | a scrub occurrence lacks rewrite authority, including a match inside a longer encoded run |
+| `step_up_once_only` | M2b-11 | landed | `envcloak approve` on a `step-up` sign-in request with `--for` or `--dev`; `step-up` sign-in approvals are `--once` only (SPEC §6.8, T5) |
 <!-- /reservations -->
 
 **Coverage tokens** (`envcloak agents status`; states, reasons and probe outcomes share one namespace):

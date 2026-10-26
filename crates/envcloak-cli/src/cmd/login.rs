@@ -62,7 +62,7 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
 fn parse_tier(s: &str) -> Option<LoginTierView> {
     match s {
         "dev" => Some(LoginTierView::Dev),
-        "each" => Some(LoginTierView::Each),
+        "each" | "step-up" => Some(LoginTierView::Each),
         "never-agent" => Some(LoginTierView::NeverAgent),
         _ => None,
     }

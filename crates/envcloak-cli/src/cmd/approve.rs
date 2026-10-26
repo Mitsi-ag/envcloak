@@ -362,6 +362,14 @@ fn run_approve_signin(
     a: &ApproveArgs,
     claims: &[String],
 ) -> Result<ExitCode, Failure> {
+    if (a.signin_dev.is_some() || (a.has_run_options && a.options.uses != Uses::Once))
+        && descriptor.tier == "each"
+    {
+        return Err(Failure::new(
+            "step_up_once_only",
+            "step-up sign-in targets allow --once only; --for and --dev are not permitted",
+        ));
+    }
     if a.options.standing.is_some()
         || !a.options.live.is_empty()
         || (a.has_run_options && a.options.uses != Uses::Once)

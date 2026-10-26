@@ -123,12 +123,16 @@ pub struct SigninOperationMeta {
     pub target_policy_id: PolicyId,
     pub target_name: String,
     pub shared_loopback_cookie_jar: bool,
+    pub revocation_endpoint: Option<String>,
+    pub revocation_verified: bool,
+    pub worker_cleanup_confirmed: bool,
     pub created_awake: Duration,
     pub captured_state: Option<CapturedBrowserState>,
     pub active_worker: Option<WorkerId>,
     pub attempt_driver_claimed: bool,
     pub supervisor_pipe: Option<SupervisorPipe>,
     pub tool_pipes: Option<(OwnedFd, OwnedFd)>,
+    pub tool_inject_frame: Option<envcloak_ipc::Frame>,
     pub publish_audited: bool,
     pub end_audited: bool,
 }
@@ -605,6 +609,7 @@ impl State {
         self.signin.attempt_supervisor.on_event(AttemptEvent::Lock);
         for meta in self.signin.ops.values_mut() {
             meta.captured_state = None;
+            meta.tool_inject_frame = None;
         }
         let effects = {
             let vault = slot_unlocked(&self.slot);
@@ -709,6 +714,7 @@ impl State {
                     self.signin.attempt_supervisor.on_event(attempt_ev);
 
                     if let Some(meta) = self.signin.ops.get_mut(&request) {
+                        meta.tool_inject_frame = None;
                         if meta.captured_state.take().is_some() {
                             self.signin.attempt_supervisor.note_state_released();
                         }
@@ -878,8 +884,15 @@ impl State {
             cookies: cookies_wire,
             storage: storage_wire,
         });
-        send_to_supervisor(&pipe.daemon_stream, &msg)
+        let frame =
+            envcloak_ipc::Frame::encode(&msg).map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        let mut daemon_stream = &pipe.daemon_stream;
+        frame
+            .write_to(&mut daemon_stream)
             .map_err(|_| RpcError::new(ErrorKind::Internal))?;
+        if meta.tool_pipes.is_some() {
+            meta.tool_inject_frame = Some(frame);
+        }
         self.signin.send_log.push(SendRecord {
             request,
             destination: SendDestination::SupervisorControlPipe {
@@ -1335,6 +1348,7 @@ fn status_view_of(
     shared_loopback_cookie_jar: bool,
 ) -> SigninStatusView {
     let op = s.signin.store.operation(&request);
+    let meta = s.signin.ops.get(&request);
     let delivered_context = if status.receipt.delivered {
         op.map(|o| format!("ctx-{}", o.context().get()))
     } else {
@@ -1346,6 +1360,18 @@ fn status_view_of(
         .and_then(|w| w.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
 
+    let revocation = if status.state == OpState::Ended && status.receipt.delivered {
+        if meta.is_some_and(|m| m.revocation_verified) {
+            "verified".to_owned()
+        } else if meta.is_some_and(|m| m.revocation_endpoint.is_none()) {
+            "server session expiry unknown".to_owned()
+        } else {
+            revocation_token(status.receipt.revocation).to_owned()
+        }
+    } else {
+        revocation_token(status.receipt.revocation).to_owned()
+    };
+
     SigninStatusView {
         request: request.to_string(),
         revision: status.revision,
@@ -1353,7 +1379,7 @@ fn status_view_of(
         retry_until_secs,
         delivered_context,
         cleanup: cleanup_token(status.receipt.cleanup).to_owned(),
-        revocation: revocation_token(status.receipt.revocation).to_owned(),
+        revocation,
         reason: if status.receipt.cleanup == Cleanup::Failed
             && matches!(
                 status.receipt.reason,
@@ -1369,6 +1395,78 @@ fn status_view_of(
         shared_loopback_cookie_jar,
         authorization,
     }
+}
+
+fn resolve_revocation_url(
+    raw: &str,
+    parsed_target: &crate::signin::targets::ParsedTarget,
+) -> Option<String> {
+    let trimmed = raw.trim();
+    let without_method = trimmed
+        .strip_prefix("POST ")
+        .or_else(|| trimmed.strip_prefix("post "))
+        .map_or(trimmed, str::trim);
+    if without_method.starts_with("http://") || without_method.starts_with("https://") {
+        Some(without_method.to_owned())
+    } else if without_method.starts_with('/') {
+        let base = parsed_target
+            .app_origins
+            .iter()
+            .next()
+            .or_else(|| parsed_target.credential_origins.iter().next())?;
+        Some(format!("{base}{without_method}"))
+    } else {
+        None
+    }
+}
+
+fn invoke_revocation_endpoint(url: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+
+    let rest = match url.strip_prefix("http://") {
+        Some(r) => r,
+        None => return false,
+    };
+    let (host_port, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let (host, port_str) = match host_port.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => (host_port, "80"),
+    };
+    let Ok(port) = port_str.parse::<u16>() else {
+        return false;
+    };
+    let ip: IpAddr = if host == "localhost" || host.ends_with(".localhost") || host == "127.0.0.1" {
+        IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else if let Ok(parsed_ip) = host.parse::<IpAddr>() {
+        parsed_ip
+    } else {
+        return false;
+    };
+    let addr = SocketAddr::new(ip, port);
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let body = "{}";
+    let req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    if stream.write_all(req.as_bytes()).is_err() {
+        return false;
+    }
+    let mut resp_buf = [0u8; 256];
+    let Ok(n) = stream.read(&mut resp_buf) else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&resp_buf[..n]);
+    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
 /// `signin.request`.
@@ -1511,6 +1609,10 @@ pub fn request(
     .map_err(|_| RpcError::with_reason(ErrorKind::InvalidParams, "invalid_signin_scope"))?;
 
     let shared_jar = parsed_target.shared_loopback_cookie_jar;
+    let revocation_endpoint = parsed_target
+        .revocation
+        .as_deref()
+        .and_then(|r| resolve_revocation_url(r, &parsed_target));
     let subj_summary = subject_summary(peer, &caller);
     let (lookup, effects) = loop {
         let mut req_bytes = [0u8; 16];
@@ -1540,12 +1642,16 @@ pub fn request(
                 target_policy_id: parsed_target.policy_id,
                 target_name: parsed_target.name.clone(),
                 shared_loopback_cookie_jar: shared_jar,
+                revocation_endpoint: revocation_endpoint.clone(),
+                revocation_verified: false,
+                worker_cleanup_confirmed: false,
                 created_awake: now.awake,
                 captured_state: None,
                 active_worker: None,
                 attempt_driver_claimed: false,
                 supervisor_pipe: None,
                 tool_pipes: None,
+                tool_inject_frame: None,
                 publish_audited: false,
                 end_audited: false,
             },
@@ -1621,18 +1727,40 @@ pub fn request(
     drop(s_guard);
     maybe_drive_test_stub_supervisor(shared, req_id);
     maybe_drive_test_worker_spec(shared, req_id);
-    if test_stub_signin_dir().is_some() || test_worker_spec_path().is_some() {
+    {
         let mut s_guard = locked_ready(shared);
         let s: &mut State = &mut s_guard;
         if let Some(op) = s.signin.store.operation(&req_id) {
-            return Ok(status_view_of(s, req_id, op.status(), shared_jar));
+            let st = op.status();
+            if st.revision != view.revision
+                || test_stub_signin_dir().is_some()
+                || test_worker_spec_path().is_some()
+            {
+                return Ok(status_view_of(s, req_id, st, shared_jar));
+            }
         }
     }
     Ok(view)
 }
 
-fn parse_signin_req_id(raw: &str) -> Result<RequestId, RpcError> {
-    RequestId::parse(raw).ok_or(RpcError::new(ErrorKind::NoSuchRequest))
+fn resolve_signin_req_id(
+    s: &State,
+    caller_root: Instance,
+    raw: &str,
+) -> Result<RequestId, RpcError> {
+    if let Some(id) = RequestId::parse(raw) {
+        return Ok(id);
+    }
+    let ctx_str = raw.strip_prefix("ctx-").unwrap_or(raw);
+    let ctx_num: u64 = ctx_str
+        .parse()
+        .map_err(|_| RpcError::new(ErrorKind::NoSuchRequest))?;
+    s.signin
+        .store
+        .operations()
+        .find(|op| op.context().get() == ctx_num && op.owner() == caller_root)
+        .map(|op| op.request())
+        .ok_or(RpcError::new(ErrorKind::NoSuchRequest))
 }
 
 /// `signin.status`. Refused before any metadata if called from another root.
@@ -1641,11 +1769,11 @@ pub fn status(
     peer: &PeerIdentity,
     p: SigninOperationParams,
 ) -> Result<SigninStatusView, RpcError> {
-    let req_id = parse_signin_req_id(&p.request)?;
     let caller = evidence(shared, peer, &[])?;
     let caller_root = Instance::from(&caller.root());
     let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
+    let req_id = resolve_signin_req_id(s, caller_root, &p.request)?;
     let now = now_of(&shared.clocks);
     let (res, effects) = {
         let vault = slot_unlocked(&s.slot);
@@ -1687,11 +1815,11 @@ pub fn cancel(
     peer: &PeerIdentity,
     p: SigninOperationParams,
 ) -> Result<SigninStatusView, RpcError> {
-    let req_id = parse_signin_req_id(&p.request)?;
     let caller = evidence(shared, peer, &[])?;
     let caller_root = Instance::from(&caller.root());
     let mut s_guard = locked_ready(shared);
     let s: &mut State = &mut s_guard;
+    let req_id = resolve_signin_req_id(s, caller_root, &p.request)?;
     let now = now_of(&shared.clocks);
     let (res, effects) = {
         let vault = slot_unlocked(&s.slot);
@@ -1731,20 +1859,18 @@ pub fn end(
     let s: &mut State = &mut s_guard;
     let now = now_of(&shared.clocks);
 
-    let req_id = if let Some(id) = RequestId::parse(&p.session) {
-        id
-    } else {
-        let ctx_str = p.session.strip_prefix("ctx-").unwrap_or(&p.session);
-        let ctx_num: u64 = ctx_str
-            .parse()
-            .map_err(|_| RpcError::new(ErrorKind::NoSuchRequest))?;
-        s.signin
-            .store
-            .operations()
-            .find(|op| op.context().get() == ctx_num && op.owner() == caller_root)
-            .map(|op| op.request())
-            .ok_or(RpcError::new(ErrorKind::NoSuchRequest))?
-    };
+    let req_id = resolve_signin_req_id(s, caller_root, &p.session)?;
+    let (rev_endpoint, worker_for_cleanup, worker_confirmed) = s
+        .signin
+        .ops
+        .get_mut(&req_id)
+        .map_or((None, None, false), |m| {
+            (
+                m.revocation_endpoint.clone(),
+                m.active_worker,
+                m.worker_cleanup_confirmed || test_stub_signin_dir().is_some(),
+            )
+        });
 
     let (res, effects) = {
         let vault = slot_unlocked(&s.slot);
@@ -1762,7 +1888,21 @@ pub fn end(
         (r, eff)
     };
     s.execute_signin_effects(effects, &now, Some(&shared.catalog));
-    let st = res.map_err(|_| RpcError::new(ErrorKind::NoSuchRequest))?;
+    let mut st = res.map_err(|_| RpcError::new(ErrorKind::NoSuchRequest))?;
+    if st.receipt.delivered {
+        if worker_confirmed && let Some(w) = worker_for_cleanup {
+            s.signin_cleanup_result(req_id, w, true, &now);
+            if let Some(op) = s.signin.store.operation(&req_id) {
+                st = op.status();
+            }
+        }
+        if let Some(url) = rev_endpoint {
+            let ok = invoke_revocation_endpoint(&url);
+            if ok && let Some(m) = s.signin.ops.get_mut(&req_id) {
+                m.revocation_verified = true;
+            }
+        }
+    }
     let shared_jar = s
         .signin
         .ops
@@ -2635,6 +2775,197 @@ fn locked_ready(shared: &Shared) -> std::sync::MutexGuard<'_, State> {
     }
 }
 
+fn resolve_default_chrome_for_testing() -> Option<(PathBuf, String)> {
+    const CHROME_VERSION: &str = "151.0.7922.34";
+    const CHROME_REVISION: &str = "1234";
+    let (plat, entry, sha256) = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        (
+            "darwin-arm64",
+            "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            "a596b1cfc6353e987fcec8d71a23a28cd6a9e7a6b4e20b908e4c4fcffe51158e",
+        )
+    } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        (
+            "linux-x64",
+            "chrome-linux64/chrome",
+            "0b20b130e7edd9dd51873be867761295fe0cfad490c2b9a64f95bd3cfc08fa71",
+        )
+    } else {
+        return None;
+    };
+
+    let mut candidates = Vec::new();
+    if let Some(p) = std::env::var_os("ENVCLOAK_CHROME_FOR_TESTING_BIN") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(p) = std::env::var_os("ENVCLOAK_CHROME_FOR_TESTING") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(pw) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH") {
+        candidates.push(
+            PathBuf::from(pw)
+                .join(format!("chromium-{CHROME_REVISION}"))
+                .join(entry),
+        );
+    }
+    if let Some(cache) = std::env::var_os("ENVCLOAK_AGENT_HOSTS") {
+        candidates.push(
+            PathBuf::from(cache)
+                .join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
+                .join(entry),
+        );
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(mut profile) = exe.parent()
+    {
+        if profile.file_name().is_some_and(|n| n == "deps")
+            && let Some(parent) = profile.parent()
+        {
+            profile = parent;
+        }
+        if let Some(target_dir) = profile.parent() {
+            candidates.push(
+                target_dir
+                    .join("agent-hosts")
+                    .join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
+                    .join(entry),
+            );
+        }
+    }
+    candidates.push(
+        PathBuf::from("/Volumes/KeenShiftDev/tmp/envcloak-target-main/agent-hosts")
+            .join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
+            .join(entry),
+    );
+    if let Some(home) = std::env::var_os("HOME") {
+        let home_dir = PathBuf::from(home);
+        candidates.push(
+            home_dir
+                .join("Library/Caches/ms-playwright")
+                .join(format!("chromium-{CHROME_REVISION}"))
+                .join(entry),
+        );
+        candidates.push(
+            home_dir
+                .join(".cache/ms-playwright")
+                .join(format!("chromium-{CHROME_REVISION}"))
+                .join(entry),
+        );
+    }
+
+    let found = candidates.into_iter().find(|p| p.is_file())?;
+    Some((found, sha256.to_owned()))
+}
+
+fn default_supervised_worker_config(
+    s: &State,
+    req_id: RequestId,
+) -> Option<SupervisedWorkerRunConfig> {
+    if test_stub_signin_dir().is_some() {
+        return None;
+    }
+    let meta = s.signin.ops.get(&req_id)?;
+    meta.tool_pipes.as_ref()?;
+    let v = s.unlocked().ok()?;
+    let parsed = find_target_by_id(v, meta.scope.target().id).ok()??;
+    let (chrome_exe, chrome_sha256) = resolve_default_chrome_for_testing()?;
+
+    let identity_check_kind = match parsed.target.identity_check.kind {
+        envcloak_signin::CheckKind::Endpoint => "endpoint".to_owned(),
+        envcloak_signin::CheckKind::Element => "dom".to_owned(),
+    };
+    let session_format = match parsed.session_format {
+        envcloak_core::vault::SessionFormat::Cookies => {
+            envcloak_browser::WorkerSessionFormat::Cookies
+        }
+        envcloak_core::vault::SessionFormat::Storage => {
+            envcloak_browser::WorkerSessionFormat::Storage
+        }
+        envcloak_core::vault::SessionFormat::CookiesAndStorage => {
+            envcloak_browser::WorkerSessionFormat::CookiesAndStorage
+        }
+    };
+    let cred_origin = parsed.credential_origins.iter().next()?.to_string();
+    let flow = if parsed.adapter_view.is_some() {
+        crate::signin::driver::DriverFlowWire::TestSession {
+            endpoint_origin: cred_origin,
+            ttl_secs: parsed.session_lifetime.as_secs(),
+        }
+    } else {
+        crate::signin::driver::DriverFlowWire::BrowserLogin {
+            login_url: format!("{cred_origin}/login"),
+            username_selector: None,
+            password_selector: None,
+            code_selector: None,
+            submit_selector: None,
+        }
+    };
+
+    let bootstrap = crate::signin::driver::DriverBootstrap {
+        app_origins: parsed.app_origins.iter().map(ToString::to_string).collect(),
+        credential_origins: parsed
+            .credential_origins
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        identity_provider_origins: parsed
+            .identity_provider_origins
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        callback_origins: parsed
+            .callback_origins
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        identity_check_kind,
+        identity_check_locator: parsed.target.identity_check.locator.as_str().to_owned(),
+        expected_account: parsed.account_label.as_str().to_owned(),
+        expected_tenant: parsed.tenant_label.as_ref().map(|t| t.as_str().to_owned()),
+        expected_role: parsed.role_label.as_str().to_owned(),
+        cookies: parsed
+            .target
+            .transfer
+            .cookies
+            .iter()
+            .map(crate::signin::driver::DriverCookieWire::from_declared)
+            .collect(),
+        storage: parsed
+            .target
+            .transfer
+            .storage
+            .iter()
+            .map(crate::signin::driver::DriverStorageWire::from_declared)
+            .collect(),
+        session_format,
+        flow,
+    };
+
+    let needs_localhost_resolver = parsed
+        .app_origins
+        .iter()
+        .chain(parsed.credential_origins.iter())
+        .chain(parsed.identity_provider_origins.iter())
+        .chain(parsed.callback_origins.iter())
+        .any(|o| {
+            let h = o.host().to_string();
+            h == "localhost" || h.ends_with(".localhost")
+        });
+
+    Some(SupervisedWorkerRunConfig {
+        bootstrap,
+        chrome_exe,
+        chrome_sha256,
+        host_resolver_rules: needs_localhost_resolver
+            .then(|| "MAP *.localhost 127.0.0.1".to_owned()),
+        test_ca_spki_sha256: None,
+        extra_chrome_args: Vec::new(),
+        status_dir: None,
+        totp_fixed_unix: None,
+        totp_no_sleep: false,
+    })
+}
+
 fn maybe_drive_test_worker_spec(shared: &Shared, req_id: RequestId) {
     let target_name = {
         let mut s = locked_ready(shared);
@@ -2659,7 +2990,11 @@ fn maybe_drive_test_worker_spec(shared: &Shared, req_id: RequestId) {
         meta.attempt_driver_claimed = true;
         meta.target_name.clone()
     };
-    let Some(cfg) = load_test_worker_spec_for_target(&target_name) else {
+    let cfg = load_test_worker_spec_for_target(&target_name).or_else(|| {
+        let s = locked_ready(shared);
+        default_supervised_worker_config(&s, req_id)
+    });
+    let Some(cfg) = cfg else {
         let mut s = locked_ready(shared);
         if let Some(meta) = s.signin.ops.get_mut(&req_id) {
             meta.attempt_driver_claimed = false;
@@ -2952,9 +3287,12 @@ pub fn run_supervised_signin_attempt(
             state,
             cleanup_confirmed,
         } => {
-            let (peer_stream, tool_pipes) = {
+            let peer_stream = {
                 let mut s = locked_ready(shared);
                 let now = now_of(&shared.clocks);
+                if let Some(m) = s.signin.ops.get_mut(&req_id) {
+                    m.worker_cleanup_confirmed = cleanup_confirmed;
+                }
                 s.audit(AuditEvent::SigninOutcome {
                     pid: peer_pid,
                     subject: subject_summary.clone(),
@@ -2992,11 +3330,6 @@ pub fn run_supervised_signin_attempt(
                     );
                     return;
                 }
-                let tool_pipes = s
-                    .signin
-                    .ops
-                    .get_mut(&req_id)
-                    .and_then(|m| m.tool_pipes.take());
                 let Some(peer_stream) = s
                     .signin
                     .ops
@@ -3008,7 +3341,7 @@ pub fn run_supervised_signin_attempt(
                     return;
                 };
                 write_test_send_log(&s.signin.send_log);
-                (peer_stream, tool_pipes)
+                peer_stream
             };
 
             envcloak_sys::pause_point("signin.after_capture");
@@ -3025,6 +3358,10 @@ pub fn run_supervised_signin_attempt(
                 write_test_send_log(&s.signin.send_log);
                 return;
             }
+            let (tool_pipes, tool_inject_frame) =
+                s.signin.ops.get_mut(&req_id).map_or((None, None), |m| {
+                    (m.tool_pipes.take(), m.tool_inject_frame.take())
+                });
             write_test_send_log(&s.signin.send_log);
 
             let Ok(ToSupervisor::InjectState(inj)) = recv_from_supervisor(&peer_stream) else {
@@ -3059,7 +3396,11 @@ pub fn run_supervised_signin_attempt(
                 }
                 if let Some((_from_client, to_client)) = tool_pipes {
                     let mut f = std::fs::File::from(to_client);
-                    let _ = writeln!(f, "published:{}:{}", pub_msg.generation, pub_msg.context);
+                    if let Some(frame) = tool_inject_frame {
+                        let _ = frame.write_to(&mut f);
+                    } else {
+                        let _ = writeln!(f, "published:{}:{}", pub_msg.generation, pub_msg.context);
+                    }
                 }
             }
             write_done_snapshot(

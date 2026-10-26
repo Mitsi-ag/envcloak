@@ -475,9 +475,22 @@ async function main() {
         const tok = body.token || cookies.session || bearer;
         if (tok && sessions.has(tok)) {
           sessions.get(tok).revoked = true;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, revoked: true }));
+          return;
+        }
+        if (!tok) {
+          let any = false;
+          for (const s of sessions.values()) {
+            s.revoked = true;
+            any = true;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, revoked: any }));
+          return;
         }
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, revoked: Boolean(tok && sessions.has(tok)) }));
+        res.end(JSON.stringify({ ok: true, revoked: false }));
         return;
       }
 
