@@ -56,7 +56,9 @@ ALLOWED = {
     "mcp": {"client", "agents", "ipc", "core", "policy", "redact", "sys"},
     "signin": {"core", "policy"},
     "browser": {"signin", "sys"},
-    "daemon": {"core", "ipc", "policy", "providers", "redact", "sys", "signin", "browser"},
+    "spend": {"core"},
+    "poll": {"core", "ipc", "providers", "sys"},
+    "daemon": {"core", "ipc", "policy", "providers", "redact", "sys", "signin", "browser", "spend"},
     "cli": {"*"},
     "proxy": set(),
     "sync": set(),
@@ -77,6 +79,14 @@ CLIENT = (
     "the client is the base the agent catalog and the MCP server build on, and never "
     "depends on them or on the scanner"
 )
+POLLER = (
+    "only the CLI (which hosts the spend-poller subcommand) may depend on envcloak-poll; "
+    "the daemon and library crates never link its HTTPS client (SPEC §4.4, D4-03, D4-27)"
+)
+SPEND = (
+    "envcloak-spend is a pure roll-up, budget, alert and card engine over envcloak-core, "
+    "with no I/O, IPC or network (D4-27)"
+)
 FORBIDDEN = {
     ("scan", "agents"): SCANNER,
     ("scan", "mcp"): SCANNER,
@@ -85,6 +95,18 @@ FORBIDDEN = {
     ("client", "agents"): CLIENT,
     ("client", "mcp"): CLIENT,
     ("client", "scan"): CLIENT,
+    ("daemon", "poll"): POLLER,
+    ("core", "poll"): POLLER,
+    ("ipc", "poll"): POLLER,
+    ("spend", "poll"): POLLER,
+    ("providers", "poll"): POLLER,
+    ("client", "poll"): POLLER,
+    ("mcp", "poll"): POLLER,
+    ("policy", "poll"): POLLER,
+    ("spend", "ipc"): SPEND,
+    ("spend", "client"): SPEND,
+    ("spend", "mcp"): SPEND,
+    ("spend", "daemon"): SPEND,
 }
 
 

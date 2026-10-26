@@ -206,18 +206,65 @@ fn the_planned_one_way_graph_passes() {
         ),
         ("envcloak-signin", &deps(&["core", "policy"])),
         ("envcloak-browser", &deps(&["signin", "sys"])),
+        ("envcloak-spend", &deps(&["core"])),
+        ("envcloak-poll", &deps(&["core", "ipc", "providers", "sys"])),
         (
             "envcloakd",
             "[dependencies]\nenvcloak-signin = { path = \"../envcloak-signin\" }\n\
-             envcloak-browser = { path = \"../envcloak-browser\" }\n",
+             envcloak-browser = { path = \"../envcloak-browser\" }\n\
+             envcloak-spend = { path = \"../envcloak-spend\" }\n",
         ),
         (
             "envcloak",
-            &deps(&["mcp", "agents", "client", "scan", "ipc", "providers"]),
+            &deps(&[
+                "mcp",
+                "agents",
+                "client",
+                "scan",
+                "ipc",
+                "providers",
+                "spend",
+                "poll",
+            ]),
         ),
     ]);
     assert!(cargo_resolves(&ws).status.success());
     assert_passes(&ws);
+}
+
+#[test]
+fn the_m4_spend_and_poll_edges_are_enforced() {
+    for (from, to, expected) in [
+        (
+            "envcloakd",
+            "envcloak-poll",
+            "daemon -> poll (normal) is forbidden: only the CLI (which hosts the spend-poller",
+        ),
+        (
+            "envcloak-spend",
+            "envcloak-poll",
+            "spend -> poll (normal) is forbidden: only the CLI (which hosts the spend-poller",
+        ),
+        (
+            "envcloak-mcp",
+            "envcloak-poll",
+            "mcp -> poll (normal) is forbidden: only the CLI (which hosts the spend-poller",
+        ),
+        (
+            "envcloak-spend",
+            "envcloak-ipc",
+            "spend -> ipc (normal) is forbidden: envcloak-spend is a pure roll-up",
+        ),
+    ] {
+        let (_t, ws) = fixture(&[
+            (to, ""),
+            (
+                from,
+                &format!("[dependencies]\n{to} = {{ path = \"../{to}\" }}\n"),
+            ),
+        ]);
+        assert_refused(&ws, &[expected]);
+    }
 }
 
 /// A forbidden edge counts however the manifest gives it: for one target

@@ -49,6 +49,14 @@ usage:
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
   envcloak signin target add|edit|rm|ls ...
   envcloak signin setup [--versions PATH] [--json]
+Not in this build (each exits 125 with not_in_this_build):
+  envcloak spend
+  envcloak sub
+  envcloak budget
+  envcloak alerts
+  envcloak card
+  envcloak edit
+  envcloak set-class
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 --- stderr
 $ envcloak --version
@@ -109,6 +117,14 @@ usage:
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
   envcloak signin target add|edit|rm|ls ...
   envcloak signin setup [--versions PATH] [--json]
+Not in this build (each exits 125 with not_in_this_build):
+  envcloak spend
+  envcloak sub
+  envcloak budget
+  envcloak alerts
+  envcloak card
+  envcloak edit
+  envcloak set-class
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.
 $ envcloak vault
 exit: 2

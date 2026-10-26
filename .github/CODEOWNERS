@@ -78,3 +78,12 @@
 /scripts/ci-paths.py                         @Mitsi-ag
 /crates/envcloak-sys/src/peer_code.rs        @Mitsi-ag
 /crates/envcloak-sys/src/peer_code/          @Mitsi-ag
+
+# M4 plan D4-02, D4-03, D4-12 and D4-27 (task M4-01): envcloak-spend holds
+# card validation, full-card storage opt-in and spend roll-up rules, and
+# envcloak-poll holds the one-shot spend-poller helper's provider adapters
+# and response redaction. Both crates and their architecture doc need a
+# code owner's review from the start.
+/crates/envcloak-spend/                      @Mitsi-ag
+/crates/envcloak-poll/                       @Mitsi-ag
+/docs/SPEND.md                               @Mitsi-ag
