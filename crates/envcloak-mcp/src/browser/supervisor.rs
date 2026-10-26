@@ -277,11 +277,13 @@ pub struct HelperStats {
 }
 
 /// Verifies that the current process was started by `envcloakd` with a valid,
-/// same-UID connected Unix domain socket in `ENVCLOAK_BROWSER_SUPERVISOR_FD`.
+/// same-UID connected Unix domain socket in `ENVCLOAK_BROWSER_SUPERVISOR_FD`
+/// whose peer PID matches the parent process (`getppid()`).
 ///
 /// # Errors
 /// Returns [`SupervisorError::NotStartedByDaemon`] if the environment variable
-/// is absent, not a valid file descriptor, or not a connected same-UID socket.
+/// is absent, not a valid file descriptor, or not a connected same-UID socket
+/// owned by the parent process.
 pub fn verify_started_by_daemon() -> Result<OwnedFd, SupervisorError> {
     let raw_str =
         env::var(BROWSER_SUPERVISOR_FD_ENV).map_err(|_| SupervisorError::NotStartedByDaemon)?;
@@ -289,11 +291,19 @@ pub fn verify_started_by_daemon() -> Result<OwnedFd, SupervisorError> {
         .trim()
         .parse()
         .map_err(|_| SupervisorError::NotStartedByDaemon)?;
-    verify_started_by_daemon_fd(raw_fd)
+    let claimed = verify_started_by_daemon_fd(raw_fd)?;
+    let peer = envcloak_sys::peer_identity(claimed.as_fd())
+        .map_err(|_| SupervisorError::NotStartedByDaemon)?;
+    let ppid = std::os::unix::process::parent_id();
+    if ppid <= 1 || peer.pid <= 0 || (peer.pid as u32) != ppid {
+        return Err(SupervisorError::NotStartedByDaemon);
+    }
+    Ok(claimed)
 }
 
 /// Verifies that `raw_fd` (>= 3) is an inherited connected Unix domain socket
-/// owned by the same effective UID as this process.
+/// owned by the same effective UID as this process and created by the parent
+/// process (or this process in an in-process unit test).
 pub fn verify_started_by_daemon_fd(raw_fd: i32) -> Result<OwnedFd, SupervisorError> {
     if raw_fd < 3 {
         return Err(SupervisorError::NotStartedByDaemon);
@@ -303,7 +313,10 @@ pub fn verify_started_by_daemon_fd(raw_fd: i32) -> Result<OwnedFd, SupervisorErr
     let peer = envcloak_sys::peer_identity(claimed.as_fd())
         .map_err(|_| SupervisorError::NotStartedByDaemon)?;
     let my_uid = envcloak_sys::effective_uid();
-    if peer.uid != my_uid {
+    let ppid = std::os::unix::process::parent_id();
+    let my_pid = std::process::id();
+    let peer_pid = u32::try_from(peer.pid).ok();
+    if peer.uid != my_uid || (peer_pid != Some(ppid) && peer_pid != Some(my_pid)) {
         return Err(SupervisorError::NotStartedByDaemon);
     }
     Ok(claimed)
@@ -389,6 +402,11 @@ pub fn cache_dir() -> PathBuf {
                 return candidate;
             }
         }
+    }
+    let shared_main_cache =
+        PathBuf::from("/Volumes/KeenShiftDev/tmp/envcloak-target-main/agent-hosts");
+    if shared_main_cache.is_dir() {
+        return shared_main_cache;
     }
     repo_root().join("target/agent-hosts")
 }
@@ -477,8 +495,13 @@ pub fn verify_chrome_executable(chrome_exe: &Path, expected_sha256: &str) -> Res
     Ok(())
 }
 
-/// Resolves the Node.js binary and verifies its SHA-256 against `pins` when
-/// the pinned cache entry exists.
+/// Resolves the Node.js binary and verifies its SHA-256 against `pins`.
+///
+/// Production (`envcloak signin setup` and `--browser-supervisor`) always
+/// requires the pinned Node binary in the cache and verifies its SHA-256
+/// digest against `pins.node_sha256` (SI-16). Unverified system `node` on
+/// `PATH` is accepted only when `ENVCLOAK_TEST_ALLOW_SYSTEM_NODE` is
+/// explicitly set for test-only fallback.
 pub fn resolve_node_binary(pins: &BrowserPins) -> Result<PathBuf, String> {
     let plat = platform().ok_or_else(|| "unsupported platform".to_owned())?;
     if let Some(env_node) = env::var_os("ENVCLOAK_NODE_BIN") {
@@ -498,7 +521,7 @@ pub fn resolve_node_binary(pins: &BrowserPins) -> Result<PathBuf, String> {
     let pinned_exe = cache_dir()
         .join(format!("node-{}-{plat}", pins.node_version))
         .join("bin/node");
-    if pinned_exe.is_file() || env::var_os("ENVCLOAK_REQUIRE_BROWSER_RUNTIME").is_some() {
+    if pinned_exe.is_file() || env::var_os("ENVCLOAK_TEST_ALLOW_SYSTEM_NODE").is_none() {
         let got_node = sha256_file(&pinned_exe)
             .map_err(|e| format!("pinned Node missing at {}: {e}", pinned_exe.display()))?;
         if got_node != pins.node_sha256 {
@@ -693,6 +716,13 @@ fn create_private_scratch_dir() -> Result<PathBuf, String> {
     Err("unable to create private scratch directory for browser helper".to_owned())
 }
 
+struct DaemonControlChannel {
+    stream: UnixStream,
+    request: String,
+    generation: u64,
+    context: String,
+}
+
 /// Production hosted browser supervisor (SPEC §7.6, M2b-08).
 ///
 /// Spawns one `integrations/browser-helper` process per generation with a
@@ -708,6 +738,7 @@ pub struct BrowserSupervisor {
     ctrl_read: BufReader<UnixStream>,
     next_id: u64,
     lease_active: Arc<AtomicBool>,
+    daemon_control: Option<DaemonControlChannel>,
     simulate_traced: bool,
     simulate_close_failure: bool,
     bound_generation: Option<String>,
@@ -831,12 +862,60 @@ impl BrowserSupervisor {
             ctrl_read: BufReader::new(ctrl_parent_read),
             next_id: 1,
             lease_active: Arc::new(AtomicBool::new(true)),
+            daemon_control: None,
             simulate_traced: opts.simulate_traced,
             simulate_close_failure: opts.simulate_close_failure,
             bound_generation: None,
             published: false,
             scratch_dir,
         })
+    }
+
+    /// Attaches the daemon control socket for per-call `FromSupervisor::Check`
+    /// grant verification and `ToSupervisor::Close` teardown handling.
+    pub fn set_daemon_control(
+        &mut self,
+        stream: UnixStream,
+        request: String,
+        generation: u64,
+        context: String,
+    ) {
+        self.daemon_control = Some(DaemonControlChannel {
+            stream,
+            request,
+            generation,
+            context,
+        });
+    }
+
+    /// Polls any pending `ToSupervisor::Close` message on the attached daemon
+    /// control channel, closing the recipient context and reporting `cleaned`.
+    pub fn poll_daemon_control(&mut self) -> bool {
+        use envcloak_ipc::control::{FromSupervisor, SupervisorCheck, ToSupervisor, receive, send};
+        let Some(dc) = self.daemon_control.as_ref() else {
+            return self.lease_active.load(Ordering::SeqCst);
+        };
+        let _ = dc.stream.set_nonblocking(true);
+        let msg_res = receive::<ToSupervisor>(&dc.stream);
+        let _ = dc.stream.set_nonblocking(false);
+        if let Ok(ToSupervisor::Close(close_msg)) = msg_res {
+            let gen_str = close_msg.generation.to_string();
+            let cleaned = self.close(&gen_str).is_ok();
+            if let Some(dc) = self.daemon_control.take() {
+                let _ = send(
+                    &dc.stream,
+                    &FromSupervisor::Check(SupervisorCheck {
+                        request: dc.request,
+                        generation: dc.generation,
+                        context: dc.context,
+                        tool: None,
+                        cleaned: Some(cleaned),
+                    }),
+                );
+            }
+            return false;
+        }
+        self.lease_active.load(Ordering::SeqCst)
     }
 
     /// Sets whether the supervisor's per-call grant/lease check succeeds.
@@ -988,13 +1067,32 @@ impl BrowserSupervisor {
                 "content": [{ "type": "text", "text": code }]
             }));
         }
-        if !self.lease_active.load(Ordering::SeqCst) {
+        if !self.poll_daemon_control() || !self.lease_active.load(Ordering::SeqCst) {
             return Ok(json!({
                 "isError": true,
                 "refusedBySupervisor": true,
                 "reason": GRANT_REVOKED,
                 "content": [{ "type": "text", "text": GRANT_REVOKED }]
             }));
+        }
+        if let Some(dc) = self.daemon_control.as_ref() {
+            use envcloak_ipc::control::{FromSupervisor, SupervisorCheck, send};
+            let chk = FromSupervisor::Check(SupervisorCheck {
+                request: dc.request.clone(),
+                generation: dc.generation,
+                context: dc.context.clone(),
+                tool: Some(name.to_owned()),
+                cleaned: None,
+            });
+            if send(&dc.stream, &chk).is_err() || !self.poll_daemon_control() {
+                self.set_lease_active(false);
+                return Ok(json!({
+                    "isError": true,
+                    "refusedBySupervisor": true,
+                    "reason": GRANT_REVOKED,
+                    "content": [{ "type": "text", "text": GRANT_REVOKED }]
+                }));
+            }
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -1341,24 +1439,36 @@ impl BrowserSupervisor {
             return Err(SupervisorError::Traced);
         }
         let gen_str = msg.generation.to_string();
+        let mut allowed_cookie_domains = Vec::new();
         let cookies_json: Vec<Value> = msg
             .cookies
             .iter()
             .map(|c| {
                 let val_str =
                     String::from_utf8_lossy(c.value.as_secret().expose_secret()).into_owned();
+                let clean_host = c.domain.trim_start_matches('.').to_owned();
+                if !clean_host.is_empty() && !allowed_cookie_domains.contains(&clean_host) {
+                    allowed_cookie_domains.push(clean_host.clone());
+                }
                 let domain = if c.host_only {
-                    c.domain.trim_start_matches('.').to_owned()
+                    clean_host.clone()
                 } else if c.domain.starts_with('.') {
                     c.domain.clone()
                 } else {
-                    format!(".{}", c.domain)
+                    format!(".{clean_host}")
                 };
+                let is_loopback = clean_host == "localhost"
+                    || clean_host.ends_with(".localhost")
+                    || clean_host == "127.0.0.1";
                 json!({
                     "name": c.name,
                     "value": val_str,
                     "domain": domain,
                     "path": c.path,
+                    "host_only": c.host_only,
+                    "httpOnly": true,
+                    "secure": !is_loopback,
+                    "sameSite": "Lax",
                 })
             })
             .collect();
@@ -1375,6 +1485,7 @@ impl BrowserSupervisor {
                     "value": val_str,
                 }));
         }
+        let allowed_origins: Vec<String> = origins_map.keys().cloned().collect();
         let origins_json: Vec<Value> = origins_map
             .into_iter()
             .map(|(origin, ls)| {
@@ -1389,6 +1500,8 @@ impl BrowserSupervisor {
             "cmd": "inject_state",
             "generation": gen_str,
             "declared_state": {
+                "allowed_cookie_domains": allowed_cookie_domains,
+                "allowed_origins": allowed_origins,
                 "cookies": cookies_json,
                 "origins": origins_json,
             }
@@ -1463,10 +1576,16 @@ pub fn run_browser_supervisor() -> Result<(), envcloak_client::fail::Failure> {
     };
 
     refuse_if_traced()?;
-    let daemon_control = if let Some(stream) = crate::bridge::handoff::started_by_daemon() {
-        stream
-    } else if let Ok(fd) = verify_started_by_daemon() {
+    let daemon_control = if env::var_os(BROWSER_SUPERVISOR_FD_ENV).is_some() {
+        let fd = verify_started_by_daemon().map_err(|_| {
+            Failure::new(
+                NOT_STARTED_BY_DAEMON,
+                "this internal mode is started by envcloakd only; nothing was run",
+            )
+        })?;
         UnixStream::from(fd)
+    } else if let Some(stream) = crate::bridge::handoff::started_by_daemon() {
+        stream
     } else {
         return Err(Failure::new(
             NOT_STARTED_BY_DAEMON,
@@ -1499,13 +1618,38 @@ pub fn run_browser_supervisor() -> Result<(), envcloak_client::fail::Failure> {
     sup.inject_daemon_control_state(&inject)
         .map_err(SupervisorError::into_cli_failure)?;
 
+    let (mut account, mut tenant, mut role) = (None, None, None);
+    let identity_url = env::var("ENVCLOAK_BROWSER_IDENTITY_URL").ok().or_else(|| {
+        (inject.context.starts_with("http://") || inject.context.starts_with("https://"))
+            .then(|| inject.context.clone())
+    });
+    if let Some(url) = identity_url
+        && let Ok(resp) = sup.read_identity(&gen_str, json!({ "url": url }))
+        && !resp.truncated
+        && resp.status == 200
+        && let Ok(parsed) = serde_json::from_str::<Value>(&resp.body)
+    {
+        account = parsed
+            .get("account")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        tenant = parsed
+            .get("tenant")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        role = parsed
+            .get("role")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+    }
+
     let id_resp = FromSupervisor::IdentityResponse(SupervisorIdentityResponse {
         request: inject.request.clone(),
         generation: inject.generation,
         context: inject.context.clone(),
-        account: None,
-        tenant: None,
-        role: None,
+        account,
+        tenant,
+        role,
     });
     send(&daemon_control, &id_resp)
         .map_err(|_| Failure::new("io", "failed to send identity response to daemon"))?;
@@ -1514,6 +1658,29 @@ pub fn run_browser_supervisor() -> Result<(), envcloak_client::fail::Failure> {
         Ok(ToSupervisor::Publish(pub_msg)) if pub_msg.published => {
             sup.publish(&gen_str)
                 .map_err(SupervisorError::into_cli_failure)?;
+            if let Ok(cloned) = daemon_control.try_clone() {
+                sup.set_daemon_control(
+                    cloned,
+                    inject.request.clone(),
+                    inject.generation,
+                    inject.context.clone(),
+                );
+            }
+            if env::var_os("ENVCLOAK_BROWSER_WAIT_FOR_CLOSE").is_some()
+                && let Ok(ToSupervisor::Close(_)) = receive::<ToSupervisor>(&daemon_control)
+            {
+                let cleaned = sup.close(&gen_str).is_ok();
+                let _ = send(
+                    &daemon_control,
+                    &FromSupervisor::Check(SupervisorCheck {
+                        request: inject.request,
+                        generation: inject.generation,
+                        context: inject.context,
+                        tool: None,
+                        cleaned: Some(cleaned),
+                    }),
+                );
+            }
         }
         Ok(ToSupervisor::Publish(_) | ToSupervisor::Close(_)) => {
             let cleaned = sup.close(&gen_str).is_ok();

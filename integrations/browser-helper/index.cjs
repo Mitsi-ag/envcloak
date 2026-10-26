@@ -358,6 +358,14 @@ async function main() {
           };
           if (c.url) {
             out.url = String(c.url);
+          } else if (c.host_only === true) {
+            const scheme = c.secure ? "https" : "http";
+            const host = String(c.domain || "").replace(/^\./, "");
+            const p = String(c.path || "/");
+            if (!p.startsWith("/") || /\s/.test(p)) {
+              throw new Error("unsupported_session_scope");
+            }
+            out.url = `${scheme}://${host}${p}`;
           } else {
             out.domain = String(c.domain);
             out.path = String(c.path || "/");
@@ -379,6 +387,7 @@ async function main() {
           throw new Error("unsupported_session_scope");
         }
         const storedCookies = await recipientContext.cookies();
+        const usedIndices = new Set();
         const matchesDeclared = cookies.every((c) => {
           const expectedName = String(c.name);
           const expectedValue = String(c.value);
@@ -400,10 +409,19 @@ async function main() {
                 }
               })()
             : String(c.domain || "").replace(/^\./, "").toLowerCase();
-          return storedCookies.some((sc) => {
-            const scHost = String(sc.domain || "").replace(/^\./, "").toLowerCase();
+          const expectHostOnly =
+            typeof c.host_only === "boolean"
+              ? c.host_only
+              : Boolean(c.url) ||
+                (typeof c.domain === "string" && c.domain.startsWith(".") ? false : null);
+          const idx = storedCookies.findIndex((sc, i) => {
+            if (usedIndices.has(i)) return false;
+            const rawScDomain = String(sc.domain || "").toLowerCase();
+            const scIsHostOnly = !rawScDomain.startsWith(".");
+            const scHost = rawScDomain.replace(/^\./, "");
             if (sc.name !== expectedName || sc.value !== expectedValue) return false;
             if (scHost !== expectedHost) return false;
+            if (expectHostOnly !== null && scIsHostOnly !== expectHostOnly) return false;
             if (sc.path !== expectedPath) return false;
             if (typeof c.httpOnly === "boolean" && sc.httpOnly !== c.httpOnly) return false;
             if (typeof c.secure === "boolean" && sc.secure !== c.secure) return false;
@@ -415,6 +433,9 @@ async function main() {
             }
             return true;
           });
+          if (idx === -1) return false;
+          usedIndices.add(idx);
+          return true;
         });
         if (!matchesDeclared || storedCookies.length !== cookies.length) {
           try {

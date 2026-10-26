@@ -1,6 +1,6 @@
 //! D-30 hosted browser tool allowlist and argument sanitizer for `envcloak mcp`.
 //!
-//! Only the 19 safe navigation, inspection, and interaction tools from
+//! Only the 20 safe navigation, inspection, and interaction tools from
 //! `@playwright/mcp` are exposed to the host agent. Dangerous tools
 //! (`browser_run_code`, `browser_run_code_unsafe`, `browser_file_upload`,
 //! `browser_pdf_save`, tracing tools, etc.), filesystem path arguments
@@ -18,6 +18,7 @@ pub const ALLOWED_BROWSER_TOOLS: &[&str] = &[
     "browser_drag",
     "browser_evaluate",
     "browser_fill_form",
+    "browser_find",
     "browser_handle_dialog",
     "browser_hover",
     "browser_navigate",
@@ -38,7 +39,6 @@ pub const EXCLUDED_BROWSER_TOOLS: &[&str] = &[
     "browser_drop",
     "browser_emulate_media",
     "browser_file_upload",
-    "browser_find",
     "browser_install",
     "browser_network_request",
     "browser_pdf_save",
@@ -106,6 +106,7 @@ impl ToolAllowlist {
                 if let Some(req) = schema.get_mut("required").and_then(Value::as_array_mut) {
                     req.retain(|v| v.as_str().is_none_or(|s| !FORBIDDEN_PATH_ARGS.contains(&s)));
                 }
+                schema.insert("additionalProperties".to_owned(), Value::Bool(false));
             }
             out.push(sanitized);
         }
@@ -196,7 +197,7 @@ impl ToolAllowlist {
         };
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
-        if authority.is_empty() || authority.contains('@') {
+        if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
             return false;
         }
         true
@@ -214,7 +215,7 @@ impl ToolAllowlist {
         }
     }
 
-    /// Returns static sanitized schemas for the 19 [`ALLOWED_BROWSER_TOOLS`] when
+    /// Returns static sanitized schemas for the 20 [`ALLOWED_BROWSER_TOOLS`] when
     /// no live helper has been queried yet.
     #[must_use]
     pub fn static_schemas() -> Vec<Value> {
@@ -245,6 +246,9 @@ impl ToolAllowlist {
                         "text": { "type": "string", "description": "Text to type" },
                         "submit": { "type": "boolean", "description": "Whether to submit after typing" }
                     }),
+                    "browser_find" => json!({
+                        "text": { "type": "string", "description": "Text to search for in the page" }
+                    }),
                     _ => json!({}),
                 };
                 json!({
@@ -253,6 +257,7 @@ impl ToolAllowlist {
                     "inputSchema": {
                         "type": "object",
                         "properties": props,
+                        "additionalProperties": false,
                     }
                 })
             })
@@ -265,8 +270,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn allowlist_admits_only_nineteen_tools_and_blocks_forbidden_args_and_schemes() {
-        assert_eq!(ALLOWED_BROWSER_TOOLS.len(), 19);
+    fn allowlist_admits_only_twenty_tools_and_blocks_forbidden_args_and_schemes() {
+        assert_eq!(ALLOWED_BROWSER_TOOLS.len(), 20);
+        assert!(ALLOWED_BROWSER_TOOLS.contains(&"browser_find"));
+        for tool in ToolAllowlist::static_schemas() {
+            assert_eq!(
+                tool.get("inputSchema")
+                    .and_then(|s| s.get("additionalProperties")),
+                Some(&Value::Bool(false))
+            );
+        }
         assert_eq!(
             ToolAllowlist::admit(
                 "browser_navigate",
@@ -293,6 +306,7 @@ mod tests {
             "chrome://settings",
             "about:blank",
             "https://user:pass@acme.localhost/login",
+            "https://evil.example\\@acme.localhost/login",
         ] {
             assert_eq!(
                 ToolAllowlist::admit("browser_navigate", &json!({ "url": bad_url })),
