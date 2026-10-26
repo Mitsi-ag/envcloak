@@ -1,6 +1,6 @@
 # Sign-in operations (`docs/SIGNIN.md`)
 
-Status: M2b-03a, M2b-03b, M2b-05 (`crates/envcloak-signin`, `crates/envcloak-daemon/src/signin/`, `crates/envcloak-cli/src/cmd/signin.rs`).
+Status: M2b-03a, M2b-03b, M2b-05, M2b-06, M2b-07, M2b-08, M2b-09, M2b-10 (`crates/envcloak-signin`, `crates/envcloak-browser`, `crates/envcloak-daemon/src/signin/`, `crates/envcloak-mcp/src/tools/signin.rs`, `crates/envcloak-cli/src/cmd/signin.rs`).
 
 EnvCloak executes app sign-in operations inside a separate worker profile, verifies the resulting session identity against a declared target policy, and injects only the declared cookies or origin storage into the agent's browser supervisor over a bound control pipe. No username, password, TOTP seed, TOTP code, or adapter key crosses the client IPC socket or enters an agent prompt.
 
@@ -167,10 +167,22 @@ When a sign-in request requires approval (`Phase::PendingApproval`), it appears 
 
 Active `dev` authorizations are listed in `envcloak grants list` (`mode: sign_in`, `uses: session`) and can be revoked individually (`envcloak grants revoke <AUTH_ID>`) or together (`envcloak grants revoke --all`), which tears down any active sign-in operation covered by a revoked authorization.
 
+## MCP sign-in tools (`M2b-06`, `M2b-10`)
+
+`envcloak mcp` lists the four sign-in tools alongside the five M2 secret tools:
+- `request_sign_in`: starts or joins an idempotent sign-in operation keyed by `(caller_root, operation_key)` for `target` and optional `role`. If the operation enters `pending_approval`, `approved`, `attempt_running`, `captured`, or `publish_decided`, the tool polls `signin.status` up to `Ctx::effective_wait()` (`--wait-ms`, defaulting to 20 seconds for `claude-code` and `codex` under the installer's 120-second per-server timeout, and 8 seconds for unknown hosts or under the `K-08` fallback when a host's per-server timeout does not lift the 10-second cutoff). If approval or publication has not completed when the wait budget expires, `request_sign_in` returns `state: "waiting_for_approval"` with the 32-hex `request` ID and `retry_until_secs`.
+- `sign_in_status`: idempotently queries the current status of an operation owned by the caller's agent root. Calls from any other subject root are refused with `no_such_request` before any metadata is returned.
+- `cancel_sign_in`: idempotently cancels an operation owned by the caller's agent root and tears down any active worker or published browser context (including a session published in a race). By contrast, MCP transport cancellation (`notifications/cancelled`) only detaches the waiting `request_sign_in` call without sending `signin.cancel`.
+- `end_sign_in_session`: idempotently ends a delivered session by `request` ID or `ctx-<n>` handle, revoking the `BrowserRelay` lease and closing the recipient browser context.
+
+Every sign-in tool passes its output through `allowlist_status_view`, which restricts `state`, `cleanup`, `revocation`, and `reason` to fixed allowlisted tokens and strips any upstream error text, password, TOTP seed, TOTP code, or `operation_key`. The `operation_key` is never written to tool outputs, daemon trace logs, or audit records.
+
 ## Gates
 
 | Gate | Where |
 |---|---|
 | `b5`, `b6`, `b7`, `b8`, `b9`, `b10`, `b11`, `b12`, `b14`, `b15`: pure retry/state machine and statement digest invariants | `crates/envcloak-signin/src/` and `crates/envcloak-signin/tests/` |
 | Daemon sign-in targets, live `World` invalidation (including negative control against a pinned snapshot), pipe-origin-bound `InjectState`, imported cookie verification, `once` vs `dev` approvals, and audit events | `crates/envcloak-daemon/src/signin/ops.rs` (unit tests) and `crates/envcloak-daemon/tests/signin.rs` |
+| Supervised sign-in attempts (`envcloakd --signin-driver` + `envcloakd --signin-reaper`), per-account serialization, TOTP replay defense, crash/kill cleanup confirmation (`b3`, `b12`, `b14`, `b15`, `b16`, `b17`) | `crates/envcloak-daemon/tests/signin_attempt.rs` and `crates/envcloak-browser/tests/reaper.rs` |
+| Hosted browser supervisor, D-30 allowlist, `BrowserRelay` lease gating, and MCP sign-in tools end-to-end (`b2` to `b11`, `b13`, `b19`) | `crates/envcloak-mcp/tests/browser_delivery.rs`, `crates/envcloak-mcp/tests/signin_tools.rs`, and `crates/envcloak-cli/tests/signin.rs` |
 | CLI `envcloak signin target add|edit|ls|rm`, loopback cookie-jar receipt note, `envcloak pending`, `envcloak approve --once|--dev`, `envcloak deny`, and `envcloak grants list|revoke` | `crates/envcloak-cli/tests/signin.rs` |

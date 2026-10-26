@@ -48,12 +48,16 @@ use serde_json::{Value, json};
 use super::skeleton::{LIVE_APPROVAL, approve, last_tool_output, vault_and_import, write_repo};
 
 /// The tools the server lists, in order.
-const TOOLS: [&str; 5] = [
+const TOOLS: [&str; 9] = [
     "list_secrets",
     "project_status",
     "add_reference",
     "run_with_secrets",
     "request_new_secret",
+    "request_sign_in",
+    "sign_in_status",
+    "cancel_sign_in",
+    "end_sign_in_session",
 ];
 
 /// The slugs `init --import` gives the fixture repo's keys.

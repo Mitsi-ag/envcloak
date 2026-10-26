@@ -51,6 +51,11 @@ pub struct Ctx {
     pending: Mutex<Tracked>,
     /// Optional explicit runtime paths for tests running an isolated daemon.
     run_paths: Option<envcloak_ipc::RunPaths>,
+    /// Optional hosted browser relay updated when sign-in sessions are
+    /// published or ended (`M2b-10`).
+    relay: Option<crate::browser::BrowserRelay>,
+    /// Whether the host's per-server timeout lifts the 10 s cutoff (`K-08`).
+    per_server_timeout_lifts_cutoff: bool,
 }
 
 /// The requests remembered, and whether one was not for want of room.
@@ -72,6 +77,8 @@ impl Ctx {
             wait,
             pending: Mutex::new(Tracked::default()),
             run_paths: None,
+            relay: None,
+            per_server_timeout_lifts_cutoff: true,
         }
     }
 
@@ -79,6 +86,38 @@ impl Ctx {
     pub fn with_run_paths(mut self, paths: envcloak_ipc::RunPaths) -> Ctx {
         self.run_paths = Some(paths);
         self
+    }
+
+    /// Attaches a [`crate::browser::BrowserRelay`] to this tool context so
+    /// sign-in tools can activate and tear down delivered browser sessions.
+    pub fn with_browser_relay(mut self, relay: crate::browser::BrowserRelay) -> Ctx {
+        self.relay = Some(relay);
+        self
+    }
+
+    /// Configures whether the host's per-server timeout lifts the 10 s cutoff
+    /// (`K-08` fallback). When `false`, the effective wait is clamped to 8 s.
+    pub fn with_timeout_lifts_cutoff(mut self, lifts: bool) -> Ctx {
+        self.per_server_timeout_lifts_cutoff = lifts;
+        self
+    }
+
+    /// Returns the attached [`crate::browser::BrowserRelay`], if any.
+    pub fn browser_relay(&self) -> Option<&crate::browser::BrowserRelay> {
+        self.relay.as_ref()
+    }
+
+    /// Effective wait duration accounting for `K-08` (`per_server_timeout_lifts_cutoff`).
+    pub fn effective_wait(&self) -> Duration {
+        if self.per_server_timeout_lifts_cutoff {
+            self.wait
+        } else {
+            self.wait
+                .min(envcloak_agents::tool_timeouts::default_wait_for(
+                    self.host.as_deref(),
+                    false,
+                ))
+        }
     }
 
     /// Remembers `id`. False when [`MAX_TRACKED`] are remembered already:

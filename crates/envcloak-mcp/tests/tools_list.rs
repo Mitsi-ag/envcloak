@@ -52,7 +52,11 @@ fn the_annotations_and_schemas_keep_their_rules() {
             "project_status",
             "add_reference",
             "run_with_secrets",
-            "request_new_secret"
+            "request_new_secret",
+            "request_sign_in",
+            "sign_in_status",
+            "cancel_sign_in",
+            "end_sign_in_session",
         ]
     );
     for t in tools {
@@ -69,16 +73,16 @@ fn the_annotations_and_schemas_keep_their_rules() {
         assert_eq!(t["inputSchema"]["additionalProperties"], false, "{name}");
         assert_eq!(t["outputSchema"]["type"], "object", "{name}");
         match name {
-            "list_secrets" | "project_status" | "request_new_secret" => {
+            "list_secrets" | "project_status" | "request_new_secret" | "sign_in_status" => {
                 assert_eq!(a["readOnlyHint"], true, "{name}");
                 assert!(a.get("destructiveHint").is_none(), "{name}");
             }
-            "run_with_secrets" => {
+            "run_with_secrets" | "request_sign_in" => {
                 assert!(a.get("readOnlyHint").is_none(), "{name}");
                 assert_eq!(a["destructiveHint"], true);
                 assert_eq!(a["openWorldHint"], true);
             }
-            "add_reference" => {
+            "add_reference" | "cancel_sign_in" | "end_sign_in_session" => {
                 assert_eq!(a["readOnlyHint"], false);
                 assert_eq!(a["destructiveHint"], false);
             }

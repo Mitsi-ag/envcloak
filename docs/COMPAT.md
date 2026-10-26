@@ -65,7 +65,7 @@ Hosts that are not driven by the scripted model in CI (`cursor`, `gemini-cli`, `
    - Runs 5 iterations per (`host`, `os`) cell (`claude-code` and `codex` on `ubuntu-latest` and `macos-latest`) against live Anthropic and OpenAI models, checking every encoding (raw, JSON-escaped, URL-encoded, base64, base64url, hex, and CR LF variants) and verifying the positive control.
    - **Release rule (SPEC §15.2 gate 41, M2 plan Q-01):** A milestone release requires at least 20 real-model runs per tier-1 host across the `release-check-models` series in which the host chooses EnvCloak (`envcloak run` or `run_with_secrets`) instead of reading `.env` directly in at least 80% of runs, with 0 fixture hits in every run. Any host below 80% is recorded here as `not reliably used`; a single fixture hit in any run holds the release.
 
-| Host | Pinned version | OS | Scripted-model story (`S1..S18`) | Real-model status (`release-check-models`) |
-|---|---|---|---|---|
-| `claude-code` | `2.1.280` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | Tracked by `release-check-models` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
-| `codex` | `0.159.2` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | Tracked by `release-check-models` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
+| Host | Pinned version | OS | Scripted-model story (`S1..S18`) | Sign-in tool wait & cutoff (`M2b-10`) | Real-model status (`release-check-models`) |
+|---|---|---|---|---|---|
+| `claude-code` | `2.1.280` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | 20 s default wait under 120 s installer timeout (`8 s` fallback under 10 s `K-08` cutoff) | Tracked by `release-check-models` for `envcloak run` / `run_with_secrets` and `request_sign_in` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |
+| `codex` | `0.159.2` | `macos`, `linux` | `passed` (0 fixture leaks, positive control > 0) | 20 s default wait under 120 s installer timeout (`8 s` fallback under 10 s `K-08` cutoff) | Tracked by `release-check-models` for `envcloak run` / `run_with_secrets` and `request_sign_in` (threshold: >= 80% over >= 20 runs, 0 leaks; otherwise `not reliably used`) |

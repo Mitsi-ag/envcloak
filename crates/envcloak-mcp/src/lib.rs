@@ -69,7 +69,7 @@ use stdio::{Line, LineReader, Outbox};
 /// How many tool calls run at once.
 pub const WORKERS: usize = 4;
 /// How many more may wait for one; a call beyond is answered `busy`.
-pub const QUEUE: usize = 32;
+pub const QUEUE: usize = 64;
 /// How long the end of input waits for the calls in hand to stop.
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(8);
 /// How long the end waits for the answers queued to be written.
@@ -395,26 +395,26 @@ impl Default for Server {
 }
 
 impl Server {
-    /// A server with the M2 tools ([`tools::m2_tools`]), each listed, and the
-    /// sign-in tools registered unlisted until M2b-10 flips `listed` to `true`.
+    /// A server with the M2 tools ([`tools::m2_tools`]) and the four sign-in
+    /// tools ([`tools::SignInTools`]), all listed (`M2b-10`).
     pub fn new() -> Server {
         let mut router = Router::new();
         for tool in tools::m2_tools() {
             // The M2 tools' names are distinct (tested).
             let _ = router.register(tool);
         }
-        let _ = tools::SignInTools::register(&mut router, false);
+        let _ = tools::SignInTools::register(&mut router, true);
         Server::with_router(router)
     }
 
-    /// A server with the M2 tools, sign-in tools, and the 20 hosted browser
-    /// tools backed by `relay` (`M2b-08`).
+    /// A server with the M2 tools, the four sign-in tools, and the 19 hosted
+    /// browser tools backed by `relay` (`M2b-08`, `M2b-10`).
     pub fn with_browser_relay(relay: browser::BrowserRelay) -> Server {
         let mut router = Router::new();
         for tool in tools::m2_tools() {
             let _ = router.register(tool);
         }
-        let _ = tools::SignInTools::register(&mut router, false);
+        let _ = tools::SignInTools::register(&mut router, true);
         let _ = browser::register_browser_tools(&mut router, relay);
         Server::with_router(router)
     }
