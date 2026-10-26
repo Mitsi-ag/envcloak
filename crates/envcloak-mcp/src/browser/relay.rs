@@ -6,6 +6,7 @@
 //! session lease before being forwarded to the supervised browser helper.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Write};
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex};
 
@@ -17,16 +18,21 @@ use crate::router::{Annotations, Backend, ToolResult, ToolSchema};
 use crate::tools::Ctx;
 
 use super::allowlist::{ALLOWED_BROWSER_TOOLS, TOOL_NOT_ALLOWED, ToolAllowlist};
-use super::supervisor::{
-    BrowserSupervisor, CONTEXT_NOT_PUBLISHED, GRANT_REVOKED, SupervisorOptions,
-};
+use super::supervisor::{BrowserSupervisor, CONTEXT_NOT_PUBLISHED, GRANT_REVOKED};
+
+struct RemoteSupervisorPipe {
+    to_sup: Option<std::fs::File>,
+    from_sup: BufReader<std::fs::File>,
+    lease_active: bool,
+}
 
 /// Shared, thread-safe handle to an optional [`BrowserSupervisor`] backing the
-/// 19 hosted browser tools in `envcloak mcp`.
+/// 20 hosted browser tools in `envcloak mcp`.
 #[derive(Clone, Default)]
 pub struct BrowserRelay {
     inner: Arc<Mutex<Option<BrowserSupervisor>>>,
-    pending_pipes: Arc<Mutex<BTreeMap<String, OwnedFd>>>,
+    remote: Arc<Mutex<Option<RemoteSupervisorPipe>>>,
+    pending_pipes: Arc<Mutex<BTreeMap<String, (OwnedFd, OwnedFd)>>>,
     activated_requests: Arc<Mutex<BTreeSet<String>>>,
     active_request: Arc<Mutex<Option<String>>>,
 }
@@ -45,6 +51,7 @@ impl BrowserRelay {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(None)),
+            remote: Arc::new(Mutex::new(None)),
             pending_pipes: Arc::new(Mutex::new(BTreeMap::new())),
             activated_requests: Arc::new(Mutex::new(BTreeSet::new())),
             active_request: Arc::new(Mutex::new(None)),
@@ -56,17 +63,19 @@ impl BrowserRelay {
     pub fn with_supervisor(supervisor: BrowserSupervisor) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Some(supervisor))),
+            remote: Arc::new(Mutex::new(None)),
             pending_pipes: Arc::new(Mutex::new(BTreeMap::new())),
             activated_requests: Arc::new(Mutex::new(BTreeSet::new())),
             active_request: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Registers the read end of the control pipe passed to `signin.request`
-    /// for `request`, so [`Self::activate_from_request`] can consume the
-    /// daemon's wiping `ToSupervisor::InjectState` frame once the sign-in
-    /// attempt is published.
-    pub fn register_request_pipe(&self, request: &str, pipe_out: OwnedFd) {
+    /// Registers the client pipe ends passed to `signin.request` for `request`,
+    /// so [`Self::activate_from_request`] can read the `"published:..."` readiness
+    /// line and forward allowed tool calls to the daemon-spawned
+    /// `envcloak mcp --browser-supervisor` child without `envcloak mcp` ever
+    /// receiving session state (`D-03`, `D-30`).
+    pub fn register_request_pipes(&self, request: &str, pipe_in: OwnedFd, pipe_out: OwnedFd) {
         if self
             .activated_requests
             .lock()
@@ -79,11 +88,11 @@ impl BrowserRelay {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(request.to_owned())
-            .or_insert(pipe_out);
+            .or_insert((pipe_in, pipe_out));
     }
 
-    /// Activates the recipient [`BrowserSupervisor`] for `request` when the
-    /// sign-in operation reaches `published` or `ready`.
+    /// Activates the recipient supervisor pipe for `request` when the sign-in
+    /// operation reaches `published` or `ready`.
     pub fn activate_from_request(&self, request: &str) {
         if self
             .activated_requests
@@ -91,45 +100,69 @@ impl BrowserRelay {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(request)
         {
+            if let Some(rem) = self
+                .remote
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_mut()
+            {
+                rem.lease_active = true;
+            }
             self.with_supervisor_mut(|sup| sup.set_lease_active(true));
             return;
         }
-        let pipe_opt = self
+        let pipes_opt = self
             .pending_pipes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(request);
-        if let Some(pipe_fd) = pipe_opt {
-            let mut file = std::fs::File::from(pipe_fd);
-            if let Ok(frame) = envcloak_ipc::Frame::read_from(&mut file)
-                && let Ok(envcloak_ipc::control::ToSupervisor::InjectState(inj)) = frame.decode()
-                && let Ok(mut sup) = BrowserSupervisor::start(SupervisorOptions {
-                    host_resolver_rules: Some("MAP *.localhost 127.0.0.1".to_owned()),
-                    ..SupervisorOptions::default()
-                })
+        if let Some((pipe_in, pipe_out)) = pipes_opt {
+            let mut from_sup = BufReader::new(std::fs::File::from(pipe_out));
+            let mut line = String::new();
+            if from_sup.read_line(&mut line).is_ok() && line.trim_start().starts_with("published:")
             {
-                let gen_str = inj.generation.to_string();
-                let _ = sup.mcp_initialize();
-                if sup.create_context(&gen_str).is_ok()
-                    && sup.inject_daemon_control_state(&inj).is_ok()
-                    && sup.publish(&gen_str).is_ok()
-                {
-                    sup.set_lease_active(true);
-                    self.attach(sup);
-                    *self
-                        .active_request
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(request.to_owned());
-                    self.activated_requests
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(request.to_owned());
-                    return;
-                }
+                *self
+                    .remote
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(RemoteSupervisorPipe {
+                        to_sup: Some(std::fs::File::from(pipe_in)),
+                        from_sup,
+                        lease_active: true,
+                    });
+                *self
+                    .active_request
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request.to_owned());
+                self.activated_requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(request.to_owned());
+                return;
             }
         }
         self.with_supervisor_mut(|sup| sup.set_lease_active(true));
+    }
+
+    /// Revokes the active session lease and closes any attached remote pipe or
+    /// local supervisor context.
+    pub fn revoke_active(&self, fallback_gen: &str) {
+        if let Some(rem) = self
+            .remote
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            rem.lease_active = false;
+            rem.to_sup = None;
+        }
+        self.with_supervisor_mut(|sup| {
+            let gen_id = sup
+                .bound_generation()
+                .map(str::to_owned)
+                .unwrap_or_else(|| fallback_gen.to_owned());
+            let _ = crate::browser::end_session(sup, &gen_id, true, false);
+        });
     }
 
     /// Replaces or attaches a [`BrowserSupervisor`] to this relay.
@@ -154,6 +187,71 @@ impl BrowserRelay {
         guard.as_mut().map(f)
     }
 
+    fn call_remote(rem: &mut RemoteSupervisorPipe, name: &str, args: &Value) -> Value {
+        if !rem.lease_active {
+            return json!({
+                "isError": true,
+                "refusedBySupervisor": true,
+                "reason": GRANT_REVOKED,
+                "content": [{ "type": "text", "text": GRANT_REVOKED }]
+            });
+        }
+        let Some(to_sup) = rem.to_sup.as_mut() else {
+            rem.lease_active = false;
+            return json!({
+                "isError": true,
+                "refusedBySupervisor": true,
+                "reason": GRANT_REVOKED,
+                "content": [{ "type": "text", "text": GRANT_REVOKED }]
+            });
+        };
+        let req_line = match serde_json::to_string(&json!({
+            "name": name,
+            "arguments": args,
+        })) {
+            Ok(s) => s,
+            Err(e) => {
+                return json!({
+                    "isError": true,
+                    "reason": "browser_tool_failed",
+                    "content": [{ "type": "text", "text": e.to_string() }]
+                });
+            }
+        };
+        if writeln!(to_sup, "{req_line}").is_err() || to_sup.flush().is_err() {
+            rem.lease_active = false;
+            rem.to_sup = None;
+            return json!({
+                "isError": true,
+                "refusedBySupervisor": true,
+                "reason": GRANT_REVOKED,
+                "content": [{ "type": "text", "text": GRANT_REVOKED }]
+            });
+        }
+        let mut reply_line = String::new();
+        match rem.from_sup.read_line(&mut reply_line) {
+            Ok(n) if n > 0 => {
+                serde_json::from_str::<Value>(reply_line.trim()).unwrap_or_else(|e| {
+                    json!({
+                        "isError": true,
+                        "reason": "browser_tool_failed",
+                        "content": [{ "type": "text", "text": e.to_string() }]
+                    })
+                })
+            }
+            _ => {
+                rem.lease_active = false;
+                rem.to_sup = None;
+                json!({
+                    "isError": true,
+                    "refusedBySupervisor": true,
+                    "reason": GRANT_REVOKED,
+                    "content": [{ "type": "text", "text": GRANT_REVOKED }]
+                })
+            }
+        }
+    }
+
     /// Invokes a browser tool by name and arguments, returning the raw JSON
     /// result payload (`isError`, `content`, `reason`, `refusedBySupervisor`).
     pub fn call_json(&self, name: &str, args: Value) -> Value {
@@ -164,6 +262,14 @@ impl BrowserRelay {
                 "reason": code,
                 "content": [{ "type": "text", "text": code }]
             });
+        }
+        if let Some(rem) = self
+            .remote
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            return Self::call_remote(rem, name, &args);
         }
         let mut guard = self
             .inner
@@ -185,6 +291,32 @@ impl BrowserRelay {
                 "content": [{ "type": "text", "text": err.to_string() }]
             }),
         }
+    }
+}
+
+fn value_to_tool_result(res: Value) -> ToolResult {
+    let is_err = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let text = res
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+    if is_err {
+        let reason: &'static str = match res.get("reason").and_then(Value::as_str) {
+            Some(GRANT_REVOKED) => GRANT_REVOKED,
+            Some(TOOL_NOT_ALLOWED) => TOOL_NOT_ALLOWED,
+            Some(CONTEXT_NOT_PUBLISHED) => CONTEXT_NOT_PUBLISHED,
+            _ if text.contains(CONTEXT_NOT_PUBLISHED) => CONTEXT_NOT_PUBLISHED,
+            _ => "browser_tool_failed",
+        };
+        ToolResult::Err(Failure::new("run_failed", format!("{reason}: {text}")))
+    } else {
+        ToolResult::Ok(res)
     }
 }
 
@@ -253,6 +385,25 @@ impl Backend for BrowserRelay {
         } else {
             false
         };
+        if let Some(rem) = self
+            .remote
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            if daemon_revoked {
+                rem.lease_active = false;
+                rem.to_sup = None;
+            }
+            if !rem.lease_active {
+                return ToolResult::Err(Failure::new(
+                    "policy_denied",
+                    format!("{GRANT_REVOKED}: the sign-in session grant was revoked"),
+                ));
+            }
+            let res = Self::call_remote(rem, name, &args_val);
+            return value_to_tool_result(res);
+        }
         let mut guard = self
             .inner
             .lock()
@@ -276,31 +427,7 @@ impl Backend for BrowserRelay {
             ));
         }
         match sup.tools_call(name, args_val) {
-            Ok(res) => {
-                let is_err = res.get("isError").and_then(Value::as_bool).unwrap_or(false);
-                let text = res
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|item| item.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                if is_err {
-                    let reason: &'static str = match res.get("reason").and_then(Value::as_str) {
-                        Some(GRANT_REVOKED) => GRANT_REVOKED,
-                        Some(TOOL_NOT_ALLOWED) => TOOL_NOT_ALLOWED,
-                        Some(CONTEXT_NOT_PUBLISHED) => CONTEXT_NOT_PUBLISHED,
-                        _ if text.contains(CONTEXT_NOT_PUBLISHED) => CONTEXT_NOT_PUBLISHED,
-                        _ => "browser_tool_failed",
-                    };
-                    ToolResult::Err(Failure::new("run_failed", format!("{reason}: {text}")))
-                } else {
-                    ToolResult::Ok(res)
-                }
-            }
+            Ok(res) => value_to_tool_result(res),
             Err(err) => ToolResult::Err(Failure::new(
                 "run_failed",
                 format!("{}: {err}", err.as_str()),

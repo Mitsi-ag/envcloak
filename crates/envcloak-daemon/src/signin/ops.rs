@@ -132,7 +132,7 @@ pub struct SigninOperationMeta {
     pub attempt_driver_claimed: bool,
     pub supervisor_pipe: Option<SupervisorPipe>,
     pub tool_pipes: Option<(OwnedFd, OwnedFd)>,
-    pub tool_inject_frame: Option<envcloak_ipc::Frame>,
+    pub revocation_cookies: Vec<(String, zeroize::Zeroizing<String>)>,
     pub publish_audited: bool,
     pub end_audited: bool,
 }
@@ -609,7 +609,7 @@ impl State {
         self.signin.attempt_supervisor.on_event(AttemptEvent::Lock);
         for meta in self.signin.ops.values_mut() {
             meta.captured_state = None;
-            meta.tool_inject_frame = None;
+            meta.revocation_cookies.clear();
         }
         let effects = {
             let vault = slot_unlocked(&self.slot);
@@ -714,7 +714,7 @@ impl State {
                     self.signin.attempt_supervisor.on_event(attempt_ev);
 
                     if let Some(meta) = self.signin.ops.get_mut(&request) {
-                        meta.tool_inject_frame = None;
+                        meta.revocation_cookies.clear();
                         if meta.captured_state.take().is_some() {
                             self.signin.attempt_supervisor.note_state_released();
                         }
@@ -848,6 +848,16 @@ impl State {
         let mut storage_wire = Vec::new();
         if let Some(captured) = meta.captured_state.take() {
             self.signin.attempt_supervisor.note_state_released();
+            if meta.revocation_endpoint.is_some() {
+                meta.revocation_cookies = captured
+                    .cookies
+                    .iter()
+                    .filter_map(|(decl, val)| {
+                        let z = crate::totp::secret_to_zeroizing_utf8(val).ok()?;
+                        Some((decl.name.as_str().to_owned(), z))
+                    })
+                    .collect();
+            }
             for (decl, val) in captured.cookies {
                 let (domain, host_only) = match &decl.domain {
                     envcloak_signin::CookieDomain::HostOnly(h) => (h.to_string(), true),
@@ -890,9 +900,6 @@ impl State {
         frame
             .write_to(&mut daemon_stream)
             .map_err(|_| RpcError::new(ErrorKind::Internal))?;
-        if meta.tool_pipes.is_some() {
-            meta.tool_inject_frame = Some(frame);
-        }
         self.signin.send_log.push(SendRecord {
             request,
             destination: SendDestination::SupervisorControlPipe {
@@ -1420,9 +1427,10 @@ fn resolve_revocation_url(
     }
 }
 
-fn invoke_revocation_endpoint(url: &str) -> bool {
+fn invoke_revocation_endpoint(url: &str, cookies: &[(String, zeroize::Zeroizing<String>)]) -> bool {
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+    use zeroize::Zeroizing;
 
     let rest = match url.strip_prefix("http://") {
         Some(r) => r,
@@ -1453,20 +1461,47 @@ fn invoke_revocation_endpoint(url: &str) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-    let body = "{}";
-    let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let mut cookie_hdr = Zeroizing::new(String::new());
+    let mut body = Zeroizing::new("{}".to_owned());
+    for (idx, (name, val_utf8)) in cookies.iter().enumerate() {
+        if idx > 0 {
+            cookie_hdr.push_str("; ");
+        }
+        cookie_hdr.push_str(name);
+        cookie_hdr.push('=');
+        cookie_hdr.push_str(val_utf8);
+        if name == "session" {
+            if let Ok(s) = serde_json::to_string(&serde_json::json!({ "token": &**val_utf8 })) {
+                *body = s;
+            }
+        }
+    }
+
+    let req = Zeroizing::new(if cookie_hdr.is_empty() {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            *body
+        )
+    } else {
+        format!(
+            "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nCookie: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            *cookie_hdr,
+            body.len(),
+            *body
+        )
+    });
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
-    let mut resp_buf = [0u8; 256];
+    let mut resp_buf = [0u8; 512];
     let Ok(n) = stream.read(&mut resp_buf) else {
         return false;
     };
     let head = String::from_utf8_lossy(&resp_buf[..n]);
-    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+    (head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200"))
+        && !head.contains("\"revoked\":false")
+        && !head.contains("\"revoked\": false")
 }
 
 /// `signin.request`.
@@ -1651,7 +1686,7 @@ pub fn request(
                 attempt_driver_claimed: false,
                 supervisor_pipe: None,
                 tool_pipes: None,
-                tool_inject_frame: None,
+                revocation_cookies: Vec::new(),
                 publish_audited: false,
                 end_audited: false,
             },
@@ -1860,13 +1895,14 @@ pub fn end(
     let now = now_of(&shared.clocks);
 
     let req_id = resolve_signin_req_id(s, caller_root, &p.session)?;
-    let (rev_endpoint, worker_for_cleanup, worker_confirmed) = s
+    let (rev_endpoint, rev_cookies, worker_for_cleanup, worker_confirmed) = s
         .signin
         .ops
         .get_mut(&req_id)
-        .map_or((None, None, false), |m| {
+        .map_or((None, Vec::new(), None, false), |m| {
             (
                 m.revocation_endpoint.clone(),
+                std::mem::take(&mut m.revocation_cookies),
                 m.active_worker,
                 m.worker_cleanup_confirmed || test_stub_signin_dir().is_some(),
             )
@@ -1897,12 +1933,13 @@ pub fn end(
             }
         }
         if let Some(url) = rev_endpoint {
-            let ok = invoke_revocation_endpoint(&url);
+            let ok = invoke_revocation_endpoint(&url, &rev_cookies);
             if ok && let Some(m) = s.signin.ops.get_mut(&req_id) {
                 m.revocation_verified = true;
             }
         }
     }
+    drop(rev_cookies);
     let shared_jar = s
         .signin
         .ops
@@ -2808,12 +2845,27 @@ fn resolve_default_chrome_for_testing() -> Option<(PathBuf, String)> {
                 .join(entry),
         );
     }
-    if let Some(cache) = std::env::var_os("ENVCLOAK_AGENT_HOSTS") {
+    for var in [
+        "ENVCLOAK_BROWSER_CACHE",
+        "ENVCLOAK_AGENT_HOSTS_DIR",
+        "ENVCLOAK_AGENT_HOSTS",
+    ] {
+        if let Some(cache) = std::env::var_os(var) {
+            let base = PathBuf::from(cache);
+            candidates.push(
+                base.join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
+                    .join(entry),
+            );
+            candidates.push(base.join(format!("chromium-{CHROME_REVISION}")).join(entry));
+        }
+    }
+    if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
+        let base = PathBuf::from(target_dir).join("agent-hosts");
         candidates.push(
-            PathBuf::from(cache)
-                .join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
+            base.join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
                 .join(entry),
         );
+        candidates.push(base.join(format!("chromium-{CHROME_REVISION}")).join(entry));
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(mut profile) = exe.parent()
@@ -2824,33 +2876,24 @@ fn resolve_default_chrome_for_testing() -> Option<(PathBuf, String)> {
             profile = parent;
         }
         if let Some(target_dir) = profile.parent() {
+            let base = target_dir.join("agent-hosts");
             candidates.push(
-                target_dir
-                    .join("agent-hosts")
-                    .join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
+                base.join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
                     .join(entry),
             );
+            candidates.push(base.join(format!("chromium-{CHROME_REVISION}")).join(entry));
         }
     }
-    candidates.push(
-        PathBuf::from("/Volumes/KeenShiftDev/tmp/envcloak-target-main/agent-hosts")
-            .join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
-            .join(entry),
-    );
-    if let Some(home) = std::env::var_os("HOME") {
-        let home_dir = PathBuf::from(home);
+    if let Some(repo_root) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+    {
+        let base = repo_root.join("target/agent-hosts");
         candidates.push(
-            home_dir
-                .join("Library/Caches/ms-playwright")
-                .join(format!("chromium-{CHROME_REVISION}"))
+            base.join(format!("chrome-for-testing-{CHROME_VERSION}-{plat}"))
                 .join(entry),
         );
-        candidates.push(
-            home_dir
-                .join(".cache/ms-playwright")
-                .join(format!("chromium-{CHROME_REVISION}"))
-                .join(entry),
-        );
+        candidates.push(base.join(format!("chromium-{CHROME_REVISION}")).join(entry));
     }
 
     let found = candidates.into_iter().find(|p| p.is_file())?;
@@ -3038,6 +3081,7 @@ pub fn run_supervised_signin_attempt(
         default_tenant,
         default_role,
         declared_cookies,
+        identity_check_url,
     ) = loop {
         let mut s = locked_ready(shared);
         let now = now_of(&shared.clocks);
@@ -3076,6 +3120,20 @@ pub fn run_supervised_signin_attempt(
                 .iter()
                 .cloned()
                 .collect();
+            let identity_check_url = {
+                let loc = meta.scope.target().identity_check.locator.as_str();
+                if loc.starts_with("http://") || loc.starts_with("https://") {
+                    Some(loc.to_owned())
+                } else if loc.starts_with('/') {
+                    cfg.bootstrap
+                        .app_origins
+                        .first()
+                        .or_else(|| cfg.bootstrap.credential_origins.first())
+                        .map(|base| format!("{base}{loc}"))
+                } else {
+                    None
+                }
+            };
             break (
                 supervisor,
                 totp,
@@ -3089,6 +3147,7 @@ pub fn run_supervised_signin_attempt(
                 default_tenant,
                 default_role,
                 declared_cookies,
+                identity_check_url,
             );
         }
         let still_queued = s
@@ -3358,47 +3417,132 @@ pub fn run_supervised_signin_attempt(
                 write_test_send_log(&s.signin.send_log);
                 return;
             }
-            let (tool_pipes, tool_inject_frame) =
-                s.signin.ops.get_mut(&req_id).map_or((None, None), |m| {
-                    (m.tool_pipes.take(), m.tool_inject_frame.take())
-                });
+            let mut tool_pipes = s
+                .signin
+                .ops
+                .get_mut(&req_id)
+                .and_then(|m| m.tool_pipes.take());
+            let daemon_stream_clone = s
+                .signin
+                .ops
+                .get(&req_id)
+                .and_then(|m| m.supervisor_pipe.as_ref())
+                .and_then(|p| p.daemon_stream.try_clone().ok());
             write_test_send_log(&s.signin.send_log);
+            drop(s);
 
-            let Ok(ToSupervisor::InjectState(inj)) = recv_from_supervisor(&peer_stream) else {
-                return;
-            };
-            let id_msg = FromSupervisor::IdentityResponse(SupervisorIdentityResponse {
-                request: inj.request,
-                generation: inj.generation,
-                context: inj.context,
-                account: Some(default_account),
-                tenant: default_tenant,
-                role: Some(default_role),
-            });
-            if send_to_supervisor(&peer_stream, &id_msg).is_err() {
-                return;
-            }
-            let _ = s.signin_poll_supervisor_pipe(req_id, &now);
-            write_test_send_log(&s.signin.send_log);
+            let envcloak_bin = std::env::var_os("ENVCLOAK_BIN")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::current_exe()
+                        .ok()
+                        .map(|p| p.with_file_name("envcloak"))
+                })
+                .filter(|p| p.is_file());
 
-            if let Ok(ToSupervisor::Publish(pub_msg)) = recv_from_supervisor(&peer_stream)
-                && pub_msg.published
+            if !cfg.chrome_exe.as_os_str().is_empty()
+                && let (Some(bin_path), Some(ds)) = (envcloak_bin, daemon_stream_clone)
+                && let Some((from_client, to_client)) = tool_pipes.take()
             {
-                let chk = FromSupervisor::Check(SupervisorCheck {
-                    request: pub_msg.request,
-                    generation: pub_msg.generation,
-                    context: pub_msg.context.clone(),
-                    tool: Some("browser_navigate".into()),
-                    cleaned: None,
-                });
-                if send_to_supervisor(&peer_stream, &chk).is_ok() {
-                    let _ = s.signin_poll_supervisor_pipe(req_id, &now);
+                use std::os::fd::{AsFd, AsRawFd};
+                use std::process::{Command, Stdio};
+
+                let peer_fd_num = peer_stream.as_raw_fd();
+                let mut cmd = Command::new(&bin_path);
+                cmd.arg("mcp")
+                    .arg("--browser-supervisor")
+                    .env("ENVCLOAK_BROWSER_SUPERVISOR_FD", peer_fd_num.to_string())
+                    .env("ENVCLOAK_BROWSER_SERVE_TOOLS", "1")
+                    .env("ENVCLOAK_CHROME_FOR_TESTING_BIN", &cfg.chrome_exe)
+                    .stdin(Stdio::from(from_client))
+                    .stdout(Stdio::from(to_client))
+                    .stderr(Stdio::null());
+                if let Some(ref url) = identity_check_url {
+                    cmd.env("ENVCLOAK_BROWSER_IDENTITY_URL", url);
                 }
-                if let Some((_from_client, to_client)) = tool_pipes {
-                    let mut f = std::fs::File::from(to_client);
-                    if let Some(frame) = tool_inject_frame {
-                        let _ = frame.write_to(&mut f);
-                    } else {
+                if let Some(ref rules) = cfg.host_resolver_rules {
+                    cmd.env("ENVCLOAK_BROWSER_HOST_RULES", rules);
+                }
+                let _ = envcloak_sys::inherit_on_spawn(&mut cmd, peer_stream.as_fd());
+                let spawned = cmd.spawn().is_ok();
+                drop(cmd);
+                drop(peer_stream);
+
+                let _ = ds.set_read_timeout(Some(Duration::from_secs(30)));
+                let first_msg = if spawned {
+                    recv_from_supervisor(&ds).ok()
+                } else {
+                    None
+                };
+                let mut s_guard = locked_ready(shared);
+                let s: &mut State = &mut s_guard;
+                let now = now_of(&shared.clocks);
+                if let Some(msg) = first_msg {
+                    let _ = s.signin_handle_supervisor_pipe_msg(req_id, msg, &now);
+                } else if let Some(sup_id) = s
+                    .signin
+                    .ops
+                    .get(&req_id)
+                    .and_then(|m| m.supervisor_pipe.as_ref().map(|p| p.supervisor))
+                {
+                    let effects = {
+                        let vault = slot_unlocked(&s.slot);
+                        let world = LiveDaemonWorld {
+                            daemon: s.signin.daemon_instance,
+                            vault,
+                            catalog: None,
+                            browser_generation: s.signin.browser_generation,
+                            ops: &s.signin.ops,
+                            auths: &s.signin.auths,
+                            overrides: &s.signin.world_overrides,
+                        };
+                        let _ = s.signin.store.supervisor_failed(
+                            &Channel::Supervisor(sup_id),
+                            &req_id,
+                            AttemptFailure::UnsupportedSessionScope,
+                            &now,
+                            &world,
+                        );
+                        s.signin.store.drain_effects()
+                    };
+                    s.execute_signin_effects(effects, &now, None);
+                }
+                write_test_send_log(&s.signin.send_log);
+            } else {
+                let mut s = locked_ready(shared);
+                let now = now_of(&shared.clocks);
+                let Ok(ToSupervisor::InjectState(inj)) = recv_from_supervisor(&peer_stream) else {
+                    return;
+                };
+                let id_msg = FromSupervisor::IdentityResponse(SupervisorIdentityResponse {
+                    request: inj.request,
+                    generation: inj.generation,
+                    context: inj.context,
+                    account: Some(default_account),
+                    tenant: default_tenant,
+                    role: Some(default_role),
+                });
+                if send_to_supervisor(&peer_stream, &id_msg).is_err() {
+                    return;
+                }
+                let _ = s.signin_poll_supervisor_pipe(req_id, &now);
+                write_test_send_log(&s.signin.send_log);
+
+                if let Ok(ToSupervisor::Publish(pub_msg)) = recv_from_supervisor(&peer_stream)
+                    && pub_msg.published
+                {
+                    let chk = FromSupervisor::Check(SupervisorCheck {
+                        request: pub_msg.request,
+                        generation: pub_msg.generation,
+                        context: pub_msg.context.clone(),
+                        tool: Some("browser_navigate".into()),
+                        cleaned: None,
+                    });
+                    if send_to_supervisor(&peer_stream, &chk).is_ok() {
+                        let _ = s.signin_poll_supervisor_pipe(req_id, &now);
+                    }
+                    if let Some((_from_client, to_client)) = tool_pipes {
+                        let mut f = std::fs::File::from(to_client);
                         let _ = writeln!(f, "published:{}:{}", pub_msg.generation, pub_msg.context);
                     }
                 }

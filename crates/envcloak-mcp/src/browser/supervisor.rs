@@ -385,8 +385,14 @@ pub fn browser_versions_path() -> PathBuf {
 /// Cache directory for pinned agent and browser runtimes.
 #[must_use]
 pub fn cache_dir() -> PathBuf {
-    if let Some(dir) = env::var_os("ENVCLOAK_AGENT_HOSTS") {
-        return PathBuf::from(dir);
+    for var in [
+        "ENVCLOAK_BROWSER_CACHE",
+        "ENVCLOAK_AGENT_HOSTS_DIR",
+        "ENVCLOAK_AGENT_HOSTS",
+    ] {
+        if let Some(dir) = env::var_os(var) {
+            return PathBuf::from(dir);
+        }
     }
     if let Ok(raw_exe) = env::current_exe() {
         let exe = fs::canonicalize(&raw_exe).unwrap_or(raw_exe);
@@ -409,11 +415,6 @@ pub fn cache_dir() -> PathBuf {
         if candidate.is_dir() {
             return candidate;
         }
-    }
-    let shared_main_cache =
-        PathBuf::from("/Volumes/KeenShiftDev/tmp/envcloak-target-main/agent-hosts");
-    if shared_main_cache.is_dir() {
-        return shared_main_cache;
     }
     repo_root().join("target/agent-hosts")
 }
@@ -671,21 +672,11 @@ pub fn resolve_browser_runtime(versions_toml: &Path) -> Result<VerifiedBrowserRu
             .join(format!("chrome-for-testing-{}-{plat}", pins.chrome_version))
             .join(&pins.chrome_entry),
     );
-    if let Some(home) = env::var_os("HOME") {
-        let home_dir = PathBuf::from(home);
-        chrome_candidates.push(
-            home_dir
-                .join("Library/Caches/ms-playwright")
-                .join(format!("chromium-{}", pins.chrome_revision))
-                .join(&pins.chrome_entry),
-        );
-        chrome_candidates.push(
-            home_dir
-                .join(".cache/ms-playwright")
-                .join(format!("chromium-{}", pins.chrome_revision))
-                .join(&pins.chrome_entry),
-        );
-    }
+    chrome_candidates.push(
+        cache_dir()
+            .join(format!("chromium-{}", pins.chrome_revision))
+            .join(&pins.chrome_entry),
+    );
 
     let found_chrome = chrome_candidates
         .into_iter()
@@ -905,22 +896,35 @@ impl BrowserSupervisor {
         let _ = dc.stream.set_nonblocking(true);
         let msg_res = receive::<ToSupervisor>(&dc.stream);
         let _ = dc.stream.set_nonblocking(false);
-        if let Ok(ToSupervisor::Close(close_msg)) = msg_res {
-            let gen_str = close_msg.generation.to_string();
-            let cleaned = self.close(&gen_str).is_ok();
-            if let Some(dc) = self.daemon_control.take() {
-                let _ = send(
-                    &dc.stream,
-                    &FromSupervisor::Check(SupervisorCheck {
-                        request: dc.request,
-                        generation: dc.generation,
-                        context: dc.context,
-                        tool: None,
-                        cleaned: Some(cleaned),
-                    }),
-                );
+        match msg_res {
+            Ok(ToSupervisor::Close(close_msg)) => {
+                let gen_str = close_msg.generation.to_string();
+                let cleaned = self.close(&gen_str).is_ok();
+                if let Some(dc) = self.daemon_control.take() {
+                    let _ = send(
+                        &dc.stream,
+                        &FromSupervisor::Check(SupervisorCheck {
+                            request: dc.request,
+                            generation: dc.generation,
+                            context: dc.context,
+                            tool: None,
+                            cleaned: Some(cleaned),
+                        }),
+                    );
+                }
+                return false;
             }
-            return false;
+            Err(envcloak_ipc::control::ControlError::Frame(
+                envcloak_ipc::FrameError::Closed | envcloak_ipc::FrameError::Truncated,
+            )) => {
+                if let Some(gen_str) = self.bound_generation.clone() {
+                    let _ = self.close(&gen_str);
+                }
+                self.set_lease_active(false);
+                self.daemon_control = None;
+                return false;
+            }
+            _ => {}
         }
         self.lease_active.load(Ordering::SeqCst)
     }
@@ -1617,8 +1621,15 @@ pub fn run_browser_supervisor() -> Result<(), envcloak_client::fail::Failure> {
     // Re-check tracer attachment immediately before accepting InjectState.
     refuse_if_traced()?;
 
-    let mut sup = BrowserSupervisor::start(SupervisorOptions::default())
-        .map_err(SupervisorError::into_cli_failure)?;
+    let host_resolver_rules = env::var("ENVCLOAK_BROWSER_HOST_RULES").ok();
+    let mut sup = BrowserSupervisor::start(SupervisorOptions {
+        host_resolver_rules,
+        ..SupervisorOptions::default()
+    })
+    .map_err(SupervisorError::into_cli_failure)?;
+    if env::var_os("ENVCLOAK_BROWSER_SERVE_TOOLS").is_some() {
+        let _ = sup.mcp_initialize();
+    }
     let gen_str = inject.generation.to_string();
     sup.create_context(&gen_str)
         .map_err(SupervisorError::into_cli_failure)?;
@@ -1665,28 +1676,117 @@ pub fn run_browser_supervisor() -> Result<(), envcloak_client::fail::Failure> {
         Ok(ToSupervisor::Publish(pub_msg)) if pub_msg.published => {
             sup.publish(&gen_str)
                 .map_err(SupervisorError::into_cli_failure)?;
-            if let Ok(cloned) = daemon_control.try_clone() {
-                sup.set_daemon_control(
-                    cloned,
-                    inject.request.clone(),
-                    inject.generation,
-                    inject.context.clone(),
-                );
-            }
-            if env::var_os("ENVCLOAK_BROWSER_WAIT_FOR_CLOSE").is_some()
-                && let Ok(ToSupervisor::Close(_)) = receive::<ToSupervisor>(&daemon_control)
-            {
-                let cleaned = sup.close(&gen_str).is_ok();
-                let _ = send(
-                    &daemon_control,
-                    &FromSupervisor::Check(SupervisorCheck {
-                        request: inject.request,
-                        generation: inject.generation,
-                        context: inject.context,
-                        tool: None,
-                        cleaned: Some(cleaned),
-                    }),
-                );
+            if env::var_os("ENVCLOAK_BROWSER_SERVE_TOOLS").is_some() {
+                let _ = daemon_control.set_read_timeout(None);
+                let mut stdout = std::io::stdout();
+                let _ = writeln!(stdout, "published:{}:{}", inject.generation, inject.context);
+                let _ = stdout.flush();
+
+                let shared_sup = std::sync::Arc::new(std::sync::Mutex::new(sup));
+                if let Ok(dc_watch) = daemon_control.try_clone() {
+                    let sup_watch = std::sync::Arc::clone(&shared_sup);
+                    let req_watch = inject.request.clone();
+                    let gen_watch = inject.generation;
+                    let ctx_watch = inject.context.clone();
+                    let gen_str_watch = gen_str.clone();
+                    std::thread::spawn(move || {
+                        let msg = receive::<ToSupervisor>(&dc_watch);
+                        let mut guard = sup_watch
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.set_lease_active(false);
+                        let cleaned = guard.close(&gen_str_watch).is_ok();
+                        if matches!(msg, Ok(ToSupervisor::Close(_))) {
+                            let _ = send(
+                                &dc_watch,
+                                &FromSupervisor::Check(SupervisorCheck {
+                                    request: req_watch,
+                                    generation: gen_watch,
+                                    context: ctx_watch,
+                                    tool: None,
+                                    cleaned: Some(cleaned),
+                                }),
+                            );
+                        }
+                    });
+                }
+
+                let stdin = std::io::BufReader::new(std::io::stdin());
+                for line_res in stdin.lines() {
+                    let Ok(line) = line_res else {
+                        break;
+                    };
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    let Ok(req_val) = serde_json::from_str::<Value>(trimmed) else {
+                        continue;
+                    };
+                    let name = req_val.get("name").and_then(Value::as_str).unwrap_or("");
+                    let args = req_val
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    let reply = {
+                        let mut guard = shared_sup
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if guard.is_lease_active() {
+                            let chk = FromSupervisor::Check(SupervisorCheck {
+                                request: inject.request.clone(),
+                                generation: inject.generation,
+                                context: inject.context.clone(),
+                                tool: Some(name.to_owned()),
+                                cleaned: None,
+                            });
+                            if send(&daemon_control, &chk).is_err() {
+                                guard.set_lease_active(false);
+                            }
+                        }
+                        match guard.tools_call(name, args) {
+                            Ok(val) => val,
+                            Err(err) => json!({
+                                "isError": true,
+                                "reason": err.as_str(),
+                                "content": [{ "type": "text", "text": err.to_string() }]
+                            }),
+                        }
+                    };
+                    if let Ok(s) = serde_json::to_string(&reply) {
+                        if writeln!(stdout, "{s}").is_err() || stdout.flush().is_err() {
+                            break;
+                        }
+                    }
+                }
+                let mut guard = shared_sup
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = guard.close(&gen_str);
+            } else {
+                if let Ok(cloned) = daemon_control.try_clone() {
+                    sup.set_daemon_control(
+                        cloned,
+                        inject.request.clone(),
+                        inject.generation,
+                        inject.context.clone(),
+                    );
+                }
+                if env::var_os("ENVCLOAK_BROWSER_WAIT_FOR_CLOSE").is_some()
+                    && let Ok(ToSupervisor::Close(_)) = receive::<ToSupervisor>(&daemon_control)
+                {
+                    let cleaned = sup.close(&gen_str).is_ok();
+                    let _ = send(
+                        &daemon_control,
+                        &FromSupervisor::Check(SupervisorCheck {
+                            request: inject.request,
+                            generation: inject.generation,
+                            context: inject.context,
+                            tool: None,
+                            cleaned: Some(cleaned),
+                        }),
+                    );
+                }
             }
         }
         Ok(ToSupervisor::Publish(_) | ToSupervisor::Close(_)) => {

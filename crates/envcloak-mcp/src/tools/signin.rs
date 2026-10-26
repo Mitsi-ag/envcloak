@@ -517,7 +517,7 @@ pub mod request_sign_in {
             deadline
         };
         let mut client = ctx.connect_for_fds()?;
-        let (_in_client, in_daemon) = UnixStream::pair()
+        let (in_client, in_daemon) = UnixStream::pair()
             .map_err(|_| Failure::new("internal", "an internal error occurred"))?;
         let (out_client, out_daemon) = UnixStream::pair()
             .map_err(|_| Failure::new("internal", "an internal error occurred"))?;
@@ -536,8 +536,13 @@ pub mod request_sign_in {
         drop(in_daemon);
         drop(out_daemon);
         if let Some(relay) = ctx.browser_relay() {
-            relay.register_request_pipe(&view.request, OwnedFd::from(out_client));
+            relay.register_request_pipes(
+                &view.request,
+                OwnedFd::from(in_client),
+                OwnedFd::from(out_client),
+            );
         } else {
+            drop(in_client);
             drop(out_client);
         }
 
@@ -721,13 +726,7 @@ pub mod cancel_sign_in {
                 .delivered_context
                 .clone()
                 .unwrap_or_else(|| view.request.clone());
-            relay.with_supervisor_mut(|sup| {
-                let gen_id = sup
-                    .bound_generation()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| fallback_gen.clone());
-                let _ = crate::browser::end_session(sup, &gen_id, true, false);
-            });
+            relay.revoke_active(&fallback_gen);
         }
         Ok(status_to_value(&view))
     }
@@ -800,13 +799,7 @@ pub mod end_sign_in_session {
                 .delivered_context
                 .clone()
                 .unwrap_or_else(|| session.to_owned());
-            relay.with_supervisor_mut(|sup| {
-                let gen_id = sup
-                    .bound_generation()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| fallback_gen.clone());
-                let _ = crate::browser::end_session(sup, &gen_id, true, false);
-            });
+            relay.revoke_active(&fallback_gen);
         }
         Ok(status_to_value(&view))
     }

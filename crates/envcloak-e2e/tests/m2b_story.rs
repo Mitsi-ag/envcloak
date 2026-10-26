@@ -17,7 +17,8 @@ use envcloak_testkit::agents::{AgentHome, Host, HostFlags, Installed, require};
 use envcloak_testkit::signin::{
     ALLOWED_BROWSER_TOOLS, BrowserSupervisor, CONTEXT_NOT_PUBLISHED, ExpectedIdentity,
     FORBIDDEN_PATH_ARGS, SigninFixture, SupervisorOptions, ToolAllowlist, http_request,
-    measure_chrome_pipe_and_session, require_browser_runtime, test_session_mint,
+    measure_chrome_pipe_and_session, require_browser_runtime, run_cookie_scope_probe,
+    test_session_mint,
 };
 use envcloak_testkit::transcripts::Sweep;
 use envcloak_testkit::{Canary, fresh_seed, labels, testkit_bin};
@@ -409,7 +410,7 @@ impl McpSession {
 #[test]
 fn m2b_acceptance_story_end_to_end() {
     envcloak_e2e::check_network();
-    let Some(_runtime) = require_browser_runtime() else {
+    let Some(runtime) = require_browser_runtime() else {
         return;
     };
     let claude_found = Installed::find(&versions_toml(), Host::ClaudeCode.id(), "native");
@@ -429,10 +430,17 @@ fn m2b_acceptance_story_end_to_end() {
     let clock_file = clock_dir.path().join("clock-offset.txt");
     std::fs::write(&clock_file, "0").unwrap();
     let clock_file_str = clock_file.to_str().unwrap().to_owned();
+    let chrome_exe_str = runtime.chrome_exe.to_str().unwrap().to_owned();
+    let node_exe_str = runtime.node_exe.to_str().unwrap().to_owned();
+    let helper_mods_str = runtime.helper_modules.to_str().unwrap().to_owned();
 
     let mut h = Harness::start_with(&[
         ("ENVCLOAK_TEST_CLOCK_FILE", &clock_file_str),
         ("ENVCLOAK_TEST_TOTP_START_UNIX", "0"),
+        ("ENVCLOAK_CHROME_FOR_TESTING_BIN", &chrome_exe_str),
+        ("ENVCLOAK_NODE_BIN", &node_exe_str),
+        ("ENVCLOAK_BROWSER_HELPER_MODULES", &helper_mods_str),
+        ("ENVCLOAK_BROWSER_HELPER_NODE_MODULES", &helper_mods_str),
     ]);
 
     let rotated_editor_pw = format!("ec-rot-pw-{:016x}", fresh_seed());
@@ -684,19 +692,56 @@ fn m2b_acceptance_story_end_to_end() {
     let tlist: SigninTargetListView = serde_json::from_slice(&ls_out.stdout).unwrap();
     assert_eq!(tlist.targets.len(), 4);
     assert!(tlist.targets.iter().all(|t| t.shared_loopback_cookie_jar));
+    assert!(
+        tlist
+            .targets
+            .iter()
+            .any(|t| t.name == "acme/form" && t.login_slug.as_deref() == Some("acme/editor")),
+        "expected acme/form target to reference acme/editor: {tlist:?}"
+    );
+    assert!(
+        tlist
+            .targets
+            .iter()
+            .any(|t| t.name == "acme/admin" && t.login_slug.as_deref() == Some("acme/admin")),
+        "expected acme/admin target to reference acme/admin: {tlist:?}"
+    );
+
+    // Add a regular env-var secret so `list_secrets` has a positive entry while
+    // verifying `D-33` (`login_reference` and login items never appear in `list_secrets`).
+    let api_key_val = format!("sk-acme-story-{:016x}", fresh_seed());
+    h.add_canary(Canary::new("OPENAI_API_KEY", api_key_val.clone()));
+    let api_key_in = secret_input(h.files(), "openai_key", api_key_val.as_bytes());
+    let add_secret = h.human(
+        &project,
+        &["add", "openai", "--slug", "openai/acme-web", "--stdin"],
+        &[(0, &api_key_in, true)],
+        &[],
+    );
+    assert_eq!(add_secret.code, 0, "{}", add_secret.all());
 
     let mut all_op_keys = Vec::new();
     let mut claude_models = Vec::new();
     let mut codex_models = Vec::new();
 
     // =========================================================================
-    // T2: Claude Code signs in through `acme/form`, person approves `--dev 10m`,
-    //     Claude Code navigates to `/dashboard`, reads `#build-number` (`4217`),
-    //     and takes a screenshot that omits `#secret-banner`.
+    // T2 & T6 (R-M2b-37 per-host loop): Real Claude Code (`T2`, `acme/form`) and
+    //     real Codex (`T6`, `acme/adapter`) sign in, person approves `--dev 10m`,
+    //     the host navigates to `/dashboard` and reads `#build-number` (`4217`).
     // =========================================================================
+    let dashboard_url = format!("{}/dashboard", origins.app);
+    // Pre-allow `browser_navigate` and `browser_snapshot` in `.codex/config.toml`
+    // so `codex exec` under `approval_policy="never"` can call them after `request_sign_in`.
+    let codex_cfg_path = h.home.home().join(".codex/config.toml");
+    let mut codex_cfg = std::fs::read_to_string(&codex_cfg_path).unwrap();
+    codex_cfg.push_str(
+        "\n[mcp_servers.envcloak.tools.browser_navigate]\napproval_mode = \"approve\"\n\
+         [mcp_servers.envcloak.tools.browser_snapshot]\napproval_mode = \"approve\"\n",
+    );
+    std::fs::write(&codex_cfg_path, &codex_cfg).unwrap();
+
     let op_t2 = format!("opkey-t2-claude-form-{:016x}", fresh_seed());
     all_op_keys.push(op_t2.clone());
-    let dashboard_url = format!("{}/dashboard", origins.app);
     let claude_script = json!({
         "steps": [
             {
@@ -733,9 +778,6 @@ fn m2b_acceptance_story_end_to_end() {
             { "say": "T2 build-number 4217 verified" }
         ]
     });
-    // Note: the 4 sign-in tools are pre-approved by `signin setup --agents
-    // --consent-approval-mode`; we pass only the 3 `browser_*` tools in
-    // `--allowedTools`.
     let claude_flags = HostFlags::claude(
         "default",
         &[
@@ -744,72 +786,142 @@ fn m2b_acceptance_story_end_to_end() {
             "mcp__envcloak__browser_take_screenshot",
         ],
     );
-    let mut running_claude = claude.spawn(
-        &claude_script,
-        "Sign in to acme/form and read #build-number on /dashboard.",
-        &claude_flags,
-        &project,
-    );
-    let held_t2 = running_claude
-        .model
-        .wait_for("step 1", &mut running_claude.child);
-    h.record("T2 Claude Code model request (held)", &held_t2.body);
-    let first_t2: Value = serde_json::from_str(&extract_last_tool_output(
-        &String::from_utf8_lossy(&held_t2.body),
-    ))
-    .expect("T2 first request_sign_in JSON output");
-    assert_eq!(first_t2["state"], "waiting_for_approval", "{first_t2}");
-    let req_t2 = first_t2["request"].as_str().unwrap().to_owned();
-    assert_eq!(pending_ids(&mut h, &project), vec![req_t2.clone()]);
 
-    let approve_t2 = h.human(
-        &project,
-        &["approve", &req_t2, "--dev", "10m", "--passphrase-fd", "3"],
-        &[(3, &pass_file, true)],
-        &[],
-    );
-    assert_eq!(approve_t2.code, 0, "{}", approve_t2.all());
-    assert!(
-        approve_t2.out().contains("dev authorization "),
-        "{}",
-        approve_t2.all()
-    );
+    let op_t6 = format!("opkey-t6-codex-{:016x}", fresh_seed());
+    all_op_keys.push(op_t6.clone());
+    let codex_script = json!({
+        "steps": [
+            {
+                "tool": "request_sign_in",
+                "namespace": "mcp__envcloak",
+                "input": {
+                    "target": "acme/adapter",
+                    "role": "editor",
+                    "operation_key": op_t6,
+                    "project_dir": project_str,
+                }
+            },
+            {
+                "tool": "request_sign_in",
+                "namespace": "mcp__envcloak",
+                "input": {
+                    "target": "acme/adapter",
+                    "role": "editor",
+                    "operation_key": op_t6,
+                    "project_dir": project_str,
+                },
+                "after": "t6_approved"
+            },
+            {
+                "tool": "browser_navigate",
+                "namespace": "mcp__envcloak",
+                "input": { "url": dashboard_url }
+            },
+            {
+                "tool": "browser_snapshot",
+                "namespace": "mcp__envcloak",
+                "input": {}
+            },
+            { "say": "T6 codex 4217 verified" }
+        ]
+    });
+    let codex_flags =
+        HostFlags::codex("read-only", "never").with(&["--dangerously-bypass-hook-trust"]);
 
-    running_claude.model.release("t2_approved");
-    let claude_run = running_claude.wait();
-    h.record("T2 Claude Code stdout", &claude_run.output.stdout);
-    h.record("T2 Claude Code stderr", &claude_run.output.stderr);
-    for r in &claude_run.model.requests {
-        h.record(&format!("T2 Claude Code model req {}", r.seq), &r.body);
+    for (label, agent_home, script, flags, gate_name, check_screenshot, is_claude) in [
+        (
+            "T2 Claude Code",
+            &claude,
+            &claude_script,
+            &claude_flags,
+            "t2_approved",
+            true,
+            true,
+        ),
+        (
+            "T6 Codex",
+            &codex,
+            &codex_script,
+            &codex_flags,
+            "t6_approved",
+            false,
+            false,
+        ),
+    ] {
+        let mut running = agent_home.spawn(
+            script,
+            "Sign in and read #build-number on /dashboard.",
+            flags,
+            &project,
+        );
+        let held = running.model.wait_for("step 1", &mut running.child);
+        h.record(&format!("{label} model request (held)"), &held.body);
+        let req_id = if is_claude {
+            let first: Value = serde_json::from_str(&extract_last_tool_output(
+                &String::from_utf8_lossy(&held.body),
+            ))
+            .expect("first request_sign_in JSON output");
+            assert_eq!(first["state"], "waiting_for_approval", "{first}");
+            let id = first["request"].as_str().unwrap().to_owned();
+            assert_eq!(pending_ids(&mut h, &project), vec![id.clone()]);
+            id
+        } else {
+            wait_for_pending_id(&mut h, &project, Duration::from_secs(10))
+        };
+
+        let approve_out = h.human(
+            &project,
+            &["approve", &req_id, "--dev", "10m", "--passphrase-fd", "3"],
+            &[(3, &pass_file, true)],
+            &[],
+        );
+        assert_eq!(approve_out.code, 0, "{}", approve_out.all());
+        assert!(
+            approve_out.out().contains("dev authorization "),
+            "{}",
+            approve_out.all()
+        );
+
+        running.model.release(gate_name);
+        let run = running.wait();
+        h.record(&format!("{label} stdout"), &run.output.stdout);
+        h.record(&format!("{label} stderr"), &run.output.stderr);
+        for r in &run.model.requests {
+            h.record(&format!("{label} model req {}", r.seq), &r.body);
+        }
+        assert_eq!(run.output.status.code(), Some(0), "{}", run.text());
+
+        if is_claude {
+            let pub_val: Value =
+                serde_json::from_str(&after_step(&run.model.requests, "step 2")).unwrap();
+            assert_eq!(pub_val["state"], "published", "{pub_val}");
+            assert_eq!(pub_val["delivered_context"], "ctx-1", "{pub_val}");
+        }
+
+        let snap = after_step(&run.model.requests, "step 4");
+        assert!(
+            snap.contains(&origins.build_number),
+            "expected #build-number {} in {label} browser_snapshot: {snap}",
+            origins.build_number
+        );
+        if check_screenshot {
+            let shot = after_step(&run.model.requests, "step 5");
+            assert!(
+                !shot.contains("SECRET-BANNER-DO-NOT-LEAK"),
+                "screenshot output must never include #secret-banner: {shot}"
+            );
+        }
+        if is_claude {
+            claude_models.push(run.model);
+        } else {
+            codex_models.push(run.model);
+        }
     }
-    assert_eq!(
-        claude_run.output.status.code(),
-        Some(0),
-        "{}",
-        claude_run.text()
-    );
-
-    let pub_t2: Value =
-        serde_json::from_str(&after_step(&claude_run.model.requests, "step 2")).unwrap();
-    assert_eq!(pub_t2["state"], "published", "{pub_t2}");
-    assert_eq!(pub_t2["delivered_context"], "ctx-1", "{pub_t2}");
-
-    let snap_t2 = after_step(&claude_run.model.requests, "step 4");
-    assert!(
-        snap_t2.contains(&origins.build_number),
-        "expected #build-number {} in Claude Code browser_snapshot: {snap_t2}",
-        origins.build_number
-    );
-    let shot_t2 = after_step(&claude_run.model.requests, "step 5");
-    assert!(
-        !shot_t2.contains("SECRET-BANNER-DO-NOT-LEAK"),
-        "screenshot output must never include #secret-banner: {shot_t2}"
-    );
-    claude_models.push(claude_run.model);
 
     let counts_t2 = control.counters().unwrap();
     assert_eq!(counts_t2.password_submissions, 1);
     assert_eq!(counts_t2.code_submissions, 1);
+    assert_eq!(counts_t2.mints, 1);
     assert_eq!(counts_t2.wrong_target_submissions, 0);
     assert_eq!(counts_t2.exfiltration_by_channel.values().sum::<u64>(), 0);
     let accepted_t2 = control.accepted_codes().unwrap();
@@ -826,6 +938,35 @@ fn m2b_acceptance_story_end_to_end() {
     control.advance_clock(30_000).unwrap();
 
     let mut mcp = McpSession::start(&h, &project, &["--wait-ms", "1500"]);
+    let list_secrets_res = mcp.call("list_secrets", json!({"project_dir": project_str}));
+    assert_eq!(list_secrets_res["isError"], false, "{list_secrets_res}");
+    let list_secrets_text = list_secrets_res["content"][0]["text"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        list_secrets_text.contains("openai/acme-web"),
+        "expected openai/acme-web in list_secrets: {list_secrets_text}"
+    );
+    assert!(
+        !list_secrets_text.contains("login_reference")
+            && !list_secrets_text.contains("password")
+            && !list_secrets_text.contains("totp")
+            && !list_secrets_text.contains("adapter_key"),
+        "list_secrets must never expose login_reference or login field names (R-M2b-01, D-33): {list_secrets_text}"
+    );
+    for item in list_secrets_res["structuredContent"]["items"]
+        .as_array()
+        .unwrap()
+    {
+        if item["class"] == "login" {
+            assert_eq!(
+                item["fields"],
+                json!([]),
+                "login item in list_secrets must expose 0 fields: {item}"
+            );
+        }
+    }
+
     let tools = mcp.list_tools();
     let tool_names: BTreeSet<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     for allowed in ALLOWED_BROWSER_TOOLS {
@@ -944,7 +1085,10 @@ fn m2b_acceptance_story_end_to_end() {
         }),
     );
     assert_eq!(retry_t4["structuredContent"]["request"], req_t4_id);
-    assert_eq!(retry_t4["structuredContent"]["state"], "published");
+    assert_eq!(
+        retry_t4["structuredContent"]["state"], "published",
+        "T4 retry_t4 failed: {retry_t4}"
+    );
     let counts_after_t4_first = control.counters().unwrap();
     assert_eq!(counts_after_t4_first.password_submissions, 2);
     assert_eq!(counts_after_t4_first.code_submissions, 2);
@@ -1031,7 +1175,7 @@ fn m2b_acceptance_story_end_to_end() {
         counts_after_adapter.code_submissions, 3,
         "adapter sign-in must submit 0 TOTP codes"
     );
-    assert_eq!(counts_after_adapter.mints, 1);
+    assert_eq!(counts_after_adapter.mints, 2);
 
     // =========================================================================
     // T5: `StepUp` target (`acme/admin`) refuses `--for 10m` and `--dev 10m`
@@ -1118,102 +1262,10 @@ fn m2b_acceptance_story_end_to_end() {
     let _ = mcp.call("cancel_sign_in", json!({"request": req_admin_2}));
 
     // =========================================================================
-    // T6: Real Codex (`codex exec`) signs in through `acme/adapter` and reads
-    //     `#build-number` (`4217`) via `browser_snapshot`.
-    // =========================================================================
-    let op_t6 = format!("opkey-t6-codex-{:016x}", fresh_seed());
-    all_op_keys.push(op_t6.clone());
-    // Pre-allow `browser_navigate` and `browser_snapshot` in `.codex/config.toml`
-    // for T6 so `codex exec` under `approval_policy="never"` can call them after
-    // `request_sign_in`.
-    let codex_cfg_path = h.home.home().join(".codex/config.toml");
-    let mut codex_cfg = std::fs::read_to_string(&codex_cfg_path).unwrap();
-    codex_cfg.push_str(
-        "\n[mcp_servers.envcloak.tools.browser_navigate]\napproval_mode = \"approve\"\n\
-         [mcp_servers.envcloak.tools.browser_snapshot]\napproval_mode = \"approve\"\n",
-    );
-    std::fs::write(&codex_cfg_path, &codex_cfg).unwrap();
-
-    let codex_script = json!({
-        "steps": [
-            {
-                "tool": "request_sign_in",
-                "namespace": "mcp__envcloak",
-                "input": {
-                    "target": "acme/adapter",
-                    "role": "editor",
-                    "operation_key": op_t6,
-                    "project_dir": project_str,
-                }
-            },
-            {
-                "tool": "request_sign_in",
-                "namespace": "mcp__envcloak",
-                "input": {
-                    "target": "acme/adapter",
-                    "role": "editor",
-                    "operation_key": op_t6,
-                    "project_dir": project_str,
-                },
-                "after": "t6_approved"
-            },
-            {
-                "tool": "browser_navigate",
-                "namespace": "mcp__envcloak",
-                "input": { "url": dashboard_url }
-            },
-            {
-                "tool": "browser_snapshot",
-                "namespace": "mcp__envcloak",
-                "input": {}
-            },
-            { "say": "T6 codex 4217 verified" }
-        ]
-    });
-    let codex_flags =
-        HostFlags::codex("read-only", "never").with(&["--dangerously-bypass-hook-trust"]);
-    let mut running_codex = codex.spawn(
-        &codex_script,
-        "Sign in to acme/adapter and read #build-number on /dashboard.",
-        &codex_flags,
-        &project,
-    );
-    let held_t6 = running_codex
-        .model
-        .wait_for("step 1", &mut running_codex.child);
-    h.record("T6 Codex model request (held)", &held_t6.body);
-    let req_t6 = wait_for_pending_id(&mut h, &project, Duration::from_secs(10));
-    let approve_t6 = h.human(
-        &project,
-        &["approve", &req_t6, "--dev", "10m", "--passphrase-fd", "3"],
-        &[(3, &pass_file, true)],
-        &[],
-    );
-    assert_eq!(approve_t6.code, 0, "{}", approve_t6.all());
-    running_codex.model.release("t6_approved");
-    let codex_run = running_codex.wait();
-    h.record("T6 Codex stdout", &codex_run.output.stdout);
-    h.record("T6 Codex stderr", &codex_run.output.stderr);
-    for r in &codex_run.model.requests {
-        h.record(&format!("T6 Codex model req {}", r.seq), &r.body);
-    }
-    assert_eq!(
-        codex_run.output.status.code(),
-        Some(0),
-        "{}",
-        codex_run.text()
-    );
-    let snap_t6 = after_step(&codex_run.model.requests, "step 4");
-    assert!(
-        snap_t6.contains(&origins.build_number),
-        "expected #build-number {} in Codex browser_snapshot: {snap_t6}",
-        origins.build_number
-    );
-    codex_models.push(codex_run.model);
-
-    // =========================================================================
     // T7: `notifications/cancelled` detaches only the MCP wait while the
-    //     operation stays pending; `cancel_sign_in` stops the operation and
+    //     operation stays pending; reusing `operation_key` with a different
+    //     target fails with `request_conflict`; 20 `sign_in_status` polls stay
+    //     `waiting_for_approval`; `cancel_sign_in` stops the operation and
     //     cleans up within 5s.
     // =========================================================================
     let mut mcp_t7 = McpSession::start(&h, &project, &["--wait-ms", "15000"]);
@@ -1241,6 +1293,37 @@ fn m2b_acceptance_story_end_to_end() {
         "notifications/cancelled must detach only the MCP wait without cancelling the operation"
     );
 
+    // Reusing `op_t7` with a different target (`acme/form`) fails with `request_conflict`.
+    let conflict_res = mcp_t7.call(
+        "request_sign_in",
+        json!({
+            "target": "acme/form",
+            "role": "editor",
+            "operation_key": op_t7,
+            "project_dir": project_str,
+        }),
+    );
+    assert_eq!(conflict_res["isError"], true, "{conflict_res}");
+    assert!(
+        conflict_res["content"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("request_conflict"),
+        "expected request_conflict when reusing operation_key with different target: {conflict_res}"
+    );
+
+    // 20 `sign_in_status` polls while pending (`b19` / `T7`).
+    for _ in 0..20 {
+        let poll = mcp_t7.call("sign_in_status", json!({"request": req_t7}));
+        assert!(
+            matches!(
+                poll["structuredContent"]["state"].as_str(),
+                Some("pending_approval" | "waiting_for_approval")
+            ),
+            "{poll}"
+        );
+    }
+
     // Cross-session isolation: another agent session (`mcp`) cannot cancel `mcp_t7`'s request.
     let cross_cancel = mcp.call("cancel_sign_in", json!({"request": req_t7}));
     assert_eq!(cross_cancel["isError"], true, "{cross_cancel}");
@@ -1261,8 +1344,20 @@ fn m2b_acceptance_story_end_to_end() {
     // =========================================================================
     // T8: `envcloak rotate acme/editor#password` invalidates the grant and
     //     closes the active browser context (`grant_revoked`); `envcloak lock`
-    //     also closes an active session (`grant_revoked`).
+    //     also closes an active session (`grant_revoked`); `b11` loopback
+    //     cookie-jar probe confirms RFC 6265 cross-port cookie sharing vs
+    //     port-isolated `localStorage`.
     // =========================================================================
+    let cookie_probe = run_cookie_scope_probe().unwrap();
+    assert!(
+        cookie_probe.same_host_other_port_cookie_present,
+        "RFC 6265 loopback cookie jar must be shared across ports (b11): {cookie_probe:?}"
+    );
+    assert!(
+        cookie_probe.same_host_other_port_local_storage_isolated,
+        "localStorage must remain port-isolated on loopback (b11): {cookie_probe:?}"
+    );
+
     // Activate a session on `acme/adapter` (covered by T4's 10m dev grant on `acme/editor`)
     // so `mcp`'s active browser context is bound to `acme/editor`.
     let op_t8_pre = format!("opkey-t8-pre-{:016x}", fresh_seed());
@@ -1382,31 +1477,12 @@ fn m2b_acceptance_story_end_to_end() {
     // =========================================================================
     // T9: `end_sign_in_session` on `acme/norevoke` (no revocation endpoint)
     //     reports `revocation: "server session expiry unknown"`, closes the
-    //     browser context, while a copied cookie still works on the server.
+    //     browser context, while the live cookie minted by that session still
+    //     works on the server.
     // =========================================================================
     std::fs::write(&clock_file, "150").unwrap();
     control.advance_clock(30_000).unwrap();
-    let (mint_status_t9, mint_body_t9) = test_session_mint(
-        &origins.app,
-        &origins.adapter_key,
-        &json!({
-            "identity": "editor@acme.test",
-            "account": "editor@acme.test",
-            "tenant": "t1",
-            "role": "editor",
-            "ttl": 600,
-        })
-        .to_string(),
-    )
-    .unwrap();
-    assert_eq!(mint_status_t9, 200);
-    let mint_json_t9: Value = serde_json::from_str(&mint_body_t9).unwrap();
-    let cookie_val_t9 = mint_json_t9["declared_state"]["cookies"][0]["value"]
-        .as_str()
-        .unwrap()
-        .to_owned();
     let whoami_url = format!("{}/api/whoami", origins.app);
-    let cookie_hdr_t9 = format!("session={cookie_val_t9}");
     let op_t9 = format!("opkey-t9-norevoke-{:016x}", fresh_seed());
     all_op_keys.push(op_t9.clone());
     let init_t9 = mcp.call(
@@ -1432,6 +1508,17 @@ fn m2b_acceptance_story_end_to_end() {
     let pub_t9 = mcp.call("sign_in_status", json!({"request": req_t9}));
     assert_eq!(pub_t9["structuredContent"]["state"], "published");
 
+    let nav_t9 = mcp.call("browser_navigate", json!({"url": dashboard_url}));
+    assert_eq!(nav_t9["isError"], false, "{nav_t9}");
+    let snap_t9 = mcp.call("browser_snapshot", json!({}));
+    assert_eq!(snap_t9["isError"], false, "{snap_t9}");
+    let snap_t9_text = snap_t9["content"][0]["text"].as_str().unwrap_or("");
+    let cookie_val_t9 = extract_session_token(snap_t9_text);
+    let cookie_hdr_t9 = format!("session={cookie_val_t9}");
+    let (status_t9_before, _) =
+        http_request("GET", &whoami_url, &[("Cookie", &cookie_hdr_t9)], "").unwrap();
+    assert_eq!(status_t9_before, 200);
+
     let ended_t9 = mcp.call("end_sign_in_session", json!({"session": req_t9}));
     assert_eq!(ended_t9["structuredContent"]["state"], "ended");
     assert_eq!(ended_t9["structuredContent"]["cleanup"], "done");
@@ -1449,7 +1536,8 @@ fn m2b_acceptance_story_end_to_end() {
     // =========================================================================
     // T10: `end_sign_in_session` on `acme/form` (with `/api/revoke`) reports
     //      `revocation: "verified"`, increments `counters.revocations`, and the
-    //      server rejects the copied cookie (`401`).
+    //      server rejects `T10`'s live session cookie (`401`) while `T9`'s
+    //      cookie remains `200`.
     // =========================================================================
     std::fs::write(&clock_file, "180").unwrap();
     control.advance_clock(30_000).unwrap();
@@ -1478,6 +1566,18 @@ fn m2b_acceptance_story_end_to_end() {
     let pub_t10 = mcp.call("sign_in_status", json!({"request": req_t10}));
     assert_eq!(pub_t10["structuredContent"]["state"], "published");
 
+    let nav_t10 = mcp.call("browser_navigate", json!({"url": dashboard_url}));
+    assert_eq!(nav_t10["isError"], false, "{nav_t10}");
+    let snap_t10 = mcp.call("browser_snapshot", json!({}));
+    assert_eq!(snap_t10["isError"], false, "{snap_t10}");
+    let snap_t10_text = snap_t10["content"][0]["text"].as_str().unwrap_or("");
+    let cookie_val_t10 = extract_session_token(snap_t10_text);
+    assert_ne!(cookie_val_t10, cookie_val_t9);
+    let cookie_hdr_t10 = format!("session={cookie_val_t10}");
+    let (status_t10_before, _) =
+        http_request("GET", &whoami_url, &[("Cookie", &cookie_hdr_t10)], "").unwrap();
+    assert_eq!(status_t10_before, 200);
+
     let rev_before = control.counters().unwrap().revocations;
     let ended_t10 = mcp.call("end_sign_in_session", json!({"session": req_t10}));
     assert_eq!(ended_t10["structuredContent"]["state"], "ended");
@@ -1492,17 +1592,165 @@ fn m2b_acceptance_story_end_to_end() {
         "expected revocations counter to increase ({rev_before} -> {rev_after})"
     );
     let (status_t10_after, _) =
-        http_request("GET", &whoami_url, &[("Cookie", &cookie_hdr_t9)], "").unwrap();
+        http_request("GET", &whoami_url, &[("Cookie", &cookie_hdr_t10)], "").unwrap();
     assert_eq!(
         status_t10_after, 401,
-        "after verified revocation, server must reject the session cookie with 401"
+        "after verified revocation, server must reject T10's session cookie with 401"
+    );
+    let (status_t9_still_ok, _) =
+        http_request("GET", &whoami_url, &[("Cookie", &cookie_hdr_t9)], "").unwrap();
+    assert_eq!(
+        status_t9_still_ok, 200,
+        "revoking T10's session must not revoke T9's unrelated session"
     );
 
     // =========================================================================
-    // T11 & T12 (part 2): Target/identity mismatch before publication discards
-    //     the context (`0` published contexts), and Chrome `--remote-debugging-pipe`
-    //     exits and reaps within 5s.
+    // T11 & T12 (part 2): Live daemon target/identity mismatch before
+    //     publication (`acme/wrong-tenant`, `--tenant t2`) fails with
+    //     `identity_unverified` (`0` published contexts); `"whoami"` barrier +
+    //     `envcloak lock` aborts before publication (`reason: "locked"`, `b15`);
+    //     and Chrome `--remote-debugging-pipe` / killed worker (`b17`) exits
+    //     and reaps within 5s.
     // =========================================================================
+    let added_wt = h.human(
+        &project,
+        &[
+            "signin",
+            "target",
+            "add",
+            "acme/wrong-tenant",
+            "--login",
+            "acme/editor",
+            "--app-origin",
+            &origins.app,
+            "--credential-origin",
+            &origins.app,
+            "--identity-check",
+            "endpoint",
+            "/login/wrong-tenant",
+            "--account",
+            "editor@acme.test",
+            "--tenant",
+            "t1",
+            "--role",
+            "editor",
+            "--cookie",
+            "session@acme.localhost/",
+            "--tier",
+            "dev",
+            "--approval-lifetime",
+            "4h",
+            "--session-lifetime",
+            "1h",
+            "--adapter",
+            "test_session",
+            "--manifest",
+            &manifest_str,
+            "--passphrase-fd",
+            "3",
+        ],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(added_wt.code, 0, "{}", added_wt.all());
+
+    let op_t11_wt = format!("opkey-t11-wt-{:016x}", fresh_seed());
+    all_op_keys.push(op_t11_wt.clone());
+    let init_t11_wt = mcp.call(
+        "request_sign_in",
+        json!({
+            "target": "acme/wrong-tenant",
+            "role": "editor",
+            "operation_key": op_t11_wt,
+            "project_dir": project_str,
+        }),
+    );
+    let req_t11_wt = init_t11_wt["structuredContent"]["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let app_t11_wt = h.human(
+        &project,
+        &["approve", &req_t11_wt, "--once", "--passphrase-fd", "3"],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(app_t11_wt.code, 0, "{}", app_t11_wt.all());
+    let status_t11_wt = mcp.call("sign_in_status", json!({"request": req_t11_wt}));
+    assert_eq!(
+        status_t11_wt["structuredContent"]["state"], "failed",
+        "{status_t11_wt}"
+    );
+    assert_eq!(
+        status_t11_wt["structuredContent"]["reason"], "identity_unverified",
+        "{status_t11_wt}"
+    );
+
+    // Live `"whoami"` barrier + `envcloak lock` before publication (`b15`).
+    let op_t11_b15 = format!("opkey-t11-b15-{:016x}", fresh_seed());
+    all_op_keys.push(op_t11_b15.clone());
+    let init_t11_b15 = mcp.call(
+        "request_sign_in",
+        json!({
+            "target": "acme/adapter",
+            "role": "editor",
+            "operation_key": op_t11_b15,
+            "project_dir": project_str,
+        }),
+    );
+    let req_t11_b15 = init_t11_b15["structuredContent"]["request"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    control.barrier("whoami").unwrap();
+    let person_b15 = h.person();
+    let cli_path = h.cli().to_string_lossy().into_owned();
+    let pass_path_str = pass_file.to_string_lossy().into_owned();
+    let proj_b15 = project.clone();
+    let req_b15_clone = req_t11_b15.clone();
+    let approve_b15_thread = std::thread::spawn(move || {
+        let out = person_b15
+            .run_argv(
+                &proj_b15,
+                &[
+                    "/bin/sh",
+                    "-c",
+                    "exec 3<\"$1\"; exec \"$2\" approve \"$3\" --once --passphrase-fd 3",
+                    "sh",
+                    &pass_path_str,
+                    &cli_path,
+                    &req_b15_clone,
+                ],
+                &[],
+                Duration::from_secs(30),
+            )
+            .expect("person_b15 approve finished");
+        (person_b15, out)
+    });
+    control.wait_barrier("whoami").unwrap();
+    let locked_b15 = h.human(&project, &["lock"], &[], &[]);
+    assert_eq!(locked_b15.code, 0, "{}", locked_b15.all());
+    control.release("whoami").unwrap();
+    let (person_b15, approve_b15_out) = approve_b15_thread.join().unwrap();
+    h.keep_person(&person_b15);
+    assert_eq!(approve_b15_out.code, 0, "{}", approve_b15_out.all());
+    let unlocked_b15 = h.human(
+        &project,
+        &["unlock", "--passphrase-fd", "3"],
+        &[(3, &pass_file, true)],
+        &[],
+    );
+    assert_eq!(unlocked_b15.code, 0, "{}", unlocked_b15.all());
+    let status_b15 = mcp.call("sign_in_status", json!({"request": req_t11_b15}));
+    assert_eq!(
+        status_b15["structuredContent"]["state"], "failed",
+        "{status_b15}"
+    );
+    assert_eq!(
+        status_b15["structuredContent"]["reason"], "locked",
+        "{status_b15}"
+    );
+
     {
         let (wt_status, wt_body) = test_session_mint(
             &origins.app,
@@ -1573,11 +1821,9 @@ fn m2b_acceptance_story_end_to_end() {
     // =========================================================================
     // T13: Whole-story canary sweep across all CLI outputs, MCP outputs, Claude
     //      Code and Codex stores, model request bodies, daemon logs, and audit
-    //      records, plus 8-digit TOTP window codes (`t - 1 ..= t + 2`) and
-    //      positive control.
+    //      records, plus 8-digit TOTP window codes (`t - 1 ..= t + 10`), 20
+    //      unissued TOTP codes, and positive control.
     // =========================================================================
-    h.assert_swept("M2b-11 whole-story sweep");
-
     let now_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -1590,12 +1836,21 @@ fn m2b_acceptance_story_end_to_end() {
         } else {
             base_step.saturating_add(offset as u64)
         };
-        issued_window_codes.push(rfc6238_totp_sha1_8(RFC6238_RAW_SEED, step));
+        let code = rfc6238_totp_sha1_8(RFC6238_RAW_SEED, step);
+        h.add_needle(format!("TOTP_WINDOW_{offset}"), code.to_vec());
+        issued_window_codes.push(code);
+    }
+    // 20 unissued 8-digit TOTP codes (`base_step + 500 .. base_step + 520`).
+    let mut unissued_codes = Vec::new();
+    for idx in 0u64..20u64 {
+        let code = rfc6238_totp_sha1_8(RFC6238_RAW_SEED, base_step + 500 + idx);
+        h.add_needle(format!("TOTP_UNISSUED_{idx}"), code.to_vec());
+        unissued_codes.push(code);
     }
     // Positive control for TOTP 8-digit code scanner: an unissued future step
     // (`base_step + 500`) must be detected in a synthetic control buffer and
     // absent everywhere else.
-    let unissued_code = rfc6238_totp_sha1_8(RFC6238_RAW_SEED, base_step + 500);
+    let unissued_code = unissued_codes[0];
     let control_buf = {
         let mut v = b"synthetic-prefix-".to_vec();
         v.extend_from_slice(&unissued_code);
@@ -1613,6 +1868,11 @@ fn m2b_acceptance_story_end_to_end() {
         accepted_all.len() >= 3,
         "expected at least 3 accepted TOTP codes across T2, T4, T5, T10"
     );
+    for (idx, acc) in accepted_all.iter().enumerate() {
+        h.add_needle(format!("TOTP_ACCEPTED_{idx}"), acc.code.as_bytes().to_vec());
+    }
+
+    h.assert_swept("M2b-11 whole-story sweep");
 
     for (agent_home, models, name) in [
         (&claude, &claude_models, "Claude Code"),
@@ -1636,11 +1896,11 @@ fn m2b_acceptance_story_end_to_end() {
 
         for req_list in models {
             for r in &req_list.requests {
-                for c in &issued_window_codes {
+                for c in issued_window_codes.iter().chain(unissued_codes.iter()) {
                     assert_eq!(
                         count_code_matches(&r.body, c),
                         0,
-                        "{name} model request leaked an 8-digit TOTP window code"
+                        "{name} model request leaked an 8-digit TOTP code"
                     );
                 }
                 let body_str = String::from_utf8_lossy(&r.body);
@@ -1650,22 +1910,15 @@ fn m2b_acceptance_story_end_to_end() {
                         "{name} model request leaked accepted TOTP code"
                     );
                 }
-                for op_key in &all_op_keys {
-                    // Note: the agent's own tool_use call arguments in the model
-                    // conversation carry the operation_key the agent chose, so we
-                    // check daemon logs and audit records below for operation_key
-                    // non-persistence.
-                    let _ = op_key;
-                }
             }
         }
     }
 
-    // Check `audit verify --json` and the raw `audit.log` on disk for TOTP codes
-    // and `operation_key` non-persistence.
+    // Check `audit verify --json`, the raw `audit.log` on disk, and the daemon
+    // log for TOTP codes and `operation_key` non-persistence.
     let audit_out = h.human(&project, &["audit", "verify", "--json"], &[], &[]);
     assert_eq!(audit_out.code, 0, "{}", audit_out.all());
-    let mut audit_blobs = vec![audit_out.stdout];
+    let mut audit_blobs = vec![audit_out.stdout, h.daemon.log().into_bytes()];
     for rel in [
         "data/envcloak/audit.log",
         "home/Library/Application Support/EnvCloak/audit.log",
@@ -1676,21 +1929,35 @@ fn m2b_acceptance_story_end_to_end() {
         }
     }
     for blob in &audit_blobs {
-        for c in &issued_window_codes {
+        for c in issued_window_codes.iter().chain(unissued_codes.iter()) {
             assert_eq!(
                 count_code_matches(blob, c),
                 0,
-                "audit output leaked an 8-digit TOTP code"
+                "audit or daemon log leaked an 8-digit TOTP code"
             );
         }
         let audit_text = String::from_utf8_lossy(blob);
         for op_key in &all_op_keys {
             assert!(
                 !audit_text.contains(op_key),
-                "audit output must never contain operation_key {op_key}"
+                "audit or daemon log must never contain operation_key {op_key}"
             );
         }
     }
+}
+
+fn extract_session_token(text: &str) -> String {
+    let prefix = "sess_";
+    let start = text
+        .find(prefix)
+        .unwrap_or_else(|| panic!("expected sess_<hex> token in snapshot: {text}"));
+    let rest = &text[start..];
+    let len = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .map(char::len_utf8)
+        .sum::<usize>();
+    rest[..len].to_owned()
 }
 
 /// Verifies the release-feature gate and the 5 `M2b-11` mutation controls:
@@ -1707,16 +1974,46 @@ fn m2b_acceptance_story_end_to_end() {
 ///    per-account TOTP ledger.
 #[test]
 fn m2b_story_mutation_controls_and_release_feature_gate() {
-    // Release-feature gate: `envcloak` and `envcloakd` production crates do not
-    // enable any test-only barrier hook in release builds.
-    let cargo_toml = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../envcloak-daemon/Cargo.toml"),
-    )
-    .unwrap();
-    assert!(
-        !cargo_toml.contains("default = [\"testing\"]"),
-        "envcloak-daemon must never enable a testing feature by default"
-    );
+    // Release-feature gate: `cargo metadata --no-deps --format-version 1` confirms
+    // `envcloak` and `envcloakd` production crates do not enable any test-only
+    // barrier feature in release builds.
+    let meta_out = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .expect("run cargo metadata");
+    assert!(meta_out.status.success());
+    let meta_json: Value = serde_json::from_slice(&meta_out.stdout).unwrap();
+    for pkg in meta_json["packages"].as_array().unwrap() {
+        let name = pkg["name"].as_str().unwrap_or("");
+        if matches!(name, "envcloak-cli" | "envcloak-daemon" | "envcloak-mcp") {
+            let default_feats = pkg["features"]["default"]
+                .as_array()
+                .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for f in &default_feats {
+                assert!(
+                    !f.contains("test"),
+                    "package {name} default features must not include test features: {default_feats:?}"
+                );
+            }
+            for dep in pkg["dependencies"].as_array().unwrap() {
+                if dep["kind"].is_null() {
+                    let dep_feats = dep["features"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    for f in &dep_feats {
+                        assert!(
+                            !f.contains("test"),
+                            "package {name} normal dependency {} enables test feature {f}",
+                            dep["name"]
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // Verify RFC 6238 SHA-1 Appendix B vector (t = 59 -> step = 1 -> 94287082).
     assert_eq!(&rfc6238_totp_sha1_8(RFC6238_RAW_SEED, 1), b"94287082");

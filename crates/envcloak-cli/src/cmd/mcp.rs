@@ -114,9 +114,16 @@ fn should_enable_browser_relay() -> bool {
     let Ok(loc) = envcloak_agents::locations::Locations::from_env() else {
         return false;
     };
-    for path in [loc.claude_instructions(), loc.codex_instructions()] {
+    let expected_block = envcloak_agents::blocks::signin_block();
+    let expected_trimmed = expected_block.trim_end_matches('\n');
+    for path in [
+        loc.claude_instructions(),
+        loc.codex_instructions(),
+        loc.copilot_instructions(),
+        loc.opencode_instructions(),
+    ] {
         if let Ok(text) = std::fs::read_to_string(path)
-            && text.contains("request_sign_in")
+            && text.contains(expected_trimmed)
         {
             return true;
         }
