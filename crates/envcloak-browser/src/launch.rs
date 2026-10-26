@@ -22,6 +22,7 @@ use std::io::{self, Read};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::os::fd::AsFd;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 

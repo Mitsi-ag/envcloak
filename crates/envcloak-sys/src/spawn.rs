@@ -341,6 +341,7 @@ unsafe fn child_exec(p: &ChildPrepared) -> ! {
         }
         // SAFETY: getppid has no preconditions; if parent died before prctl, exit immediately.
         if unsafe { libc::getppid() } != p.parent_pid {
+            // SAFETY: _exit is async-signal-safe and terminates the child immediately.
             unsafe { libc::_exit(127) };
         }
     }
