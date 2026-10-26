@@ -72,3 +72,23 @@ Because `@playwright/mcp` caches the `BrowserContext` returned by `contextGetter
 - Host-only cookies set on `http://acme.localhost:<p1>` are NOT sent to `http://idp-acme.localhost:<p2>` (different `.localhost` subdomain).
 - `localStorage` and `sessionStorage` are isolated by full `(scheme, host, port)` origin across both `acme.localhost:<p3>` and `idp-acme.localhost:<p2>`.
 - Separate Playwright `BrowserContext` instances within the same Chrome process do not share cookies or `localStorage` even for the exact same `(scheme, host, port)` origin.
+
+## 6. Sign-in Worker Driver and Reaper (`M2b-07`, `D-25`, `D-26`, `D-27`, `D-28`, `D-34`, `F-73`, `CR-3`)
+
+`crates/envcloak-browser` and `crates/envcloak-sys::spawn` implement the isolated sign-in worker driver and reaper:
+
+1. **Entry-image binding (`EntryImageAnchor`, `SPEC.md` section 6.8)**:
+   - On Linux, `EntryImageAnchor` captures a sealed in-memory copy (`memfd` with `F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK`) of the startup executable and starts `--signin-driver` and `--signin-reaper` via `execveat(fd, "", AT_EMPTY_PATH)` without reopening a path on disk.
+   - On macOS, `EntryImageAnchor` records the startup Mach-O `cdhash` and signing identity, starts `--signin-driver` and `--signin-reaper` suspended (`POSIX_SPAWN_START_SUSPENDED`), verifies the suspended child's kernel `cdhash` via `proc_info(pid)` before any user-space instruction runs, and kills/reaps the child without resuming if the identity differs.
+2. **CDP Pipe Client (`cdp.rs`) and Worker Launch (`launch.rs`, gate `b2`)**:
+   - Null-delimited JSON-RPC over `--remote-debugging-pipe` (`fd 3` / `fd 4`), bounded at `8 MiB` per frame and `4096` queued events, with value-free errors (`CdpError`) and an explicit domain allowlist (`Browser`, `Target`, `Page`, `Fetch`, `Network`, `DOM`, `Input`, `Runtime`, `DOMStorage`).
+   - `LaunchSpec` verifies the pinned Chrome for Testing executable's SHA-256 through an open file descriptor (`O_NOFOLLOW`), refuses `--remote-debugging-port` and any tracing/HAR/screenshot flag, clears the environment (`HOME` and `TMPDIR` set to the `0700` attempt directory), disables core dumps (`RLIMIT_CORE = 0`), and starts Chrome in a dedicated session (`setsid`, plus `PR_SET_PDEATHSIG = SIGKILL` on Linux) with only `fd 3` and `fd 4` inherited via `envcloak_sys::spawn_with_fds` (`OwnedChild`).
+3. **Origin Guard and Loopback Proxy (`origin_guard.rs`, `D-26`, gate `b1`)**:
+   - Enforces exact `(scheme, host, port)` matching against the target's registered `app`, `credential_entry`, `identity_provider`, and `callback` origin sets (never matching hosts by suffix and rejecting userinfo).
+   - Attaches `Target.setAutoAttach({ waitForDebuggerOnStart: true, flatten: true })` and `Fetch.enable` across targets, verifies form `action` before and immediately prior to submission, and pairs with `LoopbackOriginProxy` (`--proxy-server=127.0.0.1:<port> --proxy-bypass-list=<-loopback>`) so `sendBeacon`, `WebSocket`, `Worker`, and `ServiceWorker` cannot reach an unregistered origin.
+4. **Login State Machine (`state_machine.rs`, `D-25`, `D-27`, gates `b13`, `b16`), Identity Check (`identity.rs`, gate `b6`), State Extraction (`extract.rs`, gate `b5`), and Adapter Client (`adapter.rs`, `D-28`, gate `b19`)**:
+   - Fills credentials exclusively via `DOM.focus` + `Input.insertText` with zeroized buffers (never constructing a JS string containing a secret), caps each attempt at `1` password submission and `2` TOTP code submissions, and stops with `HandoffRequired` on CAPTCHA or unknown challenges.
+   - Verifies `{ account, tenant, role }` in the worker before extracting only the declared cookies and `localStorage` items in deterministic sorted order.
+   - Supports the `D-28` loopback test-session adapter (`POST /__envcloak/test-session` with `X-EnvCloak-Test-Key` and `POST /__envcloak/test-session/revoke`) without launching a browser.
+5. **Single-Threaded Reaper (`reaper.rs`, `D-34`, `F-73`, `CR-3`, gate `b12`)**:
+   - Holds `reaper.lock` (`flock(LOCK_EX | LOCK_NB)`), sets `PR_SET_CHILD_SUBREAPER` on Linux, owns the Chrome `OwnedChild` handle, and on `ReaperCommand::Stop`, `lifeline` EOF, or worker exit executes the strict teardown order: `has_exited` -> `signal_group_before_reap(SIGKILL)` -> `reap` + `reap_reparented_children` -> `remove_tree_beneath_and_verify(attempt_dir, "profile")` (without following symlinks) -> `create_beneath(attempt_dir, "teardown.confirmed", 0o600)` (`O_EXCL`) + `sync_file`.

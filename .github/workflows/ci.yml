@@ -693,6 +693,7 @@ jobs:
         run: |
           cargo build --locked -p envcloak -p envcloakd -p envcloak-agents -p envcloak-testkit -p envcloak-e2e --bins
           cargo test --locked -p envcloak-e2e $TESTS --test browser_helper_smoke --no-run
+          cargo test --locked -p envcloak-browser --test reaper --no-run
       # The positive control: --exact runs nothing for a name no test has,
       # and passes, so the step also requires that the one test ran and passed.
       - name: The network outside the isolation is open
@@ -762,6 +763,9 @@ jobs:
           sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
             "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
              cargo test --locked --offline -p envcloak-e2e --test browser_helper_smoke -- --nocapture --test-threads=1"
+          sudo -E env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -ec \
+            "ip link set lo up; exec setpriv --reuid=$(id -u) --regid=$(id -g) --init-groups -- \
+             cargo test --locked --offline -p envcloak-browser --test reaper -- --nocapture --test-threads=1"
       # S0's sandboxed cases the same way (the gates job runs them on pull
       # requests), on main, nightly and manual runs.
       - name: Story steps, sandboxed cases outside a user namespace, loopback only (Linux)
@@ -822,6 +826,10 @@ jobs:
             "PATH=$PATH" "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" \
             "$(command -v python3)" -c 'import os, sys; os.setgroups([4242]); os.setgid(4242); os.setuid(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' \
             "$(id -u)" cargo test --locked --offline -p envcloak-e2e $TESTS --test browser_helper_smoke -- --nocapture --test-threads=1
+          sudo -E env -u SUDO_COMMAND -u SUDO_USER -u SUDO_UID -u SUDO_GID \
+            "PATH=$PATH" "HOME=$HOME" "USER=$USER" "LOGNAME=$USER" \
+            "$(command -v python3)" -c 'import os, sys; os.setgroups([4242]); os.setgid(4242); os.setuid(int(sys.argv[1])); os.execvp(sys.argv[2], sys.argv[2:])' \
+            "$(id -u)" cargo test --locked --offline -p envcloak-browser --test reaper -- --nocapture --test-threads=1
 
   # The real-model release check (M2 plan D-13, Q-01; task M2-26): manual and
   # nightly only, with dedicated low-limit keys from Actions secrets, which pull

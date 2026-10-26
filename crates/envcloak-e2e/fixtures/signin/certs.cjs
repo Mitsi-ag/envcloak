@@ -95,10 +95,15 @@ function generateFixtureCerts() {
     isCa: true,
   });
 
+  const testCaLeafSpkiDer = leafKeys.publicKey.export({ type: "spki", format: "der" });
+  const testCaLeafSpkiSha256 = crypto
+    .createHash("sha256")
+    .update(testCaLeafSpkiDer)
+    .digest("base64");
   const testCaLeafCertPem = makeCert({
     subjectCn: "127.0.0.1",
     issuerCn: "EnvCloak SignIn Test CA",
-    pubSpkiDer: leafKeys.publicKey.export({ type: "spki", format: "der" }),
+    pubSpkiDer: testCaLeafSpkiDer,
     issuerPrivKey: caKeys.privateKey,
     isCa: false,
   });
@@ -117,6 +122,7 @@ function generateFixtureCerts() {
     testCaCertPem,
     testCaLeafCertPem,
     testCaLeafKeyPem,
+    testCaLeafSpkiSha256,
     selfSignedCertPem,
     selfSignedKeyPem,
   };

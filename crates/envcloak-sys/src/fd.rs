@@ -74,6 +74,33 @@ pub fn claim_inherited_fd(n: i32) -> io::Result<OwnedFd> {
     inherited_fd(n)
 }
 
+/// Duplicates the inherited descriptor `n` (`>= 3`) with `F_DUPFD_CLOEXEC` and
+/// closes the original descriptor `n` so that dropping the returned [`OwnedFd`]
+/// closes the last descriptor in this process referring to that open file
+/// description (`--signin-reaper` and `--signin-driver`, `M2b-07`).
+///
+/// Must only be called once per inherited descriptor number at process startup
+/// before any other handle wraps `n`.
+///
+/// # Errors
+/// Returns [`io::ErrorKind::InvalidInput`] if `n < 3`, or `EBADF` if `n` is not open.
+pub fn take_inherited_fd(n: i32) -> io::Result<OwnedFd> {
+    if n < 3 {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    // SAFETY: `F_DUPFD_CLOEXEC` creates a new close-on-exec descriptor >= 3
+    // owned by this process, and `close(n)` closes the raw inherited slot `n`
+    // that no `OwnedFd` or `File` in this freshly spawned process holds.
+    let dup = unsafe { libc::fcntl(n, libc::F_DUPFD_CLOEXEC, 16) };
+    if dup < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `n` was verified open by `fcntl` above and `dup >= 16 != n`.
+    let _ = unsafe { libc::close(n) };
+    // SAFETY: `dup` is a freshly created descriptor owned exclusively here.
+    Ok(unsafe { OwnedFd::from_raw_fd(dup) })
+}
+
 /// A new pipe, both ends close-on-exec: `(read, write)`. On Linux the
 /// flag is set as the pipe is made (`pipe2`); elsewhere just after, so a
 /// caller that starts children on other threads holds its own lock across

@@ -12,6 +12,51 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+/// Opens `path` read-only with `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY | O_CLOEXEC`,
+/// verifies via `fstat` ([`File::metadata`]) on the opened descriptor that it
+/// is a regular file, clears `O_NONBLOCK`, and returns the [`File`].
+///
+/// Never follows a terminal symlink and never blocks on a FIFO or device node.
+///
+/// # Errors
+/// Returns an [`io::Error`] if `path` contains a NUL byte, if `open` fails
+/// (including `ELOOP` on a symlink), if the opened descriptor is not a regular
+/// file, or if `fcntl` fails.
+pub fn open_regular_nofollow(path: &Path) -> io::Result<File> {
+    let b = path.as_os_str().as_bytes();
+    if b.is_empty() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let c = CString::new(b).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let flags =
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated path that outlives `open`. `open` returns
+    // a new file descriptor or -1 on error.
+    let fd = unsafe { libc::open(c.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just returned by `open`, is open, and nothing else owns it.
+    let file = File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    // SAFETY: `F_GETFL` reads flags on `file`'s open descriptor.
+    let fl = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if fl < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `F_SETFL` clears `O_NONBLOCK` on the newly opened regular file description.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, fl & !libc::O_NONBLOCK) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
 
 /// Opens `name` in the directory `dir`, read-only, with `openat(2)`:
 /// - `O_NOFOLLOW`: a symlink in its place fails with `ELOOP` and is never

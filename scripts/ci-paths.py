@@ -46,6 +46,7 @@ HARNESS = [
 GATES = HARNESS + [r"^crates/"]
 AGENTS = HARNESS + [
     r"^crates/envcloak-agents/",
+    r"^crates/envcloak-browser/",
     r"^crates/envcloak-mcp/",
     r"^integrations/",
 ]
@@ -98,6 +99,7 @@ CASES = [
     ("scripts/ci-paths.py", True, True),
     (".github/workflows/ci.yml", True, True),
     ("crates/envcloak-agents/src/probe/model/server.rs", True, True),
+    ("crates/envcloak-browser/src/lib.rs", True, True),
     ("crates/envcloak-mcp/src/lib.rs", True, True),
     ("integrations/agents.toml", False, True),
     ("integrations/browser/versions.toml", False, True),

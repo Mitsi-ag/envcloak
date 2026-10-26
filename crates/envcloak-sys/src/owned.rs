@@ -198,6 +198,7 @@ pub enum Recorded {
 pub struct RecordingProcesses {
     log: std::sync::Arc<std::sync::Mutex<Vec<Recorded>>>,
     exited: std::sync::Arc<std::sync::Mutex<Vec<libc::pid_t>>>,
+    reaped_elsewhere: std::sync::Arc<std::sync::Mutex<Vec<libc::pid_t>>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -216,6 +217,15 @@ impl RecordingProcesses {
     pub fn exit(&self, pid: libc::pid_t) {
         if let Ok(mut e) = self.exited.lock() {
             e.push(pid);
+        }
+    }
+
+    /// Simulates a child that was reaped behind the handle's back (so its pid
+    /// may have been reused by an unrelated process): every subsequent check,
+    /// signal or reap fails with `ECHILD` and emits no signal.
+    pub fn reap_elsewhere(&self, pid: libc::pid_t) {
+        if let Ok(mut r) = self.reaped_elsewhere.lock() {
+            r.push(pid);
         }
     }
 
@@ -243,11 +253,21 @@ impl RecordingProcesses {
             .map(|e| e.contains(&pid))
             .unwrap_or(false)
     }
+
+    fn is_reaped_elsewhere(&self, pid: libc::pid_t) -> bool {
+        self.reaped_elsewhere
+            .lock()
+            .map(|r| r.contains(&pid))
+            .unwrap_or(false)
+    }
 }
 
 #[cfg(any(test, feature = "testing"))]
 impl ProcessOps for RecordingProcesses {
     fn signal(&self, pid: libc::pid_t, pidfd: Option<Pidfd<'_>>, sig: i32) -> io::Result<()> {
+        if self.is_reaped_elsewhere(pid) {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
         self.record(Recorded::Signal(pid, pidfd.is_some(), sig));
         if sig == libc::SIGKILL {
             self.exit(pid);
@@ -256,6 +276,9 @@ impl ProcessOps for RecordingProcesses {
     }
 
     fn signal_group(&self, pid: libc::pid_t, sig: i32) -> io::Result<()> {
+        if self.is_reaped_elsewhere(pid) {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
         self.record(Recorded::SignalGroup(pid, sig));
         if sig == libc::SIGKILL {
             self.exit(pid);
@@ -264,16 +287,25 @@ impl ProcessOps for RecordingProcesses {
     }
 
     fn has_exited(&self, pid: libc::pid_t) -> io::Result<bool> {
+        if self.is_reaped_elsewhere(pid) {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
         self.record(Recorded::HasExited(pid));
         Ok(self.has(pid))
     }
 
     fn wait_exit(&self, pid: libc::pid_t) -> io::Result<()> {
+        if self.is_reaped_elsewhere(pid) {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
         self.record(Recorded::WaitExit(pid));
         Ok(())
     }
 
     fn reap(&self, pid: libc::pid_t) -> io::Result<ExitStatus> {
+        if self.is_reaped_elsewhere(pid) {
+            return Err(io::Error::from_raw_os_error(libc::ECHILD));
+        }
         self.record(Recorded::Reap(pid));
         Ok(ExitStatus::from_raw(0))
     }
@@ -354,6 +386,21 @@ impl<O: ProcessOps> OwnedChild<O> {
         self.pid.unsigned_abs()
     }
 
+    /// Reads the child's session ID (`getsid(self.pid)`) while the child is
+    /// owned and unreaped.
+    ///
+    /// # Errors
+    /// Returns the OS error if `getsid` fails.
+    pub fn session_id(&self) -> io::Result<u32> {
+        // SAFETY: `getsid` is a thread-safe POSIX query on `self.pid`.
+        let rc = unsafe { libc::getsid(self.pid) };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(rc.unsigned_abs())
+        }
+    }
+
     #[cfg(target_os = "linux")]
     fn pidfd(&self) -> Option<Pidfd<'_>> {
         use std::os::fd::AsFd;
@@ -388,6 +435,19 @@ impl<O: ProcessOps> OwnedChild<O> {
     /// `ECHILD` as for [`OwnedChild::signal`]; `ESRCH` when the group is
     /// empty, and `kill`'s other errors.
     pub fn signal_group(&self, sig: i32) -> io::Result<()> {
+        self.ops.signal_group(self.pid, sig)
+    }
+
+    /// Signals the process group the child leads while the child is still
+    /// unreaped (`D-34`, `F-73`, task `M2b-07`). Identical to
+    /// [`OwnedChild::signal_group`], named to document the reaper's cleanup
+    /// invariant that group signals precede [`OwnedChild::reap`].
+    ///
+    /// # Errors
+    /// `ECHILD` if the child was reaped behind the handle's back or this
+    /// process reaps on its own; `ESRCH` if the group is empty; and `kill`'s
+    /// other errors.
+    pub fn signal_group_before_reap(&self, sig: i32) -> io::Result<()> {
         self.ops.signal_group(self.pid, sig)
     }
 
