@@ -147,8 +147,8 @@ pub use lockfile::try_lock_exclusive;
 pub use owned::{OwnedChild, ProcessOps, SystemProcesses};
 pub use panic::{
     fail_point, idle_connection_override, install as install_panic_hook, linux_standing_forced,
-    panic_point, panic_with_input, pause_point, test_app_identity, test_clock_offset, test_event,
-    test_hook_vars, test_trace,
+    panic_point, panic_with_input, pause_point, test_app_configured, test_app_identity,
+    test_clock_offset, test_event, test_hook_vars, test_trace,
 };
 pub use pasteboard::{PasteboardError, PasteboardRead, read_and_clear_pasteboard};
 pub use peer::{

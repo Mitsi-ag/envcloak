@@ -192,7 +192,6 @@ fn validate_provider(provider: Option<&str>) -> Result<(), Failure> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn current_project_dir() -> Option<String> {
     use envcloak_policy::find_manifest;
     use std::path::Path;
@@ -204,6 +203,11 @@ fn current_project_dir() -> Option<String> {
 }
 
 fn add_ask(a: AddArgs) -> ExitCode {
+    use envcloak_client::connect::run_paths;
+    use envcloak_client::render::shown;
+    use envcloak_ipc::proto::AskParams;
+    use envcloak_ipc::{AskWaitOutcome, Client};
+
     if let Err(f) = validate_provider(a.provider.as_deref()) {
         return f.report(FAILURE);
     }
@@ -211,61 +215,51 @@ fn add_ask(a: AddArgs) -> ExitCode {
         return f.report(RUN_FAILURE);
     }
     #[cfg(not(target_os = "macos"))]
-    {
-        let _ = a;
-        Failure::new(
+    if !envcloak_sys::test_app_configured() {
+        return Failure::new(
             "app_required",
             "add --ask opens the EnvCloak app on macOS; on Linux, run `envcloak add` in a \
              separate terminal",
         )
-        .report(RUN_FAILURE)
+        .report(RUN_FAILURE);
     }
-    #[cfg(target_os = "macos")]
-    {
-        use envcloak_client::connect::run_paths;
-        use envcloak_client::render::shown;
-        use envcloak_ipc::proto::AskParams;
-        use envcloak_ipc::{AskWaitOutcome, Client};
-
-        if envcloak_sys::termination_ends_process().is_err() {
-            return Failure::new(
-                "run_failed",
-                "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
-            )
-            .report(RUN_FAILURE);
-        }
-        let paths = match run_paths() {
-            Ok(p) => p,
-            Err(f) => return f.report(FAILURE),
-        };
-        let params = AskParams {
-            provider: a.provider,
-            project_dir: current_project_dir(),
-            account: a.account,
-            env_hint: a.env,
-            note: a.note,
-            claims: claims(),
-        };
-        match Client::wait_for_ask(&paths, &params, a.wait.unwrap_or(MAX_WAIT)) {
-            Ok(AskWaitOutcome::Added { slug }) => {
-                if a.json {
-                    println!("{}", serde_json::json!({ "slug": slug }));
-                } else {
-                    println!("{}", shown(&slug));
-                }
-                ExitCode::SUCCESS
+    if envcloak_sys::termination_ends_process().is_err() {
+        return Failure::new(
+            "run_failed",
+            "SIGINT and SIGTERM could not be made to end the wait; nothing was sent",
+        )
+        .report(RUN_FAILURE);
+    }
+    let paths = match run_paths() {
+        Ok(p) => p,
+        Err(f) => return f.report(FAILURE),
+    };
+    let params = AskParams {
+        provider: a.provider,
+        project_dir: current_project_dir(),
+        account: a.account,
+        env_hint: a.env,
+        note: a.note,
+        claims: claims(),
+    };
+    match Client::wait_for_ask(&paths, &params, a.wait.unwrap_or(MAX_WAIT)) {
+        Ok(AskWaitOutcome::Added { slug }) => {
+            if a.json {
+                println!("{}", serde_json::json!({ "slug": slug }));
+            } else {
+                println!("{}", shown(&slug));
             }
-            Ok(AskWaitOutcome::Declined) => {
-                Failure::new("declined", "the request to add a key was declined")
-                    .report(RUN_FAILURE)
-            }
-            Ok(AskWaitOutcome::Expired) => Failure::new(
-                "expired",
-                "the request to add a key expired before it was answered",
-            )
-            .report(RUN_FAILURE),
-            Err(e) => Failure::from(e).report(FAILURE),
+            ExitCode::SUCCESS
         }
+        Ok(AskWaitOutcome::Declined) => {
+            Failure::new("declined", "the request to add a key was declined").report(RUN_FAILURE)
+        }
+        Ok(AskWaitOutcome::Expired) => Failure::new(
+            "expired",
+            "the request to add a key expired before it was answered",
+        )
+        .report(RUN_FAILURE),
+        Err(e) => Failure::from(e).report(FAILURE),
     }
 }
 

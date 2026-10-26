@@ -54,10 +54,16 @@ fn browser_runtime_or_skip() -> Option<VerifiedBrowserRuntime> {
 }
 
 fn fixture_totp_code(control: &Control, secret_hex: &str, step_offset: i64) -> String {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now_secs = loop {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now % 30 < 25 {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
     let ts = if step_offset >= 0 {
         now_secs.saturating_add((step_offset as u64) * 30)
     } else {
@@ -1218,9 +1224,32 @@ fn gate_b5_declared_state_allowlist_and_unsupported_format() {
         )
         .expect("attachToTarget");
     let session_id = attached["sessionId"].as_str().unwrap().to_owned();
+    let _ = cdp.call(Some(&session_id), "Page.enable", json!({}));
     let _ = cdp.call(Some(&session_id), "Network.enable", json!({}));
     let _ = cdp.call(Some(&session_id), "DOMStorage.enable", json!({}));
-    std::thread::sleep(Duration::from_millis(150));
+
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    let mut page_ready = false;
+    while Instant::now() < ready_deadline {
+        if let Ok(eval) = cdp.call(
+            Some(&session_id),
+            "Runtime.evaluate",
+            json!({
+                "expression": "window.location.origin + '|' + document.readyState",
+                "returnByValue": true
+            }),
+        ) && eval["result"]["value"].as_str() == Some(&format!("{}|complete", origins.app))
+        {
+            page_ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        page_ready,
+        "timed out waiting for target navigation to {}/login to complete",
+        origins.app
+    );
 
     // Seed declared + undeclared cookies and storage.
     let _ = cdp.call(
@@ -1256,13 +1285,17 @@ fn gate_b5_declared_state_allowlist_and_unsupported_format() {
             "path": "/"
         }),
     );
-    let _ = cdp.call(
-        Some(&session_id),
-        "Runtime.evaluate",
-        json!({
-            "expression": "localStorage.setItem('acme_tenant', 't1'); localStorage.setItem('secret_draft', 'do_not_capture');"
-        }),
-    );
+    let set_storage = cdp
+        .call(
+            Some(&session_id),
+            "Runtime.evaluate",
+            json!({
+                "expression": "localStorage.setItem('acme_tenant', 't1'); localStorage.setItem('secret_draft', 'do_not_capture'); localStorage.getItem('acme_tenant')",
+                "returnByValue": true
+            }),
+        )
+        .expect("set localStorage");
+    assert_eq!(set_storage["result"]["value"].as_str(), Some("t1"));
 
     let transfer = default_transfer_scope(&app_origin);
     let extracted = extract_from_cdp(
