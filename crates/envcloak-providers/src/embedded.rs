@@ -77,12 +77,15 @@ docs = "https://api-docs.deepseek.com"
 billing = "https://platform.deepseek.com/usage"
 keys = "https://platform.deepseek.com/api_keys"
 
-# Balance adapter (M4 polls it). Its request may go only to an allowed host,
-# over HTTPS, with the key in a declared auth slot.
-[balance]
+# Metrics adapter (SPEC §8, D4-05). Selects every currency by field equality
+# so accounts whose `balance_infos` array lists CNY before USD (or vice versa)
+# read both balances cleanly.
+[metrics]
 request = { method = "GET", url = "https://api.deepseek.com/user/balance", auth = "bearer" }
-value = "$.balance_infos[0].total_balance"
-currency = "$.balance_infos[0].currency"
+values = [
+    { name = "balance", path = "$.balance_infos[currency=USD].total_balance", unit = "decimal_string", select = "currency=USD", nullable = true },
+    { name = "balance", path = "$.balance_infos[currency=CNY].total_balance", unit = "decimal_string", select = "currency=CNY", nullable = true },
+]
 "#,
     ),
     (

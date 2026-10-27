@@ -19,6 +19,7 @@ root = pathlib.Path(sys.argv[1])
 TARGET_PATTERNS = (
     "crates/envcloak-spend/**/*.rs",
     "crates/envcloak-poll/**/*.rs",
+    "crates/envcloak-providers/src/metrics.rs",
     "crates/envcloak-core/src/money.rs",
     "crates/envcloak-core/src/vault/policy/**/*.rs",
     "crates/envcloak-daemon/src/spend*.rs",

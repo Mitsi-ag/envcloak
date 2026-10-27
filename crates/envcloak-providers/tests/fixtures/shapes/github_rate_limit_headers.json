@@ -1,0 +1,17 @@
+{
+  "headers": {
+    "github-authentication-token-expiration": "2026-11-15 08:30:00 UTC",
+    "x-ratelimit-remaining": "4999",
+    "x-ratelimit-reset": "1761526800"
+  },
+  "body": {
+    "resources": {
+      "core": {
+        "limit": 5000,
+        "used": 1,
+        "remaining": 4999,
+        "reset": 1761526800
+      }
+    }
+  }
+}

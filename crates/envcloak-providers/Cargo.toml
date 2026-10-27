@@ -28,3 +28,4 @@ toml_edit.workspace = true
 # Enables the `testing` feature for this crate's own tests.
 envcloak-providers = { path = ".", features = ["testing"] }
 envcloak-testkit.workspace = true
+proptest.workspace = true

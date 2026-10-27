@@ -585,6 +585,53 @@ fn same_segment(s: &str, p: &str) -> bool {
         || (s.len() > p.len() && s[p.len()] == b'.' && s[..p.len()].eq_ignore_ascii_case(p))
 }
 
+/// Field-equality array selection in a [`JsonPath`] or `[metrics]` entry,
+/// such as `currency=USD` in `$.balance_infos[currency=USD].total_balance`
+/// (SPEC §8, M4 plan D4-05).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FieldEq {
+    pub field: String,
+    pub value: String,
+}
+
+impl FieldEq {
+    /// Parses `<field>=<value>` where `<field>` is a JSON key identifier
+    /// (`1..=64` ASCII letters, digits or `_`, not starting with a digit) and
+    /// `<value>` is `1..=64` ASCII letters, digits, `_` or `-`.
+    pub fn parse(s: &str) -> Result<Self, K> {
+        let Some((field, value)) = s.split_once('=') else {
+            return Err(K::InvalidSelect);
+        };
+        if !valid_json_key(field) || !valid_select_value(value) {
+            return Err(K::InvalidSelect);
+        }
+        Ok(FieldEq {
+            field: field.to_owned(),
+            value: value.to_owned(),
+        })
+    }
+}
+
+impl core::fmt::Display for FieldEq {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}={}", self.field, self.value)
+    }
+}
+
+fn valid_json_key(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=64).contains(&b.len())
+        && !b[0].is_ascii_digit()
+        && b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
+}
+
+fn valid_select_value(value: &str) -> bool {
+    let b = value.as_bytes();
+    (1..=64).contains(&b.len())
+        && b.iter()
+            .all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+}
+
 /// One step of a [`JsonPath`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PathSegment {
@@ -592,11 +639,13 @@ pub enum PathSegment {
     Key(String),
     /// `[index]`
     Index(u32),
+    /// `[field=value]`
+    Select(FieldEq),
 }
 
 /// Where an adapter reads a number or string in a JSON response: `$`, then
-/// up to 16 `.name` or `[index]` steps, such as
-/// `$.balance_infos[0].total_balance`.
+/// up to 16 `.name`, `[index]` or `[field=value]` steps, such as
+/// `$.balance_infos[currency=USD].total_balance`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct JsonPath {
     text: String,
@@ -610,6 +659,7 @@ impl JsonPath {
             return Err(K::InvalidJsonPath);
         }
         let mut segments = Vec::new();
+        let mut has_select = false;
         let mut i = 1;
         while i < b.len() {
             let start = i + 1;
@@ -620,7 +670,7 @@ impl JsonPath {
                         .position(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
                         .map_or(b.len(), |p| start + p);
                     let name = &s[start..end];
-                    if name.is_empty() || name.len() > 64 || name.as_bytes()[0].is_ascii_digit() {
+                    if !valid_json_key(name) {
                         return Err(K::InvalidJsonPath);
                     }
                     i = end;
@@ -632,16 +682,25 @@ impl JsonPath {
                         .position(|c| *c == b']')
                         .map(|p| start + p)
                         .ok_or(K::InvalidJsonPath)?;
-                    let digits = &s[start..close];
-                    let canonical = digits == "0" || !digits.starts_with('0');
-                    if !(1..=4).contains(&digits.len())
-                        || !canonical
-                        || !digits.bytes().all(|c| c.is_ascii_digit())
-                    {
-                        return Err(K::InvalidJsonPath);
-                    }
+                    let inner = &s[start..close];
                     i = close + 1;
-                    PathSegment::Index(digits.parse().map_err(|_| K::InvalidJsonPath)?)
+                    if inner.contains('=') {
+                        if has_select {
+                            return Err(K::InvalidSelect);
+                        }
+                        let fe = FieldEq::parse(inner)?;
+                        has_select = true;
+                        PathSegment::Select(fe)
+                    } else {
+                        let canonical = inner == "0" || !inner.starts_with('0');
+                        if !(1..=4).contains(&inner.len())
+                            || !canonical
+                            || !inner.bytes().all(|c| c.is_ascii_digit())
+                        {
+                            return Err(K::InvalidJsonPath);
+                        }
+                        PathSegment::Index(inner.parse().map_err(|_| K::InvalidJsonPath)?)
+                    }
                 }
                 _ => return Err(K::InvalidJsonPath),
             };
@@ -662,6 +721,14 @@ impl JsonPath {
 
     pub fn segments(&self) -> &[PathSegment] {
         &self.segments
+    }
+
+    /// The `[field=value]` selector in this path, when one is present.
+    pub fn select(&self) -> Option<&FieldEq> {
+        self.segments.iter().find_map(|seg| match seg {
+            PathSegment::Select(fe) => Some(fe),
+            _ => None,
+        })
     }
 }
 
@@ -1137,5 +1204,35 @@ mod tests {
         }
         let deep = format!("${}", ".a".repeat(MAX_JSON_SEGMENTS + 1));
         assert_eq!(JsonPath::parse(&deep), Err(K::InvalidJsonPath));
+
+        let sel = JsonPath::parse("$.balance_infos[currency=USD].total_balance").unwrap();
+        let expected_eq = FieldEq {
+            field: "currency".into(),
+            value: "USD".into(),
+        };
+        assert_eq!(
+            sel.segments(),
+            [
+                PathSegment::Key("balance_infos".into()),
+                PathSegment::Select(expected_eq.clone()),
+                PathSegment::Key("total_balance".into()),
+            ]
+        );
+        assert_eq!(sel.select(), Some(&expected_eq));
+        assert_eq!(FieldEq::parse("currency=USD"), Ok(expected_eq));
+        assert_eq!(
+            JsonPath::parse("$.a[k=1][m=2].b"),
+            Err(K::InvalidSelect),
+            "at most one field selector per path"
+        );
+        for bad_sel in [
+            "$.a[=USD]",
+            "$.a[currency=]",
+            "$.a[1currency=USD]",
+            "$.a[currency=USD EUR]",
+            "$.a[currency=USD=1]",
+        ] {
+            assert_eq!(JsonPath::parse(bad_sel), Err(K::InvalidSelect), "{bad_sel}");
+        }
     }
 }

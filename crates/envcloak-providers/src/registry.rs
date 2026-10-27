@@ -18,7 +18,11 @@ use toml_edit::{Document, Item, TableLike};
 use crate::detect::Detection;
 use crate::embedded;
 use crate::error::{RegistryError, RegistryErrorKind as K};
-use crate::safety::{self, Anchor, AuthSlot, HostPattern, HttpsUrl, JsonPath, Suffixes};
+use crate::metrics::{
+    AllowedHeader, LiteralValue, MetricName, MetricSource, MetricSpec, MetricUnit, MetricsAdapter,
+    valid_literal_citation,
+};
+use crate::safety::{self, Anchor, AuthSlot, FieldEq, HostPattern, HttpsUrl, JsonPath, Suffixes};
 
 /// The multi-tenant suffix list's file name in `providers/`.
 pub const SUFFIX_FILE: &str = "multi-tenant-suffixes.txt";
@@ -134,6 +138,7 @@ pub struct Provider {
     pub denied_paths: Vec<String>,
     pub links: Links,
     pub balance: Option<Adapter>,
+    pub metrics: Option<MetricsAdapter>,
 }
 
 impl Provider {
@@ -392,6 +397,7 @@ struct Root<'d> {
     denied_paths: Option<Entry<'d>>,
     links: Option<Entry<'d>>,
     balance: Option<Entry<'d>>,
+    metrics: Option<Entry<'d>>,
 }
 
 /// Errors placed in one file.
@@ -561,9 +567,218 @@ impl Parser<'_> {
         }))
     }
 
+    fn metrics(
+        &self,
+        e: Option<Entry<'_>>,
+        hosts: &[HostPattern],
+        slots: &[AuthSlot],
+        denied: &[String],
+    ) -> Result<Option<MetricsAdapter>, RegistryError> {
+        let Some((item, at)) = e else {
+            return Ok(None);
+        };
+        let t = self.table(item, at.clone())?;
+        let (mut request, mut values_entry) = (None, None);
+        for (key, v) in t.iter() {
+            let kat = t.key(key).and_then(|k| k.span()).or_else(|| at.clone());
+            match key {
+                "request" => request = Some(self.request(v, kat, hosts, slots, denied)?),
+                "values" => values_entry = Some((v, kat)),
+                "builtin" => return Err(self.err(K::BuiltinRefused, kat)),
+                _ => return Err(self.err(K::UnknownKey, kat)),
+            }
+        }
+        let (Some(request), Some((values_item, values_at))) = (request, values_entry) else {
+            return Err(self.err(K::MissingKey, at));
+        };
+        let values = self.metric_values(values_item, values_at)?;
+        Ok(Some(MetricsAdapter { request, values }))
+    }
+
+    fn metric_values(&self, item: &Item, at: Span) -> Result<Vec<MetricSpec>, RegistryError> {
+        if let Some(arr) = item.as_array() {
+            if arr.is_empty() {
+                return Err(self.err(K::NoMetricValues, at));
+            }
+            if arr.len() > MAX_LIST {
+                return Err(self.err(K::TooManyEntries, at));
+            }
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr.iter() {
+                let place = v.span().or_else(|| at.clone());
+                let t = v
+                    .as_inline_table()
+                    .ok_or_else(|| self.err(K::WrongType, place.clone()))?;
+                out.push(self.metric_spec(t, place)?);
+            }
+            Ok(out)
+        } else if let Some(tables) = item.as_array_of_tables() {
+            if tables.is_empty() {
+                return Err(self.err(K::NoMetricValues, at));
+            }
+            if tables.len() > MAX_LIST {
+                return Err(self.err(K::TooManyEntries, at));
+            }
+            let mut out = Vec::with_capacity(tables.len());
+            for t in tables.iter() {
+                let place = t.span().or_else(|| at.clone());
+                out.push(self.metric_spec(t, place)?);
+            }
+            Ok(out)
+        } else {
+            Err(self.err(K::WrongType, at))
+        }
+    }
+
+    fn metric_spec(&self, t: &dyn TableLike, at: Span) -> Result<MetricSpec, RegistryError> {
+        let mut name_raw = None;
+        let mut unit_raw = None;
+        let mut path_raw = None;
+        let mut header_raw = None;
+        let mut literal_raw = None;
+        let mut source_raw = None;
+        let mut select_raw = None;
+        let mut nullable_raw = None;
+
+        for (key, v) in t.iter() {
+            let kat = t.key(key).and_then(|k| k.span()).or_else(|| at.clone());
+            match key {
+                "name" => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    name_raw = Some((s, kat));
+                }
+                "unit" => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    unit_raw = Some((s, kat));
+                }
+                "path" => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    path_raw = Some((s, kat));
+                }
+                "header" => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    header_raw = Some((s, kat));
+                }
+                "literal" => {
+                    let lit = if let Some(s) = v.as_str() {
+                        LiteralValue::Str(s.to_owned())
+                    } else if let Some(b) = v.as_bool() {
+                        LiteralValue::Bool(b)
+                    } else if let Some(n) = v.as_integer() {
+                        LiteralValue::Int(n)
+                    } else {
+                        return Err(self.err(K::WrongType, kat));
+                    };
+                    literal_raw = Some((lit, kat));
+                }
+                "source" => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    source_raw = Some((s, kat));
+                }
+                "select" => {
+                    let s = v
+                        .as_str()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    select_raw = Some((s, kat));
+                }
+                "nullable" => {
+                    let b = v
+                        .as_bool()
+                        .ok_or_else(|| self.err(K::WrongType, kat.clone()))?;
+                    nullable_raw = Some(b);
+                }
+                _ => return Err(self.err(K::UnknownKey, kat)),
+            }
+        }
+
+        let (Some((name_s, name_at)), Some((unit_s, unit_at))) = (name_raw, unit_raw) else {
+            return Err(self.err(K::MissingKey, at));
+        };
+        let name = MetricName::parse(name_s).map_err(|k| self.err(k, name_at))?;
+        let unit = MetricUnit::parse(unit_s).map_err(|k| self.err(k, unit_at))?;
+
+        let explicit_select = match select_raw {
+            Some((s, sel_at)) => Some((
+                FieldEq::parse(s).map_err(|k| self.err(k, sel_at.clone()))?,
+                sel_at,
+            )),
+            None => None,
+        };
+
+        let (source, select) = match (path_raw, header_raw, literal_raw) {
+            (Some((ps, p_at)), None, None) => {
+                if let Some((_, s_at)) = source_raw {
+                    return Err(self.err(K::UnknownKey, s_at));
+                }
+                let jp = JsonPath::parse(ps).map_err(|k| self.err(k, p_at))?;
+                let sel = match (explicit_select, jp.select()) {
+                    (Some((es, es_at)), Some(ps_eq)) if &es != ps_eq => {
+                        return Err(self.err(K::InvalidSelect, es_at));
+                    }
+                    (Some((es, _)), _) => Some(es),
+                    (None, Some(ps_eq)) => Some(ps_eq.clone()),
+                    (None, None) => None,
+                };
+                (MetricSource::Json(jp), sel)
+            }
+            (None, Some((hs, h_at)), None) => {
+                if let Some((_, s_at)) = source_raw {
+                    return Err(self.err(K::UnknownKey, s_at));
+                }
+                if let Some((_, sel_at)) = explicit_select {
+                    return Err(self.err(K::InvalidSelect, sel_at));
+                }
+                let hdr = AllowedHeader::parse(hs).map_err(|k| self.err(k, h_at))?;
+                (MetricSource::Header(hdr), None)
+            }
+            (None, None, Some((lit, lit_at))) => {
+                if let Some((_, sel_at)) = explicit_select {
+                    return Err(self.err(K::InvalidSelect, sel_at));
+                }
+                if nullable_raw.is_some() {
+                    return Err(self.err(K::InvalidLiteral, lit_at));
+                }
+                let Some((cited, src_at)) = source_raw else {
+                    return Err(self.err(K::LiteralMissingSource, lit_at));
+                };
+                if !valid_literal_citation(cited) {
+                    return Err(self.err(K::LiteralMissingSource, src_at));
+                }
+                unit.check_literal(&lit).map_err(|k| self.err(k, lit_at))?;
+                (
+                    MetricSource::Literal {
+                        value: lit,
+                        cited: cited.to_owned(),
+                    },
+                    None,
+                )
+            }
+            (None, None, None) => return Err(self.err(K::MissingKey, at)),
+            _ => return Err(self.err(K::DuplicateKey, at)),
+        };
+
+        Ok(MetricSpec {
+            name,
+            source,
+            unit,
+            select,
+            nullable: nullable_raw.unwrap_or(false),
+        })
+    }
+
     /// `{ method = "GET", url = "https://...", auth = "<slot>" }`: the URL's
     /// host must be allowed, its path must not be denied, and the key must
-    /// go in a declared slot.
+    /// go in a declared header or basic slot (never a `query:` slot, D4-04).
     fn request(
         &self,
         item: &Item,
@@ -602,8 +817,40 @@ impl Parser<'_> {
         if denied.iter().any(|p| safety::path_under(p, url.path())) {
             return Err(self.err(K::RequestPathDenied, u_at));
         }
-        let auth = AuthSlot::resolve(auth, slots).map_err(|kind| self.err(kind, a_at))?;
+        if let Some(qname) = auth.strip_prefix("query:") {
+            if AuthSlot::from_parts(None, None, None, Some(qname)).is_ok() {
+                return Err(self.err(K::QueryAuthRefused, a_at));
+            }
+        }
+        let auth = AuthSlot::resolve(auth, slots).map_err(|kind| self.err(kind, a_at.clone()))?;
+        if matches!(auth, AuthSlot::Query { .. }) {
+            return Err(self.err(K::QueryAuthRefused, a_at));
+        }
         Ok(Request { method, url, auth })
+    }
+}
+
+fn metrics_from_balance(b: &Adapter) -> MetricsAdapter {
+    let mut values = Vec::with_capacity(2);
+    values.push(MetricSpec {
+        name: MetricName::Balance,
+        select: b.value.select().cloned(),
+        source: MetricSource::Json(b.value.clone()),
+        unit: MetricUnit::DecimalString,
+        nullable: false,
+    });
+    if let Some(cur) = &b.currency {
+        values.push(MetricSpec {
+            name: MetricName::Currency,
+            select: cur.select().cloned(),
+            source: MetricSource::Json(cur.clone()),
+            unit: MetricUnit::Iso4217,
+            nullable: false,
+        });
+    }
+    MetricsAdapter {
+        request: b.request.clone(),
+        values,
     }
 }
 
@@ -661,6 +908,8 @@ fn parse_provider(
             "denied_paths" => &mut r.denied_paths,
             "links" => &mut r.links,
             "balance" => &mut r.balance,
+            "metrics" => &mut r.metrics,
+            "builtin" => return Err(p.err(K::BuiltinRefused, at)),
             _ => return Err(p.err(K::UnknownKey, at)),
         };
         *slot = Some((item, at));
@@ -724,7 +973,16 @@ fn parse_provider(
     }
 
     let links = p.links(r.links)?;
+    if r.balance.is_some() {
+        if let Some((_, m_at)) = r.metrics {
+            return Err(p.err(K::DuplicateKey, m_at));
+        }
+    }
     let balance = p.balance(r.balance, &allowed_hosts, &auth_slots, &denied_paths)?;
+    let metrics = match p.metrics(r.metrics, &allowed_hosts, &auth_slots, &denied_paths)? {
+        Some(m) => Some(m),
+        None => balance.as_ref().map(metrics_from_balance),
+    };
 
     Ok(Provider {
         id: id_ok,
@@ -738,6 +996,7 @@ fn parse_provider(
         denied_paths,
         links,
         balance,
+        metrics,
     })
 }
 

@@ -634,6 +634,7 @@ dependencies = [
  "envcloak-core",
  "envcloak-providers",
  "envcloak-testkit",
+ "proptest",
  "regex",
  "regex-syntax",
  "secrecy",

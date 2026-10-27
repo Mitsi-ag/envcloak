@@ -63,12 +63,17 @@ fn the_embedded_registry_loads() {
         assert!(!p.key_patterns.is_empty(), "{}", p.id);
         // No wildcard hosts ship yet: each key goes to named hosts only.
         assert!(p.allowed_hosts.iter().all(|h| !h.is_wildcard()), "{}", p.id);
-        // A balance request goes to an allowed host in a declared slot, and
-        // not to a denied path.
+        // A balance or metrics request goes to an allowed host in a declared
+        // header/basic slot, and not to a denied path.
         if let Some(b) = &p.balance {
             assert!(p.host_allowed(b.request.url.host()), "{}", p.id);
             assert!(p.auth_slots.contains(&b.request.auth), "{}", p.id);
             assert!(!p.path_denied(b.request.url.path()), "{}", p.id);
+        }
+        if let Some(m) = &p.metrics {
+            assert!(p.host_allowed(m.request.url.host()), "{}", p.id);
+            assert!(p.auth_slots.contains(&m.request.auth), "{}", p.id);
+            assert!(!p.path_denied(m.request.url.path()), "{}", p.id);
         }
     }
 
@@ -110,13 +115,27 @@ fn the_embedded_registry_loads() {
     );
 
     let deepseek = r.get("deepseek").unwrap();
-    let b = deepseek.balance.as_ref().unwrap();
+    let m = deepseek.metrics.as_ref().unwrap();
     assert_eq!(
-        b.request.url.as_str(),
+        m.request.url.as_str(),
         "https://api.deepseek.com/user/balance"
     );
-    assert_eq!(b.request.auth, bearer);
-    assert_eq!(b.value.as_str(), "$.balance_infos[0].total_balance");
+    assert_eq!(m.request.auth, bearer);
+    assert_eq!(m.values.len(), 2);
+    assert_eq!(
+        m.values[0]
+            .select
+            .as_ref()
+            .map(|s| (s.field.as_str(), s.value.as_str())),
+        Some(("currency", "USD"))
+    );
+    assert_eq!(
+        m.values[1]
+            .select
+            .as_ref()
+            .map(|s| (s.field.as_str(), s.value.as_str())),
+        Some(("currency", "CNY"))
+    );
 
     // The admin and key-management paths are denied.
     let openai = r.get("openai").unwrap();
@@ -339,6 +358,7 @@ fn codeowners_cover_the_registry() {
         "/crates/envcloak-providers/src/embedded.rs",
         "/crates/envcloak-providers/src/safety.rs",
         "/crates/envcloak-providers/src/registry.rs",
+        "/crates/envcloak-providers/src/metrics.rs",
         "/crates/envcloak-providers/src/detect.rs",
         "/crates/envcloak-providers/tests/",
         "/scripts/gen-providers.py",

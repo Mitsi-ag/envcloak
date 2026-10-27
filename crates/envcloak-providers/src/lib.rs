@@ -27,6 +27,7 @@
 mod detect;
 mod embedded;
 mod error;
+pub mod metrics;
 mod registry;
 mod safety;
 
@@ -35,6 +36,11 @@ pub use detect::{
     password_form_chars, shaped_like_secret,
 };
 pub use error::{RegistryError, RegistryErrorKind};
+pub use metrics::{
+    AllowedHeader, ExtractedMetric, ExtractedMetrics, LiteralValue, MAX_DECIMAL_SCALE,
+    MAX_JSON_DEPTH, MetricName, MetricSource, MetricSpec, MetricUnit, MetricValue, MetricsAdapter,
+    MetricsExtractError, ScaledAmount, parse_decimal_token, parse_github_expiry, parse_rfc3339,
+};
 #[cfg(feature = "testing")]
 pub use registry::load_from;
 pub use registry::{
@@ -42,6 +48,6 @@ pub use registry::{
     embedded_files, load_embedded,
 };
 pub use safety::{
-    AuthSlot, HostPattern, HttpsUrl, JsonPath, MAX_PATTERN, MIN_KEY_LEN, MIN_KEY_PREFIX,
+    AuthSlot, FieldEq, HostPattern, HttpsUrl, JsonPath, MAX_PATTERN, MIN_KEY_LEN, MIN_KEY_PREFIX,
     PathSegment,
 };

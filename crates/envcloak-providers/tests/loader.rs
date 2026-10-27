@@ -737,17 +737,20 @@ fn auth_slot_rules() {
     );
     assert_eq!(fails(&f).0, K::WrongType);
 
-    // A request's key goes only into a declared slot.
+    // A request's key goes only into a declared header or basic slot; any
+    // `query:` slot is refused on adapters so keys never appear in URLs (D4-04).
     let with = |label: &str| edit("auth = \"bearer\"", &format!("auth = \"{label}\""));
-    for label in [
-        "basic:user",
-        "basic:password",
-        "query:token",
-        "header:x-api-key",
-    ] {
+    for label in ["basic:user", "basic:password", "header:x-api-key"] {
         assert_eq!(
             fails(&with(label)),
             (K::AuthSlotNotDeclared, Some(REQUEST_LINE)),
+            "{label}"
+        );
+    }
+    for label in ["query:key", "query:token"] {
+        assert_eq!(
+            fails(&with(label)),
+            (K::QueryAuthRefused, Some(REQUEST_LINE)),
             "{label}"
         );
     }
@@ -758,9 +761,7 @@ fn auth_slot_rules() {
             "{label}"
         );
     }
-    for label in ["query:key", "header:authorization"] {
-        assert!(load(&with(label)).is_ok(), "{label}");
-    }
+    assert!(load(&with("header:authorization")).is_ok());
     // A Basic slot names one part (SPEC §6.2 rule 3): a provider that takes
     // its key as the user name, as Stripe does, declares that part only, and
     // a request cannot put the key in the other.
@@ -835,5 +836,40 @@ fn errors_never_quote_the_file() {
             let shown = format!("{e} {e:?}");
             assert_no_canary(shown.as_bytes(), std::slice::from_ref(c));
         }
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::test_runner::Config::with_cases(128))]
+
+    /// Randomized loader input (m4-plan §5 rule 3): arbitrary bytes and mutated
+    /// `[metrics]` / `[balance]` provider files never panic and never echo an
+    /// embedded canary in any error message.
+    #[test]
+    fn randomized_loader_input_never_panics_or_leaks(
+        raw in proptest::collection::vec(proptest::num::u8::ANY, 0..2048),
+        field in "[A-Za-z0-9_=-]{0,24}",
+        unit in "[A-Za-z0-9_(), -]{0,24}",
+        hdr in "[A-Za-z0-9_-]{0,32}",
+    ) {
+        let _ = load_from(&[
+            ("example.toml", &raw),
+            (SUFFIX_FILE, suffixes().as_bytes()),
+        ]);
+
+        let mutated = format!(
+            "id = \"example\"\n\
+             name = \"Example\"\n\
+             key_patterns = ['^ex_live_[A-Za-z0-9]{{24}}$']\n\
+             allowed_hosts = [\"api.example.com\"]\n\
+             auth = [{{ header = \"authorization\", scheme = \"Bearer\" }}]\n\
+             [metrics]\n\
+             request = {{ method = \"GET\", url = \"https://api.example.com/v1/usage\", auth = \"bearer\" }}\n\
+             values = [\n\
+               {{ name = \"balance\", path = \"$.data[{field}].v\", unit = \"{unit}\" }},\n\
+               {{ name = \"expires_at\", header = \"{hdr}\", unit = \"github_expiry\", nullable = true }},\n\
+             ]\n"
+        );
+        let _ = load(&mutated);
     }
 }

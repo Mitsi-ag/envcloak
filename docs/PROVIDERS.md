@@ -43,13 +43,15 @@ docs = "https://api-docs.deepseek.com"
 billing = "https://platform.deepseek.com/usage"
 keys = "https://platform.deepseek.com/api_keys"
 
-[balance]
+[metrics]
 request = { method = "GET", url = "https://api.deepseek.com/user/balance", auth = "bearer" }
-value = "$.balance_infos[0].total_balance"
-currency = "$.balance_infos[0].currency"
+values = [
+    { name = "balance", path = "$.balance_infos[currency=USD].total_balance", unit = "decimal_string", select = "currency=USD", nullable = true },
+    { name = "balance", path = "$.balance_infos[currency=CNY].total_balance", unit = "decimal_string", select = "currency=CNY", nullable = true },
+]
 ```
 
-`id`, `name`, `key_patterns` and `allowed_hosts` are required; `allowed_hosts` may be empty. Everything else is optional.
+`id`, `name`, `key_patterns` and `allowed_hosts` are required; `allowed_hosts` may be empty. Everything else is optional. A provider file may contain either `[metrics]` or `[balance]` (kept as a shorthand that loads into the same `MetricsAdapter` structure), never both.
 
 | Key | Rule |
 |---|---|
@@ -62,7 +64,8 @@ currency = "$.balance_infos[0].currency"
 | `auth` | Auth slots, see "Auth slots", listed once each |
 | `denied_paths` | See "Denied paths" |
 | `[links]` | `docs`, `billing`, `keys` (the page where keys are made and revoked) and `dashboard`, each an `https://` URL. Links open in a browser and never carry the key, so their hosts need not be allowed hosts |
-| `[balance]` | A balance adapter, see "Adapters" |
+| `[metrics]` | A metrics adapter (grammar v2, see "Adapters") |
+| `[balance]` | A balance adapter shorthand, normalized into `MetricsAdapter` at load time (see "Adapters") |
 
 ### Patterns
 
@@ -123,12 +126,22 @@ A request path that is not normalized counts as denied, since a server that norm
 
 ### Adapters
 
-A balance adapter is one request and where its JSON response holds the value:
+A provider file may define at most one adapter section: `[metrics]` (grammar v2, SPEC §8, D4-05) or `[balance]` (kept as a shorthand that loads into the same `MetricsAdapter` structure).
 
 - `request`: `method` (`GET` only), `url` and `auth`, all required.
   - `url` is `https://`, with no fragment, and its host must be matched by one of the provider's allowed hosts. Its path must not be under one of the provider's denied paths, or fail to be normalized as above (`RequestPathDenied`): the request carries the key, so it may not go to an endpoint the proxy would refuse. A URL with no path has the path `/`.
-  - `auth` names one of the provider's declared slots: `bearer` (the `authorization` header with scheme `Bearer`), `header:<name>` (the one header slot of that name), `basic:user`, `basic:password` or `query:<name>`. A request cannot put the key anywhere else.
-- `value`, required, and `currency`, optional: JSON paths, `$` then up to 16 `.name` or `[index]` steps (`name` a letter or `_`, then letters, digits or `_`; `index` 0 to 9999, without leading zeros).
+  - `auth` names one of the provider's declared header or basic slots: `bearer` (the `authorization` header with scheme `Bearer`), `header:<name>` (the one header slot of that name), `basic:user`, or `basic:password`. The `query:<name>` slot is refused (`QueryAuthRefused`) for every `[metrics]`, `[balance]` and builtin request so keys never appear in URLs (D4-04).
+- In `[metrics]`, `values` is a non-empty list (up to 64 entries) of metric specifications (`MetricSpec`), each with:
+  - `name` (required): a canonical metric name (`balance`, `balance_usd`, `balance_cny`, `voucher_balance`, `cash_balance`, `currency`, `credit_limit` / `limit`, `limit_remaining` / `cap_remaining`, `limit_reset` / `cap_reset`, `spend_day` / `usage_daily`, `spend_week` / `usage_weekly`, `spend_month` / `usage_monthly`, `spend_total` / `usage`, `expires_at` / `token_expires_at`, `cap_amount` / `cap`, `cap_enforced`, `cap_scope`, `is_management_key`, `byok_in_limit` / `include_byok_in_limit`, `rate_limit_remaining`, `rate_limit_reset`).
+  - Exactly one source:
+    - `path`: a JSON path (`$`, then up to 16 `.name`, `[index]`, or `[field=value]` steps, with at most one `[field=value]` array selector per path, such as `$.balance_infos[currency=USD].total_balance`).
+    - `header`: a lowercase header name on the fixed allowlist (`github-authentication-token-expiration`, `x-ratelimit-remaining`, `x-ratelimit-reset`). Any other header (including `set-cookie` or `authorization`) fails with `HeaderNotAllowed`.
+    - `literal`: a string, boolean or integer literal, which must be accompanied by a `source = "<https:// URL or research.md / SPEC.md section>"` citation (`LiteralMissingSource` when missing) and must match `unit` (`InvalidLiteral` otherwise).
+  - `unit` (required): `major`, `minor`, `decimal_string`, `cents_string`, `unix_seconds`, `rfc3339`, `github_expiry` (GitHub's `YYYY-MM-DD HH:MM:SS UTC` / `±HHMM` format, `m4/research.md` §2.6), `bool`, `iso4217`, or `enum(<comma-separated words>)` (for example `enum(daily, weekly, monthly)`).
+  - `select` (optional): `field=value` selector matching the `path`'s `[field=value]` step (inferred automatically when `path` carries `[field=value]`).
+  - `nullable` (optional boolean, default `false`): when `true`, a JSON `null` at `path` (or an absent field or header) yields `None` ("not set", never zero).
+- In `[balance]`, `value` (required) and `currency` (optional) are JSON paths normalized into `MetricName::Balance` (`decimal_string`) and `MetricName::Currency` (`iso4217`).
+- `builtin` is refused (`BuiltinRefused`) in inference provider files; only usage-credential files (`credential = "usage"`, M4-19) may name a builtin.
 
 Adapters never follow redirects (M4 sends them).
 
@@ -173,5 +186,7 @@ A registry error is a kind, the file and, where the parser recorded one, the lin
 | 11, detection part: no fixture in freed memory, even with the allocator's wipe off | `tests/detect_probe.rs` |
 | Errors carry no value | `tests/loader.rs` |
 | A key pattern without a literal prefix fails to load | `tests/loader.rs` |
-| A balance request to a denied path, in any spelling a server could normalize to one or route to it (a format suffix such as `.json`), fails to load | `tests/loader.rs` |
+| A balance or metrics request to a denied path, in any spelling a server could normalize to one or route to it (a format suffix such as `.json`), fails to load | `tests/loader.rs`, `tests/metrics.rs` |
+| Grammar v2 (`[metrics]`): `query:` auth refused, unlisted headers (`set-cookie`, `authorization`) refused, uncited literals refused, `builtin` in inference files refused, randomized loader input | `tests/metrics.rs`, `tests/loader.rs` |
+| Recorded shapes for DeepSeek (CNY-first), OpenRouter (`/api/v1/key`), Moonshot (`/v1/users/me/balance`) and GitHub (`/rate_limit` expiry header) load and extract without floats | `tests/shapes.rs` |
 | CODEOWNERS covers the provider files, their compiled copy, the generator and the loader rules | `tests/embedded.rs` |

@@ -71,10 +71,29 @@ pub enum RegistryErrorKind {
     DuplicateAuthSlot,
     /// A request puts the key in a slot the provider does not declare.
     AuthSlotNotDeclared,
+    /// A `[balance]`, `[metrics]` or `builtin` request puts the key in a
+    /// `query:` slot, which logs keys in URLs (D4-04, F12).
+    QueryAuthRefused,
     InvalidDeniedPath,
     /// A request method other than `GET`.
     InvalidMethod,
     InvalidJsonPath,
+    /// A `[metrics]` header source is not on the fixed allowlist (D4-05).
+    HeaderNotAllowed,
+    /// A `[metrics]` literal value is missing a valid `source` citation (D4-05).
+    LiteralMissingSource,
+    /// An unknown metric name in `[metrics]` (D4-05).
+    InvalidMetricName,
+    /// An unknown, malformed or incompatible metric unit in `[metrics]` (D4-05).
+    InvalidUnit,
+    /// A literal metric value does not match its declared unit or sets `nullable` (D4-05).
+    InvalidLiteral,
+    /// A field-equality selector is malformed or conflicts with the source (D4-05).
+    InvalidSelect,
+    /// A `builtin` adapter in an inference provider file (D4-05, D4-06).
+    BuiltinRefused,
+    /// `[metrics]` defines an empty `values` list.
+    NoMetricValues,
     /// A line of the multi-tenant suffix list that is not a lowercase DNS
     /// name of two or more labels.
     InvalidSuffix,
@@ -152,12 +171,29 @@ impl RegistryErrorKind {
             }
             K::DuplicateAuthSlot => "an auth slot is listed twice",
             K::AuthSlotNotDeclared => "a request's auth names no slot in auth",
+            K::QueryAuthRefused => {
+                "a request's auth may not use a query slot: query parameters put keys in URLs"
+            }
             K::InvalidDeniedPath => {
                 "invalid denied path: /, then segments of letters, digits and ._~- or a whole * \
                  segment, with no . or .. segment"
             }
             K::InvalidMethod => "a request method must be GET",
-            K::InvalidJsonPath => "invalid JSON path: $ then .name or [index] segments",
+            K::InvalidJsonPath => {
+                "invalid JSON path: $ then .name, [index] or [field=value] segments"
+            }
+            K::HeaderNotAllowed => "a metric header source is not on the fixed allowlist",
+            K::LiteralMissingSource => {
+                "a literal metric value must carry a source citation (https:// URL or research.md section)"
+            }
+            K::InvalidMetricName => "unknown metric name in [metrics]",
+            K::InvalidUnit => "invalid or incompatible metric unit",
+            K::InvalidLiteral => "a literal metric value does not match its unit or sets nullable",
+            K::InvalidSelect => "invalid field-equality selector",
+            K::BuiltinRefused => {
+                "builtin adapters are refused outside usage-credential provider files"
+            }
+            K::NoMetricValues => "[metrics] values is empty",
             K::InvalidSuffix => "not a lowercase DNS name of two or more labels",
             K::MissingFile => "a registry file is missing",
             K::UnknownFile => "not a registry file name",

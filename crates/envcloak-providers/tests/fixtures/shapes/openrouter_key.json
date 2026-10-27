@@ -1,0 +1,20 @@
+{
+  "data": {
+    "label": "work-key",
+    "limit": null,
+    "limit_remaining": null,
+    "limit_reset": "monthly",
+    "usage": 18.425,
+    "usage_daily": 1.25,
+    "usage_weekly": 6.5,
+    "usage_monthly": 18.425,
+    "byok_usage": 0,
+    "byok_usage_daily": 0,
+    "byok_usage_weekly": 0,
+    "byok_usage_monthly": 0,
+    "include_byok_in_limit": false,
+    "is_free_tier": false,
+    "is_management_key": false,
+    "expires_at": "2026-12-31T23:59:59Z"
+  }
+}
