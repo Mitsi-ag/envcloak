@@ -1,5 +1,7 @@
 [package]
 name = "envcloak-poll"
+description = "EnvCloak's one-shot spend-poller HTTPS client, TLS verifier seam and response extractor (SPEC §4.4, §8, §11; M4 plan D4-03, D4-04, D4-27)"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +12,20 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+testing = ["dep:getrandom"]
+
 [dependencies]
 envcloak-core.workspace = true
 envcloak-ipc.workspace = true
 envcloak-providers.workspace = true
 envcloak-sys.workspace = true
+getrandom = { workspace = true, optional = true }
+rustls.workspace = true
+rustls-platform-verifier.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+envcloak-poll = { path = ".", features = ["testing"] }
+envcloak-testkit.workspace = true
+tempfile.workspace = true

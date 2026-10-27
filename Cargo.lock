@@ -616,8 +616,15 @@ version = "0.1.0"
 dependencies = [
  "envcloak-core",
  "envcloak-ipc",
+ "envcloak-poll",
  "envcloak-providers",
  "envcloak-sys",
+ "envcloak-testkit",
+ "getrandom 0.4.3",
+ "rustls",
+ "rustls-platform-verifier",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]
