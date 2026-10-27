@@ -164,6 +164,12 @@ pub fn run(args: &[&str]) -> ExitCode {
         println!("usage: {USAGE_TEXT}");
         return ExitCode::SUCCESS;
     }
+    if let Some((&"--login", rest)) = args.split_first() {
+        let mut forwarded = Vec::with_capacity(rest.len() + 1);
+        forwarded.push("add");
+        forwarded.extend_from_slice(rest);
+        return super::login::run(&forwarded);
+    }
     let a = match parse(args) {
         Ok(a) => a,
         Err(why) => {

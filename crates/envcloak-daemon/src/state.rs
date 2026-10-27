@@ -261,15 +261,20 @@ impl State {
         } else {
             KeychainAnchorState::Unavailable
         };
+        let initial_slot = probe(&paths);
         let start_unix = envcloak_sys::test_hook_vars()
             .into_iter()
             .find_map(|(k, v)| {
                 (k == "ENVCLOAK_TEST_TOTP_START_UNIX").then(|| v.to_str()?.parse::<u64>().ok())?
             })
             .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs())
+                if matches!(initial_slot, Slot::Absent) {
+                    0
+                } else {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs())
+                }
             });
         let totp = Arc::new(crate::totp::TotpState::after_start(start_unix));
         let boot_id = crate::signin::sweep::BootId::current();
@@ -281,7 +286,7 @@ impl State {
             boot_id,
         ));
         let mut state = State {
-            slot: probe(&paths),
+            slot: initial_slot,
             paths,
             timer: LockTimer::new(idle_limit, now),
             last_reason: None,

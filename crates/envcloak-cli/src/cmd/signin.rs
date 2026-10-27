@@ -118,7 +118,7 @@ fn parse_duration_secs(s: &str, max_secs: u64) -> Option<u64> {
 fn parse_tier(s: &str) -> Option<LoginTierView> {
     match s {
         "dev" => Some(LoginTierView::Dev),
-        "each" => Some(LoginTierView::Each),
+        "each" | "step-up" => Some(LoginTierView::Each),
         "never-agent" => Some(LoginTierView::NeverAgent),
         _ => None,
     }
@@ -142,7 +142,10 @@ fn parse_check_kind(s: &str) -> Option<IdentityCheckKindView> {
 }
 
 fn parse_adapter(s: &str) -> Option<AdapterRefView> {
-    let (id, version) = s.split_once('@')?;
+    let (id, version) = match s.split_once('@') {
+        Some((id, version)) => (id, version),
+        None => (s, "1"),
+    };
     if id.is_empty() || version.is_empty() {
         return None;
     }
@@ -792,11 +795,23 @@ fn run_setup(args: &[&str]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut json = false;
+    let mut agents = false;
+    let mut consent_sockets = false;
+    let mut host_ids: Vec<&str> = Vec::new();
     let mut versions_path: Option<std::path::PathBuf> = None;
     let mut it = args.iter();
     while let Some(&flag) = it.next() {
         match flag {
             "--json" if !json => json = true,
+            "--agents" if !agents => agents = true,
+            "--yes" | "--consent-approval-mode" => {}
+            "--consent-sandbox-sockets" if !consent_sockets => consent_sockets = true,
+            "--agent" => {
+                let Some(&id) = it.next() else {
+                    return usage(USAGE_TEXT);
+                };
+                host_ids.push(id);
+            }
             "--versions" if versions_path.is_none() => {
                 let Some(&v) = it.next() else {
                     return usage(USAGE_TEXT);
@@ -812,6 +827,30 @@ fn run_setup(args: &[&str]) -> ExitCode {
     let vpath = versions_path.unwrap_or_else(envcloak_mcp::browser::browser_versions_path);
     match envcloak_mcp::browser::resolve_browser_runtime(&vpath) {
         Ok(rt) => {
+            if agents {
+                if !json {
+                    println!(
+                        "sign-in browser runtime verified (node {}, @playwright/mcp {}, Chrome for Testing {} r{})",
+                        escape_for_display(&rt.pins.node_version),
+                        escape_for_display(&rt.pins.helper_version),
+                        escape_for_display(&rt.pins.chrome_version),
+                        escape_for_display(&rt.pins.chrome_revision),
+                    );
+                }
+                let mut agent_args: Vec<&str> =
+                    vec!["install", "--signin", "--yes", "--consent-approval-mode"];
+                if consent_sockets {
+                    agent_args.push("--consent-sandbox-sockets");
+                }
+                for id in host_ids {
+                    agent_args.push("--agent");
+                    agent_args.push(id);
+                }
+                if json {
+                    agent_args.push("--json");
+                }
+                return super::agents::run(&agent_args);
+            }
             if json {
                 println!(
                     "{{\"status\":\"ready\",\"node_version\":{},\"helper_version\":{},\"playwright_version\":{},\"chrome_version\":{},\"chrome_revision\":{}}}",

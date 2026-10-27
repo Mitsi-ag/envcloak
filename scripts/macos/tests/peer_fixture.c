@@ -156,6 +156,10 @@ int main(int argc, char **argv) {
         char buf[8192];
         ssize_t n = read(conn, buf, sizeof(buf));
         if (n < 0) return 7;
+        if (n == 4) {
+            ssize_t more = read(conn, buf + 4, sizeof(buf) - 4);
+            if (more > 0) n += more;
+        }
         printf("%zd\n", n);
         return 0;
     }

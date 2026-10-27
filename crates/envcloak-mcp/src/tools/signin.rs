@@ -14,7 +14,7 @@
 //! filtered through [`allowlist_status_view`] so no upstream error text or
 //! credential fragment can cross into tool output.
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -517,7 +517,9 @@ pub mod request_sign_in {
             deadline
         };
         let mut client = ctx.connect_for_fds()?;
-        let (sup_in, sup_out) = UnixStream::pair()
+        let (in_client, in_daemon) = UnixStream::pair()
+            .map_err(|_| Failure::new("internal", "an internal error occurred"))?;
+        let (out_client, out_daemon) = UnixStream::pair()
             .map_err(|_| Failure::new("internal", "an internal error occurred"))?;
         let params = SigninRequestParams {
             manifest: manifest.to_string_lossy().into_owned(),
@@ -528,11 +530,21 @@ pub mod request_sign_in {
             fds: vec![FdRole::Stdin, FdRole::Stdout],
         };
         let mut view = client
-            .signin_request_with_fds(&params, &[sup_in.as_fd(), sup_out.as_fd()])
+            .signin_request_with_fds(&params, &[in_daemon.as_fd(), out_daemon.as_fd()])
             .map_err(Failure::from)?;
         drop(client);
-        drop(sup_in);
-        drop(sup_out);
+        drop(in_daemon);
+        drop(out_daemon);
+        if let Some(relay) = ctx.browser_relay() {
+            relay.register_request_pipes(
+                &view.request,
+                OwnedFd::from(in_client),
+                OwnedFd::from(out_client),
+            );
+        } else {
+            drop(in_client);
+            drop(out_client);
+        }
 
         while matches!(
             view.state.as_str(),
@@ -571,7 +583,7 @@ pub mod request_sign_in {
         if matches!(view.state.as_str(), "published" | "ready")
             && let Some(relay) = ctx.browser_relay()
         {
-            relay.with_supervisor_mut(|sup| sup.set_lease_active(true));
+            relay.activate_from_request(&view.request);
         }
         Ok(status_to_value(&view))
     }
@@ -638,6 +650,11 @@ pub mod sign_in_status {
         let deadline = call.deadline(ctx.wait);
         let mut client = ctx.connect_by(deadline)?;
         let view = client.signin_status(request).map_err(Failure::from)?;
+        if matches!(view.state.as_str(), "published" | "ready")
+            && let Some(relay) = ctx.browser_relay()
+        {
+            relay.activate_from_request(&view.request);
+        }
         Ok(status_to_value(&view))
     }
 }
@@ -705,13 +722,11 @@ pub mod cancel_sign_in {
         let mut client = ctx.connect_by(deadline)?;
         let view = client.signin_cancel(request).map_err(Failure::from)?;
         if let Some(relay) = ctx.browser_relay() {
-            let gen_id = view
+            let fallback_gen = view
                 .delivered_context
                 .clone()
                 .unwrap_or_else(|| view.request.clone());
-            relay.with_supervisor_mut(|sup| {
-                let _ = crate::browser::end_session(sup, &gen_id, true, false);
-            });
+            relay.revoke_active(&fallback_gen);
         }
         Ok(status_to_value(&view))
     }
@@ -780,13 +795,11 @@ pub mod end_sign_in_session {
         let mut client = ctx.connect_by(deadline)?;
         let view = client.signin_end(session).map_err(Failure::from)?;
         if let Some(relay) = ctx.browser_relay() {
-            let gen_id = view
+            let fallback_gen = view
                 .delivered_context
                 .clone()
                 .unwrap_or_else(|| session.to_owned());
-            relay.with_supervisor_mut(|sup| {
-                let _ = crate::browser::end_session(sup, &gen_id, true, false);
-            });
+            relay.revoke_active(&fallback_gen);
         }
         Ok(status_to_value(&view))
     }

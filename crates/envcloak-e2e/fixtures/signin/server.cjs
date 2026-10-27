@@ -304,7 +304,7 @@ async function main() {
       const ts =
         params.timestamp_secs !== undefined
           ? Number(params.timestamp_secs)
-          : Math.floor(Date.now() / 1000);
+          : Math.floor(currentClockMs() / 1000);
       const digits = params.digits ? Number(params.digits) : acct.digits;
       const algorithm = params.algorithm || acct.algorithm;
       const secretHex = params.secret_hex || acct.totpSecretHex;
@@ -377,6 +377,7 @@ async function main() {
       <div id="tenant">${effectiveTenant}</div>
       <div id="role">${effectiveRole}</div>
       <div id="build-number">${buildNumber}</div>
+      <div id="session-id">${token}</div>
       <script>
         localStorage.setItem("acme_tenant", ${JSON.stringify(effectiveTenant)});
         localStorage.setItem("acme_token", ${JSON.stringify("tok_" + token)});
@@ -438,6 +439,7 @@ async function main() {
           <div id="tenant">${sess.tenant}</div>
           <div id="role">${sess.role}</div>
           <div id="build-number">${buildNumber}</div>
+          <div id="session-id">${sess.token}</div>
           <script>localStorage.setItem("acme_tenant", ${JSON.stringify(sess.tenant)});</script>
         </body></html>`);
         return;
@@ -475,9 +477,12 @@ async function main() {
         const tok = body.token || cookies.session || bearer;
         if (tok && sessions.has(tok)) {
           sessions.get(tok).revoked = true;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok: true, revoked: true }));
+          return;
         }
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, revoked: Boolean(tok && sessions.has(tok)) }));
+        res.end(JSON.stringify({ ok: true, revoked: false }));
         return;
       }
 
