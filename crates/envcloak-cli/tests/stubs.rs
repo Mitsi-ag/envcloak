@@ -22,7 +22,15 @@ use envcloak_testkit::{TestHome, assert_no_canary, canaries, fresh_seed};
 
 /// Each registered command or option (the words that select it) and how
 /// its refusal names it.
-const STUBS: &[(&[&str], &str)] = &[];
+const STUBS: &[(&[&str], &str)] = &[
+    (&["spend"], "`envcloak spend`"),
+    (&["sub"], "`envcloak sub`"),
+    (&["budget"], "`envcloak budget`"),
+    (&["alerts"], "`envcloak alerts`"),
+    (&["card"], "`envcloak card`"),
+    (&["edit"], "`envcloak edit`"),
+    (&["set-class"], "`envcloak set-class`"),
+];
 
 /// Exit code of a stub, as of `run`'s own failures.
 const NOT_IN_THIS_BUILD: i32 = 125;

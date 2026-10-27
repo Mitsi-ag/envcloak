@@ -127,6 +127,14 @@ const HELP: &str = "usage:
   envcloak login add <slug> [--test | --live] [--tier <tier>] [--session-lifetime <dur>] [--adapter-key] [--username-fd N] [--password-fd N] [--totp-fd N] [--adapter-key-fd N] [--json]
   envcloak signin target add|edit|rm|ls ...
   envcloak signin setup [--versions PATH] [--json]
+Not in this build (each exits 125 with not_in_this_build):
+  envcloak spend
+  envcloak sub
+  envcloak budget
+  envcloak alerts
+  envcloak card
+  envcloak edit
+  envcloak set-class
 Values are never arguments: type them at the hidden prompt, or pipe them in with --stdin.";
 
 fn main() -> ExitCode {
@@ -199,6 +207,14 @@ fn main() -> ExitCode {
         ["items", rest @ ..] => cmd::items::run(rest),
         ["login", rest @ ..] => cmd::login::run(rest),
         ["signin", rest @ ..] => cmd::signin::run(rest),
+        // M4 commands, registered ahead of their tasks (M4-01).
+        ["spend", rest @ ..] => cmd::spend::run(rest),
+        ["sub", rest @ ..] => cmd::sub::run(rest),
+        ["budget", rest @ ..] => cmd::budget::run(rest),
+        ["alerts", rest @ ..] => cmd::alerts::run(rest),
+        ["card", rest @ ..] => cmd::card::run(rest),
+        ["edit", rest @ ..] => cmd::edit::run(rest),
+        ["set-class", rest @ ..] => cmd::set_class::run(rest),
         // Never echo arguments: one of them could be a pasted secret.
         _ => {
             eprintln!("envcloak: unknown command\n{HELP}");
@@ -207,12 +223,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// The refusal of an M2 or M2b command this build does not have, chosen
+/// The refusal of a command this build registers as a stub, chosen
 /// by the words that select it; `None` for any other command line. No
 /// other argument is read.
 fn not_in_this_build_whatever_the_arguments(args: &[std::ffi::OsString]) -> Option<ExitCode> {
-    let _ = args;
-    None
+    let word = |i: usize| args.get(i).and_then(|a| a.to_str());
+    Some(match word(0)? {
+        "spend" => cmd::spend::run(&[]),
+        "sub" => cmd::sub::run(&[]),
+        "budget" => cmd::budget::run(&[]),
+        "alerts" => cmd::alerts::run(&[]),
+        "card" => cmd::card::run(&[]),
+        "edit" => cmd::edit::run(&[]),
+        "set-class" => cmd::set_class::run(&[]),
+        _ => return None,
+    })
 }
 
 fn internal_hardening(hold: bool) -> ExitCode {

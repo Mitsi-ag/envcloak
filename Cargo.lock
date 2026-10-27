@@ -611,6 +611,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "envcloak-poll"
+version = "0.1.0"
+dependencies = [
+ "envcloak-core",
+ "envcloak-ipc",
+ "envcloak-providers",
+ "envcloak-sys",
+]
+
+[[package]]
 name = "envcloak-providers"
 version = "0.1.0"
 dependencies = [
@@ -678,6 +688,13 @@ dependencies = [
  "static_assertions",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "envcloak-spend"
+version = "0.1.0"
+dependencies = [
+ "envcloak-core",
 ]
 
 [[package]]

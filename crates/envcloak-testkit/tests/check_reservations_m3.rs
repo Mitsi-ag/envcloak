@@ -651,7 +651,12 @@ fn a_table_twice_under_one_heading_or_under_another_heading_fails() {
     let t = fixture();
     let path = t.home().join(IPC);
     let text = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, format!("{text}{block}")).unwrap();
+    let m3_end = text.find("\n## Reserved for M4\n").unwrap_or(text.len());
+    std::fs::write(
+        &path,
+        format!("{}{block}{}", &text[..m3_end], &text[m3_end..]),
+    )
+    .unwrap();
     assert_fails(
         &t,
         "the `reason` table appears twice under \"Reserved for M3\"",
@@ -659,10 +664,10 @@ fn a_table_twice_under_one_heading_or_under_another_heading_fails() {
     let t = fixture();
     let path = t.home().join(IPC);
     let text = std::fs::read_to_string(&path).unwrap();
-    std::fs::write(&path, format!("{text}\n## Reserved for M4\n{block}")).unwrap();
+    std::fs::write(&path, format!("{text}\n## Reserved for M99\n{block}")).unwrap();
     assert_fails(
         &t,
-        "the `reason` table is under \"Reserved for M4\", not one of the headings",
+        "the `reason` table is under \"Reserved for M99\", not one of the headings",
     );
 }
 

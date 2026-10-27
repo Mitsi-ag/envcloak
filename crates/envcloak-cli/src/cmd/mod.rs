@@ -14,7 +14,9 @@
 //! `--wait` and `--manifest`; M2-06 landed `mcp`; M2-08 landed `hook` and
 //! `agents install` and `uninstall`; M2-13 landed `items reclassify`;
 //! M2-09 landed `agents status`, and M2-28 its `--probe`; M2-19 landed
-//! `run --pty`.
+//! `run --pty`. M4-01 registers the M4 commands (`spend`, `sub`, `budget`,
+//! `alerts`, `card`, `edit` and `set-class`) as `not_in_this_build` stubs
+//! ahead of M4-04, M4-10, M4-13, M4-17, M4-18 and M4-20 (M4 plan D4-26).
 //!
 //! Argument errors never echo an argument: one could be a pasted secret.
 //! No command takes a value on the command line (gate 13): values come
@@ -24,13 +26,17 @@
 
 pub mod add;
 pub mod agents;
+pub mod alerts;
 pub mod approve;
 pub mod approve_unlocker;
 pub mod audit;
 pub mod backup;
+pub mod budget;
+pub mod card;
 pub mod check;
 pub mod daemon;
 pub mod doctor;
+pub mod edit;
 pub mod grants;
 pub mod hook;
 pub mod import;
@@ -50,10 +56,13 @@ pub mod rm;
 pub mod rotate;
 pub mod run;
 pub mod scrub;
+pub mod set_class;
 pub mod show;
 pub mod signin;
+pub mod spend;
 pub mod standing;
 pub mod status;
+pub mod sub;
 pub mod unlock;
 pub mod vault;
 
